@@ -1,0 +1,381 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/* Title: c.win
+ * Purpose: central control of window sytem events.
+ * History: IDJ: 07-Feb-92: prepared for source release
+ *      7/3/92: SJM: Unknown messages to icon bar now get passed to ICONBARLOAD rather than unknown.
+ *                   Window info messages get passed to their own window.
+ *                   MenusDeleted message gets passed to the window that last created a menu.
+ *      8/3/92: SJM: made win__discard discard all occurences of a window's event handler.
+ *      13/3/92:SJM: win_settitle doesn't use fatal form of werr when no memory.
+ *      20/4/92:SJM: remove_unknown_proc, if given 0 for proc removes all occurrences of the given handle.
+ */
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "h.os"
+#include "h.wimpx"
+#include "h.werr"
+#include "h.wimpt"
+#include "h.event"
+#include "h.msgs"
+
+#include "h.win"
+
+#define TOO_MANY msgs_lookup("win1:Too many windows - table full")
+
+/* -------- Keeping Track of All Windows. -------- */
+
+/* At the moment, a simple linear array of all windows. */
+
+typedef struct 
+{
+  wimp_w w;
+  win_event_handler proc;
+  void *handle;
+  void *menuh;
+} win__str;
+
+#define MAXWINDOWS (256 + 1)
+#define DUD (-1)
+
+static win__str *win__allwindows; /*[MAXWINDOWS]*/
+static int win__lim = 0; /* first unused index of win__allwindows */
+
+static void win__register(wimp_w w, win_event_handler proc, void *handle)
+{
+    win__str    *wp = win__allwindows;
+    int         i;
+    for (i=0; i < MAXWINDOWS; i++, wp++)
+    {
+        if (i == win__lim) {win__lim++; break;}
+        if (wp->w == w) {break;} /* found prev definition */
+        if (wp->w == DUD) {break;} /* found hole */
+    }
+
+    if (i == MAXWINDOWS)
+        werr(0, TOO_MANY);
+    else
+    {
+        wp->w = w;
+        wp->proc = proc;
+        wp->handle = handle;
+        wp->menuh = 0;
+    }
+}
+
+static void win__discard(wimp_w w)
+{
+    win__str    *wp = win__allwindows;
+    int i;
+    for (i=0; i<win__lim; i++, wp++)
+    {
+      if (wp->w == w)
+         wp->w = DUD;
+    }
+
+    while (win__lim > 0 && win__allwindows[win__lim-1].w == DUD)
+    {
+      /* decrease the limit if you can. */
+        win__lim--;
+    }
+}
+
+static win__str *win__find(wimp_w w)
+{
+    win__str    *wp = win__allwindows;
+    int         i;
+    for (i=0; i<win__lim; i++, wp++)
+        if (wp->w == w)
+            return wp;
+    return(0);
+}
+
+/* -------- Claiming Events. -------- */
+
+void win_register_event_handler(wimp_w w, win_event_handler proc, void *handle)
+{
+   if (proc == 0) 
+      win__discard(w);
+   else 
+      win__register(w, proc, handle);
+}
+
+typedef struct unknown_previewer
+{
+   struct unknown_previewer *link ;
+   win_unknown_event_processor proc ;
+   void *handle ;
+} unknown_previewer ;
+
+static wimp_w win__idle = DUD;
+#define win__unknown_flag (('U'<<24)+('N'<<16)+('K'<<8)+'N')
+
+static wimp_w win__unknown = DUD;
+static unknown_previewer *win__unknown_previewer_list = 0 ;
+
+void win_claim_idle_events(wimp_w w)
+{
+   win__idle = w; 
+}
+
+wimp_w win_idle_event_claimer(void)
+{
+   return(win__idle);
+}
+
+void win_claim_unknown_events(wimp_w w)
+{
+   win__unknown = w;
+}
+
+wimp_w win_unknown_event_claimer(void)
+{
+   return win__unknown;
+}
+
+void win_add_unknown_event_processor(win_unknown_event_processor p, void *h)
+{
+   unknown_previewer *block, *b;
+
+   /* first check to see if fn already there */
+   b = win__unknown_previewer_list ;
+   while (b != 0)
+   {
+      if (b->proc == p && b->handle == h) return;
+      b = b->link;
+   }
+
+   block = malloc(sizeof(unknown_previewer));
+   if (block != 0)
+   {
+      block->link = win__unknown_previewer_list ;
+      block->proc = p ;
+      block->handle = h ;
+      win__unknown_previewer_list = block ;
+   }
+}
+
+void win_remove_unknown_event_processor(win_unknown_event_processor p,
+                                        void *h)
+{
+   unknown_previewer *b, **pb;
+                              
+   pb = &win__unknown_previewer_list ;
+
+   while ((b = *pb) != 0)
+   {
+      if ((p == 0 || b->proc == p) && b->handle == h)
+      {
+         *pb = b->link;
+         free(b);
+         return;
+      }
+      pb = &(b->link);
+   }
+}
+
+/* -------- Menus. -------- */
+
+void win_setmenuh(wimp_w w, void *handle)
+{
+   win__str *p = win__find(w);
+   if (p != 0) {p->menuh = handle;}
+}
+
+void *win_getmenuh(wimp_w w) /* 0 if not set */
+{
+   win__str *p = win__find(w);
+   return(p==0 ? 0 : p->menuh);
+}
+
+/* -------- Processing Events. -------- */
+
+BOOL win_processevent(wimp_eventstr *e)
+{
+   wimp_w w = win__unknown_flag;
+   win__str *p;
+
+   switch (e->e) 
+   {
+      case wimp_ENULL:
+        w = win__idle;
+        break;
+
+      case wimp_EUSERDRAG:
+        w = win__unknown_flag ;
+        break;
+
+      case wimp_EREDRAW: case wimp_ECLOSE: case wimp_EOPEN:
+      case wimp_EPTRLEAVE: case wimp_EPTRENTER: case wimp_EKEY:
+      case wimp_ESCROLL:
+        w = e->data.o.w;
+        break;
+
+      case wimp_EBUT:
+        w = e->data.but.m.w;
+        if (w <= (wimp_w) -1) w = win_ICONBAR;
+        break;
+
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+        /* Some standard messages we understand, and give to the right guy. */
+        switch (e->data.msg.hdr.action) 
+        {
+           case wimp_MCLOSEDOWN:
+             exit(0);
+
+           case wimp_MDATALOAD:
+           case wimp_MDATASAVE:
+             /* Note that we're assuming the window handle's the same position in
+                both messages */
+             if (e->data.msg.data.dataload.w < 0)
+             {
+               w = win_ICONBARLOAD ;
+             } 
+             else 
+             {
+               w = e->data.msg.data.dataload.w;
+             }
+             break;
+
+           case wimp_MHELPREQUEST:
+             w = e->data.msg.data.helprequest.m.w;
+             if (w < 0) w = win_ICONBARLOAD;
+             break;
+
+           case wimp_MWindowInfo:
+             w = e->data.msg.data.words[0];
+             if (w == 0) w = win__unknown_flag;
+             break;
+
+           case wimp_MMenuClosed:
+             w = event_current_menu_window();
+             if (w == 0) w = win__unknown_flag;
+             else if (w < 0) w = win_ICONBARLOAD;
+             break;                               
+
+           default:
+             w = win__unknown_flag;
+             break;
+        }
+        break;
+
+      default:
+        w = win__unknown_flag;
+        break;
+   }
+
+   if (w==win__unknown_flag || win__find(w) == 0)
+   {
+      unknown_previewer *pr ;
+      for (pr = win__unknown_previewer_list; pr != 0; pr = pr->link)
+      {
+         if (pr->proc(e, pr->handle)) return TRUE ;
+      }
+
+      w = win__unknown ;
+   }
+
+   p = (w == DUD ? 0 : win__find(w));
+   if (p != 0) 
+   {
+      p->proc(e, p->handle);
+      return TRUE;
+   } 
+   else 
+   {
+      return FALSE;
+   }
+}
+
+/* -------- Termination. -------- */
+
+static int win__active = 0;
+
+void win_activeinc(void)
+{
+  win__active++;
+}
+
+void win_activedec(void)
+{
+  win__active--;
+}
+
+int win_activeno(void)
+{
+  return win__active;
+}
+
+/* -------- Giving away the caret. -------- */
+
+void win_give_away_caret(void)
+{
+    win__str    *wp = win__allwindows;
+    int         i;
+    for (i=0; i<win__lim; i++, wp++)
+    {
+      if (wp->w != DUD)
+      { 
+         /* found a window */
+         wimp_wstate s;
+         wimp_eventstr e;
+         (void) wimp_get_wind_state(wp->w, &s);
+         if (s.o.behind == DUD && (s.flags & wimp_WOPEN) != 0)
+         {
+            /* w is the top window */
+            /* if it wants the caret, it will grab it. */
+            e.e = wimp_EOPEN;
+            e.data.o = s.o;
+            wimpt_fake_event(&e);
+            break;
+         }
+      }
+   }
+}
+
+/* ----------- reading event handler for window ----------- */
+/* useful for intercepting events to txt windows */
+
+BOOL win_read_eventhandler(wimp_w w, win_event_handler *p, void **handle)
+{
+    win__str *wp;
+    if ((wp = win__find(w)) != NULL)
+    {
+        if (p)
+            *p = wp->proc;
+        if (handle)
+            *handle = wp->handle;
+        return(TRUE);
+    }
+    return(FALSE);
+}
+
+BOOL win_init(void)
+{
+   if (win__allwindows == 0) 
+      return((win__allwindows = malloc(MAXWINDOWS*sizeof(win__str)))!=0);
+   else
+      return TRUE;
+}
+
+/* end */

@@ -1,0 +1,1378 @@
+/*
+ * $Header: /ab/bsd:etc/scsidm/opcmds.c:bsd  1.6  $
+ * $Source: /ab/bsd:etc/scsidm/opcmds.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:        opcmds.c,v $
+ * Revision 1.6  91/09/11  15:39:54  kwelton
+ * Added new command/function disconnect().
+ * 
+ * Revision 1.5  90/08/13  15:25:50  jroach
+ * Bring Risc OS and RISCiX versions in line with each other
+ * 
+ * Revision 1.4  90/05/25  11:16:44  kwelton
+ * diagnose() sets the ALLOW_DISCONNECT flag in cmdptr->flags.
+ * 
+ * Revision 1.3  89/10/23  14:20:54  kwelton
+ * Stupid bug that has only now been picked up - Sense Data Length was cleared
+ * in senheader before being printed, instead of in selheader after being
+ * printed.
+ * 
+ * Revision 1.2  89/04/18  17:43:04  kwelton
+ * struct scsiop flags (ps_scsi.h) changed from I_... to SC_...
+ * 
+ * Revision 1.1  89/04/06  11:22:36  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /ab/bsd:etc/scsidm/opcmds.c:bsd  1.6  $";
+#endif
+
+#include <stdio.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "ps_scsi.h"
+#include "ps_direct.h"
+#include "kernel.h"
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <dev/ps_scsi.h>
+#include <dev/ps_direct.h>
+#endif
+#include "scsidm.h"
+#include "dmcmds.h"
+
+/*
+ * In RISC OS, SWI SCSI_Control 6 allows/inhibits disconnection/reselection.
+ * See page 51 of the SCSI Expansion Card User Guide for more details.
+ */
+
+#define SCSI_Control                            0x403C2
+#define RISCOS_SCSI_DISCONNECT_ON               0
+#define RISCOS_SCSI_DISCONNECT_OFF_NO_IDENTIFY  1
+#define RISCOS_SCSI_DISCONNECT_OFF_IDENTIFY     2
+#define RISCOS_SCSI_GET_CURRENT_SETTING         -1
+
+#define RISCOS_SCSI_CONTROL_6                   6
+
+        /* import externals */
+import char **iphelp;
+import struct d_parms *cdev;
+import struct scsiop devcmd;
+import DefectList defects;
+import UNIX_Info infoblock;
+
+        /* declare external functions */
+import int vdbool(), vdint(), sendglist(), vdstr(), atoi(), atox(),
+        rdmode(), wrtmode(), scanlist();
+import u_int unixstartbyte();
+import unsigned long iplims(), ipdata(), vdul();
+import bool gotdev(), runcmd(), addbad();
+import void *malloc(), clrdef();
+
+        /* declare statics */
+static char inpbuf[CANBSIZ];
+
+static char pfprompt[] = "Work with pages? (yes) >";
+static char *pfiphelp[] =
+{
+ "The SCSI  spec. defines  mode sense/select  information as a",
+ "variable length header block,  followed by one or more pages",
+ "of data. Enter `yes' if you wish to work with the pages,  or",
+ "`no' if you wish to read/write the standard header block.",
+ ""
+};
+
+static int sortdefs(), riscos_disconnect_status();
+static bool senheader();
+static void selheader(), prpage();
+
+        /* declare routines defined this segment */
+void mapdefects(), diagnose(), sensemode(), selectmode(), prdefects(),
+        namepart();
+
+/**********************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, opcmds.c:
+ *
+ * 1) void mapdefects() - map out known bad blocks
+ *
+ * 2) void diagnose() - run internal diagnostics
+ *
+ * 3) void sensemode() - read mode sense data for a given page
+ *
+ * 4) void selectmode() - write mode select data for a given page
+ *
+ * 5) static bool senheader() - mode sense on header data
+ *
+ * 6) static void selheader() - mode select on header data
+ *
+ * 7) static void prpage() - print data from a mode page
+ *
+ * 8) void prdefects() - print list of defects
+ *
+ * 9) static int sortdefs() - sort defect list into ascending order
+ *
+ * 10) void namepart() - name a partition table
+ *
+ * 11) void disconnect() - prevent/allow disconnection
+ *
+ * 12) static int riscos_disconnect_status() - gets risc os disconnect status
+ */
+
+/************************************************************************/
+
+void mapdefects(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine mapdefects() -
+         *
+         * routine reads a list of bad blocks from a file specified
+         * by the user, and sends these to the current device as
+         * additions to its glist. no value is returned.
+         *
+         */
+
+        /* declare autos */
+        register int status;
+        char fname[CANBSIZ];
+        register FILE *fp;
+        u_long nextblok;
+
+        static char *defectfiphelp[] = 
+        {
+         "The current  command is map  out defects.  Enter the name of",
+         "the file which contains a  list of all known defects for the",
+         "current device.  This list should be  a whitespace delimited",
+         "set of bad logical block numbers in decimal.",
+         ""
+        };
+
+        static char *clrfiliphelp[] =
+        {
+         "The  device has successfully mapped out all the  bad blocks,",
+         "therefore  the list of  defects is  no longer valid.  Answer",
+         "`yes' if you want this list emptied, answer `no' if you want",
+         "it kept.",
+         ""
+        };
+
+        /* check that a device has been opened */
+        if( !gotdev(*argv) )
+         return;
+
+        /* has the filename been passed as an arg? */
+        if( --argc > 0 )
+         strcpy(fname,*++argv);
+        else
+        {
+         iphelp = defectfiphelp;
+         ipdata(fname,"defects filename? >",vdstr,FALSE);
+        }
+
+        /* try to open the file */
+        if( (fp = fopen(fname,"r")) == NULL )
+        {
+         printf("cannot open file %s\n",fname);
+         return;
+        }
+
+        /* read all the bad block data from the file */
+        while( (status = fscanf(fp," %lx ",&nextblok)) == 1 )
+         if( !addbad(nextblok) )
+         {
+          printf("mapdefects: out of core\n");
+          return;
+         }
+
+        if( status != EOF )
+        {
+         /* fscanf() failed to match an arg */
+         printf("bad data format in file %s\n",fname);
+
+         /* clear the defect list before finishing */
+         clrdef();
+         return;
+        }
+        else if( (defects.dl_header & 0xffff) == 0 )
+        {
+         /* file was empty */
+         printf("file %s is empty\n",fname);
+         return;
+        }
+
+        else if( sendglist() != GOOD )
+        {
+         printf("could not remap the defects\n");
+         clrdef();
+         return;
+        }
+
+        /* ask whether to truncate the file */
+        if( --argc > 0 )
+         status = (int)ipdata(*++argv,NULL,vdbool,FALSE);
+        else
+        {
+         iphelp = clrfiliphelp;
+         status = (int)ipdata(inpbuf,"truncate the defect list? (yes) >",
+                              vdbool,TRUE);
+         if( status == USEDEFAULT )
+          status = TRUE;
+        }
+
+        /* clear the list if necessary */
+        if( status == GOOD )
+        {
+         /* close the file & open it again for writing */
+         fclose(fp);
+         if( (fp = fopen(fname,"w")) == NULL )
+          printf("do not have suitable access rights for truncating file %s\n",
+                 fname);
+         else if( ftruncate(fileno(fp),(off_t)0) < 0 )
+         {
+          printf("truncate of file %s failed because",fname);
+          perror("");
+         }
+         else
+          printf("file %s has been truncated to zero length\n",fname);
+        }
+
+        else
+         printf("\n*WARNING* file %s may contain obsolete information\n\n",
+                fname);
+
+        /* finished */
+        fclose(fp);
+        return;
+}
+
+/************************************************************************/
+
+/*ARGSUSED*/
+void diagnose(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine diagnose() -
+         *
+         * routine asks the current device to run its internal diagnostic
+         * routines. no value is returned.
+         *
+         */
+
+        /* declare autos */
+        register struct scsiop *cmdptr;
+        char null;
+
+        /* check that a device has been opened */
+        if( !gotdev(*argv) )
+         return;
+
+        /* build skeleton control block */
+        cmdptr = &devcmd;
+        bldskelcb(SDIAG,cmdptr);
+
+        /* fill in the command specific stuff */
+        cmdptr->cdb[1] |= DIAGTYPE;
+        cmdptr->xfer = 0;
+        cmdptr->addr = &null;
+        cmdptr->timeout = SDIAGTIMEO;
+#if defined(SCSIDM_FOR_RISCOS)
+        cmdptr->flags |= SC_READ;
+#elif defined(SCSIDM_FOR_RISCiX)
+        cmdptr->flags |= (SC_READ | SC_ALLOW_DISCONNECT);
+#endif
+
+        switch( runcmd(cmdptr) )
+        {
+        case GOOD:
+         printf("diagnostics passed\n");
+         break;
+
+        case BAD:
+         printf("errors were detected by the device's internal diagnostics\n");
+         break;
+
+        case BADARG:
+        default:
+         break;
+        }
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+void sensemode(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine sensemode() -
+         *
+         * routine reads mode sense data for a given page from the
+         * current device and prints it out in hex. no value is
+         * returned.
+         *
+         */
+
+        /* declare autos */
+        register int dopages, pagno, reptype;
+        u_char pageptr[MDBUFLEN];
+
+        static char *senpagiphelp[] =
+        {
+         "The current command is read mode sense data.  Enter the mode",
+         "sense  page number to be read.  The scsi standard allows for",
+         "a  maximum of 63 pages,  but the current  device may support",
+         "far less than this.",
+         ""
+        };
+
+        static char *rtypeiphelp[] =
+        {
+         "The current command is read mode sense data. Enter the class",
+         "of information required, as a number  between 0 & 3 which is",
+         "interpreted as follows:",
+         " ",
+         "  0 - report current values   1 - report changeable values",
+         "  2 - report default values   3 - report saved values",
+         ""
+        };
+
+        /* check that a device has been opened */
+        if( !gotdev(*argv) )
+         return;
+
+        /* ask whether to work with page data */
+        if( --argc > 0 )
+        {
+         if( (dopages = (int)ipdata(*++argv,NULL,
+                                    vdbool,FALSE)) == BADARG )
+          return;
+        }
+        else
+        {
+         iphelp = pfiphelp;
+         if( (dopages = (int)ipdata(inpbuf,pfprompt,
+                                    vdbool,TRUE)) == USEDEFAULT )
+          dopages = TRUE;
+        }
+
+        /* call separate function for header work */
+        if( !dopages )
+        {
+         (void)senheader(NULL);
+         return;
+        }
+
+        /* read the page number */
+        if( --argc > 0 )
+         pagno = (int)iplims(*++argv,NULL,vdint,0,62,FALSE);
+        else
+        {
+         iphelp = senpagiphelp;
+         pagno = (int)iplims(inpbuf,"read page number? >",vdint,
+                             0,62,FALSE);
+        }
+
+        /* check for bum answer */
+        if( pagno == BADARG )
+         return;
+
+        /* read the report type */
+        if( --argc > 0 )
+         reptype = (int)iplims(*++argv,NULL,vdint,0,3,FALSE);
+        else
+        {
+         iphelp = rtypeiphelp;
+         reptype = (int)iplims(inpbuf,"report type? >",vdint,0,3,FALSE);
+        }
+
+        /* sensible reply? */
+        if( reptype == BADARG )
+         return;
+
+        /* read the mode sense data */
+        if( rdmode(pageptr,pagno,reptype,FALSE) != GOOD )
+         return;
+
+        /* print the page data */
+        prpage((u_char *)pageptr);
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+void selectmode(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine selectmode() -
+         *
+         * routine writes mode select data for a given page from the
+         * current device. no value is returned.
+         *
+         */
+
+        /* declare autos */
+        register int dopages, pagno, saveit, paglen, nbytes, i;
+        register u_char *dptr, *chptr;
+        u_char inplist[3 * MDLEN], inpdata[3 * MDLEN];
+        u_char paglist[MDLEN], pagdata[MDLEN];
+        u_char modedata[MDBUFLEN], changes[MDBUFLEN];
+
+        static char *selpagiphelp[] =
+        {
+         "The current  command is  write  mode select data.  Enter the",
+         "mode  select  page number  to be written.  The scsi standard",
+         "allows for a maximum of 63 pages, but the current device may",
+         "support far less than this.",
+         ""
+        };
+
+        static char *sdataiphelp[] =
+        {
+         "The current  device allows mode  select data to be saved for",
+         "this page. Enter `yes' if you want your new data to be saved",
+         "enter `no' if you want it to affect the current values only.",
+         ""
+        };
+
+        static char *plistiphelp[] =
+        {
+         "Enter a  comma-separated list of bytes  within the page that",
+         "are  to be modified,  counting from zero.  There must  be at",
+         "least one nonzero bit for each of these bytes in the `report",
+         "changeable values' mode sense of this page.",
+         ""
+        };
+
+        static char *pdataiphelp[] =
+        {
+         "Enter a comma-separated  list of new values for each byte in",
+         "the list  given previously.  These new values are assumed to",
+         "be in hexadecimal,  and map directly onto the previous list,",
+         "i.e. the fourth value  given is mapped  onto the fourth byte",
+         "in the list.",
+         ""
+        };
+
+        /* check that a device has been opened */
+        if( !gotdev(*argv) )
+         return;
+
+        /* ask whether to work with page data */
+        if( --argc > 0 )
+        {
+         if( (dopages = (int)ipdata(*++argv,NULL,
+                                    vdbool,FALSE)) == BADARG )
+          return;
+        }
+        else
+        {
+         iphelp = pfiphelp;
+         if( (dopages = (int)ipdata(inpbuf,pfprompt,
+                                    vdbool,TRUE)) == USEDEFAULT )
+          dopages = TRUE;
+        }
+
+        /* call separate function for header work */
+        if( !dopages )
+        {
+         *argv = "selheader";
+         selheader(argc,argv);
+         return;
+        }
+
+        /* read the page number */
+        if( --argc > 0 )
+         pagno = (int)iplims(*++argv,NULL,vdint,0,62,FALSE);
+        else
+        {
+         iphelp = selpagiphelp;
+         pagno = (int)iplims(inpbuf,"write page number? >",vdint,
+                             0,62,FALSE);
+        }
+
+        /* check for a bum answer */
+        if( pagno == BADARG )
+         return;
+
+        /* read the data for the current page */
+        if( rdmode(modedata,pagno,REPCURRENT,TRUE) != GOOD )
+         return;
+
+        /* calculate the start address of the page */
+        paglen = *(modedata + 3);
+        dptr = modedata + (paglen + 4);
+
+        /* now calculate its length & set page pointer */
+        paglen = *(dptr + 1);
+        paglen += 2;
+
+        /* see whether this page can be saved */
+        saveit = (*dptr & 0x80) ? TRUE : FALSE;
+
+        /*
+         * print the current page if new bytes not
+         * specified on the command line
+         */
+        if( (saveit && argc <= 2) || (!saveit && argc <= 1) )
+         prpage(modedata);
+
+        /* test whether this pages parameters can be saved */
+        if( saveit )
+        {
+         /* parameters can be saved, does the user want to? */
+         if( --argc > 0 )
+         {
+          if( (saveit = ipdata(*++argv,NULL,vdbool,FALSE)) == BADARG )
+           return;
+         }
+         else
+         {
+          iphelp = sdataiphelp;
+          if( (saveit = ipdata(inpbuf,"save the data? (yes) >",
+                               vdbool,TRUE)) == USEDEFAULT )
+           saveit = TRUE;
+         }
+        }
+
+        /* read the changeable values */
+        if( rdmode(changes,pagno,REPCHANGE,TRUE) != GOOD )
+         return;
+
+        /*
+         * in general, most of the information from mode sense can
+         * be returned to mode select. However, a few bytes need
+         * adjustment, so this is done here
+         */
+        *modedata = 0;          /* sense data length, reserved in select */
+        *dptr &= 0x7f;          /* clear bit signalling save possible */
+
+        /* address the start of the masks page */
+        chptr = changes + changes[3] + 4;
+
+        /* set defaults for all the changeable values */
+        *(dptr - 2) &= 0x2f;
+        for( i = 0; i < paglen; ++i )
+         *(dptr + i) &= *(chptr + i);
+
+        /*
+         * if list of byte numbers given on the command line,
+         * force the list of values to be given also.
+         */
+        if( --argc == 1 )
+        {
+         /* got one, but not the other */
+         printf("must supply data if byte numbers specified\n");
+         return;
+        }
+
+        /* read the list of bytes to be changed */
+        if( argc > 0 )
+         strcpy(inplist,*++argv);
+        else
+        {
+         iphelp = plistiphelp;
+         ipdata(inplist,"change byte numbers? >",vdstr,FALSE);
+        }
+
+        /* scan the list */
+        if( (nbytes = scanlist(inplist,paglist,atoi)) == -1 )
+         /* error occured in scan */
+         return;
+        else if( nbytes > paglen )
+        {
+         printf("input list names more bytes than the page contains\n");
+         return;
+        }
+
+        /* read the list of new values */
+        if( argc > 0 )
+         strcpy(inpdata,*++argv);
+        else
+        {
+         iphelp = pdataiphelp;
+         ipdata(inpdata,"new values [in hex]? >",vdstr,FALSE);
+        }
+
+        /* scan the list */
+        if( (i = scanlist(inpdata,pagdata,atox)) == -1 )
+         /* error occured in scan */
+         return;
+        else if( i != nbytes )
+        {
+         printf("incorrect number of new values (%d should be %d)\n",
+                 i,nbytes);
+         return;
+        }
+
+        /* fill these new values in */
+        for( i = 0; i < nbytes; ++i )
+        {
+         register int index;
+
+         /* calculate index into page data */
+         if( (index = *(paglist + i)) >= paglen )
+         {
+          printf("byte %d: page is not that long\n",index);
+          return;
+         }
+
+         /* test for silly values */
+         else if( index < 0 )
+         {
+          printf("%d: nonsensical byte number\n",index);
+          return;
+         }
+         else if( index < 2 )
+         {
+          printf("Cannot change the first two bytes on a page\n");
+          return;
+         }
+
+         /* check that data is valid */
+         else if( (*(pagdata + i) & *(chptr + index)) != *(pagdata + i) )
+         {
+          printf("byte %d: invalid data %#02x (change mask = %#02x)\n",
+                 index,*(pagdata + i),*(chptr + index));
+          return;
+         }
+         else
+          *(dptr + index) = *(pagdata + i);
+        }
+
+        /* write this data out to the device */
+        if( wrtmode(modedata,saveit,FALSE,pagno) != GOOD )
+         return;
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+static bool senheader(data)
+
+char *data;
+
+{
+        /*
+         * subroutine senheader() -
+         *
+         * routine performs a mode sense on the standard SCSI header
+         * data. returned value is TRUE if all OK, else FALSE.
+         *
+         */
+
+        /* declare autos */
+        register int nbytes;
+        register char mindata[4];
+        register struct scsiop *cmdptr;
+        static char *dptr = NULL;
+
+        /* free core if necessary */
+        if( dptr != NULL )
+        {
+         free(dptr);
+         dptr = NULL;
+        }
+
+        /*
+         * read the length of the header block, pretend we are
+         * reading page zero, but do not allocate enough space
+         * for the page data - it is not required.
+         */
+        cmdptr = &devcmd;
+        bldskelcb(MODESEN,cmdptr);
+
+        /* fill in device specific stuff */
+        cmdptr->cdb[4] = 4;
+        cmdptr->xfer = 4;
+        cmdptr->addr = mindata;
+        cmdptr->timeout = MSNTIMEO;
+        cmdptr->flags |= SC_READ;
+
+        /* run this command */
+        if( runicmd(cmdptr) != GOOD )
+         /* cannot proceed */
+         return(FALSE);
+
+        /* OK - read the length of the header */
+#if 0
+        nbytes = mindata[3] + 4;
+#else
+        nbytes = mindata[0] + 1;
+#endif
+
+        /* allocate some space for the full header */
+        if( (dptr = malloc(nbytes)) == NULL )
+        {
+         fputs("senheader(): out of core\n",stdout);
+         return(FALSE);
+        }
+
+        /* rebuild the cdb */
+        cmdptr->cdb[4] = nbytes;
+        cmdptr->xfer = nbytes;
+        cmdptr->addr = dptr;
+
+        /* try to send this command */
+        if( runcmd(cmdptr) != GOOD )
+        {
+         fputs("cannot read header bytes\n",stdout);
+         return(FALSE);
+        }
+        else
+        {
+         register int i = 0;
+         register char *cptr = dptr;
+
+         /* copy the data across if required */
+         if( data != NULL )
+          bcopy(dptr,data,nbytes);
+
+         /* print the data */
+         while( i < nbytes )
+         {
+          printf("%02x  ",*(u_char *)cptr++);
+          if( !(++i % 8) )
+           putchar('\n');
+         }
+         if( (i % 8) )
+          putchar('\n');
+        }
+
+        /* finished */
+        free(dptr);
+        dptr = NULL;
+        return(TRUE);
+}
+
+/************************************************************************/
+
+static void selheader(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine selheader() -
+         *
+         * routine performs a mode select on the standard SCSI header
+         * data. no value is returned.
+         *
+         */
+
+        /* declare autos */
+        register int i, datalen, nbytes;
+        register struct scsiop *cmdptr;
+        char data[CANBSIZ];
+        u_char hdrlist[CANBSIZ], hdrdata[CANBSIZ];
+        u_char inplist[CANBSIZ], inpdata[CANBSIZ];
+
+        static char *hlistiphelp[] =
+        {
+         "Enter a comma-separated list of bytes within the header that",
+         "are to be modified.  It is your responsibility to ensure the",
+         "current drive will allow changes to be made to these bytes.",
+         ""
+        };
+
+        static char *hdataiphelp[] =
+        {
+         "Enter a comma-separated  list of new values for each byte in",
+         "the list  given previously.  These new values are assumed to",
+         "be in hexadecimal,  and map directly onto the previous list,",
+         "i.e. the fourth value  given is mapped  onto the fourth byte",
+         "in the list.",
+         ""
+        };
+
+        /*
+         * if list of byte numbers given on the command line, force the
+         * list of values to be given also.
+         */
+        if( --argc == 1 )
+        {
+         /* got one, but not the other */
+         fputs("must supply data if byte numbers specified\n",stdout);
+         return;
+        }
+
+        /* read & print the current data */
+        if( !senheader(data) )
+         /* give up */
+         return;
+        else
+        {
+         /* must clear the Sense Data Length */
+         data[0] = 0;
+
+         /* get header length */
+         datalen = data[3] + 4;
+        }
+
+        /* read the list of bytes to be changed */
+        if( argc > 0 )
+         strcpy(inplist,*++argv);
+        else
+        {
+         iphelp = hlistiphelp;
+         ipdata(inplist,"change byte numbers? >",vdstr,FALSE);
+        }
+
+        /* scan the list */
+        if( (nbytes = scanlist(inplist,hdrlist,atoi)) == -1 )
+         /* error occured in scan */
+         return;
+        else if( nbytes > datalen )
+        {
+         fputs("input list names more bytes than the header contains\n",
+                stdout);
+         return;
+        }
+
+        /* read the list of new values */
+        if( --argc > 0 )
+         strcpy(inpdata,*++argv);
+        else
+        {
+         iphelp = hdataiphelp;
+         ipdata(inpdata,"new values [in hex]? >",vdstr,FALSE);
+        }
+
+        /* scan the list */
+        if( (i = scanlist(inpdata,hdrdata,atox)) == -1 )
+         /* error in scan */
+         return;
+        else if( i != nbytes )
+        {
+         printf("incorrect number of new values (%d should be %d)\n",
+                i,nbytes);
+         return;
+        }
+
+        /* fill the new value in */
+        for( i = 0; i < nbytes; ++i )
+        {
+         register int index;
+
+         /* calculate index into data */
+         if( (index = hdrlist[i]) >= datalen )
+         {
+          printf("byte %d: header is not that long\n",index);
+          return;
+         }
+
+         /* test for silly values */
+         else if( index < 0 )
+         {
+          printf("%d: nonsensical byte number\n",index);
+          return;
+         }
+
+         else
+          data[index] = hdrdata[index];
+        }
+
+        /* build the command to write this data */
+        cmdptr = &devcmd;
+        bldskelcb(MODESEL,cmdptr);
+
+        /* fill in the command specific stuff */
+        cmdptr->cdb[4] = datalen;
+        cmdptr->xfer = datalen;
+        cmdptr->addr = data;
+        cmdptr->timeout = MSLTIMEO;
+        cmdptr->flags |= SC_WRITE;
+
+        /* run the command */
+        if( runcmd(cmdptr) != GOOD )
+        {
+         fputs("could not write the new data\n",stdout);
+         return;
+        }
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+static void prpage(pageptr)
+
+u_char *pageptr;
+
+{
+        /*
+         * subroutine prpage() -
+         *
+         * routine prints the page data returned from the current device
+         * and held in pageptr. no value is returned.
+         *
+         */
+
+        /* declare autos */
+        register int paglen, cansave, i;
+        register u_char *dataptr;
+
+        /* calculate the start address of the page */
+        paglen = *((u_char *)(pageptr + 3));
+        dataptr = pageptr + paglen + 4;
+
+        /* test whether this pages parameters can be saved */
+        cansave = *dataptr & 0x80;
+
+        /* now read the true length of the page */
+        paglen = *((u_char *)(dataptr + 1));
+        paglen += 2;
+
+        /* print the data out */
+        printf("the data on this page can%s be saved\n",cansave ? "" : " not");
+        for( i = 0; i < paglen; )
+        {
+         printf("%02hx  ",(u_char)*(dataptr + i));
+         if( !(++i % 8) )
+          putchar('\n');
+        }
+
+        /* tidy up with a final newline if necessary */
+        if( (i % 8) )
+         putchar('\n');
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+void prdefects(argc,argv)
+
+/*ARGSUSED*/
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine prdefects() -
+         *
+         * routine prints the GLIST from the current scsi device. no value
+         * is returned.
+         *
+         */
+
+        /* declare autos */
+        register u_int dlsize, i;
+        register u_char *dlptr, *cptr;
+        register struct scsiop *cmdptr;
+        u_char mindl[4];
+
+        /* check that a device has been opened */
+        if( !gotdev(*argv) )
+         return;
+
+        /* build skeleton control block */
+        cmdptr = &devcmd;
+        bldskelcb(RDDEF,cmdptr);
+
+        /* fill in the command specific stuff */
+        cmdptr->cdb[2] = RDDTYPE;
+        storelong((cmdptr->cdb) + 7,4l,2);
+        cmdptr->xfer = 4;
+        cmdptr->addr = (char *)mindl;
+        cmdptr->timeout = RDDTIMEO;
+        cmdptr->flags |= SC_READ;
+
+        /* run this command */
+        if( runcmd(cmdptr) != GOOD )
+         return;
+
+        /* read the true defect list length */
+        dlsize = (u_int)fetchlong((char *)(mindl + 2),2);
+
+        /* allocate some RAM & read the list if necessary */
+        if( dlsize != 0 )
+        {
+         if( (dlptr = malloc(dlsize + 4)) == NULL )
+         {
+          printf("prdefects: out of core\n");
+          return;
+         }
+
+         /* now fill in the command proper */
+         storelong((cmdptr->cdb) + 7,(long)(dlsize + 4),2);
+         cmdptr->xfer = (int)(dlsize + 4);
+         cmdptr->addr = (char *)dlptr;
+         if( runcmd(cmdptr) != GOOD )
+          return;
+
+         /* adjust size of list from bytes to no. of entries */
+         dlsize /= RDDESIZE;
+
+         /* sort & print the list */
+         qsort((char *)(cptr = (dlptr + 4)),dlsize,RDDESIZE,sortdefs);
+
+         fputs("\n\t\t+--------+----------+------+--------+",stdout);
+         fputs("\n\t\t| Defect | Cylinder | Head | Sector |",stdout);
+         fputs("\n\t\t+--------+----------+------+--------+\n",stdout);
+
+         for( i = 0; i < dlsize; ++i, cptr += RDDESIZE )
+         {
+          printf("\t\t|  %4d  ",i);
+          printf("|  %6u  ",(u_int)fetchlong((cptr + 1),2));
+          printf("|  %2u  ",(u_int)*(cptr + 3));
+          printf("|  %3u   |\n",(u_int)*(cptr + 7));
+         }
+
+         fputs("\t\t+--------+----------+------+--------+\n\n",stdout);
+
+         /* get rid of the temporary buffer */
+         free(dlptr);
+        }
+        else
+         printf("Defect list is empty\n");
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+static int sortdefs(a,b)
+
+u_char *a, *b;
+
+{
+        /*
+         * subroutine sortdefs() -
+         *
+         * routine sorts the defect list into ascending order, determined
+         * by, cylinder, head then sector number. returned value is
+         * (a) - (b).
+         *
+         */
+
+        /* declare autos */
+        register int retc;
+        register u_int aval, bval;
+
+        /* sort on cylinder no. */
+        aval = (u_int)fetchlong(a + 1,2);
+        bval = (u_int)fetchlong(b + 1,2);
+        if( (retc = (aval - bval)) != 0 )
+         return(retc);
+
+        /* sort on head number */
+        aval = (int)(a + 3);
+        bval = (int)(b + 3);
+        if( (retc = (aval - bval)) != 0 )
+         return(retc);
+
+        /* sort on physical sector */
+        return(((int)(a + 7)) - ((int)(b + 7)));
+}
+
+/************************************************************************/
+
+void namepart(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine namepart() -
+         *
+         * routine allows text to be entered in partitions' name fields.
+         * no value is returned.
+         *
+         */
+
+        /* declare autos */
+        register int nparts;
+        register char *cptr;
+        u_char ptlist[CANBSIZ];
+        UNIX_Info newtable;
+
+        static char *plistiphelp[] =
+        {
+         "The current command is define partition names. Enter a comma",
+         "separated  list of the  partitions to be defined.  A maximum",
+         "of seven partitions is allowed, numbered from 0 to 6.",
+         ""
+        };
+
+        static char *pnameiphelp[] =
+        {
+         "Enter the new partition name. This can have a maximum length",
+         "of 15 characters, any text after this will be truncated",
+         "",
+        };
+
+        /* check that a device name has been given */
+        if( !gotdev(*argv) )
+         return;
+
+        /* get the list of partitions to define */
+        if( --argc > 0 )
+         cptr = *++argv;
+        else
+        {
+         iphelp = plistiphelp;
+         (void)ipdata(inpbuf,"Define which partitions? >",vdstr,FALSE);
+         cptr = inpbuf;
+        }
+
+        /* scan the list of partitions */
+        if( (nparts = scanlist((u_char *)cptr,ptlist,atoi)) == -1 )
+         /* error in scanlist() */
+         return;
+        else if( nparts > (MAX_PARTITION - 1))
+        {
+         printf("Can only specify a maximum of %d partitions\n",
+                (MAX_PARTITION - 1));
+         return;
+        }
+        else
+        {
+         register int i;
+         register short done = 0;
+         register Partition *pptr;
+
+         /* copy the current partition table into working table */
+         bcopy((char *)&infoblock,(char *)&newtable,sizeof(UNIX_Info));
+
+         /* set help in case it is needed */
+         iphelp = pnameiphelp;
+
+         /* loop over all partitions to be defined */
+         for( i = 0; i < nparts; ++i )
+         {
+          /*
+           * cannot check for < 0: -ve numbers will come out
+           * in the wash as large +ve numbers as ptlist is unsigned.
+           */
+          if(  ptlist[i] >= (MAX_PARTITION - 1) )
+          {
+           printf("Bad partition number %d, must be in the range 0 -> %d\n",
+                  ((char *)ptlist)[i],MAX_PARTITION - 2);
+           return;
+          }
+
+          /* set pointer to current partition */
+          pptr = (newtable.pt.pt) + ptlist[i];
+
+          /* check that this partition has not already been defined */
+          if( (done & (1 << ptlist[i])) )
+          {
+           printf("Partition %d: duplicate definition\n",
+                  ptlist[i]);
+           return;
+          }
+          else
+           done |= 1 << ptlist[i];
+
+          /* read the new name */
+          if( --argc > 0 )
+          {
+           /* truncate the text before copying */
+           *(*++argv + (TEXT - 1)) = '\0';
+           strcpy(pptr->text,*argv);
+          }
+          else
+          {
+           /* print the existing text */
+           printf("Current name for partition %d is `%s'\n",
+                  ptlist[i],pptr->text);
+
+           /* read the new text */
+           (void)ipdata(inpbuf,"Enter the new name >",vdstr,FALSE);
+
+           /* truncate the text before copying */
+           *(inpbuf + (TEXT - 1)) = '\0';
+           strcpy(pptr->text,inpbuf);
+          }
+         }
+        }
+
+        /* write this new table to disk */
+        (void)wrtptable(&newtable,unixstartbyte(FALSE),FALSE);
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+void disconnect(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine disconnect() -
+         *
+         * routine eithers prints disconnection status for this
+         * device (if no args given), or sets new status (on/off).
+         * no value is returned.
+         *
+         */
+
+        /* declare autos */
+        int status;
+        bool ok = TRUE;
+
+        /* check that device name has been given */
+        if( !gotdev(*argv) )
+            return;
+
+        if( argc == 1 )
+        {
+            /*
+             * no args - print current status
+             */
+#if defined(SCSIDM_FOR_RISCOS)
+           status = RISCOS_SCSI_GET_CURRENT_SETTING; 
+           if( riscos_disconnect_status(&status) ) {
+               printf("disconnection is set to ");
+               switch(status){
+                case RISCOS_SCSI_DISCONNECT_ON:         
+                        printf("on\n");
+                        break;
+                case RISCOS_SCSI_DISCONNECT_OFF_IDENTIFY:               
+                        printf("off - identify sent\n");
+                        break;
+                case RISCOS_SCSI_DISCONNECT_OFF_NO_IDENTIFY:    
+                        printf("off - no identify sent\n");
+                        break;
+                default:                                        
+                        printf("%d - this shouldn't happen\n", status);
+                        break;
+              }
+           }
+           else
+                printf("Error in getting status for device\n");
+#elif defined(SCSIDM_FOR_RISCiX)
+            if( disconnect_status(&status, FALSE) )
+                printf("disconnection is %s\n",
+                       (status == SCSI_DISCONNECT_ON) ? "on" : "off");
+#endif
+        }
+
+        else if( argc == 2 )
+        {
+            /*
+             * turn disconnection on or off
+             */
+            ++argv;
+
+#if defined(SCSIDM_FOR_RISCOS)
+            if( !strcmp(*argv, "on") )
+                status = RISCOS_SCSI_DISCONNECT_ON;
+
+            else if( !strcmp(*argv, "off") )
+                status = RISCOS_SCSI_DISCONNECT_OFF_IDENTIFY;
+#elif defined(SCSIDM_FOR_RISCiX)
+            if( !strcmp(*argv, "on") )
+                status = SCSI_DISCONNECT_ON;
+
+            else if( !strcmp(*argv, "off") )
+                status = SCSI_DISCONNECT_OFF;
+#endif
+
+            else
+                ok = FALSE;
+
+            if( ok )
+#if defined(SCSIDM_FOR_RISCOS)
+                (void)riscos_disconnect_status(&status);
+#elif defined(SCSIDM_FOR_RISCiX)
+                (void)disconnect_status(&status, TRUE);
+#endif
+        }
+
+        else
+            ok = FALSE;
+
+        if( !ok )
+        {
+            printf("Invalid option for disconnect: %s\n",
+                    *argv);
+            printf("usage: disconnect [on|off]\n");
+        }
+}
+
+/************************************************************************/
+
+
+#if defined(SCSIDM_FOR_RISCOS)
+
+static int riscos_disconnect_status(status)
+
+int *status;
+{
+        _kernel_swi_regs        regs;
+        _kernel_oserror         *error;
+
+        /*
+         * subroutine riscos_disconnect_status() -
+         *
+         * routine reads / writes disconnect status. returned
+         * value is 1 if command OK, else 0.
+         *
+         * Uses SCSI_Control 6.
+         * On entry:    R0      6
+         *              R1      Device ID
+         *              R2      0       allow disconnect
+         *                      1       inhibit disconnect by sending identify
+         *                      2       inhibit disconnect with no identify
+         *                      -1      return current setting
+         *
+         * See page 51 of the SCSI Expansion Card User Guide for more details.
+         */
+
+         /*
+          * Set up the registers
+          */
+         regs.r[0] = RISCOS_SCSI_CONTROL_6;
+         regs.r[1] = cdev->d_fd;
+         regs.r[2] = *status;
+
+        error = _kernel_swi(SCSI_Control, &regs, &regs);
+
+        *status = regs.r[2];    /* Previous setting */
+        
+        if(*status == RISCOS_SCSI_GET_CURRENT_SETTING)
+                *status = regs.r[2];    /* Previous setting */
+
+        /* finished */
+        return((error != 0) ? 0 : 1 );
+}
+#endif
+
+/************************************************************************/

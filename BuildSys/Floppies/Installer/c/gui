@@ -1,0 +1,507 @@
+
+/* gui.c */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimplib.h"
+#include "toolbox.h"
+#include "gadgets.h"
+#include "event.h"
+#include "window.h"
+
+#include "main.h"
+#include "utils.h"
+#include "gui.h"
+#include "unarc.h"
+
+#define WimpVersion    310
+
+/* if true, poll floppy drive when waiting for disc; may thrash drives
+   without proper disc changed detection */
+#define FloppyPoll 0
+
+static WimpPollBlock  poll_block;
+static MessagesFD     messages;
+static IdBlock        id_block;
+
+static ObjectId       intro_win, options_win, status_win,
+                      advice_win, caution_win;
+
+static TopLeft        *last_topleft;
+static int            next_showtype;
+
+/* options_win components */
+static  ComponentId  path_display = 0x8;
+static  ComponentId  new_active_button = 0xe;
+static  ComponentId  old_active_button = 0xf;
+static  ComponentId  writable_directory_name = 0xc;
+
+/* status_win components */
+static  ComponentId  status_display   = 0x1f;
+static  ComponentId  percent_complete = 0x1;
+static  ComponentId  continue_button  = 0x1d;
+static  ComponentId  cancel_button    = 0x1e;
+
+static  int toolbox_events = 0, wimp_messages = 0, event_code;
+
+/* install progress control */
+static volatile int progress_count = 1, progress_saved = 0;
+
+/* flag threading of unarchive(), which can can call back to gui */
+static volatile int unarchive_threaded;
+
+static char extracting_message[256];
+
+/* ------------------------------------------------------------------------ */
+
+static void hourglass(int state)
+{
+  if (state)
+    _swix(Hourglass_On,0);
+  else
+    _swix(Hourglass_Off,0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void terminal_error(_kernel_oserror* er)
+{
+  _swix(Wimp_ReportError,_INR(0,2),er,0,"Installer");
+  exit(0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void set_gadgetfade(ObjectId w, ComponentId g, unsigned int fade)
+{
+  unsigned int gflags;
+
+  gadget_get_flags(0,w,g,&gflags);
+  if (fade)
+   gadget_set_flags(0,w,g,gflags | 0x80000000);
+  else
+   gadget_set_flags(0,w,g,gflags & 0x7fffffff);
+}
+
+/* ------------------------------------------------------------------------ */
+
+/* non-fatal 'error' which halts install process */
+static void error(char *message, int bell)
+{
+  if (progress_count != 0)
+  {
+    if (bell) _swix(0x107,0);
+    button_set_value(0,status_win,status_display,message);
+    slider_set_colour(0,status_win,percent_complete,11,0);
+    set_gadgetfade(status_win,continue_button,0);
+    window_set_title(0,status_win,"Installation paused");
+    progress_saved = progress_count;
+    progress_count = 0;
+  }
+}
+
+static void clear_error(void)
+{
+  if (progress_count == 0)
+  {
+    button_set_value(0,status_win,status_display,extracting_message);
+    slider_set_colour(0,status_win,percent_complete,10,0);
+    set_gadgetfade(status_win,continue_button,1);
+    window_set_title(0,status_win,"Installing");
+    progress_count = progress_saved;
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int quit(WimpMessage *messages,void *handle)
+{
+  exit(0);
+  return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int cancel(int event_code,ToolboxEvent *event,
+                  IdBlock *id_block,void *handle)
+{
+  exit(0);
+  return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void get_topleft(IdBlock *id_block)
+{
+  WimpGetWindowStateBlock wstate;
+  _kernel_oserror         *e;
+  static TopLeft          gotten_topleft;
+
+  e = window_get_wimp_handle(0,id_block->self_id,&wstate.window_handle);
+  if (e) terminal_error(e);
+
+  e = wimp_get_window_state(&wstate);
+  if (e) terminal_error(e);
+
+  last_topleft  = &gotten_topleft;
+  next_showtype = Toolbox_ShowObject_TopLeft;
+
+  gotten_topleft.x = wstate.visible_area.xmin;
+  gotten_topleft.y = wstate.visible_area.ymax;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int install(int event_code,WimpPollBlock *event,
+                   IdBlock *id_block,void *handle)
+{
+  _kernel_oserror *e;
+  int  dummy;
+  char to_dir[256];
+
+  if (unarchive_threaded) return 1;
+
+  switch(progress_count)
+  {
+    case 0: /* halted */
+      break;
+    case 1:
+      writablefield_get_value(0,options_win,writable_directory_name,
+                              control.ires_dirname,256,&dummy);
+      button_set_value(0,status_win,status_display,"Commencing installation");
+      if (check_feasibility()) progress_count++;
+      break;
+    case 2:
+      unarchive_threaded = 1;
+      sprintf(to_dir,"%s.$.%s",control.res_devicename,control.ires_dirname);
+      e = unarchive(to_dir);
+      if (e) terminal_error(e);
+      unarchive_threaded = 0;
+      extracting_message[0] = '\0';
+      progress_count++;
+    default: /* done */
+      slider_set_value(0,status_win,percent_complete,100);
+      if (control.activate_newres)
+      {
+        set_gadgetfade(status_win,continue_button,1);
+        set_gadgetfade(status_win,cancel_button,1);
+        button_set_value(0,status_win,status_display,"activating new resources");
+        hourglass(1);
+        e = activate_newresources();
+        if (e)
+        {
+          hourglass(0);
+          terminal_error(e); /* hope this does not happen! */
+        }
+        button_set_value(0,status_win,status_display,"about to shutdown");
+        do_shutdown(250);
+        hourglass(0);
+      }
+      exit(0);
+      break;
+  }
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int install_options(int event_code,ToolboxEvent *event,
+                           IdBlock *id_block,void *handle)
+{
+  get_topleft(id_block);
+
+  if (control.OSversion == OSversion_370)
+    radiobutton_set_state(0,options_win,old_active_button,1);
+  else
+    radiobutton_set_state(0,options_win,new_active_button,1);
+
+  toolbox_show_object(0,options_win,next_showtype,last_topleft,0,-1);
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int start_install(int event_code,ToolboxEvent *event,
+                         IdBlock *id_block,void *handle)
+{
+  get_topleft(id_block);
+
+  button_set_value(0,status_win,status_display,"");
+  toolbox_show_object(0,status_win,next_showtype,last_topleft,0,-1);
+
+  event_register_wimp_handler(-1,Wimp_ENull,install,0);
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int give_caution(int event_code,ToolboxEvent *event,
+                        IdBlock *id_block, void *handle)
+{
+  _kernel_oserror *e;
+
+  get_topleft(id_block);
+
+  if (control.activate_newres)
+  {
+    if (control.OSversion == OSversion_370)
+    {
+      e = toolbox_create_object(0,"Caution3",&caution_win);
+      if (e) terminal_error(e);
+    }
+    else
+    {
+      e = toolbox_create_object(0,"Caution",&caution_win);
+      if (e) terminal_error(e);
+    }
+  }
+  else
+  {
+    if (control.OSversion == OSversion_370)
+    {
+      return start_install(event_code,event,id_block,handle);
+    }
+    else
+    {
+      e = toolbox_create_object(0,"Caution2",&caution_win);
+      if (e) terminal_error(e);
+    }
+  }
+
+  event_register_toolbox_handler(caution_win,1,start_install,0);
+  toolbox_show_object(0,caution_win,next_showtype,last_topleft,0,-1);
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int give_advice(int event_code,ToolboxEvent *event,
+                        IdBlock *id_block,void *handle)
+{
+  int             state,selected, apps_in_root;
+  char            message[256];
+  _kernel_oserror *e;
+
+  get_topleft(id_block);
+
+  radiobutton_get_state(0,options_win,new_active_button,&state,&selected);
+  control.activate_newres = (selected == new_active_button);
+
+  if (!control.activate_newres)
+    return give_caution(event_code,event,id_block,handle);
+
+  apps_in_root = check_apps_in_root();
+  if (!apps_in_root)  
+    return give_caution(event_code,event,id_block,handle);
+
+  e = toolbox_create_object(0,"Advice",&advice_win);
+  if (e) terminal_error(e);
+
+  event_register_toolbox_handler(advice_win,1,give_caution,0);
+  sprintf(message,"(%s.$) We recommend that these are",
+          control.res_devicename);
+  button_set_value(0,advice_win,0x16,message);
+  toolbox_show_object(0,advice_win,next_showtype,last_topleft,0,-1);
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int install_pause(int event_code,ToolboxEvent *event,
+                         IdBlock *id_block,void *handle)
+{
+  error("",0);
+  return 1;
+}
+
+
+
+static int install_continue(int event_code,ToolboxEvent *event,
+                            IdBlock *id_block,void *handle)
+{
+  clear_error();
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void register_event_handlers()
+{
+  event_register_message_handler(Wimp_MQuit,quit,0);
+  event_register_message_handler(Wimp_MPreQuit,quit,0);
+  event_register_toolbox_handler(intro_win,1,install_options,0);
+  event_register_toolbox_handler(options_win,1,give_advice,0);
+  event_register_toolbox_handler(-1,2,cancel,0);
+  event_register_toolbox_handler(status_win,4,install_continue,0);
+  event_register_toolbox_handler(-1,0x101,install_pause,0);
+  event_register_toolbox_handler(-1,0x102,install_continue,0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void unarc_getfloppy(int floppy_index, char *foundpath)
+{
+  char want_floppy[256], message[256];
+  int  found;
+#if FloppyPoll
+  int  itime;
+#endif
+
+  sprintf(want_floppy,"%s" FloppiesName "%02d.$.",
+          control.floppy_root,floppy_index);
+
+#if FloppyPoll
+  sprintf(message,"Please insert disc %1d\n",floppy_index);
+#else
+  sprintf(message,"Please insert disc %1d, then click Continue\n",
+          floppy_index);
+#endif
+
+  do
+  {
+    found = get_floppy(want_floppy,message);
+    while(!found && (progress_count == 0))
+    {
+#if FloppyPoll
+      _swix(OS_ReadMonotonicTime,_OUT(0),&itime);
+      event_poll_idle(&event_code, &poll_block, itime + 200, 0);
+      found = get_floppy(want_floppy,NULL);
+#else
+      event_poll(&event_code, &poll_block, 0);
+      if (progress_count) found = get_floppy(want_floppy,message);
+#endif
+      if (found) clear_error();
+    }
+  } while (!found);
+
+  if (floppy_index == 1)
+    sprintf(foundpath,"%s" ArcsName1 "%02d",want_floppy,floppy_index);
+  else
+    sprintf(foundpath,"%s" ArcsName2 "%02d",want_floppy,floppy_index);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void unarc_progress(int bytessofar, int nest, char *objname)
+{
+  static int last_pcent = 0;
+  int        i, pcent, update;
+  float      ftb, fbs, fpc;
+
+  update = 0;
+
+  ftb = (float)control.total_bytes;
+  fbs = (float)bytessofar;
+  fpc = fbs*100.0F/ftb;
+
+  pcent = (int)(fpc + 0.5F);
+  if (pcent <   1) pcent =   1; /* show some progress! */
+
+  if (pcent != last_pcent)
+  {
+    slider_set_value(0,status_win,percent_complete,pcent);
+    update = 1;
+  }
+  last_pcent = pcent;
+
+  if (objname && (nest == 1))
+  {
+    for (i=0; i<ResListSize; i++)
+    {
+      if (strcmp(objname,control.res_list[i]) == 0)
+      {
+        sprintf(extracting_message,"extracting %s",objname);
+        button_set_value(0,status_win,status_display,
+                         extracting_message);
+        update = 1;
+        break;
+      }
+    }
+  }
+
+  /* to make sure we poll now and then */
+  if (update) event_poll(&event_code, &poll_block, 0);
+
+  /* to pause unarchiving if gui has paused */
+  while (progress_count == 0) event_poll(&event_code, &poll_block, 0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+void gui_installer_init(void)
+{
+  _kernel_oserror* er;
+  char  pathname[256], message[256];
+
+  unarchive_threaded = 0;
+  last_topleft       = NULL;
+  next_showtype      = Toolbox_ShowObject_Default;
+
+  extracting_message[0] = '\0';
+
+  er = toolbox_initialise (0, WimpVersion, &wimp_messages,
+                           &toolbox_events, "<Installer$Dir>",
+                           &messages, &id_block,0,0,0);
+  if (er) terminal_error(er);
+
+  if ((er = toolbox_create_object(0,"Intro",&intro_win)) != NULL)
+    terminal_error(er);
+  if ((er = toolbox_create_object(0,"Install",&options_win)) != NULL)
+    terminal_error(er);
+  if ((er = toolbox_create_object(0,"Installing",&status_win)) != NULL)
+    terminal_error(er);
+
+  sprintf(pathname,"%s.$.",control.res_devicename);
+  displayfield_set_value(0,options_win,path_display,pathname);
+  writablefield_set_value(0,options_win,writable_directory_name,
+                          control.ires_dirname);
+
+  sprintf(message,"The upgrade requires %1d Mbytes of disc space (estimated)",
+          control.min_freespace);
+  button_set_value(0,intro_win,0x15,message);
+  toolbox_show_object(0,intro_win,0,0,0,-1);
+
+  event_initialise (&id_block);
+  register_event_handlers();
+  event_set_mask(256);
+
+  er = unarchive_init(control.max_objsize,
+                      unarc_progress,unarc_getfloppy,terminal_error);
+  if (er) terminal_error(er);
+}
+
+/* ------------------------------------------------------------------------ */
+
+void gui_installer_poll(void)
+{
+  while (TRUE) event_poll(&event_code, &poll_block, 0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+void gui_installer_message(char *message, int bell)
+{
+  error(message,bell);
+}
+
+/* ------------------------------------------------------------------------ */
+
+void gui_installer_terminal_error(char *message)
+{
+  static _kernel_oserror e;
+
+  e.errnum = 0;
+  strcpy(e.errmess,message);
+  terminal_error(&e);
+}

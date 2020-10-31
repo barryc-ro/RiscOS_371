@@ -1,0 +1,933 @@
+
+#define NOFTRACE
+
+/*
+
+  Merlyn Kline, 1995
+
+:NOTES
+
+The background fetcher
+
+This fetches a list of browser_token structures. There are
+browser->ntokens of these, numbered from 1 to ntokens.
+
+:END
+
+:MESSAGES
+notitle:Untitled: URL=
+CANCEL:(Fetch cancelled, page truncated)
+txtfile:TextFile
+htmfile:HTMLFile
+urlfile:URLData
+linktext:LinkText
+Refs:References in this document:
+:END
+
+:HISTORY
+:END
+
+*/
+
+#ifdef FTRACE
+#define ftrace(a) trace_printf(" ftch:%s",a);
+#else
+#define ftrace(a)
+#endif
+
+#include "stdlib.h"
+#include "stddef.h"
+#include "string.h"
+#include "stdio.h"
+
+/*----------------------------------------------------------------------*/
+#include "os.h"
+#include "msgs.h"
+#include "wimpt.h"
+#include "bbc.h"
+#include "flex.h"
+#include "win.h" /* fixes problem caused by incorrect header for iconbar.c since Acorn had a go at it */
+#include "saveas.h"
+#include "swis.h"
+
+#include "url.h"
+
+/*----------------------------------------------------------------------*/
+#include "Browser.h"
+#include "Reformat.h"
+/*----------------------------------------------------------------------*/
+#include "Defs.h"
+#include "Status.h"
+#include "ErrorGen.h"
+#include "Defs.h"
+#include "IconBar.h"
+#include "Button.h"
+#include "Save.h"
+#include "URLv.h"
+#include "mflex.h"
+#include "Images.h"
+#include "Forms.h"
+#include "Redraw.h"
+#include "Save.h"
+
+#ifdef TRACE
+  #include "svcprint.h"
+#endif
+
+/*----------------------------------------------------------------------*/
+#include "struct.h"
+
+#define PAL(x); {if(!params.fixedptr) {if(x) bbc_vduq(19,2,25,0,0,0x90); else bbc_vduq(19,2,25,255,0,0);}} /* ;{{ define to be null */
+
+#if 0
+/* this bit here so GenH2 will include it in the header */
+/*----------------------------------------------------------------------*/
+#define DISPLAY_NAMED 2000000000
+/*----------------------------------------------------------------------*/
+#define ISBODY(p) (((p)->type&HEAD)==0)
+/*----------------------------------------------------------------------*/
+#define ISHEAD(p) (!ISBODY((p)))
+/*----------------------------------------------------------------------*/
+#define ISBULLET(p) ((p)->style&LI)
+/*----------------------------------------------------------------------*/
+#define ISLINK(p) ((p->style&A)&&p->anchor)
+#endif
+
+static int anchors;
+
+/*----------------------------------------------------------------------*/
+HStream *fetch_token_address(browser *b,int token)
+{
+  HStream *tp;
+
+  tp=b->stream;
+  while(--token && tp) tp=tp->next;
+  return(tp);
+}
+
+/*----------------------------------------------------------------------*/
+void *fetch_token_data_address(browser *b,int token)
+{
+  HStream *tp;
+
+  tp=fetch_token_address(b,token);
+  if(tp->style&HR) return(NULL);
+  else if(tp->style&IMG) return(NULL); /* ;{{ */
+  return(tp->text);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fetch_set_chunk_size_f(browser *b,int ntokens)
+{
+  int size;
+
+  size=ntokens*sizeof(browser_token);
+  size=((size/BLOCKSIZE)+1)*BLOCKSIZE;
+  return(browser_set_chunk_size_f(b,CK_TKNS,size));
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *fetch_set_data_chunk_size_f(browser *b,int size)
+{
+  size=((size/BLOCKSIZE)+1)*BLOCKSIZE;
+  return(browser_set_chunk_size_f(b,CK_DATA,size));
+}
+
+#ifdef RANSCODE
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *fetch_make_data_space_available_f(browser *b,int size)
+{
+  int needed;
+
+  needed=size-((b->dsize-1)-b->datasize); /* always reserve an extra byte for writing terminators */
+  if(needed>0) return(fetch_set_data_chunk_size_f(b,b->dsize+needed));
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fetch_convert_error(int e)
+{
+  PAL(255);
+  if(e)
+  {
+    os_error err;
+
+    STRFILL(err.errmess,HTML_LastError);
+    if(e>0) err.errnum=e; else err.errnum=0x8000-e;
+    return(errorgen((int)&err));
+  }
+  return(NULL);
+}
+#endif
+
+#define F(C,X) fprintf(f,"%c",(t->style&(X))?C:'.');
+
+static void trace_tokens(browser *b,char *id)
+{
+  FILE *f;
+  HStream *t;
+
+  f=fopen(":4.Trace.TokenList","a");
+  fprintf(f,"\n\nToken trace: %s\n",id);
+  fprintf(f,"\n     Style    Type     In text     src      anchor");
+  fprintf(f,"\n     -------- -------- -- -------- -------- --------\n");
+  t=b->stream;
+  while(t)
+  {
+    F('f',FORM);
+    F('s',SELECT);
+    F('i',INPUT);
+    F('t',TEXTAREA);
+    fprintf(f," %08x %08x %2d %08p %08p %08p",t->style,t->type,t->indent,t->text,t->src,t->anchor);
+    fprintf(f,"  '"); if(t->text) fprintf(f,"%s",t->text); fprintf(f,"'");
+    fprintf(f,"  '"); if(t->src) fprintf(f,"%s",t->src); fprintf(f,"'");
+    fprintf(f,"  '"); if(t->anchor) fprintf(f,"%s",t->anchor); fprintf(f,"'");
+    fprintf(f,"\n");
+    t=t->next;
+  }
+  fclose(f);
+}
+
+
+/*----------------------------------------------------------------------*/
+BOOL fetch_fetching(browser *b)
+{
+  return(b->status_fetch!=BS_IDLE);
+}
+
+/*----------------------------------------------------------------------*/
+void fetch_stop(browser *b,BOOL keep_source)
+{
+  if(b->status_fetch!=BS_IDLE && !keep_source) browser_destroy_source(b);
+  b->status_fetch=BS_IDLE;
+  if(b->savefile) {fclose(b->savefile); b->savefile=NULL;}
+  b->savelink=FALSE;
+  if(b->h_fetch && b->h_fetch!=b->h_display) {PAL(0); html_close(b->h_fetch); PAL(255);}
+  b->h_fetch=0; /* discard handle being fetched */
+  browser_set_chunk_size_f(b,CK_FURL,0); /* discard URL being fetched */
+  b->reloading=0;
+  status_set_animation_state(b,0);
+  status_new_status(b);
+  reformat_check_extent(b);
+  button_set_states(b);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL fetch_chkerr(browser *b,os_error *e)
+{
+  if(e)
+  {
+    wimpt_complain(e);
+    browser_stop_f(b,TRUE);
+    return(TRUE);
+  }
+  return(FALSE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *browser_update_urlbar(browser *b)
+{
+  if(b->urlbar.flags&PANE_ISOPEN)
+  {
+    wimp_icon ic;
+    wimp_caretstr c;
+
+    wimp_get_icon_info(b->urlbar.w,2,&ic);
+    strncpy(ic.data.indirecttext.buffer,browser_current_url(b),ic.data.indirecttext.bufflen);
+    ic.data.indirecttext.buffer[ic.data.indirecttext.bufflen-1]=0;
+    wimp_set_icon_state(b->urlbar.w,2,0,0);
+    wimp_get_caret_pos(&c);
+    if(c.w==b->urlbar.w && c.i==2)
+    {
+      c.index=strlen(ic.data.indirecttext.buffer);
+      wimp_set_caret_pos(&c);
+    }
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL fetch_save_url(char *pathname,void *handle)
+{
+  browser       *b;
+  int           bytes;
+  FILE          *f;
+  char          cli[320];
+  os_regset     r;
+
+  pathname=pathname;
+  b=(browser*)handle;
+  f=fopen(pathname,"wb");
+  b->savefile=NULL;
+  b->savelink=FALSE;
+  r.r[0]=2;
+  r.r[1]=(int)pathname;
+  r.r[2]=0xdeaddead;
+  r.r[3]=0xdeaddead;
+  os_swix(XOS_Bit|OS_File,&r);
+  r.r[0]=3;
+  r.r[1]=(int)pathname;
+  r.r[2]=0xdeaddead;
+  r.r[3]=0xdeaddead;
+  os_swix(XOS_Bit|OS_File,&r);
+  if(!f) {wimpt_complain((os_error*)_kernel_last_oserror()); return(FALSE);}
+  if(b->source && mflex_size(&b->source))
+  {
+    bytes=fwrite(b->source,1,mflex_size(&b->source),f);
+    b->bytes_fetched=mflex_size(&b->source);
+    mflex_free(&b->source);
+    b->source=NULL;
+    if(bytes!=b->bytes_fetched) {wimpt_complain((os_error*)_kernel_last_oserror()); fclose(f); return(FALSE);}
+    status_show_progress(b);
+    b->source=NULL;
+  }
+  b->savefile=f;
+  return(TRUE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void fetch_build_leaf(char *url,char *buffer,int size)
+{
+  char *s,*e,c;
+  int  l;
+
+  e=strchr(url,'?');
+  if(!e) e=strchr(url,0);
+  c=*e;
+  *e=0;
+  s=strrchr(url,'/');
+  if(!s) s=strrchr(url,':');
+  if(!s) s=url; else s++;
+  l=e-s;
+  if(l>=size) l=size-1;
+  if(l)
+  {
+    strncpy(buffer,s,l);
+    buffer[l]=0;
+  }
+  else strcpy(buffer,msgs_lookup("urlfile:URLData"));
+  *e=c;
+  s=buffer;
+  while(*s) {if(*s=='.') *s='/'; s++;}
+}
+
+/*----------------------------------------------------------------------*/
+void fetch_fetcher(browser *b)
+{
+  HStreamRef tptr;
+  int        i,remn,sofar,waiting;
+  int        start;
+  BOOL       formflag;
+
+ftrace("Start");
+  start=0;
+  if(b->ntokens) formflag=!!(fetch_token_address(b,b->ntokens)->style&FORM);
+  else formflag=FALSE;
+  for(i=0;i<10;i++) /* get several tokens on each null event (if available) */
+  {
+ftrace("get token");
+    if(b->status_fetch==BS_DATAFETCH)
+    {
+ftrace("datafetch start");
+      if(b->savefile)
+      {
+        char buffer[2048];
+        int  success,bytes,done;
+
+ftrace("getting chunk");
+        success=!wimpt_complain(html_get_next_chunk(b->h_fetch,buffer,sizeof(buffer),&done,&bytes));
+ftrace("writing chunk");
+        if(success && bytes) success=fwrite(buffer,1,bytes,b->savefile);
+        if(success!=bytes && bytes)
+        {
+          success=0;
+          wimpt_complain((os_error*)_kernel_last_oserror());
+        }
+        if(success && done)
+        {
+          os_regset r;
+
+          r.r[0]=7;
+          r.r[1]=b->savefile->__file;
+          r.r[2]=(int)buffer;
+          r.r[3]=sizeof(buffer);
+          os_swix(XOS_Bit|OS_Args,&r);
+        }
+        if(!success || done) fetch_stop(b,TRUE);
+        if(success && done)
+        {
+          os_regset r;
+
+          r.r[0]=18;
+          r.r[1]=(int)buffer;
+          r.r[2]=b->savetype;
+          os_swix(XOS_Bit|OS_File,&r);
+        }
+ftrace("showing progress");
+        status_show_progress(b);
+      }
+ftrace("done");
+      return;
+    }
+ftrace("get next token");
+    if(fetch_chkerr(b,html_get_next_token(b->h_fetch,&remn,&sofar,&tptr,&waiting,&b->source,browser_fetching_url(b)))) return;
+ftrace("show progress");
+    status_show_progress(b);
+    if(waiting==3 || (b->savelink && b->source && !waiting))
+    { /* the url being fetched is not parseable or its a forced save */
+      char pathname[256];
+
+ftrace("init datafetch");
+      b->status_fetch=BS_DATAFETCH;
+      b->savetype=remn;
+ftrace("build leaf");
+      fetch_build_leaf(browser_fetching_url(b),pathname,sizeof(pathname));
+ftrace("call saveas");
+      if(!saveas(remn,pathname,-1,fetch_save_url,NULL,NULL,(void*)b) || !b->savefile) fetch_stop(b,TRUE);
+ftrace("done");
+      return;
+    }
+    else if(waiting==2)
+    { /* a redirect has occurred */
+      char *url;
+
+ftrace("redirect");
+      url=(char*)remn;
+ftrace("set chunk for url");
+      if(fetch_chkerr(b,browser_set_chunk_size_f(b,CK_FURL,WORDALIGN(strlen(url)+1)))) return;
+ftrace("copy url");
+      strcpy(browser_fetching_url(b),url);
+ftrace("record history");
+      browser_record_global_history_f(url);
+ftrace("show status");
+      status_new_status(b);
+    }
+    else if(!waiting)
+    {
+ftrace("got a bit...");
+      if(!start) start=b->nlines;
+      if(b->status_fetch==BS_STARTED)
+      { /* this is the first token on this page */
+        int         l;
+        char        *tempurl;
+        wimp_wstate state;
+
+ftrace("first token, init page");
+        l=strlen(browser_fetching_url(b)); /* copy the fetching URL to the displayed URL */
+        if(fetch_chkerr(b,browser_set_chunk_size_f(b,CK_DURL,WORDALIGN(l+1)))) return;
+        strcpy(browser_current_url(b),browser_fetching_url(b));
+        tempurl=malloc(l+1);
+        if(tempurl)
+        {
+ftrace("create tempurl");
+          strcpy(tempurl,browser_fetching_url(b));
+ftrace("record history(2)");
+          browser_record_global_history_f(tempurl);
+ftrace("free tempurl");
+          free(tempurl);
+        }
+        strcpy(b->title,msgs_lookup("notitle:Untitled: URL=")); /* initialise the title for the new page */
+        strncpy(b->title+strlen(b->title),browser_current_url(b),sizeof(b->title)-strlen(b->title)-1);
+        b->title[sizeof(b->title)-1]=0;
+        browser_redraw_title(b);
+        browser_update_urlbar(b);
+        b->status_fetch=BS_FETCHING; /* reset status and dispose of previously displayed page data */
+        if(b->h_display && b->h_display!=b->h_fetch) {PAL(0); html_close(b->h_display); PAL(255); b->h_display=0;}
+        b->h_display=b->h_fetch;
+        b->stream=tptr;
+        b->ntokens=0;
+        b->datasize=0;
+        b->backgroundcol=-1;
+        b->linkcol=params.col_link;
+        b->textcol=params.col_text;
+        b->usedcol=params.col_used;
+        b->aacol=redraw_backcol(b);;
+        b->backimage=0;
+        b->highlight=0;
+        b->max_width=0;
+        b->stoplooking=0;
+        if(fetch_find_name_tag(browser_current_url(b))) b->display_request=DISPLAY_NAMED;
+        fetch_set_chunk_size_f(b,0);
+        fetch_set_data_chunk_size_f(b,0);
+        image_discard(b);
+        form_discard(b);
+        wimp_get_wind_state(b->w,&state);
+        state.o.y=512;
+        wimp_open_wind(&state.o);
+        browser_pointer_check(b);
+ftrace("init reformat");
+        reformat_format_from(b,0);
+ftrace("init new status");
+        status_new_status(b);
+ftrace("init done");
+      }
+      if(!tptr) /* there is no token and we're not waiting: must be EOF */
+      {
+ftrace("page finished, stopping");
+        fetch_stop(b,TRUE);
+        return;
+      }
+      if(tptr)
+      {
+ftrace("got a token");
+
+#ifdef TRACE
+  Printf("New token, ntokens = %d\nToken IMG: %d\n   ISBODY: %d\n      SRC: '%s'\n",
+          b->ntokens,
+          ((tptr->style) & IMG),
+          ISBODY(tptr),
+          tptr->src);
+#endif
+        b->ntokens++;
+        if(ISBODY(tptr))
+        {
+          if(tptr->style&IMG && tptr->src)
+          {
+            if(fetch_chkerr(b,image_new_image(b,tptr->src,b->ntokens,FALSE))) return;
+          }
+          if(tptr->style&FORM)
+          {
+            if(!formflag) if(fetch_chkerr(b,form_new_form(b,b->ntokens))) return;
+            if(tptr->style&INPUT)
+            {
+              switch(tptr->type&TYPE_RESET)
+              {
+                case TYPE_TEXT:     if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_text,tptr->text))) return; break;
+                case TYPE_PASSWORD: if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_password,tptr->text))) return; break;
+                case TYPE_CHECKBOX: if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_checkbox,(char*)(tptr->type&TYPE_CHECKED)))) return; break;
+                case TYPE_RADIO:    if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_radio,(char*)(tptr->type&TYPE_CHECKED)))) return; break;
+                case TYPE_IMAGE:    if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_image,NULL))) return; break;
+                case TYPE_HIDDEN:   if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_hidden,NULL))) return; break;
+                case TYPE_SUBMIT:   if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_submit,NULL))) return; break;
+                case TYPE_RESET:    if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_reset,NULL))) return; break;
+              }
+
+            }
+            if(tptr->style&TEXTAREA)
+            {
+              if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_textarea,tptr->text))) return;
+            }
+            if(tptr->style&SELECT)
+            {
+              if(fetch_chkerr(b,form_new_field(b,b->ntokens,form_select,tptr->value))) return;
+            }
+            formflag=TRUE;
+          }
+          else formflag=FALSE;
+        }
+        else
+        {
+          if((tptr->style&TITLE) && tptr->text)
+          {
+            STRFILL(b->title,tptr->text);
+            browser_redraw_title(b);
+          }
+          if(tptr->style&IMG)
+          {
+            if(tptr->src)
+            {
+              image_new_image(b,tptr->src,b->ntokens,TRUE);
+              b->backimage=b->nimages;
+            }
+            if(tptr->maxlen!=(unsigned int)-1)
+            {
+              b->backgroundcol=tptr->maxlen;
+              if(!b->backimage) b->aacol=b->backgroundcol;
+              browser_update_bottom(b,0);
+            }
+            if(tptr->size!=(unsigned int)-1) b->textcol=tptr->size;
+            if(tptr->rows!=(unsigned int)-1) b->linkcol=tptr->rows;
+            if(tptr->cols!=(unsigned int)-1) b->usedcol=tptr->cols;
+          }
+        }
+ftrace("added it");
+      }
+    }
+  }
+ftrace("call reformat");
+  if(start) reformat_format_from(b,start-1);
+ftrace("done");
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fetch_start(browser *b)
+{
+  int      h,method;
+  os_error *e;
+
+  if(!browser_fetching_url(b) || !*browser_fetching_url(b))
+  {
+    b->status_fetch=BS_IDLE;
+    status_new_status(b);
+    return(NULL);
+  }
+  PAL(0);
+#ifdef RANSCODE
+  e=fetch_convert_error(HTML_get(browser_fetching_url(b),(int)b,&h,0,0/*;{{*/,0));
+#else
+  method=b->extradata?URL_Method_http_POST:URL_Method_http_GET;
+  e=html_get(browser_fetching_url(b),b->extradata,&h,method,user.name,TRUE,!b->reloading);
+  if(b->extradata) mflex_free(&b->extradata);
+  b->extradata=NULL;
+#endif
+  PAL(255);
+  if(e)
+  {
+    b->status_fetch=BS_IDLE;
+    status_new_status(b);
+    return(e);
+  }
+  b->h_fetch=h;
+  b->status_fetch=BS_STARTED;
+  status_new_status(b);
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fetch_cancel(browser *b)
+{
+  int  i,nl;
+  char text[100]={0};
+
+  static HTMLToken tokens[]=
+  {
+    {HTML_HR,0,0,0,0},
+    {HTML_Text,0,TOK_BOLD|TOK_ITALIC,0,0}
+  };
+
+  if(b->h_fetch && b->h_fetch!=b->h_display) {PAL(0); html_close(b->h_fetch); PAL(255);}
+  if(!fetch_fetching(b)) return(NULL);
+  nl=b->nlines;
+  if(b->status_fetch!=BS_START || !b->ntokens)
+  {
+/* ;{{
+    STRFILL(text,msgs_lookup("CANCEL:(Fetch cancelled, page truncated)"));
+    tokens[1].length=strlen(text);
+    tokens[1].value.text=text;
+    for(i=0;i<sizeof(tokens)/sizeof(tokens[0]);i++) fetch_add_html_token(b,&tokens[i]);
+*/
+  }
+  fetch_stop(b,FALSE);
+  reformat_format_from(b,nl-1);
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static char fetch_hr_text[]="\n  ------------------------------------------------------------\n";
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static char *fetch_create_image_text(HStream *t,char *s,int size)
+{
+  s[0]='[';
+  s[1]=0;
+  if(t->text) strncpy(s+1,t->text,size-1);
+  s[size-2]=0;
+  if(s[1]==0) strcat(s,"IMAGE");
+  strcat(s,"]");
+  return(s);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int fetch_write_ref(BOOL getsize)
+{ /* build a reference - if getsize, return size, else save and return success flag */
+  char j[30];
+
+  anchors++;
+  sprintf(j,"[%d]",anchors);
+  if(getsize) return(strlen(j));
+  return(save_write_bytes(j,strlen(j)));
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int fetch_summarise_refs(browser* b, BOOL getsize)
+{
+  int     i,size=0,n=0;
+  char    j[512];
+  HStream *t,*l;
+
+  if(!anchors) return(getsize?0:TRUE);
+  sprintf(j,"\n\n\n==============================================================================\n\n%s\n\n",
+          msgs_lookup("Refs:References in this document:"));
+  size+=strlen(j);
+  if(!getsize && !save_write_bytes(j,strlen(j))) return(FALSE);
+  t=l=0;
+  for(i=1;i<=b->ntokens;i++)
+  {
+    t=fetch_token_address(b,i);
+    if(ISBODY(t) && ISLINK(t) && (!l || !ISLINK(l) || l->anchor!=t->anchor))
+    {
+      n++;
+      sprintf(j,"%8d. ",n);
+      size+=strlen(j);
+      if(!getsize && !save_write_bytes(j,strlen(j))) return(FALSE);
+      STRFILL(j,t->anchor);
+      size+=strlen(j);
+      if(!getsize && !save_write_bytes(j,strlen(j))) return(FALSE);
+      size++;
+      if(!getsize && !save_write_bytes("\n",1)) return(FALSE);
+    }
+    l=t;
+  }
+  return(getsize?size:TRUE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL fetch_text_sub_saver(void *handle,BOOL getsize)
+{
+  int           i;
+  HStream       *t,*l;
+  void          *d;
+  browser       *b;
+  int           size=0,s;
+
+  b=(browser*)handle;
+  t=l=NULL;
+  anchors=0;
+  for(i=1;i<=b->ntokens;i++)
+  {
+    t=fetch_token_address(b,i);
+    if(ISBODY(t))
+    {
+      if(l && ISLINK(l) && (!ISLINK(t) || t->anchor!=l->anchor))
+      {
+        s=fetch_write_ref(getsize);
+        if(getsize) size+=s; else if(!s) return(FALSE);
+      }
+      if(reformat_newline(b,t,l,0))
+      {
+        if(getsize) size+=1+t->indent;
+        else
+        {
+          int  i=t->indent;
+          char s[]="																				";
+
+          if(!save_write_bytes("\n",1)) return(FALSE);
+          while(i>0)
+          {
+            if(!save_write_bytes(s,(sizeof(s)<i)?sizeof(s):i)) return(FALSE);
+            i-=sizeof(s);
+          }
+        }
+      }
+      if(t->style&P)
+        {
+        if(getsize) size+=1;
+        else if(!save_write_bytes("\n",1)) return(FALSE);
+        }
+      l=t;
+      if(t->style&IMG)
+      {
+        char j[500];
+
+        fetch_create_image_text(t,j,sizeof(j));
+        if(getsize) size+=strlen(j);
+        else if(!save_write_bytes(j,strlen(j))) return(FALSE);
+      }
+      else if(ISBULLET(t))
+      {
+        if(getsize) size+=2;
+        else if(!save_write_bytes("è ",2)) return(FALSE);
+      }
+      else if(t->style&HR)
+      {
+        if(getsize) size+=sizeof(fetch_hr_text)-1;
+        else if(!save_write_bytes(fetch_hr_text,sizeof(fetch_hr_text)-1)) return(FALSE);
+      }
+      else if(t->style&TEXTAREA)
+      {
+        if(getsize) size+=4+strlen(form_get_field(b,i)->text);
+        else
+        {
+          save_write_bytes(" [",2);
+          save_write_bytes(form_get_field(b,i)->text,strlen(form_get_field(b,i)->text));
+          save_write_bytes("] ",2);
+        }
+      }
+      else if(t->style&SELECT)
+      {
+        if(getsize) size+=7+strlen(form_get_field_text(b,i));
+        else
+        {
+          save_write_bytes(" [",2);
+          save_write_bytes(form_get_field_text(b,i),strlen(form_get_field_text(b,i)));
+          save_write_bytes("][>] ",5);
+        }
+      }
+      else if(t->style&INPUT)
+      {
+        switch(t->type&TYPE_RESET)
+        {
+          case TYPE_TEXT:
+            if(getsize) size+=4+strlen(form_get_field(b,i)->text);
+            else
+            {
+              save_write_bytes(" [",2);
+              save_write_bytes(form_get_field(b,i)->text,strlen(form_get_field(b,i)->text));
+              save_write_bytes("] ",2);
+            }
+          break;
+          case TYPE_PASSWORD:
+            if(getsize) size+=4+strlen(form_get_field(b,i)->text);
+            else
+            {
+              int j,l;
+
+              save_write_bytes(" [",2);
+              l=strlen(form_get_field(b,i)->text);
+              for(j=0;j<l;j++) save_write_bytes("*",1);
+              save_write_bytes("] ",2);
+            }
+          break;
+          case TYPE_CHECKBOX:
+            if(getsize) size+=3;
+            else if(!save_write_bytes(form_get_field(b,i)->checked?"[Ä]":"[_]",3)) return(FALSE);
+          break;
+          case TYPE_RADIO:
+            if(getsize) size+=3;
+            else if(!save_write_bytes(form_get_field(b,i)->checked?"(è)":"(_)",3)) return(FALSE);
+          break;
+          case TYPE_IMAGE: break;
+          case TYPE_HIDDEN: break;
+          case TYPE_SUBMIT: /* same as TYPE_RESET: no break */
+          case TYPE_RESET:
+          {
+            char *p;
+
+            p=form_button_text(t);
+            if(getsize) size+=strlen(p)+4;
+            else
+            {
+              if(!save_write_bytes(" <",2)) return(FALSE);
+              if(!save_write_bytes(p,strlen(p))) return(FALSE);
+              if(!save_write_bytes("> ",2)) return(FALSE);
+            }
+          } break;
+        }
+      }
+      else
+      {
+        d=fetch_token_data_address(b,i);
+        if(getsize && d) size+=strlen((char*)d);
+        else if(d && !save_write_bytes(d,strlen((char*)d))) return(FALSE);
+      }
+    }
+  }
+  if(t && ISLINK(t))
+  {
+    s=fetch_write_ref(getsize);
+    if(getsize) size+=s; else if(!s) return(FALSE);
+  }
+  s=fetch_summarise_refs(b,getsize);
+  if(getsize) size+=s; else if(!s) return(FALSE);
+  return(getsize?size:TRUE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL fetch_text_saver(void *handle,char *pathname)
+{
+  pathname=pathname;
+  return(fetch_text_sub_saver(handle,FALSE));
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int fetch_text_size(browser *b)
+{
+  return(fetch_text_sub_saver(b,TRUE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fetch_save_text(browser *b)
+{
+  char pathname[256];
+
+  strcpy(pathname,msgs_lookup("txtfile:TextFile"));
+  button_set_flags(b,B_SAVETEXT,TRUE,FALSE);
+  save_saveas(FILETYPE_TEXT,pathname,fetch_text_size(b),fetch_text_saver,NULL,(void*)b);
+  button_set_flags(b,B_SAVETEXT,FALSE,FALSE);
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL fetch_html_saver(void *handle,char *pathname)
+{
+  browser       *b;
+
+  pathname=pathname;
+  b=(browser*)handle;
+  if(!save_write_bytes(b->source,mflex_size((flex_ptr)&b->source))) return(FALSE);
+  return(TRUE);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fetch_save_html(browser *b)
+{
+  char pathname[256];
+
+  if(b->source && mflex_size((flex_ptr)&b->source) && !fetch_fetching(b))
+  {
+    strcpy(pathname,msgs_lookup("htmfile:HTMLFile"));
+    button_set_flags(b,B_SAVEHTML,TRUE,FALSE);
+    save_saveas(FILETYPE_HTML,pathname,mflex_size((flex_ptr)&b->source),fetch_html_saver,NULL,(void*)b);
+    button_set_flags(b,B_SAVEHTML,FALSE,FALSE);
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL fetch_link_saver(void *handle,char *pathname)
+{
+  char *c;
+
+  c=(char*)handle;
+  return(save_write_bytes(c,strlen(c)));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fetch_save_link(browser *b,int token)
+{
+  char    pathname[256];
+  HStream *tp;
+
+  tp=fetch_token_address(b,token);
+  if(tp && tp->anchor)
+  {
+    char url[1024];
+
+    strcpy(pathname,msgs_lookup("linktext:LinkText"));
+    STRFILL(url,tp->anchor);
+    save_saveas(0xfff,pathname,strlen(pathname),fetch_link_saver,NULL,url);
+  }
+  else bbc_vdu(7);
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+int fetch_find_anchor_token(browser *b,char *anchor_name)
+{
+  HStream *tp;
+  int     i;
+
+  tp=b->stream;
+  i=1;
+  while(tp)
+  {
+    if((tp->style&A) && tp->name && !strcmp(tp->name,anchor_name)) return(i);
+    i++;
+    tp=tp->next;
+  }
+  return(0);
+}
+
+/*----------------------------------------------------------------------*/
+char *fetch_find_name_tag(char *url)
+{ /* find the # separating an anchor name in a URL */
+  char *p;
+
+  p=strchr(url,'/');
+  if(p) p=strchr(p+1,'/');
+  if(p) p=strchr(p+1,'/');
+  if(p) p=strchr(p+1,'#');
+  return(p);
+}
+

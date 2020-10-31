@@ -1,0 +1,387 @@
+/*
+ * sound.c
+ *
+ * This is the module that handles the Sound window.
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+#include "help.h"
+#include "visdelay.h"
+
+#include "configure.h"
+#include "sound.h"
+#include "cmos.h"
+
+#define SoundWindow_VolumeDown       1
+#define SoundWindow_VolumeBar        2
+#define SoundWindow_VolumeUp         3
+#define SoundWindow_VoiceName        5
+#define SoundWindow_VoiceMenu        6
+#define SoundWindow_VoiceDown        7
+#define SoundWindow_VoiceNumber      8
+#define SoundWindow_VoiceUp          9
+#define SoundWindow_Speaker         10
+#define SoundWindow_Quiet           11
+#define SoundWindow_Loud            12
+#define SoundWindow_16bit           15
+
+static int sound_window=0;
+static int volume_length=0;
+static menu voices_menu=NULL;
+
+static void get_volumelength(void)
+{
+ wimp_icon i;
+ wimp_get_icon_info(sound_window,SoundWindow_VolumeBar,&i);
+ volume_length=i.box.x1-i.box.x0;
+}
+
+static void sound_setvolume(void)
+{
+ int volume=(cmos_get(CMOS_Volume) >> 4) & 7;
+ int volumes[]={0x01,0x13,0x25,0x37,0x49,0x5b,0x6d,0x7f};
+ wimp_icreate i;
+ int handle;
+ int new_length=(( (volume_length*100) / 0x7f )*volumes[volume] ) / 100;
+ int old_length;
+ _kernel_swi_regs r;
+ wimp_get_icon_info(sound_window,SoundWindow_VolumeBar,&i.i);
+ old_length=i.i.box.x1-i.i.box.x0;
+ wimp_delete_icon(sound_window,SoundWindow_VolumeBar);
+ i.w=sound_window;
+ r.r[0]=sound_window;
+ r.r[2]=i.i.box.y0;
+ r.r[4]=i.i.box.y1;
+ if (new_length > old_length)
+ {
+  r.r[1]=i.i.box.x1-4;
+  r.r[3]=i.i.box.x0+new_length+24;
+ }
+ else
+ {
+  r.r[1]=i.i.box.x0+new_length-20;
+  r.r[3]=i.i.box.x1+24;
+ }
+ i.i.box.x1=i.i.box.x0+new_length;
+ wimp_create_icon(&i,&handle);
+ _kernel_swi(XOS_Bit | Wimp_ForceRedraw,&r,&r);
+}
+
+
+static void sound_setvoice(void)
+{
+ int voice=cmos_get(CMOS_Voice) & 0xf;
+ _kernel_swi_regs r;
+ wimp_icon i;
+ wimp_get_icon_info(sound_window,SoundWindow_VoiceNumber,&i);
+ sprintf(i.data.indirecttext.buffer,"%i",voice+1);
+ r.r[0]=2;
+ r.r[1]=voice+1;
+ _kernel_swi(XOS_Bit | Sound_InstallVoice,&r,&r);
+ wimp_get_icon_info(sound_window,SoundWindow_VoiceName,&i);
+ sprintf(i.data.indirecttext.buffer,"%s",r.r[3] ? (char *)r.r[3] : "*** None ***");
+
+ wimp_set_icon_state( sound_window,SoundWindow_VoiceNumber,0,0);
+ wimp_set_icon_state( sound_window,SoundWindow_VoiceName  ,0,0);
+}
+
+static void sound_setspeaker(void)
+{
+ int on=(cmos_get(CMOS_Speaker) >> 7) & 1;
+ wimp_set_icon_state(sound_window,SoundWindow_Speaker,
+                     on ? wimp_ISELECTED : 0,
+                     wimp_ISELECTED);
+}
+
+static void sound_setbellvolume(void)
+{
+ int on=(cmos_get(CMOS_BellVolume) >> 1) & 1;
+
+ wimp_set_icon_state(sound_window,SoundWindow_Quiet,
+                     on ? 0 : wimp_ISELECTED,wimp_ISELECTED);
+ wimp_set_icon_state(sound_window,SoundWindow_Loud,
+                     on ? wimp_ISELECTED : 0,
+                     wimp_ISELECTED);
+}
+
+static void sound_set16bit(void)
+{
+ int on=cmos_get(CMOS_PrintSound) & 0x60;
+ wimp_set_icon_state(sound_window,SoundWindow_16bit,
+                     on ? wimp_ISELECTED : 0, wimp_ISELECTED);
+}
+
+static void change_bellvolume(int value)
+{
+ int byte=cmos_get(CMOS_BellVolume);
+ _kernel_swi_regs r;
+ cmos_set(CMOS_BellVolume,(byte & ~(1<<1)) | (value<<1));
+ sound_setbellvolume();
+ r.r[0]=212;
+ r.r[1]=value ? 0x80 : 0xd0;
+ r.r[2]=0;
+ _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+ printf("\07");
+}
+
+static void change_speaker()
+{
+ int byte=cmos_get(CMOS_Speaker) ^ (1<<7);
+ _kernel_swi_regs r;
+ cmos_set(CMOS_Speaker,byte);
+ sound_setspeaker();
+ r.r[0]=(byte & (1<<7)) ? 2 : 1;
+ _kernel_swi(XOS_Bit | Sound_Speaker,&r,&r);
+ printf("\07");
+}
+
+static void change_volume(int by)
+{
+ int byte=cmos_get(CMOS_Volume);
+ int volumes[] = {0x01, 0x13, 0x25, 0x37, 0x49, 0x5B, 0x6D, 0x7F};
+ int volume=( byte >> 4) & 7;
+ volume+=by;
+ if ((volume >=0) && (volume <=7))
+ {
+  _kernel_swi_regs r;
+  cmos_set(CMOS_Volume,(byte & ~(7<<4)) | (volume<<4));
+  r.r[0]=volumes[volume];
+  _kernel_swi(XOS_Bit | Sound_Volume,&r,&r);
+  printf("\07");
+ }
+ sound_setvolume();
+}
+
+static void change_voice(int by)
+{
+ int byte=cmos_get(CMOS_Voice);
+ int voice= byte & 0xf;
+ voice+=by;
+ if ((voice >=0) && (voice <=15))
+ {
+  _kernel_swi_regs r;
+  cmos_set(CMOS_Voice,(byte & ~(0xf)) | voice);
+  r.r[0]=1;
+  r.r[1]=voice+1;
+  _kernel_swi(XOS_Bit | Sound_AttachVoice,&r,&r);
+  printf("\07");
+ }
+ sound_setvoice();
+}
+
+static void change_voice_tovalue(int value)
+{
+ int byte=cmos_get(CMOS_Voice);
+ if ((value >=1) && (value <=16))
+ {
+  _kernel_swi_regs r;
+  cmos_set(CMOS_Voice,(byte & ~(0xf)) | (value-1));
+  r.r[0]=1;
+  r.r[1]=value;
+  _kernel_swi(XOS_Bit | Sound_AttachVoice,&r,&r);
+  printf("\07");
+ }
+ sound_setvoice();
+}
+
+static void change_16bit(void)
+{
+ int byte=cmos_get(CMOS_PrintSound);
+ byte = byte & 0x60 ? byte & 0x1F : (byte & 0x1F) | 0xA0;
+ cmos_set(CMOS_PrintSound,byte);
+ wimp_set_icon_state(sound_window,SoundWindow_16bit,
+                     byte & 0x60 ? wimp_ISELECTED : 0, wimp_ISELECTED);
+}
+
+/* If RISC_OSLib provided a function to unpick menu structures I would put the
+ * menu string in the help entry.  As it is, I would have to unpick it myself
+ * or cache it elsewhere (the enumeration process is too slow to go through each
+ * time we get a help event).  So I'll settle for a single help string for the
+ * whole menu.
+ */
+
+static void create_voicemenu(int adjust)
+{
+        _kernel_swi_regs r;
+        int i;
+
+        if (!adjust)
+        {
+                visdelay_begin();
+                if (voices_menu != NULL) menu_dispose(&voices_menu,TRUE);
+                voices_menu=NULL;
+                for (i=1;i<=16;i++)
+                {
+                        r.r[0]=2;
+                        r.r[1]=i;
+                        if ((os_error *)_kernel_swi(XOS_Bit | Sound_InstallVoice,&r,&r))
+                        {
+                                visdelay_end();
+                                return;
+                        }
+                        if (r.r[2] != 0)
+                        {
+                                if (voices_menu==NULL)
+                                {
+                                        voices_menu=menu_new(msgs_lookup("VTitle"),(char *)r.r[3]);
+                                }
+                                else
+                                {
+                                        menu_extend(voices_menu,(char *)r.r[3]);
+                                }
+                        }
+                }
+        }
+        visdelay_end();
+
+        open_button_menu( Menu_Voice, sound_window, SoundWindow_VoiceMenu, menu_syshandle( voices_menu ), "MHVOICE" );
+}
+
+
+static int sound_unknown_event_handler(wimp_eventstr *e,void *handle)
+{
+ handle=handle;
+ switch (e->e)
+ {
+  case wimp_EMENU:
+       {
+        wimp_mousestr m;
+        if (current_menu != Menu_Voice) return FALSE;
+        change_voice_tovalue(e->data.menu[0]+1);
+        wimp_get_point_info(&m);
+        if (m.bbits & wimp_BRIGHT) create_voicemenu(1);
+       }
+       break;
+  }
+ return FALSE;
+}
+
+
+static void sound_event_handler(wimp_eventstr *e,void *handle)
+{
+        handle=handle;
+
+        switch (e->e)
+        {
+        case wimp_EOPEN:
+                wimp_open_wind(&e->data.o);
+                break;
+        case wimp_ECLOSE:
+               {
+                wimp_mousestr m;
+                wimp_get_point_info(&m);
+                if (m.bbits==wimp_BRIGHT)
+                {
+                        wimp_wstate s;
+                        wimp_get_wind_state(sound_window,&s);
+                        reopen_main_window(s.o.box.x0,s.o.box.y1);
+                }
+                delete_window( &sound_window );
+                win_remove_unknown_event_processor(sound_unknown_event_handler,NULL);
+               }
+                break;
+        case wimp_EBUT:
+                if ( (e->data.but.m.i==SoundWindow_VoiceMenu)  &&
+                     ((e->data.but.m.bbits & (wimp_BLEFT | wimp_BMID)) != 0)
+                   )
+                {
+                        create_voicemenu(0);
+                }
+
+                if ((e->data.but.m.bbits==wimp_BRIGHT) ||
+                    (e->data.but.m.bbits==wimp_BLEFT)
+                   )
+                {
+                        int sign=(e->data.but.m.bbits == wimp_BRIGHT) ? 1 : -1;
+                        switch (e->data.but.m.i)
+                        {
+                        case SoundWindow_Loud:
+                                change_bellvolume(1);
+                                break;
+                        case SoundWindow_Quiet:
+                                change_bellvolume(0);
+                                break;
+                        case SoundWindow_Speaker:
+                                change_speaker();
+                                break;
+                        case SoundWindow_VolumeUp:
+                                change_volume(-sign);
+                                break;
+                        case SoundWindow_VolumeDown:
+                                change_volume(sign);
+                                break;
+                        case SoundWindow_VoiceUp:
+                                change_voice(-sign);
+                                break;
+                        case SoundWindow_VoiceDown:
+                                change_voice(sign);
+                                break;
+                        case SoundWindow_16bit:
+                                change_16bit();
+                                break;
+                        }
+                }
+                break;
+        case wimp_EKEY:
+                if (e->data.key.chcode != 13)
+                {
+                        wimp_processkey(e->data.key.chcode);
+                }
+                else
+                {
+                        wimp_icon i;
+                        int value=-1;
+                        wimp_get_icon_info(sound_window,e->data.key.c.i,&i);
+                        sscanf(i.data.indirecttext.buffer,"%i",&value);
+                        switch (e->data.key.c.i)
+                        {
+                        case SoundWindow_VoiceNumber:
+                                change_voice_tovalue(value);
+                                break;
+                        }
+                        disown_caret();
+                }
+                break;
+        }
+}
+
+
+int sound_create_window(void)
+{
+        if (! sound_window)
+        {
+                sound_window=create_window("Sound",sound_event_handler,"SO");
+                win_add_unknown_event_processor(sound_unknown_event_handler,NULL);
+                get_volumelength();
+        }
+        sound_setvolume();
+        sound_setvoice();
+        sound_setspeaker();
+        sound_setbellvolume();
+        sound_set16bit();
+        return sound_window;
+}
+
+void sound_update_window(void)
+{
+        if (sound_window) sound_create_window();
+}

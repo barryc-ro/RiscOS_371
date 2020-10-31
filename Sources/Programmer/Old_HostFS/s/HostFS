@@ -1,0 +1,2035 @@
+        TTL     > <wini>arm.HostFS.HostFS - Host Filing System + Tube interface
+
+; ***********************************
+; ***    C h a n g e   L i s t    ***
+; ***********************************
+
+; Date       Name  Version Description
+; ----       ----  ------- -----------
+; xx-Feb-88  SKS    0.22   Add TubeRC4 'go' action for MrLoughborough
+; 16-Feb-88  SKS    0.23   Add FSRedeclare action (so we can reinit FileSwitch)
+; 16-Feb-88  SKS    0.24   Stop TubeRC4 exploding people's machines
+;                          Made events work again, changed error numbers
+; 24-Feb-88  SKS    0.25   Tried adding optional 'quickstart' option
+; 01-Mar-88  SKS    0.26   Had to slow it down a bit
+; 03-Mar-88  SKS    0.27   Debungling for Sam
+; 31-Mar-88  SKS    0.28   Fixed error handling
+; 26-Apr-88  SKS    0.29   Fixed reset handling, used MUL in ReadDirEntries
+; 27-Apr-88  SKS    0.30   Added reconnection from Host
+; 02-May-88  SKS    0.31   Added *map,*compact. Fixed syntax messages
+;                          Fixed ReadDirEntries and the L(ock) bit
+; 06-May-88  SKS    0.32   Added Host OSWord capability
+; 09-May-88  SKS    0.33   Fixed ReadDirEntries to have a 0 in the right place
+; 10-May-88  SKS    0.34   Added Host_HostVdu,TubeVdu (stole TubeSWI chunk)
+; 24-May-88  SKS    0.35   Added code to speed up ReadDirEntries
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:ModHand
+        GET     Hdr:Services
+        GET     Hdr:Proc
+        GET     Hdr:File
+        GET     Hdr:LowFSi
+        GET     Hdr:EnvNumbers
+        GET     Hdr:CMOS
+        GET     Hdr:HostFS
+
+        GET     Version
+
+        LEADR   Module_LoadAddr
+
+
+        GBLL    minimal                 ; Cut down version for more ROM space
+minimal SETL    False
+;minimal SETL    True
+
+        GBLL    fsdebug                 ; Higher level filing system functions
+fsdebug SETL    False
+;fsdebug SETL    True
+
+        GBLL    xferdebug               ; Low level Tube access @ IRQ/FIQ level
+                                        ; and peeking/poking in foreground
+xferdebug SETL  False
+;xferdebug SETL  True
+
+        GBLL    initdebug
+initdebug SETL  False
+;initdebug SETL  True
+
+        GBLL    debugword
+debugword SETL  False
+;debugword SETL  True
+
+
+Proc_Debug SETL xferdebug :LOR: fsdebug :LOR: initdebug :LOR: debugword
+
+        GET     Hdr:Debug
+
+
+ [ xferdebug
+border * &40000000
+ ]
+
+TAB     *       9
+LF      *       10
+CR      *       13
+space   *       " "
+
+; IRQ mode registers (r13-r14 only are banked)
+
+tubewrk2  RN    r9      ; Only used in IRQ mode stuff
+tubewrk   RN    r10
+tubebase  RN    r11     ; Loaded each time from initial value
+;wp       RN    r12
+
+
+; FIQ mode registers (r10-r14 only are banked (3um ARM))
+
+;tubebase RN    r11_fiq
+xferaddr  RN    r12_fiq
+xfertemp  RN    r13_fiq
+
+FIQCodeAddress  *       &1C
+
+IO_FastCycle    *       &03340000       ; Podule slot 0; &03344000 = slot 1 etc
+
+TubeNumber      *       &010B00         ; Number to be added to errors (wdfs)
+
+adfsDirLength     *     5 * 256
+wdfsDirLength     *     11 * 256
+adfsDirEntries    *     47
+wdfsDirEntries    *     105
+
+gbpb_firstentry   *     5       ; Offset of first entry in directory
+
+        ^     0, r9
+gbpb_entrybuffer  #     2       ; Dealign by 2
+gbpb_filename     #     10
+gbpb_readattr     *     gbpb_filename
+gbpb_writeattr    *     gbpb_filename+1
+gbpb_lockedattr   *     gbpb_filename+2
+gbpb_directoryattr *    gbpb_filename+3
+gbpb_loadaddr     #     4       ; So that this field is aligned
+gbpb_execaddr     #     4
+gbpb_length       #     4
+gbpb_sectoraddr   #     3
+gbpb_sequence     #     1
+gbpb_entrytotal   *     :INDEX: (@-gbpb_filename)
+gbpb_buffersize   *     :INDEX: (@-gbpb_entrybuffer)
+
+
+; Workspace layout
+
+        ^     0, wp
+
+HostErrorBuffer   #     256
+FileNameBuffer    #     256     ; Reused by GBPB 8-10 ops
+LibraryNameBuffer #     128
+
+TubeAddress       #     4       ; Base of Tube hardware
+FIQTableAddress   #     4       ; Table of FIQ routine offsets
+PollHostDelay     #     4
+WhereToCall       #     4       ; Nasty address for rc 4
+
+CallBackBuffer    #     16*4
+
+TextOffset        #     4       ; Where to put a character from Host
+DirectoryHandle   #     4
+DirectoryLength   #     4
+DirectoryEntries  #     4
+
+ReadEntriesBlock  #     gbpb_buffersize ; Probably dealigning, so watch it !
+
+; Byte workspace
+
+HostErrorFlag     #     1
+DoneStarBack      #     1
+FSToRestore       #     1
+WhetherToCall     #     1
+
+ [ :LNOT: minimal
+        AlignSpace 256
+TextBuffer        #     32*1024-:INDEX:@ ; A little excessive perhaps !
+ ]
+
+        AlignSpace 256
+CachedDirectory #     wdfsDirLength
+CachedDirname   #     256
+
+HostWorkspaceEnd  #     0
+
+
+; ****************** HostFile Module code starts here *************************
+
+Module_BaseAddr
+
+        DCD     0
+        DCD     HostFS_Init     -Module_BaseAddr
+        DCD     HostFS_Die      -Module_BaseAddr
+        DCD     HostFS_Service  -Module_BaseAddr
+        DCD     HostFS_Title    -Module_BaseAddr
+        DCD     HostFS_Help     -Module_BaseAddr
+        DCD     HostFS_HC_Table -Module_BaseAddr
+        DCD     Module_SWISystemBase + TubeSWI * Module_SWIChunkSize
+        DCD     HostFS_SWICode  -Module_BaseAddr
+        DCD     HostFS_SWITable -Module_BaseAddr
+
+HostFS_Title
+        DCB     "HostFS", 0
+
+HostFS_SWITable
+        DCB     "HostFS", 0
+        DCB     "HostVdu",0
+        DCB     "TubeVdu",0
+        DCB     "WriteC",0
+        DCB     0
+
+HostFS_Help
+        DCB     "HostFS"
+        DCB     TAB, TAB
+        DCB     "$Version ($CurrentDate)", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; NB. Can't talk to Tube during initialisation, only after reset has come round
+
+; r0-r6 trashable
+
+HostFS_Init ENTRY
+
+        LDR     r2, [r12]               ; Coming from hard reset ?
+        TEQ     r2, #0
+        MOVNE   wp, r2
+        BNE     %FT50
+
+        BL      ReadTubeCMOS            ; Do we have a Tube configured ?
+        EXIT    VS
+
+        MOVS    r4, r2, LSR #(8-3+1)    ; Configured slot. 2_xx0 -> none
+        EXIT    CC                      ; VClear, no workspace claimed, no fs
+
+ [ initdebug
+        DLINE "Claiming ws"
+ ]
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =:INDEX: HostWorkspaceEnd
+        SWI     XOS_Module
+        EXIT    VS                      ; 'No room in RMA' acceptable error msg
+        STR     r2, [r12]
+        MOV     wp, r2
+
+        LDR     r14, =IO_FastCycle
+        ORRNE   r14, r14, r4, LSL #14   ; Add in slot offset
+        STR     r14, TubeAddress        ; A useful address to keep around
+ [ initdebug
+        DREG r14, "Tube at "
+ ]
+
+10      LDRB    r0, [r10], #1           ; no command tail ?
+        CMP     r0, #space
+        BEQ     %BT10
+
+        LDRLO   r0, =3600*1024/2        ; 3600ms - allow time for ADFS floppy
+        LDRHI   r0, =1500*1024/2        ; to spin up and get started if no arg
+        STR     r0, PollHostDelay
+
+        ADR     r1, %FT99               ; Reset library name to default
+        BL      SetLibraryName
+
+        BL      InvalidateDircache
+
+        ADR     r14, Module_BaseAddr
+        CMP     r14, #&03800000
+        BLLO    HostFS_ServiceReset   ; Buzz Tube if running in RAM
+
+50      BL      AddFilingSystems
+        EXIT
+
+99
+        DCB     0
+        ALIGN
+
+        LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+AddFilingSystems ENTRY "r2"
+
+        ADRL    r2, BBC_FSInfoBlock
+        BL      AddFilingSystem
+        ADD     r2, r2, #(BBCB_FSInfoBlock - BBC_FSInfoBlock)
+        BLVC    AddFilingSystem
+ [ :LNOT: minimal
+        ADD     r2, r2, #(hostvdu_FSInfoBlock - BBCB_FSInfoBlock)
+        BLVC    AddFilingSystem
+ ]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r2 -> Filing System info block
+
+; Out   r0 corrupt/error^
+
+AddFilingSystem ENTRY "r1-r3"
+
+        MOV     r0, #FSControl_AddFS
+        ADR     r1, BBC_ModuleBase
+        SUB     r2, r2, r1
+        MOV     r3, wp                  ; Pass wp st. dereference unnecessary
+        SWI     XOS_FSControl
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Let Module handler take care of removing our workspace on fatal death
+; or shunting it around on Tidy - none of it is absolute
+
+HostFS_Die ENTRY "r0-r1"
+
+        LDR     wp, [r12]
+        CMP     wp, #0                  ; Are we active ?
+        EXIT    EQ                      ; VClear
+
+        MOV     r0, #IrqV               ; Release IRQ vector
+        ADRL    r1, IRQHandler
+        MOV     r2, wp
+        SWI     XOS_Release
+
+        MOV     r0, #WrchV              ; Release WrchV
+        ADRL    r1, WRCHandler
+        MOV     r2, wp
+        SWI     XOS_Release
+
+        MOV     r0, #FSControl_RemoveFS
+        ADRL    r1, BBC_Name
+        SWI     XOS_FSControl
+
+        MOV     r0, #FSControl_RemoveFS
+        ADRL    r1, BBCB_Name
+        SWI     XOS_FSControl
+
+ [ :LNOT: minimal
+        MOV     r0, #FSControl_RemoveFS
+        ADRL    r1, hostvdu_Name
+        SWI     XOS_FSControl
+ ]
+        EXITS                           ; Assumes VClear in entry lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+HostFS_Service ROUT
+
+        LDR     wp, [r12]
+        CMP     wp, #0                  ; Are we active ?
+        MOVEQ   pc, lr                  ; Pass it on if not
+
+        TEQ     r1, #Service_UKCommand
+        BEQ     HostFS_ServiceUKCommand
+        TEQ     r1, #Service_UKWord
+        BEQ     HostFS_ServiceUKWord
+        TEQ     r1, #Service_FSRedeclare
+        BEQ     HostFS_ServiceFSRedeclare
+        TEQ     r1, #Service_Reset
+        BEQ     HostFS_ServiceReset
+        MOV     pc, lr                  ; Pass it on
+
+
+HostFS_ServiceUKCommand ENTRY "r10-r11"
+
+        LDRB    r14, [r0]               ; Is it an '@' command ?
+        TEQ     r14, #"@"
+        EXIT    NE                      ; Pass it on then
+
+        ADD     r1, r0, #1              ; Skip past '@' char + pass to Host
+        BL      Host_CLI
+        MOV     r1, #0                  ; Claiming the service always
+        MOVVC   r0, #0                  ; No error
+        EXIT
+
+
+HostFS_ServiceFSRedeclare ENTRY "r0"
+
+        BL      AddFilingSystems
+        EXIT
+
+
+HostFS_ServiceReset ENTRY "r0-r3"
+
+; On reset, the Host is sitting waiting for the parasite to send a NUL
+; terminated string across - no IRQ or FIQ will come from the Host until this
+; NUL has been sent. We can set up dummy FIQ handlers to cope with language ROM
+; transfers, which will occur (if at all) whilst we are polling R2_status for
+; continuation. Obviously, we must be able to enable IRQs at this stage !
+
+ [ initdebug
+        DLINE "InitResetCommon"
+ ]
+        MOV     r14, #0                 ; Not ok to call code now
+        STRB    r14, WhetherToCall
+
+ [ initdebug
+        DLINE "Claiming IRQ"
+ ]
+        ADRL    r0, DuffFIQTable        ; Set up duff IRQ/FIQ handlers
+        BL      ClaimIRQ                ; And sit on IRQ vector
+
+ [ initdebug
+        DLINE "Claiming FIQ"
+ ]
+        BL      Host_ClaimFIQ           ; Need it even for duff handlers !
+
+; Copy system title across to the Host
+
+ [ initdebug
+        DLINE "Copying title"
+ ]
+        MOV     r0, #LF
+        BL      Host_WriteC
+        MOV     r0, #CR
+        BL      Host_WriteC
+
+        MOV     r0, #0                  ; Cause 'OS message' error
+        MOV     r1, #0
+        SWI     XOS_Byte
+        ADD     r0, r0, #4              ; Skip error number
+        BL      Host_Write0
+
+        ADR     r0, HelloHostProcessor
+        BL      Host_Write0
+
+        MOV     r0, #0                  ; We get IRQed as soon as this NUL
+        BL      Host_WriteC             ; is recieved (potentially) to do the
+                                        ; default langauge copy to parasite
+
+        BL      PollContinuationTillBored
+
+        BL      Host_ReleaseFIQ
+
+        ADRL    r0, RealFIQTable        ; Install real FIQ handlers
+        STR     r0, FIQTableAddress     ; to myself
+
+        MOV     r14, #-1                ; Ok to call code now
+        STRB    r14, WhetherToCall
+        CLRV
+        EXIT
+
+
+HelloHostProcessor
+
+        DCB     LF,CR
+        DCB     LF, 0
+        ALIGN
+
+
+HostFS_ServiceUKWord
+
+        TEQ     r2, #&70
+        TEQNE   r2, #&71
+        TEQNE   r2, #&72
+        MOVNE   pc, lr                  ; Not for us
+
+        ENTRY   "r0, r2"
+        MOV     r0, r2
+        MOV     r1, r3
+        BL      Host_Word
+        MOV     r2, r0
+        MOV     r1, #0                  ; Claim service
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+ReadTubeCMOS ENTRY "r0, r1"
+
+        MOV     r0, #ReadCMOS
+        MOV     r1, #TutuCMOS
+        SWI     XOS_Byte
+        STRVS   r0, [sp]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;                 T U B E   C O M M A N D S   S E C T I O N
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+HostFS_HC_Table ; Name Max Min
+
+        Command BBC,      0, 0
+        Command BBCB,     0, 0
+
+        Command HostVdu,  0, 0
+        Command TubeVdu,  0, 0
+
+        Command ReconnectHost,  0, 0
+
+        Command Back,     0, 0, FS_Command_Flag
+        Command Bye,      0, 0, FS_Command_Flag
+        Command Compact,  0, 0, FS_Command_Flag
+        Command Free,     0, 0, FS_Command_Flag
+        Command Map,      0, 0, FS_Command_Flag
+
+        Command HostPodule, 0, 0, Status_Keyword_Flag ; Config/Status parm
+        Command NoHostPodule, 0, 0, Status_Keyword_Flag ; Config/Status parm
+
+        DCB     0                       ; That's all folks !
+
+; Help and syntax messages
+
+BBC_Help
+        DCB     "*BBC selects the unbuffered Host Filing System."
+        DCB     CR
+BBC_Syntax
+        DCB     "Syntax: *BBC", 0
+
+BBCB_Help
+        DCB     "*BBCB selects the buffered Host Filing System."
+        DCB     CR
+BBCB_Syntax
+        DCB     "Syntax: *BBCB", 0
+
+HostVdu_Help
+        DCB     "*HostVdu redirects vdu output to the BBC Host."
+        DCB     CR
+HostVdu_Syntax
+        DCB     "Syntax: *HostVdu", 0
+
+ReconnectHost_Help
+        DCB     "*ReconnectHost reestablishes the connection to the BBC Host."
+        DCB     CR
+ReconnectHost_Syntax
+        DCB     "Syntax: *ReconnectHost", 0
+
+TubeVdu_Help
+        DCB     "*TubeVdu redirects vdu output to the a500."
+        DCB     CR
+TubeVdu_Syntax
+        DCB     "Syntax: *TubeVdu", 0
+
+Back_Help
+        DCB     "*Back swaps current and previous directories."
+        DCB     CR
+Back_Syntax
+        DCB     "Syntax: *Back", 0
+
+Bye_Help
+        DCB     "*Bye logs off the network/parks the winchester."
+        DCB     CR
+Bye_Syntax
+        DCB     "Syntax: *Bye", 0
+
+Compact_Help
+        DCB     "*Compact collects free spaces together by moving files."
+        DCB     CR
+Compact_Syntax
+        DCB     "Syntax: *Compact", 0
+
+Free_Help
+        DCB     "*Free displays disc usage."
+        DCB     CR
+Free_Syntax
+        DCB     "Syntax: *Free", 0
+
+Map_Help
+        DCB     "*Map displays disc fragmentation."
+        DCB     CR
+Map_Syntax
+        DCB     "Syntax: *Map", 0
+
+        ALIGN                           ; Just the once, please
+
+HostPodule_Help     * Module_BaseAddr
+HostPodule_Syntax   * Module_BaseAddr
+NoHostPodule_Help   * Module_BaseAddr
+NoHostPodule_Syntax * Module_BaseAddr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Bits associated with utility commands. r0-r6 trashable
+
+BBC_Code ENTRY
+
+;       LDR     wp, [r12]               ; Not needed here
+
+        ADRL    r1, BBC_Name
+
+10      MOV     r0, #FSControl_SelectFS
+        SWI     XOS_FSControl
+        EXIT
+
+
+BBCB_Code ALTENTRY
+
+        ADRL    r1, BBCB_Name
+        B       %BT10
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; NB. wp already correct on FileCommands and FileEntries
+
+; Can't be seen if no configured Host. Phew !
+
+Back_Code ENTRY
+
+        BL      DoStarBack              ; A little trivial, huh ?
+        EXIT
+
+
+Bye_Code
+        ADR     r1, %FT91
+        B       %FA50
+
+Compact_Code
+        ADR     r1, %FT92
+        B       %FA50
+
+Map_Code
+        ADR     r1, %FT93
+        B       %FA50
+
+Free_Code
+        ADR     r1, %FT90
+
+50      Push    lr
+        BL      Host_CLI
+        Pull    pc
+
+90
+        DCB     "Free", 0
+91
+        DCB     "Bye", 0
+92
+        DCB     "Compact", 0
+93
+        DCB     "Map", 0
+
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+ReconnectHost_Code ENTRY
+
+        LDR     wp, [r12]
+
+        ADR     r0, HelloAgain
+        BL      Host_Write0
+
+        MOV     r0, #0
+        BL      Host_WriteC
+
+        BL      PollContinuationTillBored
+        EXIT
+
+
+HelloAgain
+        DCB     "Hello again!", LF,CR, LF, 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; *Configure/*Status HostPodule
+
+HostPodule_Code ENTRY "r0-r2"           ; r0 is return code if VSet
+
+        CMP     r0, #0                  ; *Configure<CR> ?
+        BNE     %FT10
+        SWI     XOS_WriteS
+        DCB     "HostPodule <D>", LF,CR, 0
+        ALIGN
+05      STRVS   r0, [sp]                ; Bastard Bastard Bastard Bastard Basta
+        EXIT
+
+
+10      CMP     r0, #1                  ; *Status
+        BNE     %FT20
+
+11      BL      ReadTubeCMOS            ; Entered from below
+        BVS     %BT05
+        MOVS    r0, r2, LSR #(8-3+1)    ; Just 3 bits at the top of the byte
+        BCS     %FT15                   ; 2_xx0 -> no Tube
+        SWI     XOS_WriteI+"N"
+        SWIVC   XOS_WriteI+"o"
+        SWIVC   XOS_WriteI+" "
+
+15      BVS     %BT05
+        SWI     XOS_WriteS
+        DCB     "HostPodule", 0
+        ALIGN
+        BVS     %BT05
+        BCC     %FT19                   ; The C flag got preserved through that
+
+        SUB     sp, sp, #8              ; Make a hole for string buffer
+        MOV     r1, sp
+        MOV     r2, #8-1
+        SWI     XOS_BinaryToDecimal
+        MOV     r0, #0
+        STRB    r0, [r1, r2]
+        MOV     r0, sp
+        SWI     XOS_WriteI+" "
+        SWIVC   XOS_Write0
+        ADD     sp, sp, #8
+
+19      SWIVC   XOS_NewLine
+        B       %BT05                   ; Exit testing V
+
+
+20      MOV     r1, r0                  ; Get command^
+        LDRB    r0, [r1]                ; Do we have a parm ?
+        CMP     r0, #" "
+        BLO     %FT85                   ; Need a numeric parm
+
+        MOV     r0, #(2_10 :SHL: 30)    ; Detect naff term chars
+        SWI     XOS_ReadUnsigned
+        BVS     %FT85
+        CMP     r2, #3                  ; Check ourselves
+        BHI     %FT80
+
+25      LDRB    r0, [r1], #1            ; Must have no trailing garbage
+        CMP     r0, #" "
+        BEQ     %BT25
+        BHI     %FT85                   ; 'Numeric needed'
+
+        MOV     r0, r2, LSL #(8-3+1)
+        ORR     r0, r0, #(2_001 :SHL: (8-3)) ; Means we have a Tube
+
+30      BL      ReadTubeCMOS
+        BIC     r2, r2, #(2_111 :SHL: (8-3))
+        ORR     r2, r2, r0
+        MOV     r0, #WriteCMOS
+        MOV     r1, #TutuCMOS
+        SWIVC   XOS_Byte
+        B       %BT05                   ; Exit testing V
+
+
+80      MOV     r0, #2                  ; Configure parameter too big
+81      SETV
+        BVS     %BT05
+
+85      MOV     r0, #1                  ; Numeric parameter needed
+        BVS     %BA81
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; *Configure/*Status NoHostPodule
+
+NoHostPodule_Code ALTENTRY
+
+        CMP     r0, #0                  ; *Configure<CR> ?
+        BNE     %FT10
+
+        SWI     XOS_WriteS
+        DCB     "NoHostPodule", LF,CR, 0
+        ALIGN
+        B       %BT05
+
+10      CMP     r0, #1                  ; *Status
+        BEQ     %BT11
+
+        MOV     r1, r0                  ; Get command^
+        LDRB    r0, [r1], #1            ; Do we have a parm ?
+        CMP     r0, #" "
+        MOV     r0, #0                  ; No tube / Bad configure option !!!
+        BHS     %BA81                   ; Configure error
+
+        B       %BT30                   ; Configure no tube state
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+HostVdu_Code ENTRY
+
+        SWI     XHostFS_HostVdu
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+TubeVdu_Code ENTRY
+
+        SWI     XHostFS_TubeVdu
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r10-r12 trashable
+
+HostFS_SWICode ROUT
+
+        LDR     wp, [r12]
+        CMP     wp, #0
+        ADREQ   r0, %FT90
+        ORREQS  pc, lr, #V_bit
+
+        CMP     r11, #MaxSwi            ; Number of valid SWI entries
+        ADDCC   pc, pc, r11, LSL #2
+        MOVCSS  pc, lr
+
+JumpTable
+        B       DoHostVdu
+        B       DoTubeVdu
+        B       Host_WriteC
+
+MaxSwi  *       (.-JumpTable) / 4
+
+90
+        DCD     TubeNumber+4
+        DCB     "No configured Host", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+DoHostVdu ENTRY "r0-r2"
+
+        MOV     r0, #WrchV              ; Claim WrchV
+        ADR     r1, WRCHandler
+        MOV     r2, wp
+        SWI     XOS_Claim
+        STRVS   r0, [sp]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+DoTubeVdu ENTRY "r0-r2"
+
+        MOV     r0, #WrchV              ; Release WrchV
+        ADR     r1, WRCHandler
+        MOV     r2, wp
+        SWI     XOS_Release
+        STRVS   r0, [sp]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Sit on WrchV printing characters to the Host
+
+WRCHandler ROUT
+
+        BL      Host_WriteC
+        Pull    pc                      ; Claim it
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;           A C T U A L   F I L I N G   S Y S T E M   S T U F F
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; bbc - fs number &0B
+
+BBC_ModuleBase  *       Module_BaseAddr
+BBC_Commands    *       BBC_ModuleBase
+
+BBC             FSHeader fsinfo_special + &0B ; Fudge for Modula-2 utils (wdfs)
+
+BBC_Name        DCB     "BBC", 0
+
+BBC_StartupText DCB     "Acorn BBC Host Filing System", 0
+        ALIGN
+
+BBC_BufferSize   *      0
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; bbcb - fs number &11
+
+BBCB_ModuleBase  *      Module_BaseAddr
+BBCB_Commands    *      BBCB_ModuleBase
+BBCB_GBPB        *      BBCB_ModuleBase
+
+BBCB             FSHeader fsinfo_special + &11
+
+BBCB_Name        DCB    "BBCB", 0
+
+BBCB_StartupText DCB    "Acorn BBC(B) Host Filing System", 0
+        ALIGN
+
+BBCB_BufferSize  *      1024
+
+ [ :LNOT: minimal
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; hostvdu - fs number &1E, nullok
+
+hostvdu_ModuleBase  *   Module_BaseAddr
+
+hostvdu_Commands    *   hostvdu_ModuleBase ; ie. 0 - no commands or help
+hostvdu_StartupText *   hostvdu_ModuleBase
+hostvdu_GBPB        *   hostvdu_ModuleBase
+
+hostvdu         FSHeader fsinfo_nullnameok + &1E
+
+hostvdu_Name    DCB     "hostvdu", 0
+        ALIGN
+ ]
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Filing System entry points. All entered with wp valid. May corrupt r10,r11,wp
+
+BBC_File
+BBCB_File ENTRY
+
+        BL      SortOutNameFudges       ; May get errors
+        EXIT    VS
+
+        TEQ     r0, #fsfile_Load
+        TEQNE   r0, #fsfile_ReadInfo
+        BLNE    InvalidateDircache
+
+        TEQ     r0, #fsfile_CreateDir   ; CDIR must be fudged back to star cmd
+        BEQ     %FT50
+
+        MOV     r6, r1                  ; Preserve name^ for OPT1 1 messages
+        BL      Host_File
+        ORR     r5, r5, #&11            ; Force readable (DFS is a cunt)
+
+30      BL      SortOutEndFudges
+        EXIT
+
+
+50      ADR     r0, BBC_CDIR
+        BL      Host_CLI_Pair           ; Takes two strings
+        MOVVC   r0, #2                  ; DIR type
+        BVC     %BT30
+
+        LDRB    r14, [r0]
+        CMP     r14, #&C4               ; Already exists ?
+        SETV    NE
+        B       %BT30
+
+BBC_CDIR DCB    "CDIR ", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+BBC_Open ENTRY
+
+        BL      BBCB_Open
+        ORRVC   r0, r0, #fsopen_UnbufferedGBPB  ; Dozy muthafucka prawnface !!!
+        MOV     r2, #BBC_BufferSize
+        EXIT
+
+
+BBCB_Open ENTRY "r0, r1" ; bits / handle poked in here
+
+        BL      SortOutNameFudges
+        BVS     %FT99
+
+        TEQ     r0, #fsopen_CreateUpdate
+        BLEQ    InvalidateDircache
+
+        ADD     r0, r0, #1      ; Reconvert for Host Filing Systems
+        MOV     r0, r0, LSL #(8-2)
+        BL      Host_Open
+        BVS     %FT99
+        STR     r0, [sp, #4*1]  ; Resultis 0 if not found / <> 0 good handle
+
+        CMP     r0, #0          ; Opened file ?
+        BEQ     %FT90           ; Don't bother mucking about with file if not
+
+        MOV     r0, #OSFile_ReadInfo
+        BL      Host_File       ; Read file attributes
+        BVS     %FT99
+
+        CMP     r0, #2
+        MOVEQ   r0, #fsopen_IsDirectory + fsopen_ReadPermission
+        ; If it's a dir, set r~w access
+        MOVEQ   r3, r4          ; File extent = Directory size
+
+        MOVNE   r0, r5, LSL #30 ; Put in bits 31..30. Not Dir. Zero devid
+        STR     r0, [sp, #4*0]  ; Poke access/type/devid word into stack
+        BEQ     %FT50           ; Can't read extent of a dir !
+
+        MOV     r0, #OSArgs_ReadEXT
+        LDR     r1, [sp, #4*1]  ; Get handle back
+        BL      Host_Args
+        BVS     %FT99
+        MOV     r3, r2          ; File extent
+
+        BL      IndicateHostFilingSystem
+        BVS     %FT99
+        BNE     %FT45           ; File size - only net supports read size
+        MOV     r0, #OSArgs_ReadSize
+        BL      Host_Args
+        BVS     %FT99
+45      MOV     r4, r2          ; So just use extent if adfs/wdfs
+
+50      MOV     r2, #BBCB_BufferSize
+
+90      BL      SortOutEndFudges
+        CLRV
+        EXIT
+
+
+99      STR     r0, [sp]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Unbuffered GET
+
+; r1 = handle
+
+BBC_Get ENTRY
+
+        BL      Host_BGet
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Buffered GET
+
+; r1 = handle
+; r2 = buffer address   | -1 for scattered buffers
+; r3 = n bytes          | address,length pair list^
+; r4 = file address     | start of scatter address
+
+BBCB_Get ENTRY
+
+        CMP     r2, #-1 ; Can't cope with this yet
+        BEQ     %FT90
+
+        CMP     r3, #4*1024*1024        ; It's only a 4 meg machine
+        BHS     TooMuchToHandle
+
+        MOV     r0, #OSGBPB_ReadFromGiven ; Read from file at given PTR
+        BL      Host_GBPB
+        EXIT
+
+90      ADR     r0, %FT95
+        SETV
+        EXIT
+95
+        DCD     0
+        DCB     "BBC(B) can't scatter load", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Unbuffered PUT
+
+BBC_Put ENTRY
+
+        BL      Host_BPut
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Buffered PUT
+
+; r1 = handle
+; r2 = buffer address   | -1 for scattered buffers
+; r3 = n bytes          | address,length pair list^
+; r4 = file address     | start of scatter address
+
+BBCB_Put ENTRY
+
+        CMP     r2, #-1
+        BEQ     %FT90
+
+        CMP     r3, #4*1024*1024        ; It's only a 4 meg machine
+        BHS     TooMuchToHandle
+
+        MOV     r0, #OSGBPB_WriteAtGiven ; Write to file at given PTR
+        BL      Host_GBPB
+        EXIT
+
+90      ADR     r0, %FT95
+        SETV
+        EXIT
+95
+        DCD     0
+        DCB     "BBC(B) can't scatter save", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    lr stacked
+
+TooMuchToHandle ROUT
+
+        ADR     r0, %FT99
+        Pull    lr
+        ORRS    pc, lr, #V_bit
+99
+        DCD     0
+        DCB     "Silly nbytes for xfer", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Unbuffered fast GBPB
+
+; r0 = GBPB file op
+; r1 = handle
+; r2 = memory address
+; r3 = n bytes
+; r4 = file address
+
+; Out     r2-r4 updated as 'usual' for the cruddy IO system you're using
+
+BBC_GBPB ENTRY
+
+ [ fsdebug
+ DREG r0, "Called BBC_GBPB with rc ",cc
+ DREG r1, ", handle "
+ DREG r2, ", memadr "
+ DREG r3, ", nbytes "
+ DREG r4, ", fileptr "
+ ]
+        CMP     r3, #4*1024*1024        ; It's only a 4 meg machine
+        BHS     TooMuchToHandle
+
+        BL      Host_GBPB
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+BBC_Args
+BBCB_Args ENTRY
+
+        CMP     r0, #fsargs_EOFCheck    ; Have to osbyte this one across
+        BEQ     %FT20
+
+        TEQNE   r0, #fsargs_EnsureSize  ; Reserve given space, and fill with
+        MOVEQ   r0, #OSArgs_SetEXT      ; zeroes too
+        BEQ     %FT10
+
+        CMP     r0, #fsargs_ReadLoadExec ; Oh golly, this is difficile !
+        MOVEQ   r2, #0                  ; So pretend it's not datestamped
+        MOVEQ   r3, #0                  ; That'll teach me to invent silly
+                                        ; fsargs operations ! VClear
+        CMPNE   r0, #fsargs_WriteZeroes ; Always get this after EnsureSize
+        EXIT    EQ                      ; so we can safely ignore it ! VClear
+
+
+        TEQ     r0, #fsargs_Flush
+        MOVEQ   r0, #OSArgs_Flush
+
+10      BL      Host_Args
+        EXIT
+
+
+20      MOV     r0, #&7F                ; Reconvert to OSByte EOF for Host
+        BL      Host_Byte
+        MOVS    r2, r1                  ;  0 <-> not EOF
+        MOVNE   r1, #-1                 ; -1 <-> EOF
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+BBC_Close
+BBCB_Close ENTRY
+
+        BL      Host_Close
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+BBC_Func
+BBCB_Func ENTRY
+
+        TEQ     r0, #fsfunc_ShutDown
+        BEQ     %FT90
+
+        TEQ     r0, #fsfunc_Opt         ; Can't do *OPT via OSCLI
+        BEQ     %FT85
+
+        TEQ     r0, #fsfunc_ReadDiscName
+        TEQNE   r0, #fsfunc_ReadCSDName
+        TEQNE   r0, #fsfunc_ReadLIBName
+        BNE     %FT05
+        ADD     r0, r0, #(OSGBPB_ReadDiscName-fsfunc_ReadDiscName)
+        BL      Host_GBPB               ; r2 -> memory. No buffer limit
+        EXIT
+
+05      TEQ     r0, #fsfunc_Bootup
+        BNE     %FT15
+
+        ADR     r0, %FT09               ; *&.!ArmBoot
+        SWI     XOS_CLI
+        EXIT
+09
+        DCB     "&.!ArmBoot", 0
+        ALIGN
+
+15      BL      SortOutNameFudges
+
+        TEQ     r0, #fsfunc_ReadDirEntries
+        TEQNE   r0, #fsfunc_ReadDirEntriesInfo
+        BNE     %FT20
+        BL      BBC_ReadDirEntries
+        B       %FT80
+
+
+20      TEQ     r0, #fsfunc_Rename      ; Rename takes two strings
+        BNE     %FT40
+        BL      InvalidateDircache
+        Push    r1
+        MOV     r1, r2
+        BL      SortOutNameFudges
+        CMP     r1, r2                  ; Mustn't be too hard !
+        Pull    r1
+        MOVNE   r1, #0                  ; Indicate too hard
+        EXIT    NE
+        BL      GlueR1R2Together
+        B       %FT70
+
+
+40      TEQ     r0, #fsfunc_Access      ; Have to slap the attribute string on
+        BNE     %FT50
+        BL      InvalidateDircache
+        BL      GlueR1R2Together
+        B       %FT70
+
+
+50      TEQ     r0, #fsfunc_Dir         ; If DIR, ignore pending BACK
+        BNE     %FT60
+        MOV     r2, #0                  ; And stay on the FS we got as special
+        STRB    r2, FSToRestore
+        LDRB    r2, DoneStarBack
+        TEQ     r2, #0                  ; Had we set a BACK ?
+        BEQ     %FT70
+        MOV     r2, #0
+        STRB    r2, DoneStarBack
+        BL      strlen                  ; If resultant string is null then
+        TEQ     r3, #0                  ; *DIR \ -> just *BACK, ie. completed
+        EXIT    EQ
+        B       %FT70                   ; Else we need to complete 'DIR fred'
+
+60      CMP     r0, #fsfunc_Lib         ; We take notice of *LIB
+        BNE     %FT70
+        BL      SetLibraryName          ; So take a copy
+
+70      ADR     r2, NastyHostOscliTable
+        ADD     r0, r2, r0, LSL #3      ; All are 8 bytes long (padded)
+        BL      Host_CLI_Pair           ; Takes two strings
+
+80      BLVC    SortOutEndFudges
+        EXIT
+
+
+85      MOV     r0, #139                ; *OPT osbyte, X, Y
+        BL      Host_Byte
+        EXIT
+
+90
+ [ :LNOT: minimal
+        MOV     r2, #11                 ; Park wdfs
+        BL      ParkHostFilingSystem
+ ]
+        MOV     r2, #8                  ; Park adfs
+        BL      ParkHostFilingSystem
+        MOV     r2, #5                  ; Park nfs
+        BL      ParkHostFilingSystem
+        EXIT
+
+
+NastyHostOscliTable
+
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Dir * 8
+        DCB     "Dir    ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Lib * 8
+        DCB     "Lib    ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Cat * 8
+        DCB     "Cat    ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Ex * 8
+        DCB     "Ex     ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_LCat * 8
+        DCB     "LCat   ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_LEx * 8
+        DCB     "LEx    ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Info * 8
+        DCB     "Info   ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Opt * 8
+        DCB     "|      ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Rename * 8
+        DCB     "Rename ",0
+        ASSERT (.-NastyHostOscliTable) = fsfunc_Access * 8
+        DCB     "Access ",0
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+BBC_ReadDirEntries ENTRY "r0-r9" ; Update here. Make indexing easy too
+
+        ADR     r9, ReadEntriesBlock    ; And preserve it, please !
+
+        BL      SussHostFilingSystem
+        CMP     r0, #8                  ; adfs ?
+        MOVEQ   r0, #adfsDirLength
+        MOVEQ   r2, #adfsDirEntries
+        BEQ     %FT50
+ [ :LNOT: minimal
+        CMP     r0, #11                 ; wdfs ?
+        MOVEQ   r0, #wdfsDirLength
+        MOVEQ   r2, #wdfsDirEntries
+        BEQ     %FT50
+ ]
+        PullEnv
+        ADR     r0, %FT09
+        ORRS    pc, lr, #V_bit
+09
+        DCD     TubeNumber+3
+        DCB     "Bad Host Filing System for ReadDirEntries", 0
+        ALIGN
+
+
+50 ; adfs/wdfs/vfs case. Poke around in the Dir !
+
+        STR     r0, DirectoryLength
+        STR     r2, DirectoryEntries
+
+        BL      CacheDirectory
+        BVS     %FT99
+
+        LDR     r5, [sp, #4*2]          ; Punter memory
+        MOV     r6, #0                  ; Done no names yet
+        LDR     r7, [sp, #4*4]          ; Starting point in directory
+        LDR     r8, [sp, #4*5]          ; Limit on memory
+        ADD     r8, r8, r5              ; Must not corrupt this or beyond
+
+70 ; Get one name at a time and molest into punter space
+
+        LDR     r14, DirectoryEntries   ; Done all we possibly can ?
+        CMP     r7, r14
+        MOVHS   r7, #-1                 ; So don't call us again
+        BHS     %FT86                   ; Good exit
+
+        LDR     r14, [sp, #4*3]         ; Reached required number of names yet
+        CMP     r6, r14
+        BHS     %FT86                   ; Good exit
+
+        MOV     r14, #gbpb_entrytotal   ; r4 := r7 * r14 (entryNo * entryLen)
+        MUL     r4, r7, r14             ; MLA is no use here !
+        ADD     r4, r4, #gbpb_firstentry ; r4 +:= start offset
+        ADR     r14, CachedDirectory
+        ADD     r4, r4, r14             ; r4 +:= dir address
+        ADR     r2, gbpb_filename       ; Copy an entry into my workspace
+        MOV     r3, #gbpb_entrytotal-1  ; One entry at a time is all I can
+
+71      LDRB    r14, [r4, r3]
+        STRB    r14, [r2, r3]
+        SUBS    r3, r3, #1
+        BPL     %BT71
+
+        LDRB    r14, gbpb_filename      ; End of the dir ?
+        TEQ     r14, #0
+        MOVEQ   r7, #-1                 ; So don't call us again
+        BEQ     %FT86                   ; Good exit
+
+        LDR     r14, [sp]               ; What was the op ?
+        TEQ     r14, #fsfunc_ReadDirEntriesInfo
+        BNE     %FT83
+
+; Doing info block as well (load/exec/length/attr/type)
+
+        ADD     r5, r5, #3              ; ALIGN r5 for info block
+        BIC     r5, r5, #3
+        SUB     r0, r8, r5              ; How much remains to be filled ?
+        CMP     r0, #20                 ; Needs 20 more bytes
+        BLE     %FT86                   ; Good exit (not enough room for info)
+
+        MOV     r4, #1                  ; Usually a file
+        LDRB    r0, gbpb_directoryattr
+        TST     r0, #&80
+        MOVNE   r4, #2                  ; But sometimes a directory
+
+        MOV     r3, #0
+        LDRB    r0, gbpb_readattr
+        TST     r0, #&80
+        MOVNE   r3, #(read_attribute + public_read_attribute)
+        LDRB    r0, gbpb_writeattr
+        TST     r0, #&80
+        ORRNE   r3, r3, #(write_attribute + public_write_attribute)
+        LDRB    r0, gbpb_lockedattr
+        TST     r0, #&80
+        ORRNE   r3, r3, #locked_attribute
+
+        ADR     r0, gbpb_loadaddr
+        LDMIA   r0, {r0-r2}             ; Read load/exec/length of file
+        STMIA   r5!, {r0-r4}            ; Put info in ++
+
+83 ; Copy filename into punter memory at r5, limit r8
+
+ [ fsdebug
+ DLINE "Copying filename ",cc
+ ]
+        MOV     r2, #0
+        ADR     r1, gbpb_filename
+84      CMP     r5, r8                  ; Can't copy ?
+ [ fsdebug
+ SWIHS XOS_NewLine
+ ]
+        BHS     %FT86                   ; Good exit, but a little premature
+        CMP     r2, #10                 ; End of name anyway ?
+        MOVHS   r0, #0                  ; Force termination
+        LDRLOB  r0, [r1], #1
+        ANDLO   r0, r0, #&7F            ; Take out the attributes
+        CMP     r0, #" "
+        MOVLS   r0, #0                  ; Force termination
+ [ fsdebug
+ SWIHI XOS_WriteC
+ SWILS XOS_NewLine
+ ]
+        STRB    r0, [r5], #1
+        ADDHI   r2, r2, #1              ; Another char copied
+        BHI     %BT84
+
+        ADD     r6, r6, #1              ; Done another entry ok
+        ADD     r7, r7, #1              ; So point to next one
+        B       %BT70                   ; Loop till bored
+
+
+86      STR     r6, [sp, #4*3]          ; Update number of names copied
+        STR     r7, [sp, #4*4]          ; Update next point in dir offset
+        LDR     r2, [sp, #4*2]          ; Start of buffer originally
+        SUB     r5, r5, r2              ; Where we got to - sob
+        STR     r5, [sp, #4*5]          ; Update amount of buffer used
+
+99      STRVS   r0, [sp]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r1 -> dirname
+
+CacheDirectory ENTRY "r1-r9"
+
+ [ fsdebug
+ DSTRING r1,"CacheDirectory "
+ ]
+        MOV     r2, r1
+        ADR     r1, CachedDirname
+        BL      strcmp
+        EXIT    EQ                      ; Already cached
+
+ [ fsdebug
+ DSTRING r2,"Copying dirname "
+ ]
+        BL      strcpy
+ [ fsdebug
+ DSTRING r1,"CacheDirname set to "
+ ]
+
+        LDRB    r14, [r1]               ; Null name ? (CSD has been remappped
+        CMP     r14, #0                 ; to null by SortOutNameFudges)
+        BNE     %FT60
+
+ [ fsdebug
+ DLINE "Reading CSD name"
+ ]
+        MOV     r0, #6                  ; Read CSD name into scratch area
+        MOV     r1, #0
+        ADR     r2, HostErrorBuffer
+        MOV     r3, #256
+        MOV     r4, #0
+        BL      Host_GBPB
+        BVS     %FT89                   ; No files open yet
+        LDRB    r0, HostErrorBuffer     ; Length of disc name
+        ADR     r3, HostErrorBuffer+1   ; Start of disc name
+        ADD     r3, r3, r0              ; Skip over drive name
+        LDRB    r0, [r3], #1            ; Length of CSD name; Skip to name
+        MOV     r14, #0                 ; Terminate it
+        STRB    r14, [r3, r0]
+
+ [ fsdebug
+ DSTRING r3,"CSD name is "
+ ]
+        ADR     r1, FileNameBuffer      ; Copy (molesting) into FileNameBuffer
+        LDRB    r14, [r3]               ; Is it '$'
+        CMP     r14, #"$"               ; Null prefix if so
+        MOVNE   r14, #"^"               ; Else prefix with '^.'
+        STRNEB  r14, [r1]
+        MOVNE   r14, #"."
+        STRNEB  r14, [r1, #1]
+        MOV     r14, #0
+        STREQB  r14, [r1]               ; Either stuff null at front
+        STRNEB  r14, [r1, #2]           ; or after the dot
+        MOV     r2, r3
+        BL      strcat                  ; Now got '^.csdname' in buffer <- r1
+                                        ; Or just '$'
+
+60 ; r1 -> dir name to use
+
+ [ fsdebug
+ DSTRING r1, "Opening directory "
+ ]
+        MOV     r0, #open_read
+        BL      Host_Open
+        BVS     %FT89                   ; Update error, not yet open
+        STR     r0, DirectoryHandle
+
+; Check that it's a real directory first
+
+        MOV     r1, r0
+        MOV     r0, #OSArgs_ReadEXT
+        BL      Host_Args
+        BVS     %FT91                   ; Close file exit
+
+        LDR     r3, DirectoryLength
+ [ fsdebug
+ DREG r3, "DirectoryLength "
+ ]
+        CMP     r2, r3
+        BNE     %FT92                   ; Bad directory
+
+        MOV     r4, #0                  ; Read directory into core
+        MOV     r0, #OSGBPB_ReadFromGiven
+        LDR     r1, DirectoryHandle
+        ADR     r2, CachedDirectory
+        BL      Host_GBPB
+        BVS     %FT91                   ; Close file exit
+        ADR     r2, CachedDirectory
+
+        LDR     r4, DirectoryLength
+        SUB     r9, r4, #6              ; Last block at len-6 (last byte UND)
+        ADD     r9, r9, r2
+
+        LDRB    r0, [r2, #0]            ; Sequence numbers the same ?
+        LDRB    r1, [r9, #0]
+ [ fsdebug
+ DREG r0, "SN 1 ",cc
+ DREG r1, ", SN 2 "
+ ]
+        CMP     r0, r1
+        BNE     %FT92                   ; Bad directory
+
+        MOV     r3, #4                  ; Is it huge ?
+        ADR     r1, %FT97               ; The 'ID' string !
+70      LDRB    r0, [r1, r3]
+        LDRB    r14, [r2, r3]
+        CMP     r0, r14
+        LDREQB  r14, [r9, r3]
+        CMPEQ   r0, r14
+        BNE     %FT92                   ; Bad directory
+        SUBS    r3, r3, #1
+        BNE     %BT70
+
+
+90      LDR     r1, DirectoryHandle     ; Good exit
+        BL      Host_Close
+89      STRVS   r0, [sp]
+        EXIT
+
+91      LDR     r1, DirectoryHandle     ; Close file exit
+        STR     r0, [sp]                ; Put error into stack anyway
+        BL      Host_Close              ; Preserves r0 if no error
+        BL      InvalidateDircache
+        SETV                            ; Ignore any error from close
+        EXIT
+
+92      ADR     r0, %FT93
+        SETV
+        B       %BT91                   ; Close file exit
+93
+        DCD     TubeNumber+4
+        DCB     "Bad directory", 0
+
+95
+        DCB     "^.", 0
+97
+        DCB     0, "Hugo"
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Preserves V
+
+InvalidateDircache ENTRY "r0"
+
+        LDR     r14, crappyname
+        ADR     r0, CachedDirname
+        STR     r14, [r0]
+        EXITS
+
+crappyname
+        DCB     "@%&", 0                ; Invalid dirname, picked up as word
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;            Utility routines to get higher level stuff working
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Out   r0 = FS on Host/error^
+
+SussHostFilingSystem ENTRY "r1-r2"
+
+        MOV     r0, #0                  ; Lots of zeroes should suffice
+        MOV     r1, #0
+        MOV     r2, #0
+        BL      Host_Args
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; adfs:,wdfs: HI; nfs: EQ; dfs: LO
+
+IndicateHostFilingSystem ENTRY "r0"
+
+        BL      SussHostFilingSystem
+        CMPVC   r0, #5                  ; Am it de nfs ?
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r2 = FS to select on Host
+
+SelectHostFilingSystem ENTRY "r0-r1"
+
+ [ fsdebug
+ DREG r2,"Selecting Host fs type "
+ ]
+        MOV     r0, #143
+        MOV     r1, #Service_StartUpFS
+        BL      Host_Byte
+        STRVS   r0, [sp]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r2 = FS to select + bye on Host
+
+; Out   No error, old fs back
+
+ParkHostFilingSystem ENTRY "r0"
+
+        BL      SussHostFilingSystem
+        STRB    r0, FSToRestore
+
+        BL      SelectHostFilingSystem
+        BL      SussHostFilingSystem
+        TEQ     r0, r2
+        ADREQ   r0, %FT90
+        BLEQ    Host_CLI
+
+        LDRB    r2, FSToRestore
+        BL      SelectHostFilingSystem
+        CLRV
+        EXIT
+90
+        DCB     "Bye", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Fudges CSD prefix by removing it completely, ie. '@.fred'->'fred', '@'->''
+; Fudges CSL prefix using current library prefix, ie. '%.jim'->'abcde.jim'
+; Fudges PSD prefix for adfs/wdfs using *BACK - nfs/dfs maps to CSD
+
+; In    r1 -> filename
+;       r6 -> special field
+
+SortOutNameFudges ENTRY
+
+        MOV     r14, #0                 ; Not done *BACK yet
+        STRB    r14, DoneStarBack
+        STRB    r14, FSToRestore
+
+        BL      SussSpecialField        ; Select Host fs for operation
+        EXIT    VS
+
+        LDRB    r14, [r1]               ; Are we at all interested ?
+        TEQ     r14, #"\"
+        TEQNE   r14, #"@"
+        TEQNE   r14, #"%"
+        EXIT    NE
+
+        LDRB    r14, [r1, #1]
+        TEQ     r14, #0                 ; Is it single char ?
+        BEQ     %FT60
+
+        LDRB    r14, [r1], #2           ; Skip past <char>. in all cases
+
+        TEQ     r14, #"@"               ; CSD char ? (@)
+        EXIT    EQ                      ; Astoundingly simple, wasn't it ?
+
+        TEQ     r14, #"%"               ; CSL char ? (%)
+        BLEQ    AppendNameToLibrary
+        EXIT    EQ                      ; A little more complicated, perhaps
+
+        TEQ     r14, #"\"               ; PSD char ? (\)
+50      BLEQ    DoStarBack
+        EXIT
+
+60      LDRB    r14, [r1], #1           ; Point to the null by default if not
+        TEQ     r14, #"\"
+        BEQ     %BT50
+        TEQ     r14, #"%"               ; CSL char ? (%)
+        ADREQ   r1, LibraryNameBuffer   ; Return fudged library
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Try to select the appropriate Host fs
+
+; In    r6 -> special field or 0
+
+SussSpecialField ENTRY "r0-r4"
+
+        CMP     r6, #0          ; Don't change if no special field. VClear
+        STREQB  r6, FSToRestore
+        EXIT    EQ
+
+ [ fsdebug
+ DSTRING r6, "Special field is "
+ ]
+        ADR     r0, fsname_Types ; Point to first name in list
+
+10      MOV     r2, r6          ; Restore search name each time
+
+15      LDRB    r1, [r0], #1    ; Get char from stored name
+ [ fsdebug
+        Push r0
+        MOV r0,r1
+        CMP r1,#" "
+        SWIHI XOS_WriteC
+        SWILS XOS_NewLine
+        Pull r0
+ ]
+        TEQ     r1, #&FF        ; Ended all stored names ?
+        BEQ     %FT70
+        LDRB    r3, [r2], #1    ; Get char from special buffer
+        CMP     r1, #" "        ; Ended both names together ?
+        CMPLS   r3, #0
+        BEQ     %FT50           ; Found it if so
+        UpperCase r3, r4        ; Name stored uppercased
+        CMP     r1, r3          ; Loop if still matching
+        BEQ     %BT15
+
+        SUB     r0, r0, #1      ; Point back one char in stored name
+19      LDRB    r1, [r0], #1    ; Skip to start of next stored name
+        CMP     r1, #" "
+        BHI     %BT19
+
+        B       %BT10           ; r0 -> next name to try
+
+
+50 ; Byte at end of name is fs type
+
+        BL      SussHostFilingSystem
+        BVS     %FT75
+        STRB    r0, FSToRestore
+
+        MOV     r2, r1
+        BL      SelectHostFilingSystem
+        BVS     %FT75
+
+        BL      SussHostFilingSystem ; Check that we did it ok
+        CMP     r0, r2
+        BNE     %FT70           ; Else unknown, I suppose
+        EXIT
+
+
+70      ADR     r0, %FT90
+        SETV
+75      STR     r0, [sp]
+        EXIT
+90
+        DCD     TubeNumber+2
+        DCB     "Unknown Host Filing System", 0
+
+fsname_Types ; Allow expansion (may need extra synonyms, for instance)
+
+        DCB     "ADFS",   8
+        DCB     "NET",    5
+
+ [ :LNOT: minimal
+        DCB     "WDFS",   11    ; Good ones
+        DCB     "NFS",    5
+        DCB     "VFS",    10
+        DCB     "TAPE",   1     ; Silly ones
+        DCB     "TAPE12", 1
+        DCB     "CFS",    1
+        DCB     "TAPE3",  2
+        DCB     "ROM",    3
+        DCB     "RFS",    3
+        DCB     "DFS",    4
+        DCB     "DISC",   4
+        DCB     "DISK",   4
+        DCB     "IEEE",   7
+        DCB     "TELESOFT", 6
+ ]
+        DCB     &FF             ; End of table
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Must go back to CSD if we had done *BACK, but do it before restoring old FS !
+
+; Out   r0, V accumulated
+
+SortOutEndFudges ENTRY "r2"
+
+        LDRB    r14, DoneStarBack
+        CMP     r14, #0                 ; VClear
+        BLNE    DoStarBack
+        EXIT    VS
+
+        LDRB    r2, FSToRestore
+        CMP     r2, #0                  ; VClear
+        BLNE    SelectHostFilingSystem
+        EXIT    VS
+        EXITS                           ; Preserve caller V
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Only issue *BACK if adfs/wdfs
+
+DoStarBack ENTRY "r0, r1"
+
+        BL      IndicateHostFilingSystem
+        BVS     %FT80
+        MOVLS   r14, #0
+        MOVHI   r14, #1
+        STRHI   r14, DoneStarBack
+        ADRHI   r1, %FT90
+        BLHI    Host_CLI
+80      STRVS   r0, [sp]
+        EXIT
+90
+        DCB     "Back", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r1 -> object to set as CSL
+
+; Out   r1 -> possibly fudged object to set as CSL
+
+SetLibraryName ENTRY "r0, r2-r3"
+
+        BL      strlen                  ; *LIB <null> -> $.Library
+        TEQ     r3, #0
+        ADREQ   r1, %FT90
+        STREQ   r1, [sp, #4*1]          ; Return fudged name to set
+        MOV     r2, r1                  ; Otherwise use given name
+        ADR     r1, LibraryNameBuffer
+        BL      strcpy                  ; Copy given library name into buffer
+        EXITS
+90
+        DCB     "$.Library", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r1 -> name to append
+
+; Out   r1 -> CSL.name in filename buffer
+
+AppendNameToLibrary ENTRY "r0, r2"
+
+        MOV     r0, r1                  ; Save filename^
+        ADR     r1, FileNameBuffer
+        ADR     r2, LibraryNameBuffer
+        BL      strcpy                  ; Copy library name into filename
+        ADR     r2, %FT90               ; Bang a dot onto it
+        BL      strcat
+        MOV     r2, r0
+        BL      strcat                  ; Copy passed filename into filename
+        EXITS                           ; Resultis bodged name
+90
+        DCB     ".", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r1, r2 -> strings to glue together eg. Rename, Access
+
+; Out   r1 -> new string 'aaa bbb' in filename buffer
+
+GlueR1R2Together ENTRY "r2"
+
+        MOV     r2, r1
+        ADR     r1, FileNameBuffer      ; Dest^
+        BL      strcpy
+        ADR     r2, %FT90
+        BL      strcat
+        LDR     r2, [sp]
+        BL      strcat
+        EXITS                           ; Resultis bodged name
+90
+        DCB     " ", 0
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; strlen
+; ======
+;
+; Find the length of a string (exclusive of terminator, so can't HeapGet (0))
+
+; In    r1 -> CtrlChar terminated string
+
+; Out   r3 = number of chars (can be used as size for Heap)
+
+strlen ENTRY r0
+
+        MOV     r3, #0
+10      LDRB    r0, [r1, r3]
+        CMP     r0, #space
+        ADDHS   r3, r3, #1
+        BHS     %BT10
+        EXITS
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; strcmp
+; ======
+
+; In    r1,r2 -> null terminated strings
+
+strcmp ENTRY "r0-r2"
+ [ fsdebug
+ DSTRING r1,"strcmp ",cc
+ DSTRING r2,", "
+ ]
+10      LDRB    r0,  [r1], #1
+        LDRB    r14, [r2], #1
+        CMP     r0, r14
+ [ fsdebug
+ BEQ %FT00
+ DLINE "Strings are unequal"
+00
+ ]
+        EXIT    NE
+        CMP     r0, #0
+        BNE     %BT10
+ [ fsdebug
+ DLINE "Strings are equal"
+ ]
+        EXIT                            ; EQ
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; strcat
+; ======
+;
+; Concatenate two strings
+
+; In    r1, r2 -> CtrlChar terminated strings
+
+; Out   new string in r1 = "r1" :CC: "r2" :CC: 0
+
+strcat ENTRY "r0-r2"
+
+05      LDRB    r0, [r1], #1    ; Find where to stick the appendage
+        CMP     r0, #space
+        BHS     %BT05
+        SUB     r1, r1, #1      ; Point back to the term char
+
+10      LDRB    r0, [r2], #1    ; Src
+        CMP     r0, #space      ; Don't copy any spaces or CtrlChars to dest
+        MOVLO   r0, #0          ; Terminate fullfilename with 0 if CtrlChar
+        STRB    r0, [r1], #1    ; Copy to *r1++
+        BHS     %BT10           ; Loop until we've found a CtrlChar
+
+        EXITS
+
+; .............................................................................
+;
+; strcpy
+; ======
+;
+; Copy a string and terminate with 0
+
+; In    r1 -> dest area, r2 -> CtrlChar terminated src string
+
+strcpy  ALTENTRY
+
+        B       %BT10
+
+ [ :LNOT: minimal
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;                       H O S T   V D U   S T R E A M
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Some common routines
+
+CommonArgs
+        CMP     r0, #fsargs_EOFCheck    ; EOF always
+        MOVEQ   r1, #-1
+        CMPNE   r0, #fsargs_Flush       ; nop
+        CMPNE   r0, #fsargs_EnsureSize  ; nop. r2out = r2in
+        MOVEQ   pc, lr
+
+        CMP     r0, #fsargs_ReadLoadExec ; Undated file - don't restamp
+        MOVEQ   r2, #0
+        MOVEQ   r3, #0
+        MOVEQ   pc, lr
+
+        CMP     r0, #fsargs_ReadPTR     ; Return PTR#, EXT#, SizeOf# = 0
+        CMPNE   r0, #fsargs_ReadEXT
+        CMPNE   r0, #fsargs_ReadSize
+        MOVEQ   r2, #0
+        CMPNE   r0, #fsargs_SetPTR      ; nop
+        CMPNE   r0, #fsargs_SetEXT      ; nop
+
+        MOV     pc, lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+CommonFunc
+        CMP     r0, #fsfunc_ShutDown    ; nop
+        CMPNE   r0, #fsfunc_Bootup      ; nop
+        MOVEQ   pc, lr                  ; EQ -> 'done it'
+
+        CMP     r0, #fsfunc_ReadDirEntries
+        CMPNE   r0, #fsfunc_ReadDirEntriesInfo
+        MOVEQ   r3, #0                  ; No files returned
+        MOVEQ   r4, #-1                 ; Don't call me again
+        MOVEQ   r5, #0                  ; No buffer usage
+
+        MOV     pc, lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; The vdu streams direct output to the current BBC MOS output device - ie. what
+; is currently selected by *fx3 so output goes to spool (if selected) etc.
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In : r0 = op, r1 -> name, r2 = load, r3 = exec, r4 = start, r5 = end
+
+hostvdu_File
+        MOV     r6, r1                  ; Filename to return for monitor msg
+
+        CMP     r0, #fsfile_ReadInfo
+        CMPNE   r0, #fsfile_Delete      ; NB. This is a remove function !
+        CMPNE   r0, #fsfile_Create
+        CMPNE   r0, #fsfile_CreateDir
+        MOVEQ   r0, #0                  ; Object not found; no info
+        MOVEQS  pc, lr                  ; VClear
+
+        CMP     r0, #fsfile_Save        ; Send block to vdu drivers
+        BNE     NaffHostVduOp
+
+        Push    lr
+50      CMP     r4, r5                  ; Finished yet ? VClear if so
+        Pull    pc, EQ                  ; VClear
+        LDRB    r0, [r4], #1
+        BL      hostvdu_Put
+        BVC     %BT50
+        Pull    pc                      ; VClear
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; 0 -> OPENIN, 1 -> OPENOUT, 2 -> OPENUP
+
+hostvdu_Open
+        CMP     r0, #0
+        BEQ     NaffHostVduOp
+
+; Can only write to the vdu streams, but we can have many streams open at
+; once, but always return the same handle as separate streams are not distinct
+
+        MOV     r0, #fsopen_WritePermission
+        MOV     r1, #65                 ; A reasonable handle
+        MOV     r2, #0                  ; Single byte job
+hostvdu_Close
+        MOVS    pc, lr                  ; VClear
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+hostvdu_Put ENTRY
+
+        BL      Host_WriteC
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+hostvdu_Args
+        Push    lr
+        BL      CommonArgs
+        B       hostvdu_ArgsFunc
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+hostvdu_Func
+        Push    lr
+        BL      CommonFunc
+
+hostvdu_ArgsFunc
+        Pull    pc, EQ
+        Pull    lr
+
+; .............................................................................
+
+NaffHostVduOp
+        ADR     r0, %FT99
+        ORRS    pc, lr, #V_bit
+99
+        DCD     &4601
+        DCB     "Bad operation on hostvdu:", 0
+        ALIGN
+
+hostvdu_Get *    NaffHostVduOp
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ ]
+
+ [ Proc_Debug
+        InsertDebugRoutines
+ ]
+
+        LNK     s.TubePokers

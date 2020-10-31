@@ -1,0 +1,197 @@
+; > TranSprite
+                                                                                           
+; ********************************************************************************
+; 
+; sprite_plotmasktransformed
+; sprite_plotspritetransformed
+; 
+;   in: r0  = reason code, tells you how r1, r2 should be handled.
+;       r1 -> sprite control block
+;       r2 -> sprite name / pointer to sprite (if r0 =&2xx).
+;       r3  = flags word
+;                   bit 0 set => R6 -> destination co-ords, else matrix.
+;                   bit 1 set => R4 -> source rectangle within sprite.
+;                   others are reserved for future expansion.
+;
+;       r4   = source rectangle block (if R3 bit 1 set).
+;       r5   = GCOL action (bit 3 for masking, bit 4 for using sprite's palette)
+;       r6  -> matrix (if R3 bit 0 clear):
+;               r6!0,4,8,12,16,20 = matrix (as for Draw module)
+;       r6  -> destination co-ordinates
+;               r6!0,4 = X0,Y0 screen (1/256ths OS unit)
+;               r6!8,12 = X1,Y1 on screen (1/256ths OS unit)
+;               r6!16,20 = X2, Y2 on screen (1/256ths OS unit)
+;               r6!24,28 = X3, Y3 on screen (1/256ths OS unit)
+;       r7  -> translation table ( <= 0 => none).
+;
+; The source cordinates are inclusive at the bottom-left, and exclusive at the
+; top right.
+;
+; When specifying a destination parallelogram, the source rectangle is mapped as onto
+; the destination as follows:
+;
+;       x0, y1  ->  X0, Y0
+;       x1, y1  ->  X1, Y1
+;       x1, y0  ->  X2, Y2
+;       x0, y0  ->  X3, Y3
+; 
+; In the future it may be possible to set the destination to an arbitary
+; quadrilateral, rather than a parallelogram.   ** THIS IS NOT YET SUPPORTED **
+;
+; The routine handling this call should ensure that the resulting image covers exactly
+; the area that a call to Draw_Fill would produce if passed the same rectangle
+; and relevant transformation matrix, where it is filling to half-way through
+; the boundary.
+;
+; If your printer driver supports transformed sprites then it should set bit 27
+; of the printer driver info word to reflect this, so that applications 
+; authors can take advantage of the new features. 
+;
+; ********************************************************************************
+ 
+sprite_plotmasktransformed
+sprite_plotspritetransformed
+        Push    "R0-R7,R8-R10,LR"
+        CLRV
+
+        LDR     LR,disabled             ; if a null clip area then return
+        TST     lr,#disabled_nullclip
+        Pull    "R0-R7,R8-R10,PC",NE
+
+        TST     R3,#1:SHL:0             ; is it a matrix or a parallelogram?
+        BEQ     sprite_transformtomatrix
+
+        MOV     R8,R6
+        MOV     R9,#4                   ; transform 4 co-ordinates
+
+sprite_transformtocoordsloop
+        LDMIA   R8,{R0,R1}
+        BL      offset_R0R1             ; adjust via a suitable offset
+        STMIA   R8!,{R0,R1}
+        SUBS    R9,R9,#1
+        BNE     sprite_transformtocoordsloop
+
+        B       sprite_plotittransformed        
+
+sprite_transformtomatrix
+        LDR     R0,[R6,#4*0]            ; adjust matrix xx
+  Debug JPEG, "sprite matrix xx > ", R0
+        BL      XScale
+  Debug JPEG, "sprite matrix xx < ", R0
+        STR     R0,[R6,#4*0]
+
+        LDR     R0,[R6,#4*2]            ; adjust matrix xy
+  Debug JPEG, "sprite matrix xy > ", R0
+        BL      XScale
+  Debug JPEG, "sprite matrix xy < ", R0
+        STR     R0,[R6,#4*2]
+
+        LDR     R0,[R6,#4*1]            ; adjust matrix yx
+  Debug JPEG, "sprite matrix yx > ", R0
+        BL      YScale
+  Debug JPEG, "sprite matrix yx < ", R0
+        STR     R0,[R6,#4*1]
+
+        LDR     R0,[R6,#4*3]            ; adjust matrix yy
+  Debug JPEG, "sprite matrix yy > ", R0
+        BL      YScale
+  Debug JPEG, "sprite matrix yy < ", R0
+        STR     R0,[R6,#4*3]
+
+        ADD     R8,R6,#16               ; -> co-ordinates
+        LDMIA   R8,{R0,R1}
+        BL      offset_R0R1
+        STMIA   R8,{R0,R1}              ; adjust and store them back
+
+sprite_plotittransformed
+        LDMIA   SP,{R0-R1}
+        BICS    R9,R0,#&FF              ; get area code, 256, 512 or 768
+        BNE     sprite_transhasvalidareapointer
+
+        AND     R0,R0,#&0FF
+        ORR     R0,R0,#&100             ; so convert to a named call with given block
+
+
+        Push    "R0"
+        MOV     R0,#3                   ; =sprite pool reason
+        SWI     XOS_ReadDynamicArea
+        MOV     R1,R0                   ; -> system sprite pool
+        Pull    "R0"
+
+sprite_transhasvalidareapointer
+        [ Medusa
+        Push    "R0-R6"
+        
+        MOV     R0,#3                   ; =sprite pool reason
+        SWI     XOS_ReadDynamicArea
+        MOV     R1,R0                   ; -> system sprite pool
+
+        LDR     R0, [SP, #4*7]
+        BIC     R0,R0,#&ff
+        ORR     R0,R0, #SpriteReason_ReadSpriteSize
+        SWI     XOS_SpriteOp
+
+        MOV     LR, R6, LSR #27
+        AND     LR, LR, #31
+        TEQ     LR, #5                  ; is sprite 16bpp
+        TEQNE   LR, #6                  ; or 32bpp ?
+        BNE     %FT02
+       
+        [ Libra1
+        LDRB    R6, job_strip_type
+        CMP     R6, #0
+        CMPNE   R6, #1
+        BLEQ    sprite_makemono32Ktable ; create fake greyscale colourtrans32K
+        CMP     R6, #2
+        BLEQ    sprite_make256c32Ktable ; create fake colour colourtrans32K
+        |
+        LDRB    R6, printer_strip_type
+        CMP     R6,#2
+        BLEQ    sprite_make256c32Ktable ; create fake colour colourtrans32K
+        BLNE    sprite_makemono32Ktable ; create fake greyscale colourtrans32K
+        ]
+        ]
+        
+02
+        Pull    "R0-R6"
+        
+
+        TEQ     R7,#0                   ; did the caller specify a transformation table
+        BNE     sprite_plottransformed
+
+
+        Push    "R0-R4"
+        MOV     R0,#-1
+        MOV     R1,#-1
+        MOV     R2,#-1
+        MOV     R3,#-1
+        ADRL    R4,job_spritetrans
+        SWI     XColourTrans_SelectTable; make a temp translation table as required
+        STRVS   R0,[SP,#0]              ; stash error pointer if required
+        Pull    "R0-R4"                 ; and balance the stack
+        BVS     sprite_plottransformedreturn
+
+        ADRL    R7,job_spritetrans      ; -> translation table setup
+
+sprite_plottransformed  
+        BL      pass_spriteop           ; pass on the sprite op call
+
+
+sprite_plottransformedreturn
+        STRVS   R0,[SP]                 ; stash the error pointer as required
+        Pull    "R0-R7,R8-R10,PC"
+
+offset_R0R1
+        Push    "LR"
+        BL      XScale                  ; scale X co-ordinate
+        LDR     LR,job_currentXoffset   
+        SUB     R0,R0,LR                ; adjust via user offset
+        Push    "R0"                    ; push to stack
+        MOV     R0,R1
+        BL      YScale
+        LDR     LR,job_currentYoffset
+        SUB     R1,R0,LR                ; do same for Y co-ordinate
+        Pull    "R0,PC",,^              ; and then pull the lot back!
+
+
+        END

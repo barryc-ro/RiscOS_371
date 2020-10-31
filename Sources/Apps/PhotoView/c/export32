@@ -1,0 +1,290 @@
+/*
+ *  c.export32
+ *
+ *  Routines for saving/exporting a 32 bpp sprite.
+ *
+ *  This is temporary until the proper export
+ *  code becomes available.
+ *
+ */
+
+
+#include <stdio.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+
+#include "menu.h"
+#include "saveas.h"
+#include "werr.h"
+#include "wimpt.h"
+#include "visdelay.h"
+
+
+#include "pcdlib.h"
+
+#include "image.h"
+
+
+
+extern image_str  *images;
+
+
+int  export_resolution;
+int  export_orientation;
+
+
+
+#define  Filetype_Sprite  0xff9
+
+
+#define  Export_CHUNKROWS  16
+          /* must be power of two */
+
+
+#define  Err(x)  if ((err = (x)) != NULL)                        \
+                 {                                               \
+                    werr(0,"PhotoCD error: %s",err->errmess);    \
+                    return FALSE;                                \
+                 }
+
+#define  Err2(x) if ((err = (x)) != NULL)                        \
+                 {                                               \
+                    werr(0,"PhotoCD error: %s",err->errmess);    \
+                    /* close the file */                         \
+                    r.r[0] = 0;                                  \
+                    r.r[1] = fh;                                 \
+                    _kernel_swi(OS_Find, &r, &r);                \
+                    /* delete the file */                        \
+                    remove(filename);                            \
+                    /* free the chunk */                         \
+                    flex_free((flex_ptr)&chunk);                 \
+                    return FALSE;                                \
+                 }
+
+
+
+/*--------------------------------------------------------------------------*/
+/*      Sprite save routines                                                */
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL  export32_saver(char *filename, void *handle)
+/*--- read and save a new format sprite to disc ---*/
+{
+   int           img_id = (int)handle;
+   int          *chunk;
+   int           w, h;
+   PCDphotoHdl   pcdh;
+   PCDstatus     err;
+   PCDrect       rect;
+   int           i, y,dy;
+   int           fh;
+   _kernel_swi_regs   r;
+   BOOL          portrait;
+   BOOL          rot180;
+
+
+   portrait = ((export_orientation & 0x3) % 2 == 1) ? TRUE : FALSE;
+   rot180   = ((export_orientation & 0x3) == 2);
+      /* if reading image at 180 degrees, we will read the image in
+         strips from bottom to top, so that the read-ahead buffer
+         is used effectively (and hence makes reading faster) */
+
+   /*--- get image size ---*/
+   if (portrait)
+   {
+      Err(PCDlistResolution(export_resolution, &h, &w));
+   }
+   else
+   {
+      Err(PCDlistResolution(export_resolution, &w, &h));
+   }
+
+
+   /*--- is there anough disc space for sprite? ---*/
+   r.r[0] = 11;             /* create an empty file */
+   r.r[1] = (int)filename;
+   r.r[2] = Filetype_Sprite;
+   r.r[4] = 0;
+   r.r[5] = 12 + (44 + (w * 4) * h);
+   if (wimpt_complain((os_error *)_kernel_swi(OS_File, &r, &r)) != NULL)
+      return FALSE;
+
+
+   /*--- attempt to claim an intermediate read buffer ---*/
+   if (!flex_alloc((flex_ptr)&chunk, (w * 4) * Export_CHUNKROWS))
+   {
+      werr(FALSE, msgs_lookup("pcdnomem:Not enough memory"));
+      remove(filename);       /* delete the sprite file */
+      return FALSE;
+   }
+
+
+   /*--- open the file ---*/
+   r.r[0] = 0xc0;     /* open a new file */
+   r.r[1] = (int)filename;
+   _kernel_swi(OS_Find, &r, &r);
+   if ((fh = r.r[0]) == 0)
+   {
+      werr(FALSE, msgs_lookup("notsave:Could not open file for saving"));
+      return FALSE;
+   }
+
+
+   visdelay_begin();
+
+
+   /*--- create and save the sprite header ---*/
+
+   /* file header */
+   chunk[0]  = 1;                          /* number of sprites */
+   chunk[1]  = 16;                         /* offset to first sprite */
+   chunk[2]  = 16 + (44 + (w * 4) * h);    /* offset to first free byte */
+
+   /* sprite header */
+   chunk[3]  = (44 + (w * 4) * h);             /* sprite size */
+   chunk[4]  = chunk[5] = chunk[6] = 0;        /* (name needs trailing zeroes) */
+   strcpy((char *)(&chunk[4]), "pcd_image");
+   chunk[7]  = w - 1;                          /* (each pixel occupies a word) */
+   chunk[8]  = h - 1;
+   chunk[9]  = 0;                              /* first bit used */
+   chunk[10] = 31;                             /* last bit used */
+   chunk[11] = 44;                             /* offset to sprite */
+   chunk[12] = 44;                             /* offset to mask */
+                   /* x dpi */  /* y dpi */  /* bpp+1 */
+   chunk[13] = 1 | (90 << 1) | (90 << 14) | (6 << 27);    /* sprite type */
+
+   /* save it */
+   r.r[0] = 2;             /* write bytes to current file pointer */
+   r.r[1] = fh;
+   r.r[2] = (int)chunk;
+   r.r[3] = (12 + 44);
+   err = (PCDstatus)_kernel_swi(OS_GBPB, &r, &r);
+   if (err != NULL)
+   {
+      visdelay_end();
+      werr(FALSE, err->errmess);
+
+      /* close the file */
+      r.r[0] = 0;
+      r.r[1] = fh;
+      _kernel_swi(OS_Find, &r, &r);
+      /* free the chunk */
+      flex_free((flex_ptr)&chunk);
+      return FALSE;
+   }
+
+
+   pcdh = images[img_id].pcdhdl;
+
+
+   /*--- set the resolution ---*/
+   Err2(PCDsetResolution(pcdh, export_resolution));
+
+   /*--- set the orientation ---*/
+   i = (export_orientation % 4) * 90;
+   if (export_orientation >= 4)
+      i |= 0x80000000;
+   Err2(PCDsetTransform(pcdh, i));
+
+   /*--- set up the callback functions ---*/
+   /* (these are not required - make sure they are 'off') */
+   PCDsetProgress(pcdh, NULL, 0);
+   PCDsetAbort(pcdh, NULL, 0);
+
+   /*--- set up image reading pars ---*/
+   Err2(PCDsetFormat(pcdh, PCD_RGB));
+   Err2(PCDsetPlaneColumn(pcdh, 1, 4));
+
+
+   rect.left   = 0;
+   rect.right  = w;
+
+   if (!rot180)
+   {
+      y  = 0;
+      dy = Export_CHUNKROWS;
+   }
+   else
+   {
+      /* start at bottom and work up */
+      y  = h - Export_CHUNKROWS;
+      dy = -Export_CHUNKROWS;
+   }
+
+
+   /*--- clear the chunk to zero, so that the extra (fourth) byte in each pixel is zero ---*/
+   memset(chunk, 0, (w * 4) * Export_CHUNKROWS);
+
+
+   /*--- now loop through the image, alternately reading and saving chunks ---*/
+   i = 0;
+   while (i < h)
+   {
+      rect.top    = y;
+      rect.bottom = y + Export_CHUNKROWS;
+
+
+      /*--- read the chunk of image ---*/
+      err = PCDgetBlock(pcdh, &rect, (PCDRAWDATA)chunk, ((long)w * 4));
+
+
+      /*--- write out this chunk to file ---*/
+
+      if (rot180 && (err == NULL))
+      {
+         r.r[0] = 1;             /* set file pointer */
+         r.r[1] = fh;
+         r.r[2] = 12 + 44 + (y * (w * 4));
+         err = (PCDstatus)_kernel_swi(OS_Args, &r, &r);
+      }
+
+      if (err == NULL)
+      {
+         r.r[0] = 2;             /* write bytes to current file pointer */
+         r.r[1] = fh;
+         r.r[2] = (int)chunk;
+         r.r[3] = (w * 4) * Export_CHUNKROWS;
+         err = (PCDstatus)_kernel_swi(OS_GBPB, &r, &r);
+      }
+
+      if (err != NULL)
+      {
+         visdelay_end();
+         werr(FALSE, err->errmess);
+
+         /* close the file */
+         r.r[0] = 0;
+         r.r[1] = fh;
+         _kernel_swi(OS_Find, &r, &r);
+
+         return FALSE;
+      }
+
+      y += dy;
+      i += Export_CHUNKROWS;
+
+      visdelay_percent(i * 100 / h);
+   }
+
+   visdelay_end();
+
+   /*--- free the chunk ---*/
+   flex_free((flex_ptr)&chunk);
+
+   /*--- close the file ---*/
+   r.r[0] = 0;
+   r.r[1] = fh;
+   _kernel_swi(OS_Find, &r, &r);
+
+
+   return TRUE;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+

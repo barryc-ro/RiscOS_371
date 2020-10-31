@@ -1,0 +1,333 @@
+/* > spr_disp.c
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "bbc.h"
+#include "coords.h"
+#include "template.h"
+#include "visdelay.h"
+#include "werr.h"
+#include "wimpx.h"
+#include "win.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "macros.h"
+#include "redraw.h"
+#include "wmisc.h"
+
+#include "spr.h"
+#include "screenmode.h"
+
+#include "spr_disp.h"
+
+/* -------------------------------------------------------------------------------------- */
+
+enum
+{
+    setby_Zoom,
+    setby_Size
+};
+
+struct sprdisplay
+{
+    wimp_w          w;
+    template        *t;
+
+    spr_area        sprarea;
+    sprite_info     info;
+    sprite_factors  factors;
+    char            sprname[13];
+    void            *pixtrans;          /* malloced by generate table */
+
+    int             setby;
+    int             zoom_mul, zoom_div;
+
+    BOOL            fast;               /* skip colourtrans calls */
+    BOOL            def_palette;
+
+    sprdisplay_event_handler    handler;
+    void                        *handle;
+
+    sprdisplay_redraw_handler   redraw_fn;
+    void                        *redraw_handle;
+};
+
+#define VIEWER_IDENT            "sprdisp"
+
+/* -------------------------------------------------------------------------------------- */
+
+static void convert_coord(sprdisplay sdp, spr_coord *sprite, spr_coord *wimp)
+{
+    wimp->x = sprite->x * sdp->factors.xmag * screen_Vars.dx / sdp->factors.xdiv;
+    wimp->y = sprite->y * sdp->factors.ymag * screen_Vars.dy / sdp->factors.ydiv;
+}
+
+static void set_scaling(sprdisplay sdp)
+{
+    if (sdp->setby == setby_Zoom)
+    {
+        sdp->factors.xdiv = sdp->zoom_div*mode_xppi(sdp->info.mode);
+        sdp->factors.ydiv = sdp->zoom_div*mode_yppi(sdp->info.mode);
+    }
+    else
+    {
+        sdp->factors.xdiv = sdp->info.width;
+        sdp->factors.ydiv = sdp->info.height;
+    }
+}
+
+static void set_extent(sprdisplay sdp, BOOL infront)
+{
+    wimp_openstr    o = window_state(sdp->w);
+    wimp_redrawstr  r;
+
+    no_err(spr_ReturnInfo_named(sdp->sprarea, sdp->sprname, &sdp->info));
+
+    set_scaling(sdp);
+
+    r.w = sdp->w;
+    r.box.x0 = r.box.y0 = 0;
+    if (sdp->setby == setby_Zoom)
+    {
+        r.box.x1 = (sdp->info.width*sdp->zoom_mul*OS_UNITS_PER_INCH) / sdp->factors.xdiv;
+        r.box.y1 = (sdp->info.height*sdp->zoom_mul*OS_UNITS_PER_INCH) / sdp->factors.ydiv;
+    }
+    else
+    {
+        r.box.x1 = sdp->zoom_mul;
+        r.box.y1 = sdp->zoom_div;
+    }
+
+    no_err(wimp_set_extent(&r));
+
+    if (infront)
+        o.behind = -1;
+
+    o.box.x1 = o.box.x0 + r.box.x1;
+    o.box.y0 = o.box.y1 - r.box.y1;
+    no_err(wimp_open_wind(&o));
+}
+
+/* -------------------------------------------------------------------------------------- */
+
+static coords_pointstr  lwa;
+
+static void display_redraw_setup(void *handle, wimp_redrawstr *r, BOOL local)
+{
+    sprdisplay sdp = handle;
+
+    if (sdp->sprarea && !sdp->fast)
+    {
+        sprite_factors  *sf = &sdp->factors;
+
+/* mode-sensitive factors */
+        if (sdp->setby == setby_Zoom)
+        {
+            sf->xmag = sdp->zoom_mul*mode_xppi(-1);
+            sf->ymag = sdp->zoom_mul*mode_yppi(-1);
+        }
+        else
+        {
+            sf->xmag = sdp->zoom_mul >> screen_Vars.xeig;
+            sf->ymag = sdp->zoom_div >> screen_Vars.yeig;
+        }
+
+        visdelay_begin();
+        os_err(spr_GenerateTable_named(sdp->sprarea, sdp->sprname, &sdp->pixtrans));
+        visdelay_end();
+
+        sdp->fast = sdp->pixtrans == NULL && sf->xmag == sf->xdiv && sf->ymag == sf->ydiv &&
+                    screen_Vars.bpp == mode_bpp(sdp->info.mode);
+    }
+    lwa.x = lwa.y = 0;
+    coords_point_toscreen(&lwa, (coords_cvtstr *)&r->box);
+    UNUSED(local);
+}
+
+static void display_redraw_fn(void *handle, wimp_redrawstr *r, BOOL local)
+{
+    sprdisplay sdp = handle;
+    if (sdp->sprarea)
+    {
+        if (sdp->fast)
+            no_err(spr_PutSprite_named(sdp->sprarea, sdp->sprname, lwa.x, lwa.y, 0));
+        else
+            no_err(spr_PutSpriteScaled_named(sdp->sprarea, sdp->sprname, lwa.x, lwa.y, 0, &sdp->factors, sdp->pixtrans));
+    }
+    else
+        bbc_rectanglefill(r->g.x0, r->g.y0, r->g.x1 - r->g.x0, r->g.y1 - r->g.y0);
+
+    if (sdp->redraw_fn)
+        sdp->redraw_fn((spr_coord *)&lwa, r, sdp->redraw_handle);
+
+    UNUSED(local);
+    UNUSED(r);
+}
+
+static void display_events(wimp_eventstr *e, void *handle)
+{
+    sprdisplay sdp = handle;
+
+    if (sdp->handler == NULL || !sdp->handler(e, sdp->handle))  switch (e->e)
+    {
+        case wimp_EOPEN:
+            no_err(wimp_open_wind(&e->data.o));
+            break;
+      
+        case wimp_ECLOSE:
+            sprdisplay_dispose(&sdp);
+            break;
+
+        case wimp_EREDRAW:
+            sdp->fast = FALSE;
+            redraw_window(e->data.o.w, display_redraw_setup, display_redraw_fn, sdp);
+            break;
+    }
+}
+
+/* -------------------------------------------------------------------------------------- */
+
+void sprdisplay_dispose(sprdisplay *psdp)
+{
+    sprdisplay sdp = *psdp;
+    if (sdp)
+    {
+        if (sdp->w)
+        {
+            no_err(wimp_close_wind(sdp->w));
+            no_err(wimp_delete_wind(sdp->w));
+        }
+
+        if (sdp->t)
+        {
+            if (sdp->t->workspacesize)
+                free(sdp->t->workspace);
+            free(sdp->t);
+        }
+
+        free(sdp->pixtrans);
+
+        free(sdp);
+        *psdp = NULL;
+    }
+}
+
+void sprdisplay_update(sprdisplay sdp, spr_area anchor, const char *sprname)
+{
+    if (sdp)
+    {
+        sdp->sprarea = anchor;
+
+        if (sprname)
+            strcpy(sdp->sprname, sprname);
+        if (anchor)
+            set_extent(sdp, FALSE);
+
+        force_redraw_window(sdp->w);
+    }
+}
+
+void sprdisplay_modechange(sprdisplay sdp)
+{
+    set_scaling(sdp);
+}
+
+sprdisplay sprdisplay_open(spr_area anchor, const char *sprname)
+{
+    sprdisplay sdp = calloc(sizeof(struct sprdisplay), 1);
+
+    if (sdp)
+    {
+        sdp->sprarea = anchor;
+        if (sprname)
+            strcpy(sdp->sprname, sprname);
+
+        sdp->t = template_copy(template_find(VIEWER_IDENT));
+        sdp->zoom_mul = sdp->zoom_div = 1;
+        sdp->setby = setby_Zoom;
+        if (sdp->t)
+        {
+            wimp_wind *wp = &sdp->t->window;
+
+            if (os_err(wimp_create_wind(wp, &sdp->w)) == NULL)
+            {
+                win_register_event_handler(sdp->w, display_events, sdp);
+
+                if (anchor)
+                    set_extent(sdp, TRUE);
+            }
+            else
+                sprdisplay_dispose(&sdp);
+        }
+        else
+            sprdisplay_dispose(&sdp);
+    }
+    return sdp;
+}
+
+void sprdisplay_eventhandler(sprdisplay sdp, sprdisplay_event_handler handler, void *handle)
+{
+    sdp->handler = handler;
+    sdp->handle = handle;
+}
+
+wimp_w sprdisplay_syshandle(sprdisplay sdp)
+{
+    return sdp->w;
+}
+
+void sprdisplay_setzoom(sprdisplay sdp, int zoom_mul, int zoom_div)
+{
+    sdp->setby = setby_Zoom;
+    sdp->zoom_mul = zoom_mul;
+    sdp->zoom_div = zoom_div;
+    set_extent(sdp, FALSE);
+    force_redraw_window(sdp->w);
+}
+
+void sprdisplay_setsize(sprdisplay sdp, int xsize, int ysize)
+{
+    sdp->setby = setby_Size;
+    sdp->zoom_mul = xsize;
+    sdp->zoom_div = ysize;
+    set_extent(sdp, FALSE);
+    force_redraw_window(sdp->w);
+}
+
+void sprdisplay_localredrawarea(sprdisplay sdp, spr_box *box, BOOL fast)
+{
+    wimp_redrawstr r;
+    r.w = sdp->w;
+    if (box == NULL)
+    {
+        r.box.x0 = r.box.y0 = 0;
+        r.box.x1 = r.box.y1 = 0x4000;
+    }
+    else
+    {
+        convert_coord(sdp, &box->corner[0], (spr_coord *)&r.box.x0);
+        convert_coord(sdp, &box->corner[1], (spr_coord *)&r.box.x1);
+    }
+    sdp->fast = fast;
+    redraw_local(&r, display_redraw_setup, display_redraw_fn, sdp);
+}
+
+void sprdisplay_localredraw(sprdisplay sdp, BOOL fast)
+{
+    sprdisplay_localredrawarea(sdp, NULL, fast);
+}
+
+void sprdisplay_redrawhandler(sprdisplay sdp, sprdisplay_redraw_handler fn, void *handle)
+{
+    sdp->redraw_fn = fn;
+    sdp->redraw_handle = handle;
+}
+
+/* -------------------------------------------------------------------------------------- */
+
+/* eof sprdisplay.c */

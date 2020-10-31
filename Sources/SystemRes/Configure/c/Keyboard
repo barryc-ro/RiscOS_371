@@ -1,0 +1,299 @@
+/*
+ * keyboard.c
+ *
+ * This is the module that handles the Keyboard window. 
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"    
+
+#include "configure.h"
+#include "keyboard.h" 
+#include "cmos.h"
+
+#define KeyboardWindow_AutoRepeatEnable  2
+#define KeyboardWindow_DelayDown         4
+#define KeyboardWindow_DelayValue        5
+#define KeyboardWindow_DelayUp           6
+#define KeyboardWindow_RepeatDown        9
+#define KeyboardWindow_RepeatValue       10
+#define KeyboardWindow_RepeatUp          11
+#define KeyboardWindow_FirstCapsLock     15  /* 15-17 */
+
+static int keyboard_window=0;
+
+static void keyboard_setdelay(void)
+{
+        int delay=cmos_get(CMOS_KeyDelay);
+        int on=(delay != 0);
+        wimp_icon i;
+        wimp_caretstr c;
+
+        wimp_get_icon_info(keyboard_window,KeyboardWindow_DelayValue,&i);
+        wimp_get_caret_pos(&c);
+        sprintf(i.data.indirecttext.buffer,"%i",delay);
+        c.index=-1;
+        wimp_set_caret_pos(&c);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_AutoRepeatEnable,on ? wimp_ISELECTED : 0,wimp_ISELECTED);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_DelayValue,!on       ? wimp_INOSELECT : 0,wimp_INOSELECT);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_DelayUp,!on          ? wimp_INOSELECT : 0,wimp_INOSELECT);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_DelayDown,!on        ? wimp_INOSELECT : 0,wimp_INOSELECT);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_RepeatValue,!on      ? wimp_INOSELECT : 0,wimp_INOSELECT);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_RepeatUp,!on         ? wimp_INOSELECT : 0,wimp_INOSELECT);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_RepeatDown,!on       ? wimp_INOSELECT : 0,wimp_INOSELECT);
+}
+
+static void keyboard_setrepeat(void)
+{
+        int repeat=cmos_get(CMOS_KeyRepeat);
+        wimp_icon i;
+        wimp_caretstr c;
+
+        wimp_get_icon_info(keyboard_window,KeyboardWindow_RepeatValue,&i);
+        wimp_get_caret_pos(&c);
+        sprintf(i.data.indirecttext.buffer,"%i",repeat);
+        c.index=-1;
+        wimp_set_caret_pos(&c);
+        wimp_set_icon_state(keyboard_window,KeyboardWindow_RepeatValue,0,0);
+}
+
+
+static void keyboard_setcapslock(void)
+{
+        int type=(cmos_get(CMOS_CapsLock) >> 3) & 7;
+        int i,offset=2;        /* go backwords */
+
+        while ((type & 1)==0) 
+        {
+                offset-=1;            /* go backwards */
+                type>>=1;
+        }
+        for (i=0;i<=2;i++)
+        wimp_set_icon_state( keyboard_window,
+                             KeyboardWindow_FirstCapsLock+i,
+                             i==offset ? wimp_ISELECTED : 0,
+                             wimp_ISELECTED);
+}
+
+static void change_delay(int by)
+{
+        int delay=cmos_get(CMOS_KeyDelay);
+
+        delay+=by;
+        if ( (delay>=1) && (delay<=255) )
+        {
+                _kernel_swi_regs r;
+                r.r[0]=11;
+                r.r[1]=delay;
+                _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+                cmos_set(CMOS_KeyDelay,delay);
+        }
+        keyboard_setdelay();
+}
+
+static void change_delay_tovalue(int value)
+{
+        int d=cmos_get(CMOS_KeyDelay);
+
+        if (d==value) return;
+        if ( (value>=1) && (value<=255) )
+        {
+                _kernel_swi_regs r;
+                r.r[0]=11;
+                r.r[1]=value;
+                _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+                cmos_set(CMOS_KeyDelay,value);
+        }
+        keyboard_setdelay();
+}
+
+
+static void change_repeat(int by)
+{
+        int repeat=cmos_get(CMOS_KeyRepeat);
+
+        repeat+=by;
+        if ( (repeat>=0) && (repeat<=255) )
+        {
+                _kernel_swi_regs r;
+                r.r[0]=12;
+                r.r[1]=repeat;
+                _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+                cmos_set(CMOS_KeyRepeat,repeat);
+        }
+        keyboard_setrepeat();
+}
+
+static void change_repeat_tovalue(int value)
+{
+        int repeat=cmos_get(CMOS_KeyRepeat);
+
+        if (repeat==value) return;
+        if ( (value>=1) && (value<=255) )
+        {
+                _kernel_swi_regs r;
+                r.r[0]=12;
+                r.r[1]=value;
+                _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+                cmos_set(CMOS_KeyRepeat,value);
+        }
+        keyboard_setrepeat();
+}
+
+
+static void change_capslock(int value)
+{
+        int byte=cmos_get(CMOS_CapsLock);
+        int bits=1<<(2-value);         /* Get it the right way round */
+        _kernel_swi_regs r;
+
+        cmos_set(CMOS_CapsLock,(byte & ~(7<<3)) | (bits<<3)); 
+        r.r[0]=202;
+        r.r[1]=(value == 2) ? (1<<7) : ( (value==1) ? (1<<4) : 0);
+        r.r[2]=~((1<<4) | (1<<7));
+        _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+        r.r[0]=118;
+        _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+        keyboard_setcapslock();
+}
+
+static void change_repeatenable()
+{
+        int on=cmos_get(CMOS_KeyDelay) == 0 ? 30 : 0;
+        _kernel_swi_regs r;
+
+        cmos_set(CMOS_KeyDelay,on);
+        r.r[0]=11;
+        r.r[1]=on;
+        _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+        keyboard_setdelay();
+}
+
+static int icon_numeric_value( int icon_number )
+{
+        wimp_icon i;
+        int value=-1;
+
+        wimp_get_icon_info( keyboard_window, icon_number, &i );
+        if (strcmp( i.data.indirecttext.buffer,"" )==0 ) return -1;
+        if (sscanf(i.data.indirecttext.buffer,"%i",&value)!=1) return -1;
+        return value;
+}
+
+static void keyboard_event_handler(wimp_eventstr *e,void *handle)
+{
+        handle = handle;
+
+        switch (e->e)
+        {
+        case wimp_EOPEN:
+                wimp_open_wind(&e->data.o);
+                break;
+        case wimp_ECLOSE:
+               {
+                wimp_mousestr m;
+                wimp_get_point_info(&m);
+                if (m.bbits==wimp_BRIGHT) 
+                {
+                        wimp_wstate s;
+                        wimp_get_wind_state(keyboard_window,&s);
+                        reopen_main_window(s.o.box.x0,s.o.box.y1);
+                }
+                delete_window( &keyboard_window );
+               }
+                break;
+        case wimp_EBUT:
+                if ((e->data.but.m.bbits==wimp_BRIGHT) ||
+                    (e->data.but.m.bbits==wimp_BLEFT)
+                   )
+                {
+                        if ((e->data.but.m.i >= KeyboardWindow_FirstCapsLock) && 
+                            (e->data.but.m.i <= KeyboardWindow_FirstCapsLock+2)
+                           )
+                        {
+                                change_capslock(e->data.but.m.i-KeyboardWindow_FirstCapsLock);
+                        }
+                        else
+                        {
+                                int sign=(e->data.but.m.bbits == wimp_BRIGHT) ? 1 : -1;
+                                switch (e->data.but.m.i)
+                                {
+                                case KeyboardWindow_AutoRepeatEnable:
+                                        change_repeatenable();
+                                        break;
+                                case KeyboardWindow_DelayUp:
+                                        change_delay_tovalue( icon_numeric_value( KeyboardWindow_DelayValue ));
+                                        change_delay(-sign);
+                                        break;
+                                case KeyboardWindow_DelayDown:
+                                        change_delay_tovalue( icon_numeric_value( KeyboardWindow_DelayValue ));
+                                        change_delay(sign);
+                                        break;
+                                case KeyboardWindow_RepeatDown:
+                                        change_repeat_tovalue( icon_numeric_value( KeyboardWindow_RepeatValue ));
+                                        change_repeat(sign);
+                                        break;
+                                case KeyboardWindow_RepeatUp:
+                                        change_repeat_tovalue( icon_numeric_value( KeyboardWindow_RepeatValue ));
+                                        change_repeat(-sign);
+                                        break;
+                                }
+                        }
+                }
+                break;
+        case wimp_EKEY:
+                if (unknown_configure_key(e->data.key.chcode))
+                {
+                        wimp_processkey(e->data.key.chcode);
+                }
+                else  
+                { 
+                        switch (e->data.key.c.i)
+                        {
+                        case KeyboardWindow_DelayValue:
+                                change_delay_tovalue( icon_numeric_value( KeyboardWindow_DelayValue ));
+                                break;
+                        case KeyboardWindow_RepeatValue:
+                                change_repeat_tovalue( icon_numeric_value( KeyboardWindow_RepeatValue ));
+                                break;
+                        }
+                }
+                break;
+        }
+}
+
+
+int keyboard_create_window(void)
+{
+        if (! keyboard_window)
+        {
+                keyboard_window=create_window("Keyboard",keyboard_event_handler,"KE");
+        }
+        keyboard_setrepeat();
+        keyboard_setdelay();
+        keyboard_setcapslock();
+        return keyboard_window;
+}
+
+void keyboard_update_window(void)
+{
+        if (keyboard_window) keyboard_create_window();
+}

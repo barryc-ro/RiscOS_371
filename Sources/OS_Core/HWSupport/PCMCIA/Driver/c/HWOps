@@ -1,0 +1,970 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  HWOps.c                                                                          ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA_Drv Module                                                 ***/
+/***  Version:       0.01                                                              ***/
+/***                                                                                   ***/
+/***  By:            William Turner, Acorn Computers Ltd.                              ***/
+/***  Date:          8th July 1994                                                     ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains the low level hardware control routines. This should be  ***/
+/***                 the only module which controls any of the ASICs registers. The    ***/
+/***                 interrupt handler routine is also handled here.                   ***/
+/***                                                                                   ***/
+/***                 Functions 13,14 read/write various registers to increase speed.   ***/
+/***                   This is done as the functions are likely to be called from IRQs ***/
+/***                                                                                   ***/
+/***                 Functions 15,16 alter slot page register (in Functions.c)         ***/
+/***                   This is done to increase speed, as they are irq code.           ***/
+/***                                                                                   ***/
+/***                 Note that none of the routines update the CCB.                    ***/
+/***                                                                                   ***/
+/***  History:       0.01 8th July 1994 - Original version                             ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Routines:-                                                                       ***/
+/***    InitialiseHardware()                                                           ***/
+/***    InitialiseSlots()                                                              ***/
+/***    FinaliseHardware()                                                             ***/
+
+/***    IRQHandler()                                                                   ***/
+
+/***    SendCardReset()                                                                ***/
+/***    Set_IRQMaskRegister()                                                          ***/
+/***    Set_DataMode()                                                                 ***/
+/***    Set_UpperLower16Bit()                                                          ***/
+/***    Set_SkewPage()                                                                 ***/
+/***    Set_Page()                                                                     ***/
+/***    Set_AddressSpace()                                                             ***/
+/***    Set_AccessTime()                                                               ***/
+/***    Set_Voltage()                                                                  ***/
+/***    Set_Power()                                                                    ***/
+/***    Set_ProgramVoltage()                                                           ***/
+/***    ClearRdyIOIrqs()                                                               ***/
+
+/***    Read_IRQStatusRegister()                                                       ***/
+/***    Read_SlotPageRegister()                                                        ***/
+/***    Read_VoltControlRegister()                                                     ***/
+/***    Read_SlotStatusRegister()                                                      ***/
+/***    Read_SlotAccessModeRegister()                                                  ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "time.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Error.h"
+#include "hwops.h"
+#include "hardware.h"
+#include "Misc.h"
+#include "Variables.h"
+#include "Interrupts.h"
+#include "functions.h"
+
+#include "Debug.h"
+/* Note Debugging requires a TML/Tube system to be attached */
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  InitialiseHardware()                                                             ***/
+/***                                                                                   ***/
+/***  This function searches for the hardware and its physical location. The number of ***/
+/***  PCMCIA slots is then stored in a global variable so that the interrupt and CCB   ***/
+/***  blocks can be initialised                                                        ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    NULL pointer, if installed succesfully.                                        ***/
+/***    ErrorBlock, if an error occured.                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+_kernel_oserror *InitialiseHardware()
+    {
+    _kernel_oserror    *error = NULL;
+    int                 tempaddr;
+    _kernel_swi_regs    swi_regs;
+    int                 numslots;
+    char                loop;
+
+    #if Debug == TRUE
+        DebugMessage("yK","Trying to find out how many slots attached...\n");
+    #endif
+    /** First, how many podule slots are there in the system? **/
+    _kernel_swi(Podule_ReturnNumber, &swi_regs, &swi_regs); /* answer in r[0] */
+    numslots = swi_regs.r[0];
+    #if Debug == TRUE
+        DebugMessage("yK","Think there are %d podule slots in the machine...\n", numslots);
+    #endif
+    /** Next, scan through them looking for Berlin podules (starting at 0), counting the number of PCMCIA slots**/
+    for(loop = 0; (loop < numslots) && (error == NULL); loop++) {
+        swi_regs.r[0] = READ_INFO__EXPANSION_CARD_ID;
+        swi_regs.r[1] = (int)&tempaddr;
+        swi_regs.r[2] = 4;
+        swi_regs.r[3] = loop;
+        if(_kernel_swi(Podule_ReadInfo, &swi_regs, &swi_regs) == NULL) {
+            #if Debug == TRUE
+                DebugMessage("yK","The podule id for slot %d is %d...\n", loop, tempaddr);
+            #endif
+            if( ((tempaddr >> SIMPLE_PODULE__ID__SHIFT) & SIMPLE_PODULE__ID__MASK) == SIMPLE_ID_VALUE) {
+                error = InstallInterrupts(loop);
+                NumberOfSlots = NumberOfSlots + 2;
+                PoduleSlotsUsed = PoduleSlotsUsed | (1 << loop);
+            }
+        }
+    }
+
+#if Debug == TRUE
+    DebugMessage("yK","%d slots found.\n",NumberOfSlots);
+    DebugMessage("yK","Error pointer is %d.\n",error);
+#endif
+    if(NumberOfSlots == 0) error = SetError(ERROR__NO_PCMCIA_HARDWARE);
+    if(error == NULL) EnablePoduleIRQs(); /** Still disabled on Berlin though **/
+    else NumberOfSlots = 0; /** ie there was a problem installing the irqs => Hardware failure */
+
+    return(error);
+}
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  InitialiseSlots()                                                                ***/
+/***                                                                                   ***/
+/***  This function initialises the PCMCIA hardware to a pre-defined state. The CCB    ***/
+/***  blocks are also initialised.                                                     ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    NULL pointer, if installed succesfully.                                        ***/
+/***    ErrorBlock, if an error occured.                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+_kernel_oserror *InitialiseSlots()
+    {
+    _kernel_oserror    *error = NULL;
+    char                loop;
+    int                 result;
+    char                slotcounter = 0;
+    _kernel_swi_regs    swi_regs;
+
+    /* First of all, we'll set the CCB values that are 'known' on startup */
+    for(loop = 0; loop < NumberOfSlots; loop++) {
+        CCB_Block[loop].IRQ_Mask               = DEFAULT__IRQ_MASK;
+        CCB_Block[loop].IRQ_Call_R2            = DEFAULT__IRQ_R2;
+        CCB_Block[loop].CardIRQ_Call_Address   = DEFAULT__IRQ_CALL;
+        CCB_Block[loop].CardIRQ_Call_R12       = DEFAULT__IRQ_R12;
+        CCB_Block[loop].MemoryIRQ_Call_Address = DEFAULT__IRQ_CALL;
+        CCB_Block[loop].MemoryIRQ_Call_R12     = DEFAULT__IRQ_R12;
+        CCB_Block[loop].IOIRQ_Call_Address     = DEFAULT__IRQ_CALL;
+        CCB_Block[loop].IOIRQ_Call_R12         = DEFAULT__IRQ_R12;
+        CCB_Block[loop].CommonAccessTime       = DEFAULT__COMMON_ACCESS_TIME;
+        CCB_Block[loop].AttribAccessTime       = DEFAULT__ATTRIB_ACCESS_TIME;
+        CCB_Block[loop].Common3vAccessTime     = DEFAULT__COMMON_3V_ACCESS_TIME;
+        CCB_Block[loop].Attrib3vAccessTime     = DEFAULT__ATTRIB_3V_ACCESS_TIME;
+    }
+
+    /** loop through the Berlin-used podule slots **/
+    for(loop = 0; loop < 32; loop++) {
+        if(PoduleSlotsUsed & (1 << loop)) {
+            #if Debug == TRUE
+                DebugMessage("yK","Setting up the CCB block: %d, %d\n",PoduleSlotsUsed,loop);
+                DebugMessage("yK","Slotcounter is %d\n",slotcounter);
+            #endif
+            /** set up the CCB and slot hardware to the default states (2 slots/adaptor) **/
+            CCB_Block[slotcounter].Adaptor_Register_Base  = (HARDWARE_REGISTER)(PODULE_SPACE__BASE + (loop * PODULE_CHUNK__SIZE) + ADAPTOR_REGISTER_BASE);
+            CCB_Block[slotcounter+1].Adaptor_Register_Base= CCB_Block[slotcounter].Adaptor_Register_Base;
+            CCB_Block[slotcounter].Slot_Register_Base     = CCB_Block[slotcounter].Adaptor_Register_Base + SLOT_REGISTER_BASE;
+            CCB_Block[slotcounter+1].Slot_Register_Base   = CCB_Block[slotcounter].Slot_Register_Base + SLOT_REGISTER_CHUNKSIZE;
+            #if Debug == TRUE
+                DebugMessage("yK","    Adaptor register base set up as &%08X\n",CCB_Block[slotcounter].Adaptor_Register_Base);
+                DebugMessage("yK","    Slot register base set up as &%08X\n",CCB_Block[slotcounter].Slot_Register_Base);
+            #endif
+
+            swi_regs.r[0] = READ_INFO__EASI_LOGICAL_ADDRESS;
+            swi_regs.r[1] = (int)&result;
+            swi_regs.r[2] = 4;
+            swi_regs.r[3] = loop;
+            _kernel_swi(Podule_ReadInfo, &swi_regs, &swi_regs);
+            CCB_Block[slotcounter].PCMCIA_Space_Base      = result;
+            CCB_Block[slotcounter+1].PCMCIA_Space_Base    = result + PCMCIA_EASI__SIZE;
+
+            /* Now the CCBs look vaguely Ok, it's time to change the 'ardware */
+            /* Hw defaults to mem/attrib access, page 0, so just need to send a slot init & set the access speed...*/
+            Set_AccessTime(slotcounter, DEFAULT__ATTRIB_ACCESS_TIME);
+            Set_AccessTime(slotcounter+1, DEFAULT__ATTRIB_ACCESS_TIME);
+            /* Note: Power to the slot is off at this point, the CardInitialise will put it on */
+/*            swi_regs.r[0] = 15;
+            swi_regs.r[7] = slotcounter;
+            Function_CardInitialise(&swi_regs);
+            swi_regs.r[7] = slotcounter+1;
+            Function_CardInitialise(&swi_regs);
+            slotcounter = slotcounter + 2; */
+        }
+    }
+    /*************************************************************************************************/
+    /*** NOTE: The Berlin interrupts are disabled! They are enabled _after_ the PCMCIA Manager has ***/
+    /***       registered an IRQ routine with the hardware driver.                                 ***/
+    /*************************************************************************************************/
+    return(error);
+}
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  FinaliseHardware()                                                               ***/
+/***                                                                                   ***/
+/***  This function ensures that the hardware is fully de-installed such that the      ***/
+/***  hardware can no longer effect the host system (ie. removes interrupts etc).      ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    NULL pointer, if installed succesfully.                                        ***/
+/***    ErrorBlock, if an error occured.                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+void FinaliseHardware(void)
+    {
+    int                 loop;
+
+    /*************************************************************************************/
+    /***        Kill IRQs for the affected podules                                     ***/
+    /*************************************************************************************/
+    for(loop = 0; loop < 32; loop++) {
+        if(PoduleSlotsUsed & (1<<loop)) {
+            *(volatile char *)(PODULE_SPACE__BASE + (loop * PODULE_CHUNK__SIZE) + ADAPTOR_REGISTER_BASE + ADAPTOR__IRQ_MASK_REG__OFFSET) = 0;
+            RemoveInterrupts(loop);
+            #if Debug == TRUE
+                DebugMessage("yK","Removed IRQ handler\n");
+            #endif
+        }
+    }
+}
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  IRQHandler(swi regs, pw)                                                         ***/
+/***                                                                                   ***/
+/***  This function handles the Berlin-generated IRQs, sending them to the right handlr***/
+/***  via a 'callback', or directly, depending on the IRQ type.                        ***/
+/***                                                                                   ***/
+/***  I don't _think_ that this routine is called if the irq is not claimed, so no checks*/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+int IRQHandler(_kernel_swi_regs *entry_regs, void *pw)
+    {
+    int                 hiprimask = 0;
+    int                 hiprislot = 0;
+    int                 loop;
+    int                 slothandle = 0;
+    int                 jump_address = 0;
+    int                 jump_r12 = 0;
+    int                 irq_cause = 0;
+    BOOL                card_detect = FALSE;
+    static _kernel_swi_regs    call_regs;
+    _kernel_swi_regs    regs;
+
+    /** We've got an IRQ! **/
+
+    /*** IF IRQDEBUG IS TRUE, THEN THE BERLIN HARDWARE _MUST_ BE IN PODULE SLOT ZERO (0) ***/
+    /*** DON'T MOAN ABOUT IT, JUST PUT UP WITH IT!                                       ***/
+
+#if (IrqDebug == TRUE) && (Debug == TRUE)
+    *(volatile char *)(PODULE_SPACE__BASE + ADAPTOR__IRQ_MASK_REG__OFFSET) = 0;
+    *(volatile char *)(PODULE_SPACE__BASE+(3*PODULE_CHUNK__SIZE)+ADAPTOR__IRQ_MASK_REG__OFFSET) = 0;
+#endif
+    /** look through all the known Berlin podules, keeping track of the one with the **/
+    /** highest priority interrupt **/
+    #if (Debug == TRUE) && (IrqDebug == TRUE)
+        DebugMessage("kY","Yup,here we is, in the irq code!\n");
+    #endif
+    startgoto:
+    /* In this loop, using slothandle and irq_cause as temporary vars */
+    for(loop = 0; loop < 32; loop++) {
+        if(PoduleSlotsUsed & (1<<loop)) {
+            slothandle = *(volatile char *)(PODULE_SPACE__BASE+(loop * PODULE_CHUNK__SIZE)+ADAPTOR_REGISTER_BASE+ADAPTOR__IRQ_STATUS_REG__OFFSET);
+            #if (Debug == TRUE) && (IrqDebug == TRUE)
+                DebugMessage("kY","Podslots used bitarray = %d, the one being examined is %d\n",PoduleSlotsUsed,loop);
+                DebugMessage("kY","Read &%02X from the irq status register",slothandle);
+            #endif
+            if(slothandle > irq_cause) {
+                #if (Debug == TRUE) && (IrqDebug == TRUE)
+                    DebugMessage("kY","It's higher priority than anything else so far...\n");
+                #endif
+                irq_cause = slothandle;
+                hiprimask = *(volatile char *)(PODULE_SPACE__BASE+(loop * PODULE_CHUNK__SIZE)+ADAPTOR_REGISTER_BASE+ADAPTOR__IRQ_MASK_REG__OFFSET);
+                hiprislot = loop;
+            }
+        }
+    }
+    #if (Debug == TRUE) && (IrqDebug == TRUE)
+        DebugMessage("kY","\nThe hiprislot is %d, and the hiprimask is &%02X\n",hiprislot,hiprimask);
+    #endif
+    /** Ok, deal with this podule/IRQ. First, what sort is it? **/
+    /** Very first, which slot of the two is it? **/
+    if((irq_cause & IRQ__SLOT0_PRI_MASK) < (irq_cause & IRQ__SLOT1_PRI_MASK)) slothandle = 1; else slothandle = 0;
+    slothandle = slothandle + (hiprislot << 1);
+    #if (Debug == TRUE) && (IrqDebug == TRUE)
+        DebugMessage("kY","So, we have decided it is slot %d that interrupted.\n",slothandle);
+    #endif
+    /** Do bittests to determine type & thus dest addr,r12 - clear the mask bits here to remove the phys irq... **/
+    #if (Debug == TRUE) && (IrqDebug == TRUE)
+        DebugMessage("kY","Right, it's a");
+    #endif
+    if(irq_cause & IRQ__CDINT) {
+        jump_address = CCB_Block[slothandle].CardIRQ_Call_Address;
+        jump_r12     = CCB_Block[slothandle].CardIRQ_Call_R12;
+        hiprimask = hiprimask & IRQ__CDINT_PRI_MASK & IRQ__IOINT_PRI_MASK & IRQ__READY_PRI_MASK; /* clear the lot! **/
+        card_detect = TRUE;
+        #if (Debug == TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY"," Card insert/remove interrupt\n");
+        #endif
+    }
+    else if(irq_cause & IRQ__IOINT) {
+        jump_address = CCB_Block[slothandle].IOIRQ_Call_Address;
+        jump_r12     = CCB_Block[slothandle].IOIRQ_Call_R12;
+        hiprimask = hiprimask & IRQ__IOINT_PRI_MASK;
+        irq_cause = PCMCIA__IRQ_CAUSE__IO;
+        #if (Debug == TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY","an IO interrupt\n");
+        #endif
+    }
+    else if(irq_cause & IRQ__READY) {
+        jump_address = CCB_Block[slothandle].MemoryIRQ_Call_Address;
+        jump_r12     = CCB_Block[slothandle].MemoryIRQ_Call_R12;
+        hiprimask = hiprimask & IRQ__READY_PRI_MASK;
+        irq_cause = PCMCIA__IRQ_CAUSE__READY;
+        #if (Debug == TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY"," Card ready/busy interrupt\n");
+        #endif
+    }
+    /** And now REALLY clear the mask bits in the hardware **/
+    *(volatile char *)(PODULE_SPACE__BASE + (hiprislot * PODULE_CHUNK__SIZE) + ADAPTOR_REGISTER_BASE + ADAPTOR__IRQ_MASK_REG__OFFSET) = hiprimask;
+    #if (Debug == TRUE) && (IrqDebug == TRUE)
+        DebugMessage("kY","So, set the mask bits to &%02X\n",hiprimask);
+    #endif
+
+    /** Prepare for the jump... **/
+    call_regs.r[0] = irq_cause;
+    call_regs.r[1] = slothandle;
+    call_regs.r[2] = CCB_Block[slothandle].IRQ_Call_R2;
+
+    #if (Debug == TRUE) && (IrqDebug == TRUE)
+        DebugMessage("kY","Preparing to jump!\n");
+        DebugMessage("kY","r0 = %d\n",call_regs.r[0]);
+        DebugMessage("kY","r1 = %d\n",call_regs.r[1]);
+        DebugMessage("kY","r2 = &%08X\n",call_regs.r[2]);
+    #endif
+
+    if(card_detect) { /** if a card detect irq, then kick off a callback handler to the jump address **/
+        /** NB: The callbacked stuff needs a fn to remove the irq and unmask the cd irq once the stuff's been dealt with **/
+        /** Set up the calling register block **/
+        call_regs.r[0] = jump_r12; /** 'Proper' R12 value **/
+        regs.r[0] = jump_address;
+        regs.r[1] = (int)&call_regs; /** R12 is set to point to the register block **/
+        #if (Debug == TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY","Card detect, so doing a callback to &%08X\n",regs.r[0]);
+        #endif
+        _kernel_swi(OS_AddCallBack, &regs, &regs);
+        #if (Debug == TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY","Exiting IRQ routine NOW!\n",regs.r[0]);
+        #endif
+        return(1);
+    }
+    else /** if an irq or rdy/bsy and claimed, then jump! **/
+    {
+        #if (Debug == TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY","Jumping...\n");
+        #endif
+        if(jump_address != 0) IRQ_Jump(jump_address, jump_r12, (int)&call_regs); /*Best double-check*/
+        /** back here after the jump if non-cd irq... **/
+        #if (Debug == TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY","Back, so irq being allowed to occur again...\n");
+        #endif
+
+        /** Now the tricky bit... What if more than one IRQ had occured? The IRQ line will still be **/
+        /** active, but will not change state. Um, tricky.                                          **/
+        ClearRdyIOIrqs(slothandle); /** Clear the edge detect jic another irq occurs **/
+
+        loop = *(CCB_Block[slothandle].Slot_Register_Base + SLOT__STATUS_REG__OFFSET);
+        #if (Debug==TRUE) && (IrqDebug == TRUE)
+            DebugMessage("kY","Slot status register read as %d\n",loop);
+        #endif
+        /** If the IRQ line is active, then goto the start of this function **/
+        if((loop & (1<<5)) == 0) goto startgoto;
+
+        /** so allow the irq to occur again (assume it's source has been cleared) by changing mask back to CCB'd value **/
+        Set_IRQMaskRegister(slothandle,0);
+        /** if not claimed, then this leaves the bit masked off **/
+        return (1);
+    }
+}
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  SendCardReset(slot handle)                                                       ***/
+/***                                                                                   ***/
+/***  This function does a card soft-reset cycle.                                      ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void SendCardReset(SLOT_HANDLE slothandle)
+    {
+    unsigned int        reg_contents;
+    int                 StartTime;
+    int                 EndTime;
+
+    /*****************************/
+    /** First, disable the slot **/
+    /*****************************/
+    reg_contents = *(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__DISABLE_SLOT_REG__OFFSET);
+    if(slothandle % 2 == 0) reg_contents = reg_contents & (1 << DISABLE_SLOT__SLOT0__SHIFT);
+    else reg_contents = reg_contents & (1 << DISABLE_SLOT__SLOT1__SHIFT);
+    *(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__DISABLE_SLOT_REG__OFFSET) = reg_contents;
+
+    /********************/
+    /* Generate a reset */
+    /********************/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET)) & ~(1 << SLOT__CARD_RESET__SHIFT);
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET) = reg_contents; /*ie clr reset bit*/
+
+    /*************************/
+    /* Now wait 10us minimum */
+    /*************************/
+    StartTime = clock();
+    EndTime = StartTime + 2;
+    #if Debug == TRUE
+        DebugMessage("yK", "Waiting...\n");
+    #endif
+    while(clock() < EndTime);
+    #if Debug == TRUE
+        DebugMessage("yK", "Negate reset\n");
+    #endif
+
+    /*******************************/
+    /* Reset the card reset bit :-)*/
+    /*******************************/
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET) = reg_contents | (1 << SLOT__CARD_RESET__SHIFT);
+
+    /**********************/
+    /* Re-enable the slot */
+    /**********************/
+    reg_contents = *(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__DISABLE_SLOT_REG__OFFSET);
+    if(slothandle % 2 == 0) reg_contents = reg_contents & ~(1 << DISABLE_SLOT__SLOT0__SHIFT);
+    else reg_contents = reg_contents & ~(1 << DISABLE_SLOT__SLOT1__SHIFT);
+    *(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__DISABLE_SLOT_REG__OFFSET) = reg_contents;
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_IRQMaskRegister(slot handle)                                                 ***/
+/***                                                                                   ***/
+/***  This function changes the IRQ mask of the adaptor to the CCB-stored value.       ***/
+/***  (with a couple of quick fixes)                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+void Set_IRQMaskRegister(SLOT_HANDLE slothandle, char ncds)
+    {
+    int         sourcereg;
+    int         buildreg = 0;
+    int         regmask;
+    /* If CardIRQ field !=0 and ncds ==0 then CDs are allowed */
+
+    #if Debug == TRUE
+        DebugMessage("yK","Entered Set_IRQRegister\n");
+    #endif
+    sourcereg = *(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__IRQ_MASK_REG__OFFSET);
+    #if Debug == TRUE
+        DebugMessage("yK","    Mask is read as being &%02X\n",sourcereg);
+    #endif
+
+    /** The below is a hack 'cos I _know_ odd numbered slothandles are slot 1 on an adaptor **/
+    if((slothandle % 2) == 0) regmask = IRQ__SLOT0_PRI_MASK;
+    else regmask = IRQ__SLOT1_PRI_MASK;
+
+    sourcereg = sourcereg & ~regmask;
+
+    if((CCB_Block[slothandle].CardIRQ_Call_Address != 0) && (ncds == 0)) buildreg = buildreg | (3 << IRQ__CDINT_SLOT1__SHIFT); /* Sets CD Irqs on */
+    if((CCB_Block[slothandle].IRQ_Mask & IRQ_MASK__READY_CHG) !=0) buildreg = buildreg | (3 << IRQ__READY_SLOT1__SHIFT);
+    if((CCB_Block[slothandle].IRQ_Mask & IRQ_MASK__IO_IRQ) !=0) buildreg = buildreg | (3 << IRQ__IOINT_SLOT1__SHIFT);
+    #if Debug == TRUE
+        DebugMessage("yK","    Mask bits being set are &%02X\n",buildreg);
+    #endif
+
+    buildreg = (buildreg & regmask) | sourcereg;
+    #if Debug == TRUE
+        DebugMessage("yK","    Mask is being written with &%02X\n",buildreg);
+    #endif
+    *(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__IRQ_MASK_REG__OFFSET) = buildreg;
+}
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_DataMode(slot handle, value)                                                 ***/
+/***                                                                                   ***/
+/***  This function changes the datamode of the specified slot to the value given.     ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_DataMode(SLOT_HANDLE slothandle, int dmode)
+    {
+    unsigned int        sourcereg;
+
+    sourcereg = *(CCB_Block[slothandle].Slot_Register_Base + SLOT__ACCESS_MODE_REG__OFFSET);
+    #if Debug == TRUE
+        DebugMessage("yK","Grabbed %d from location &%08X\n",sourcereg,CCB_Block[slothandle].Slot_Register_Base + SLOT__ACCESS_MODE_REG__OFFSET);
+    #endif
+
+    /** clear the XIP, Mode bits (ie default to mem, 16bit **/
+    sourcereg = sourcereg & ~(1 << SLOT__ACCESS_MODE__SHIFT);
+    sourcereg = sourcereg & ~(1 << SLOT__ACCESS_32B__SHIFT);
+    sourcereg = sourcereg & ~(1 << SLOT__ACCESS_IO_1__SHIFT);
+    sourcereg = sourcereg & ~(1 << SLOT__ACCESS_IO_2__SHIFT);
+
+    if(dmode > DATA_MODE__32BIT) {
+        /** Selecting an io datamode, but which? **/
+        sourcereg = sourcereg | (1 << SLOT__ACCESS_MODE__SHIFT);/** well, definitely I/O mode, XIP off **/
+        if(dmode == DATA_MODE__16BIT_IO_1) sourcereg = sourcereg | (1 << SLOT__ACCESS_IO_1__SHIFT);
+        else if(dmode == DATA_MODE__16BIT_IO_2) sourcereg = sourcereg | (1 << SLOT__ACCESS_IO_2__SHIFT);
+    }
+    else if(dmode == DATA_MODE__32BIT) sourcereg = sourcereg | (1 << SLOT__ACCESS_32B__SHIFT);/** Switch XIP on **/
+    #if Debug == TRUE
+        DebugMessage("yK","Writing %d back to this location\n",sourcereg);
+    #endif
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__ACCESS_MODE_REG__OFFSET) = sourcereg;
+
+    if((dmode == DATA_MODE__16BIT_LOWER) || (dmode == DATA_MODE__16BIT_UPPER)) {
+        sourcereg = *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET);
+        #if Debug == TRUE
+            DebugMessage("yK","16-bit, so got %d from location &%08X\n",sourcereg,CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET);
+        #endif
+        sourcereg = sourcereg & ~(1 << SLOT__16BIT_HI_LO__SHIFT);
+        if(dmode == DATA_MODE__16BIT_UPPER) sourcereg = sourcereg | (1 << SLOT__16BIT_HI_LO__SHIFT);
+        #if Debug == TRUE
+            DebugMessage("yK","Written %d back\n",sourcereg);
+        #endif
+        *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET) = sourcereg;
+    }
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_UpperLower16Bit(slot handle, value)                                          ***/
+/***                                                                                   ***/
+/***  This function changes to reading the upper/lower 16 bits of a 32-bit word.       ***/
+/***  NB: 'value' must be 0 or 1                                                       ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_UpperLower16Bit(SLOT_HANDLE slothandle, int value)
+    {
+    unsigned int        reg_contents;
+
+    /** read the slot page register excluding the upper/lower bit **/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET)) & ~(1 << SLOT__16BIT_HI_LO__SHIFT);
+
+    /** change the register and write it back **/
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET) = reg_contents | (value << SLOT__16BIT_HI_LO__SHIFT);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_SkewPage(slot handle, value)                                                 ***/
+/***                                                                                   ***/
+/***  This function changes the skew page (normally used for I/O accesses.             ***/
+/***  NB: 'Value' must be 0 or 1                                                       ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_SkewPage(SLOT_HANDLE slothandle, int value)
+    {
+    unsigned int        reg_contents;
+
+    /** read the slot page register excluding the skew bits **/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET)) & ~(SLOT__SKEW_PAGE__MASK << SLOT__SKEW_PAGE__SHIFT);
+
+    /** change the register and write it back **/
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET) = reg_contents | (value << SLOT__SKEW_PAGE__SHIFT);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_Page(slot handle, page value)                                                ***/
+/***                                                                                   ***/
+/***  This function selects the specified page on the specified slot.                  ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_Page(SLOT_HANDLE slothandle, int page_value)
+    {
+    unsigned int        reg_contents;
+
+    /** read the slot page register excluding the page control bits **/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET)) & ~(SLOT__PAGE__MASK << SLOT__PAGE__SHIFT);
+
+    /** chage the page ctrl bits and write it back **/
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET) = reg_contents | (page_value << SLOT__PAGE__SHIFT);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_AddressSpace(slot handle, area)                                              ***/
+/***                                                                                   ***/
+/***  This function sets the address space to be accessed on the specified slot        ***/
+/***  NB: Values for 'area' can only be 0 or 1 (comm, attr)                            ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_AddressSpace(SLOT_HANDLE slothandle, char area)
+    {
+    unsigned int        reg_contents;
+
+    if(area == 0) area = 1;
+    else area = 0;
+    /** read the slot control register **/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET)) & ~(1 << SLOT__MEM_SPACE__SHIFT);
+    #if Debug == TRUE
+        DebugMessage("yK","Slot page reg read as &%08X\n",reg_contents);
+    #endif
+    /** change the memory space bit and write it back **/
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET) = reg_contents | (area << SLOT__MEM_SPACE__SHIFT);
+    #if Debug == TRUE
+        DebugMessage("yK","Slot page reg written as &%08X\n",reg_contents | (area << SLOT__MEM_SPACE__SHIFT));
+    #endif
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_AccessTime(slot handle, time in ns)                                          ***/
+/***                                                                                   ***/
+/***  This function sets the access time for the specified slot.                       ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_AccessTime(SLOT_HANDLE slothandle, int access_speed)
+    {
+    /** NOTE: Everything's in 1ns units **/
+
+    access_speed = (access_speed * 2) / STATEMACHINE_CLOCKPERIOD;
+    if(access_speed & 1) access_speed = (access_speed / 2) + 1;
+    else access_speed = access_speed / 2;
+
+#if Debug == TRUE
+    DebugMessage("yK","    Slot set up for %d waitstates.\n", access_speed);
+    DebugMessage("yK","    which means writing &%02X to the register\n",(access_speed & SLOT__ACCESS_TIME__MASK) << SLOT__ACCESS_TIME__SHIFT);
+    DebugMessage("yK"," BTW the register is at &%08X\n",CCB_Block[slothandle].Slot_Register_Base+SLOT__ACCESS_TIME_REG__OFFSET);
+#endif
+
+    /** write it into the register **/
+    *(CCB_Block[slothandle].Slot_Register_Base+SLOT__ACCESS_TIME_REG__OFFSET) = (access_speed & SLOT__ACCESS_TIME__MASK) << SLOT__ACCESS_TIME__SHIFT;
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_Voltage(slot handle, voltage id)                                             ***/
+/***                                                                                   ***/
+/***  This function sets the Vcc voltage for the specified slot.                       ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_Voltage(SLOT_HANDLE slothandle, char voltage_id)
+    {
+    int                 reg_contents;
+
+    /** read the voltage control register **/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET)) & ~(1 << SLOT__VCC_3V_OR_5V__SHIFT);
+
+    /** write it into the register **/
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET) = reg_contents | (voltage_id << SLOT__VCC_3V_OR_5V__SHIFT);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_Power(slot handle, on/off)                                                   ***/
+/***                                                                                   ***/
+/***  This function sets the Vcc voltage on/off for the specified slot.                ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_Power(SLOT_HANDLE slothandle, char voltage_id)
+    {
+    int                 reg_contents;
+
+    /** read the voltage control register **/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET)) & ~(1 << SLOT__VCC_SWITCH__SHIFT);
+
+    /** write it into the register **/
+    *(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET) = reg_contents | (voltage_id << SLOT__VCC_SWITCH__SHIFT);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Set_ProgramVoltage(slot handle, voltage id, prog_num)                            ***/
+/***                                                                                   ***/
+/***  This function sets the programming voltages for the specified slot.              ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+void Set_ProgramVoltage(SLOT_HANDLE slothandle, char voltage_id, char prog_num)
+    {
+    int                 reg_contents;
+
+    /** read the voltage control register w/out any masking **/
+    reg_contents = (*(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET));
+
+    /** write it into the register **/
+    if(prog_num == 1) {
+        *(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET)
+         = (reg_contents & ~(SLOT__VPP1_VALUE__MASK << SLOT__VPP1_VALUE__SHIFT)) | (voltage_id << SLOT__VPP1_VALUE__SHIFT);
+    }
+    else
+    {
+        *(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET)
+         = (reg_contents & ~(SLOT__VPP2_VALUE__MASK << SLOT__VPP2_VALUE__SHIFT)) | (voltage_id << SLOT__VPP2_VALUE__SHIFT);
+    }
+}
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  ClearRdyIOIrqs(slot handle)                                                      ***/
+/***                                                                                   ***/
+/***  This function clears the rdy and io irq edge detect register bits                ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+void ClearRdyIOIrqs(SLOT_HANDLE slothandle)
+    {
+    int                 newmask;
+
+    if((slothandle % 2) == 0) newmask = 0x22;
+    else newmask = 0x11;
+
+    #if Debug == TRUE
+        DebugMessage("yK",">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>CLEARING edr's\n");
+    #endif
+
+    /** change the register and write it back **/
+    *(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__EDGEDETECT_CLEAR_REG__OFFSET) = newmask;
+}
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Read_IRQRequestRegister(slot handle)                                             ***/
+/***                                                                                   ***/
+/***  This function reads the IRQ generated state for the system.                      ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+int Read_IRQRequestRegister(SLOT_HANDLE slothandle)
+    {
+    /** Read it from the register **/
+    return(*(CCB_Block[slothandle].Adaptor_Register_Base + ADAPTOR__IRQ_REQUEST_REG__OFFSET));
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Read_SlotPageRegister(slot handle)                                               ***/
+/***                                                                                   ***/
+/***  This function reads the slot page register.                                      ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+int Read_SlotPageRegister(SLOT_HANDLE slothandle)
+    {
+    /** Read it from the register **/
+    return(*(CCB_Block[slothandle].Slot_Register_Base + SLOT__PAGE_REG__OFFSET));
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Read_VoltControlRegister(slot handle)                                            ***/
+/***                                                                                   ***/
+/***  This function reads the voltage control register.                                ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+int Read_VoltControlRegister(SLOT_HANDLE slothandle)
+    {
+    /** Read it from the register **/
+    return(*(CCB_Block[slothandle].Slot_Register_Base + SLOT__VOLTAGE_CONTROL_REG__OFFSET));
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Read_SlotStatusRegister(slot handle)                                             ***/
+/***                                                                                   ***/
+/***  This function reads the slot status register.                                    ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+int Read_SlotStatusRegister(SLOT_HANDLE slothandle)
+    {
+    /** Read it from the register **/
+    #if Debug == TRUE
+        DebugMessage("yK","Slot status register for slothandle %d\n",slothandle);
+        DebugMessage("yK","is at &%08X\n",CCB_Block[slothandle].Slot_Register_Base + SLOT__STATUS_REG__OFFSET);
+    #endif
+    return(*(CCB_Block[slothandle].Slot_Register_Base + SLOT__STATUS_REG__OFFSET));
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Read_SlotAccessModeRegister(slot handle)                                         ***/
+/***                                                                                   ***/
+/***  This function reads the slot access mode register.                               ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    nothing (void)                                                                 ***/
+/***                                                                                   ***/
+/***  Error:                                                                           ***/
+/***    Never      (caller should always provide correct slot address)                 ***/
+/*****************************************************************************************/
+
+int Read_SlotAccessModeRegister(SLOT_HANDLE slothandle)
+    {
+    /** Read it from the register **/
+    return(*(CCB_Block[slothandle].Slot_Register_Base + SLOT__ACCESS_MODE_REG__OFFSET));
+}

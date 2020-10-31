@@ -1,0 +1,517 @@
+
+; > Sources.PDriverPS.JPEG
+
+
+; ----- jpeg_ctrans_handle -----
+jpeg_ctrans_handle
+        Debug JPEG, "PostScript jpeg_ctrans_handle called - SHOULD NOT HAVE BEEN!"
+        MOV     PC, LR
+
+; ----- jpeg_plotscaled -----
+;
+;  handle intercepted JPEG_PlotScaled calls
+;
+; Entry
+;   R0 = pointer to JPEG loaded in memory
+;   R1 = x coordinate for plot
+;   R2 = y coordinate for plot
+;   R3 = pointer to scale factors or 0             
+;   R4 = length of data in memory (bytes)
+;   R5 = Flags (ignored by this routine)
+;         b0 set: dither output when plotting 24 bit JPEG at 8bpp or below
+;
+; Note: it is assumed that caller has protected register contents as required
+;
+jpeg_plotscaled
+        Push    "LR"
+
+; do nothing on counting pass
+        LDR     LR, counting_pass
+        CMP     LR, #0
+        Pull    "PC",NE
+
+        PrError jpeg_plotscaled_return
+
+        Debug JPEG, "jpeg_plotscaled called (PostScript)", R0,R1,R2,R3,R4
+
+        MOV     R6, #0
+        STR     R6, jpeg_buffer_sprite           ; no buffer sprite yet
+
+; Save current graphics state, then translate to jpeg origin
+        [       PSCoordSpeedUps
+        BL      ensure_OScoords
+        BLVC    output_gsave
+        |
+        BL      output_gsave
+        ]
+        BVS     jpeg_plotscaled_return
+        BL      jpeg_translatebyR1R2
+
+; get info on JPEG
+        Push    "R0-R4"         ; don't care about R5
+        MOV     R1, R0          ; R1 -> JPEG
+        MOV     R0, #1          ; reason code = return dimensions
+        MOV     R2, R4          ; R2 = JPEG length
+        SWI     XJPEG_Info
+        Pull    "R1-R5",VS
+        BVS     jpeg_plotscaled_return
+        Debug JPEG, "info width height flags", R2, R3, R0
+        MOV     R5, R2          ; R5 = width in pixels
+        MOV     R6, R3          ; R6 = height in pixels
+        AND     R7, R0, #1      ; R7 bit 0 = JPEG-is-grey flag (1/0 for grey/colour)
+        Pull    "R0-R4"
+
+        Push    "R4"
+        MOV     R4,R6           ; height in pixels
+        BL      jpeg_scaling
+        Pull    "R4"
+
+        LDR     LR, info_features
+        TST     LR, #1          ; is output to monochrome printer?
+        ORREQ   R7, R7, #2      ; if yes, set printer-is-grey flag in R7 (bit 1)
+        Debug JPEG, "printer,jpeg type (R7) = ", R7
+
+; code from this point shared with plottransformed case
+; registers should now look like:
+;   R0 -> JPEG in memory
+;   R4 = length of JPEG in memory (bytes)
+;   R5 = width of JPEG (pixels)
+;   R6 = height of JPEG (pixels)
+;   R7 = JPEG,printer grey flags (bits 0,1; set if grey)
+;   R1,R2,R3,R8 = scratch
+;
+jpeg_do_output
+        LDRB    R8,joblevel2
+        CMP     R8,#0
+        BEQ     jdo_notL2
+        BL      jpeg_do_outputL2
+        BVS     jpeg_plotscaled_return
+        B       jpeg_do_output_done
+
+jdo_notL2
+        BL      jpeg_output_to_buffersprite
+        BVS     jpeg_plotscaled_return
+
+        MOV     R8, R0
+        MOV     R0, #0
+        SWI     XJPEG_PDriverIntercept  ; intercept off
+        BVS     jpeg_plotscaled_return
+        MOV     R0, R8                  ; R0 -> JPEG (restored)
+
+        PrPair  R5, R6                  ; width, height
+        CMP     R7, #0
+        BEQ     %FT01
+        Debug JPEG, " - printer and/or jpeg is grey (use image operator)"
+        PrLnIm  "J8"                    ; image operator
+        B       %FT02
+01
+        Debug JPEG, " - printer and jpeg are colour (use colorimage operator)"
+        PrLnIm  "J32"                   ; colorimage operator
+02
+        MOV     R8, R5                  ; R8 = width
+        LDR     R1, jpeg_buffer_sprite
+        Debug JPEG, "  using sprite area @ ", R1
+        ADD     R1, R1, #60             ; R1 -> sprite image itself
+        ADD     R1, R1, R5, LSL #2      ; R1 -> 2nd row (ie bottom row) of sprite image
+
+        MOV     R2, #0                  ; JPEG y plot coord starts at 0
+
+jpeg_psimage_nextrow
+        Push    "R1"
+        MOV     R1, #0                  ; x plot coord is 0
+        MOV     R3, #0                  ; unit plot scale factors
+        MOV     R5, #0                  ; no JPEG dithering
+        Debug JPEG, "  row JPEG x y scale length", R6,R0,R1,R2,R3,R4
+        SWI     XJPEG_PlotScaled        ; next JPEG decompress plot
+        Pull    "R1"
+        BVS     jpeg_plotscaled_return
+        MOV     R9, #0                  ; R9 = index of next pixel in row
+        MOV     R5, R0                  ; R5 -> JPEG (saved)
+jpeg_psimage_nextpixel
+        LDR     R3, [R1, R9]            ; R3 = next pixel value from sprite buffer
+        CMP     R7, #0
+        BEQ     jpeg_psimage_pcol_jcol
+        CMP     R7, #2
+        BEQ     jpeg_psimage_pgry_jcol
+
+; R7 should be 1 or 3 - printer grey or colour, jpeg grey
+;        Debug JPEG,"jpeg grey (R1 R7 R9)", R1,R7,R9
+        MOV     R0, R3, LSR #8          ; output green byte as grey (red,green,blue all equal)
+        BL      output_hexbyte
+        BVS     jpeg_plotscaled_return
+        B       jpeg_psimage_outpix_done
+
+; R7 = 0 - printer colour, jpeg colour
+jpeg_psimage_pcol_jcol
+;        Debug JPEG,"jpeg colour & printer colour (R1 R7 R9)", R1,R7,R9
+        MOV     R0, R3                  ; red
+        BL      output_hexbyte
+        MOVVC   R0, R3, LSR #8          ; green
+        BLVC    output_hexbyte
+        MOVVC   R0, R3, LSR #16         ; blue
+        BLVC    output_hexbyte
+        BVS     jpeg_plotscaled_return
+        B       jpeg_psimage_outpix_done
+
+; R7 = 2 - printer grey, jpeg colour
+jpeg_psimage_pgry_jcol
+;        Debug JPEG,"jpeg colour & printer grey (R1 R7 R9)", R1,R7,R9
+        Push    "R1"
+        AND     R1, R3, #&FF            ; red
+        ADD     R0, R1, R1, LSL #2      ; red*5
+        MOV     R1, R3, LSR #8
+        AND     R1, R1, #&FF            ; green
+        ADD     R0, R0, R1              ; red*5 + green
+        ADD     R0, R0, R1, LSL #3      ; red*5 + green*9
+        MOV     R1, R3, LSR #16
+        AND     R1, R1, #&FF            ; blue
+        ADD     R0, R0, R1, LSL #1      ; red*5 + green*9 + blue*2
+        MOV     R0, R0, LSR #4          ; (red*5 + green*9 + blue*2)/16 = grey value
+        BL      output_hexbyte
+        Pull    "R1"
+        BVS     jpeg_plotscaled_return
+
+jpeg_psimage_outpix_done
+        ADD     R9, R9, #4
+        TST     R9, #31*4               
+        CMPNE   R9, R8, LSL #2
+        BNE     jpeg_psimage_nextpixel
+        BL      output_immstring        ; new line about every 32 pixels, or at end of row
+        DCB     10,0
+        ALIGN
+        BVS     jpeg_plotscaled_return
+        CMP     R9, R8, LSL #2
+        BNE     jpeg_psimage_nextpixel
+        MOV     R0, R5                  ; R0 -> JPEG (restored)
+        SUB     R2, R2, #2              ; y plot coord down by 2 OS units (1 row)
+        SUBS    R6, R6, #1              ; R6 = rows of image left
+        BNE     jpeg_psimage_nextrow
+
+jpeg_do_output_done
+        BL      output_grestore         ; done so grestore
+        BVS     jpeg_plotscaled_return
+
+        MOV     R0, #1
+        SWI     XJPEG_PDriverIntercept  ; intercept back on
+
+        B       jpeg_plotscaled_return
+
+        PrError
+jpeg_plotscaled_return
+        Debug JPEG, "jpeg_plot returning"
+        BL      jpeg_release_buffersprite
+        Pull    "PC"
+
+
+;routine used for JPEG output in Level2 case
+;hey, we can just dump the JPEG data via ASCII85 encoding (a LOT more compact)!
+;entry as for jpeg_do_output fragment of jpeg_plotscaled
+jpeg_do_outputL2
+        PrError jpdol2_return
+        Push    "LR"
+        PrPair  R5, R6                  ; width, height
+        TST     R7,#1
+        BEQ     jpdol2_colourjp
+        PrLnIm  "J8"
+        B       jpdol2_dump
+jpdol2_colourjp
+        PrLnIm  "J32"
+jpdol2_dump
+        BL      ascii85_begin
+        MOV     R1,R4
+        BL      ascii85_block
+        BL      ascii85_end
+        PrError
+jpdol2_return
+        Pull    "PC"
+
+
+; ----- jpeg_translatebyR1R2 -----
+;
+; Subroutine to translate the co-ordinate system by the vector held in
+; R1,R2. Optimises out translations by 0,0. Preserves all registers.
+;
+jpeg_translatebyR1R2
+        Push    "R0,R1,R3,R4,LR"
+        PrError jpeg_translatebyR1R2_return
+
+        Debug JPEG, "jpeg_translatebyR1R2", R1, R2
+
+        MOV     R3, R1
+        MOV     R4, R2
+
+        CLRV
+        ORRS    LR,R3,R4
+        BEQ     jpeg_translatebyR1R2_return
+
+        PrPair  R3,R4,CorruptR0andR1
+        PrLnIm  "T",FallThroughOnError
+
+        PrError
+jpeg_translatebyR1R2_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,R3,R4,PC"
+
+
+; ----- jpeg_scaling -----
+;
+; adjust jpeg scaling for current eig factors, and set PS scaling matrix
+;
+; Entry:
+;   R3 = pointer to scaling factors, or 0 for unit scale
+;   R4 = JPEG height, in pixels
+;
+jpeg_scaling
+        Push    "R0-R8,LR"
+        PrError jpeg_scaling_return
+
+        MOV     R8,R4
+
+        CMP     R3, #0
+        LDMNEIA R3, {R4-R7}
+        MOVEQ   R4, #1
+        MOVEQ   R5, #1
+        MOVEQ   R6, #1
+        MOVEQ   R7, #1
+
+        Debug JPEG, "jpeg_scaling", R4, R5, R6, R7
+
+        LDR     R2, currxeig
+        MOV     R4, R4, LSL R2
+        LDR     R2, curryeig
+        MOV     R5, R5, LSL R2
+
+        PrPair  R4, R6
+        PrPair  R5, R7
+        PrLnIm  "SS"
+
+        MOV     R2,R8
+        PrNumSp R2
+        PrLnIm  "JM", FallThroughOnError
+        PrError
+jpeg_scaling_return
+        STRVS   R0, [R13]
+        Pull    "R0-R8,PC"
+
+
+; ----- jpeg_output_to_buffersprite -----
+;
+; Allocate 32 bit buffer Sprite for decompression, and switch output to it
+;   (note that all SpriteOp's used here - 9,15,60 - will be passed through
+;    normally without having to change printer interception status)
+;
+; Entry:
+;   R5 = width of JPEG in pixels
+;   R6 = height of JPEG in pixels
+;
+; Exit:
+;   sprite area allocated (ptr in jpeg_buffer_sprite), output switched to sprite
+;
+jpeg_output_to_buffersprite
+        Push    "R0-R7,LR"
+
+        Debug JPEG, "jpeg_output_to_buffersprite (w h flags) ", R5, R6, R7
+
+        MOV     R3, R5, LSL #3          ; allow 2 row buffer, 4-byte pixels (ie. 8*width)
+        ADD     R3, R3, #64             ; enough for header info (no palette)
+        Debug JPEG, "  claim bytes = ", R3
+        MOV     R0, #ModHandReason_Claim
+        SWI     XOS_Module
+        BVS     jpeg_obs_return
+        STR     R2, jpeg_buffer_sprite   ; -> sprite area
+        Debug JPEG, "  Sprite area @ ", R2
+        STR     R3, [R2,#0]
+        MOV     R0, #16
+        STR     R0, [R2,#8]
+        MOV     R0, #9
+        ORR     R0, R0, #256            ; init user sprite area
+        MOV     R1, R2                  ; R1 -> sprite area
+  Debug JPEG, "SpriteOp ", R0, R1, R2, R3
+        SWI     XOS_SpriteOp
+        BVS     jpeg_obs_return
+        MOV     R0, #15
+        ORR     R0, R0, #256            ; create sprite
+        ADR     R2, jpeg_SpName
+        MOV     R3, #0
+        MOV     R4, R5                  ; R4 = width
+        MOV     R5, #2                  ; R5 = height = 2
+        ADR     R6, jpeg_DeepSp32
+        LDR     R6, [R6]                ; 32 bit 90x90 dpi Sprite
+  Debug JPEG, "SpriteOp ", R0, R1, R2, R3, R4, R5, R6
+        SWI     XOS_SpriteOp
+        BVS     jpeg_obs_return
+        MOV     R0, #60
+        ORR     R0, R0, #256            ; switch output to Sprite
+        MOV     R3, #0                  ; no need for save area
+  Debug JPEG, "SpriteOp ", R0, R1, R2, R3
+        SWI     XOS_SpriteOp
+  Debug JPEG, "SpriteOp return ", R0, R1, R2, R3
+        BVS     jpeg_obs_return
+        ADR     R4, jpeg_buffersp_save
+        STMIA   R4, {R0-R3}             ; save 'previous output state' regs
+jpeg_obs_return
+  Debug JPEG, "jpeg_output_to_buffersprite return"
+        STRVS   R0,[R13]
+        Pull    "R0-R7,PC"
+
+jpeg_DeepSp32
+        DCD     &301680B5               ; 32 bit 90x90 dpi Sprite
+jpeg_SpName
+        DCB     "jp"
+        DCB     0
+        ALIGN
+
+; may be used to clean up on error - hence ignore new errors, preserve flags
+jpeg_release_buffersprite
+        Push    "R0-R4,LR"
+
+        Debug JPEG, "jpeg_release_buffer_sprite called"
+
+        LDR     R2, jpeg_buffer_sprite
+        CMP     R2, #0
+        BEQ     jpeg_releasebs_return
+        Debug JPEG, " ... and something to release"
+        ADR     R4, jpeg_buffersp_save
+        LDMIA   R4, {R0-R3}
+        SWI     XOS_SpriteOp            ; restore vdu output state
+        MOV     R0, #ModHandReason_Free
+        LDR     R2, jpeg_buffer_sprite
+        SWI     XOS_Module
+jpeg_releasebs_return
+        Pull    "R0-R4,PC",,^
+
+
+; ----- jpeg_plottransformed -----
+;
+; handle intercepted JPEG_PlotTransformed calls
+;
+; Entry:
+;   R0 = pointer to JPEG file loaded in memory
+;   R1 = flag word
+;        bit 0 set: R2 is pointer to dest co-ords, else pointer to matrix
+;        bit 1 set: dither output when plotting 24 bit JPEG at 8bpp or below (ignored)
+;   R2 = pointer to matrix (as for Draw module), or
+;        pointer to destination co-ordinate block, depending on R1:b0\
+;   R3 = length of data in memory (bytes)
+;
+; Note: it is assumed that caller has protected register contents as required
+;
+jpeg_plottransformed
+        Push    "LR"
+
+; do nothing on counting pass
+        LDR     LR, counting_pass
+        CMP     LR, #0
+        Pull    "PC",NE
+
+        PrError jpeg_plottransformed_error_return
+
+        Debug JPEG, "jpeg_plottransformed called (PostScript)", R0,R1,R2,R3
+
+        MOV     R4, #0
+        STR     R4, jpeg_buffer_sprite           ; no buffer sprite yet
+
+; get info on JPEG
+        Push    "R0-R3"
+        MOV     R1, R0          ; R1 -> JPEG
+        MOV     R0, #1          ; reason code = return dimensions
+        MOV     R2, R3          ; R2 = JPEG length
+        SWI     XJPEG_Info
+        Pull    "R1-R4",VS
+        BVS     jpeg_plottransformed_error_return
+        Debug JPEG, "info width height flags", R2, R3, R0
+        STR     R4, jpeg_trans_xdpi
+        STR     R5, jpeg_trans_ydpi
+        MOV     R5, R2          ; R5 = width in pixels
+        MOV     R6, R3          ; R6 = height in pixels
+        AND     R7, R0, #1      ; R7 bit 0 = JPEG-is-grey flag (1/0 for grey/colour)
+        Pull    "R0-R3"
+
+        LDR     LR, info_features
+        TST     LR, #1          ; is output to monochrome printer?
+        ORREQ   R7, R7, #2      ; if yes, set printer-is-grey flag in R7 (bit 1)
+        Debug JPEG, "printer,jpeg type (R7) = ", R7
+
+        MOV     LR, #0
+        STR     LR, sourceclip_x
+        STR     LR, sourceclip_y
+
+; Save current graphics state
+        [       PSCoordSpeedUps
+        BL      ensure_OScoords
+        BLVC    output_gsave
+        |
+        BL      output_gsave
+        ]
+        BVS     jpeg_plottransformed_error_return
+
+        TST     R1, #1
+        BEQ     jpeg_trans_matrix       ; it's a matrix plot
+
+        Debug JPEG, "Transform to dest block"
+
+        MOV     R8, #8                  ; output 4 coordinate pairs
+00      LDR     R4, [R2], #4
+        Debug  JPEG, " -- ", R4
+        PrNumSp R4
+        SUBS    R8, R8, #1
+        BNE     %BT00
+
+; Output the width and height in pixels
+        RSB     R6, R6, #0              ; negate height (coordinate flip)
+        PrPair  R5, R6
+        PrLnIm  "PAR"                   ; fit into parallogram command
+        RSB     R6, R6, #0              ; un-negate height
+
+; unit scaling info
+        PrLnIm  "1 1 1 1 SS"
+        PrNumSp R6
+        PrLnIm  "JM"
+        MOV     R4, R3                  ; R4 = length of jpeg
+        B       jpeg_do_output
+
+jpeg_trans_matrix
+        Debug JPEG, "Transform to matrix"
+
+        MOV     R8, #6
+01
+        LDR     R4, [R2], #4
+        Debug JPEG, " -- ", R4
+        PrNumSp R4
+        SUBS    R8,R8,#1
+        BNE     %BT01
+
+        PrLnIm  "SDM"
+
+        BL      jpeg_trans_matrix_scaling
+        BVS     jpeg_plottransformed_error_return
+
+        MOV     R4, R3                  ; R4 = length of jpeg
+        B       jpeg_do_output
+
+        PrError
+jpeg_plottransformed_error_return
+        Debug JPEG, "jpeg_plottransformed returning"
+        BL      jpeg_release_buffersprite
+        Pull    "PC"
+
+
+; for the transform to matrix case, scale appropriately:
+;   output: 180 <x dpi> 180 <y dpi> SS <height> JM
+;   where dpi are dots-per-inch of JPEG, and 180,180 is user dpi for PostScript
+;
+jpeg_trans_matrix_scaling
+        Push    "R0-R4,LR"
+        MOV     R3, #180                ; 180 dpi PostScript units
+        LDR     R4, jpeg_trans_xdpi
+        PrPair  R3, R4,,FallThroughOnError
+        LDRVC   R4, jpeg_trans_ydpi
+        PrPair  R3, R4,,FallThroughOnError
+        PrLnIm  "SS", FallThroughOnError 
+        PrNumSp R6,,FallThroughOnError
+        PrLnIm  "JM", FallThroughOnError
+        STRVS   R0, [SP]
+        Pull    "R0-R4,PC"
+
+
+        END

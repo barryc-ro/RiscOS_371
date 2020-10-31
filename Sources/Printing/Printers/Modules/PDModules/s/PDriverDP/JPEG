@@ -1,0 +1,359 @@
+
+; > Sources.PDriverDP.JPEG
+
+
+; ----- jpeg_ctrans_handle -----
+;
+; handle intercepted ColourTrans Select/Generate Table
+;
+; Entry: R4 -> (at least 12 byte) buffer for 32K trans table descriptor
+;
+; Exit:  buffer filled in; registers R0-R9 may be corrupted
+;
+
+jpeg_ctrans_handle
+        Push    "LR"
+        LDRB    R8, job_strip_type      ;decide whether 256 grey or 256 colour table needed
+        Debug   JPEG, "MJS: jpeg coltrans, strip type = ", R8
+        CMP     R8, #0
+        CMPNE   R8, #1
+        BLEQ    sprite_makemono32Ktable
+        CMP     R8, #2
+        BLEQ    sprite_make256c32Ktable
+; copy returned 12 byte descriptor to requester's buffer
+        LDR     R9, [R7], #4
+        Debug   JPEG, "MJS: 1st guard word = ", R9
+        STR     R9, [R4], #4
+        LDR     R9, [R7], #4
+        Debug   JPEG, "MJS: 32K table @ ", R9
+        STR     R9, [R4], #4
+        LDR     R9, [R7], #4
+        Debug   JPEG, "MJS: 2nd guard word = ", R9
+        STR     R9, [R4], #4
+        Pull    "PC"
+
+
+; ----- jpeg_plotscaled -----
+;
+;  handle intercepted JPEG_PlotScaled calls
+;
+; Entry
+;   R0 = pointer to JPEG loaded in memory
+;   R1 = x coordinate for plot
+;   R2 = y coordinate for plot
+;   R3 = pointer to scale factors or 0             
+;   R4 = length of data in memory (bytes)
+;   R5 = Flags (ignored by this routine)
+;         b0 set: dither output when plotting 24 bit JPEG at 8bpp or below
+;
+; Note: it is assumed that caller has protected register contents as required
+;
+; The strategy of this call is:
+;   1) From the pixel dimensions of the JPEG, the print rectangle transformation,
+;      the requested scale factors and the screen eig factors, calculate the
+;      required scaling and offset into buffer sprite (call image_scale)
+;   2) Construct a destination coord block for transformed plotting (output of
+;      image_scale)
+;   3) Temporarily disable JPEG intercepts, and call JPEG_PlotTransformed
+
+jpeg_plotscaled
+        Push    "LR"
+
+        LDR     LR, counting_pass
+        CMP     LR, #0
+        BEQ     jpeg_plotscaled_notjustcounting
+
+; counting pass: call info to find max memory requirement
+        MOV     R1, R0          ; R1 -> JPEG
+        MOV     R2, R4          ; R2 = length of JPEG in memory
+        MOV     R0, #1          ; reasoncode = return dimensions
+        SWI     XJPEG_Info
+        Pull    "PC", VS
+        LDR     R0, jpeg_maxmemory
+        CMP     R6, R0
+        STRGT   R6, jpeg_maxmemory
+        Debug   JPEG, "counting JPEG width height workspace maxbefore",R2,R3,R6,R0
+        Pull    "PC"
+
+jpeg_plotscaled_notjustcounting
+
+        LDRB    LR, disabled
+        TST     LR, #disabled_nullclip  ; nothing to do if null clip region
+        Pull    "PC",NE
+
+        MOV     R5, R0          ; R5 -> JPEG (saved)
+
+; flag jpeg plot in progress to non-deep strip type, for colourtrans intercept from JPEG
+        LDRB    R0, job_strip_type
+        CMP     R0, #2
+        MOVLE   R0, #1                  ; flag that jpeg plot will rely on ctrans table
+        MOVGT   R0, #0
+        STR     R0, jpeg_ctransflag
+
+; turn off JPEG plotting intercept now (set bit 0 to 0)
+        CMP     R0, #0
+        MOVNE   R0, #2                  ; set 'use ctrans' (bit 1) - advice to jpeg plot
+        SWI     XJPEG_PDriverIntercept
+        Pull    "PC", VS
+
+        CMP     R3, #0
+        ADRLE   R3, unitscale   ; default to unit scale factors (1,1,1,1)
+
+; 1st irritating register shuffle, to call JPEG_Info
+        Push    "R1,R2,R3,R4"   ; save x coord, y coord, scale factors, length
+        MOV     R1, R5          ; R1 -> JPEG
+        MOV     R0, #1          ; ask for dimensions
+        MOV     R2, R4          ; length in memory
+        SWI     XJPEG_Info
+        Pull    "R1,R2,R3,R4",VS
+        Pull    "PC",VS
+
+; 2nd irritating register shuffle, to call image_scaling
+        MOV     R0, R1          ; R0 -> JPEG (saved)
+        MOV     R1, R2          ; R1 = width (pixels)
+        MOV     R2, R3          ; R2 = height (pixels)
+        Pull    "R3,R4,R6,R8"   ; R3=x coord, R4=y coord, R6=scale factors, R8=length
+        BL      image_scaling
+
+; 3rd irritating register shuffle, to call JPEG_PlotTransformed
+        MOV     R1, #1          ; flag 'R2 -> dest coord block'
+        MOV     R2, R6          ; R2 -> dest coords
+        MOV     R3, R8          ; R3 = length
+        SWI     XJPEG_PlotTransformed
+        Pull    "PC",VS
+
+; turn JPEG plotting intercept back on
+        MOV     R0, #1
+        SWI     XJPEG_PDriverIntercept
+
+; reset flag
+        MOV     R0, #0
+        STR     R0, jpeg_ctransflag
+
+        Pull    "PC"
+
+unitscale       & 1,1,1,1
+
+
+; ----- image_scaling -----
+;
+; Entry:
+;   R1 =  width of image, in pixels
+;   R2 =  height of image, in pixels
+;   R3 =  x coord of image plot relative to current rectangle
+;   R4 =  y coord of image plot relative to current rectangle
+;   R6 -> scale factors (must not be 0)
+;   job_spritescale is workspace for destination coords block (cf SpriteOp 56)
+; Exit:
+;   R6 -> destination coords block, filled in to give correct scaling and offset into
+;         device buffer sprite
+;   all other registers preserved
+
+image_scaling
+
+        Push    "R0-R4,R8,LR"
+        Push    "R3,R4"                 ; save lower left co-ordinates
+
+; first, adjust scale factors to be correct for plotting pixels in OS resolution
+;   (180 dpi), by using current xeig, yeig factors
+
+        LDR     R0,[R6,#0]              ; scale, x multiplier
+        MUL     R0,R1,R0                ; times image width
+        LDR     R1,[R6,#8]              ; scale, x divisor
+        LDR     LR, currxeig            ; x eig factor for current screen mode
+        MOV     R8, #1
+        MOV     R8, R8, LSL LR
+        SUB     R8, R8, #1              ; = mask for lower 'xeig' bits
+
+; adjust x scale by shifting divisor down, if no loss of precision, else by
+;   shifting multiplier up
+        TST     R1, R8
+        MOVEQ   R1, R1, LSR LR
+        MOVNE   R0, R0, LSL LR
+
+        TEQ     R1,#0                   ; trap division by zero
+        BLNE    Divide                  ; divide out yielding target x size (OS units)
+        ADD     R3,R3,R0                ; now R3 = the right-hand x co-ordinate
+
+        LDR     R0,[R6,#4]              ; scale, y multiplier
+        MUL     R0,R2,R0                ; times image height
+        LDR     R1,[R6,#12]             ; scale, y divisor
+        LDR     LR, curryeig            ; y eig factor for current screen mode
+        MOV     R8, #1
+        MOV     R8, R8, LSL LR
+        SUB     R8, R8, #1              ; = mask for lower 'yeig' bits
+
+; adjust y scale by shifting divisor down, if no loss of precision, else by
+;   shifting multiplier up
+        TST     R1, R8
+        MOVEQ   R1, R1, LSR LR
+        MOVNE   R0, R0, LSL LR
+
+        TEQ     R1,#0                   ; trap division by zero
+        BLNE    Divide                  ; divide out yielding target y size (OS units)
+        ADD     R4,R4,R0                ; now R4 = the top y co-ordinate
+
+; now, scale/offset correctly for device pixels in the buffer sprite, taking account of
+;   the transformation supplied for the printer rectangle
+
+        BL      scale_r3r4              ; scale, translate for current print rectangle
+        Debug   JPEG,"JPEG Top right co-ordinates",R3,R4        
+
+; snap to device pixels, then convert to 256'ths OS units (for destination rectangle)
+        MOV     R3,R3,LSR #bufferpix_l2size
+        MOV     R3,R3,LSL #8+bufferpix_l2size
+        MOV     R4,R4,LSR #bufferpix_l2size
+        MOV     R4,R4,LSL #8+bufferpix_l2size
+      
+; now: R3 = right x co-ordinate of the image destination rectangle
+;      R4 = top   y co-ordinate of the image destination rectangle
+
+        STR     R3,job_spritescale+8    ; is x coord of dest point 1 (X1 for SpritOp 56) ...
+        STR     R3,job_spritescale+16   ; .. and 2 (X2)
+
+        STR     R4,job_spritescale+4    ; is y coord of dest point 0 (Y0)
+        STR     R4,job_spritescale+12   ; ... and 1 (Y1)
+
+        Pull    "R3,R4"                 ; restore lower left co-ordinates
+        BL      scale_r3r4              ; scale these to device values
+
+; snap to device pixels, then convert to 256'ths OS units (for destination rectangle)
+        MOV     R3,R3,LSR #bufferpix_l2size
+        MOV     R3,R3,LSL #8+bufferpix_l2size
+        MOV     R4,R4,LSR #bufferpix_l2size
+        MOV     R4,R4,LSL #8+bufferpix_l2size
+
+; now: R3 = left   x co-ordinate of the image destination rectangle
+;      R4 = bottom y co-ordinate of the image destination rectangle
+
+        STR     R3,job_spritescale      ; (X0)
+        STR     R3,job_spritescale+24   ; (X3)
+
+        STR     R4,job_spritescale+28   ; (Y3)
+        STR     R4,job_spritescale+20   ; (Y2)
+       
+        ADRL    R6,job_spritescale      ; R6 -> SpriteOp 56 style destination block
+
+        Pull    "R0-R4,R8,PC"
+
+
+; ----- jpeg_plottransformed -----
+;
+; handle intercepted JPEG_PlotTransformed calls
+;
+; Entry:
+;   R0 = pointer to JPEG file loaded in memory
+;   R1 = flag word
+;        bit 0 set: R2 is pointer to dest co-ords, else pointer to matrix
+;        bit 1 set: dither output when plotting 24 bit JPEG at 8bpp or below
+;   R2 = pointer to matrix (as for Draw module), or
+;        pointer to destination co-ordinate block, depending on R1:b0\
+;   R3 = length of data in memory (bytes)
+;
+; Note: it is assumed that caller has protected register contents as required
+;
+; This call just adjusts the transform destination block, or the transform matrix,
+; to account for current print scaling/origin, then hands the call on - it is left
+; to SpriteExtend to decide whether the required transformation is supported
+
+jpeg_plottransformed
+        Push    "LR"
+
+        LDR     LR, counting_pass
+        CMP     LR, #0
+        BEQ     jpeg_plottransformed_notjustcounting
+
+; counting pass: call info to find max memory requirement
+        MOV     R1, R0          ; R1 -> JPEG
+        MOV     R2, R3          ; R2 = length of JPEG in memory
+        MOV     R0, #1          ; reasoncode = return dimensions
+        SWI     XJPEG_Info
+        Pull    "PC", VS
+        LDR     R0, jpeg_maxmemory
+        CMP     R6, R0
+        STRGT   R6, jpeg_maxmemory
+        Debug   JPEG, "counting JPEG width height workspace maxbefore",R2,R3,R6,R0
+        Pull    "PC"
+
+jpeg_plottransformed_notjustcounting
+        LDRB    LR, disabled
+        TST     LR, #disabled_nullclip  ; nothing to do if null clip region
+        Pull    "PC",NE
+
+        MOV     R5, R0          ; R5 -> JPEG (saved)
+        MOV     R6, R1          ; R6 = flag word (saved)
+
+; flag jpeg plot in progress to non-deep strip type, for colourtrans intercept from JPEG
+        LDRB    R0, job_strip_type
+        CMP     R0, #2
+        MOVLE   R0, #1                  ; flag that jpeg plot will rely on ctrans table
+        MOVGT   R0, #0
+        STR     R0, jpeg_ctransflag
+
+; turn off JPEG plotting intercept now (set bit 0 to 0)
+        CMP     R0, #0
+        MOVNE   R0, #2                  ; set 'use ctrans' (bit 1) - advice to jpeg plot
+        SWI     XJPEG_PDriverIntercept
+        Pull    "PC", VS
+
+; have we got a destination block or a transform matrix?
+        TST     R1, #1          ; test bit 0
+        BEQ     jpeg_plottrans_matrix
+
+; we have a destination block
+        MOV     R8, R2          ; R8 -> dest block
+        MOV     R9, #4          ; 4 coordinates to adjust
+
+jpeg_plottrans_coordsloop
+        LDMIA   R8, {R0, R1}
+        BL      offset_R0R1
+        STMIA   R8!, {R0, R1}
+        SUBS    R9, R9, #1
+        BNE     jpeg_plottrans_coordsloop
+        B       jpeg_plottrans_doit
+
+jpeg_plottrans_matrix
+        LDR     R0, [R2,#4*0]   ; matrix xx
+  Debug JPEG, "jpeg transform matrix xx > ", R0
+        BL      XScale
+  Debug JPEG, "jpeg transform matrix xx < ", R0
+        STR     R0, [R2,#4*0]
+        LDR     R0, [R2,#4*2]   ; matrix xy
+  Debug JPEG, "jpeg transform matrix xy > ", R0
+        BL      XScale
+  Debug JPEG, "jpeg transform matrix xy < ", R0
+        STR     R0, [R2,#4*2]
+        LDR     R0, [R2,#4*1]   ; matrix yx
+  Debug JPEG, "jpeg transform matrix yx > ", R0
+        BL      YScale
+  Debug JPEG, "jpeg transform matrix yx < ", R0
+        STR     R0, [R2,#4*1]
+        LDR     R0, [R2,#4*3]   ; matrix yy
+  Debug JPEG, "jpeg transform matrix yy > ", R0
+        BL      YScale
+  Debug JPEG, "jpeg transform matrix yy < ", R0
+        STR     R0, [R2,#4*3]
+
+        ADD     R8, R2, #16     ; -> coordinates
+        LDMIA   R8, {R0, R1}
+        BL      offset_R0R1
+        STMIA   R8, {R0, R1}
+
+jpeg_plottrans_doit
+        MOV     R0, R5          ; R0 -> JPEG (restored)
+        MOV     R1, R6          ; R1 = flags (restored)
+        SWI     XJPEG_PlotTransformed
+        Pull    "PC",VS
+
+; turn JPEG plotting intercept back on
+        MOV     R0, #1
+        SWI     XJPEG_PDriverIntercept
+
+; reset flag
+        MOV     R0, #0
+        STR     R0, jpeg_ctransflag
+
+        Pull    "PC"
+
+
+        END

@@ -1,0 +1,495 @@
+/* > arsndcode.c
+
+ * © SJ Middleton, 1994
+
+ * CHANGE LOG:
+ *  05/10/93:   changed root for sound code to ARMovie$SoundDir
+ *  08/11/93:   call alloc_nextiscalled() before allocating sound buffers
+ *  16/11/93:   change starttiming to use new ARTools$Clockrate variable
+ *  25/11/93:   change ARTools use to use arsnd_varval() (see arsnd.c)
+ *  03/12/93:   use ARMovie$Dir if ARMovie$SoundDir not available
+ *  10/12/93:   changed getsoundcode() to cope with Type 2 audio. Use getsoundcode_str() now instead.
+ *              change claimsoundbuffers. changed error messages slightly.
+ *  23/01/94:   fill in new arsound_hdr details for new scheme.
+ *              new interface to timing.
+ *              removed cache code since new sound players can stay loaded
+ *  01/03/94:   new bit in polladdr flags, timing is not done if sound system disabled. 
+ */
+
+#include "alarm.h"
+#include "kernel.h"
+#include "msgs.h"
+#include "os.h"
+#include "swis.h"
+#include "werr.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "device.h"
+
+#include "armovie.h"
+#include "arsound.h"
+#include "arutils.h"
+#include "utils.h"
+
+#define NO_REPLAY_FILE          msgs_lookup("arsnd0:Replay sound code '%s' not found.")
+#define NO_SOUNDCODE_LOADED     msgs_lookup("arsnd1:Cannot claim sound buffers - no sound code loaded.")
+#define SOUND_BUFFERS           msgs_lookup("arsnd2:Replay sound")
+#define UNKNOWN_FORMAT          msgs_lookup("arsnd3:Unknown Replay sound format (%d).")
+#define NO_SOUNDCODE_LOADED1    msgs_lookup("arsnd4:Cannot start timing - no sound code loaded/device not claimed.")
+#define SOUND_BUFFERS1          msgs_lookup("arsnd5:Replay sound buffers")
+
+#define LOW_QUALITY             1
+#define HIGH_QUALITY            4
+
+/* ------------------------------------------------------------------------------------------------- */
+
+/*
+ * Sound playback code file handling
+ * The playback code is loaded on initialisation and on every mode change to check the VIDC speed
+ * (except on RISC OS 3 machines), and is kept in memory until a different bit of sound code is needed
+
+ * soundcode is held in the RMA always
+ * buffers can be in the RMA or allocated bu user supplied function (ie flex probably)
+
+ * poll_addr is set up when soundcode is loaded (armovie_getsoundcode()) but can be redirected.
+
+ * Assumptions are made that soundcode will always be allocated in fixed memory
+ * ie malloc or module_claim.
+ */
+
+static void                 *soundcode_ptr = NULL;      /* actual code start ptr */
+static int                  soundcode_size;             /* size of playback code file */
+
+static arsound_hdr          *soundcode = NULL;          /* ptr to code when loaded into RMA */
+static arsound_pollstr      *poll_addr = NULL;          /* ptr to mute flags structure */
+
+static char                 *cache_file = NULL;         /* malloc'd pathname */
+
+static mem_allocfn          sound_alloc = m_alloc;
+static mem_freefn           sound_free = m_free;
+
+static BOOL                 playing = FALSE;
+
+/* ------------------------------------------------------------------------------------------------- */
+
+static armovie_releasefn    sound_releasefn = 0;
+static void                 *sound_releasehandle = NULL;
+
+static device               sound_dev = NULL;
+static BOOL                 can_claim_device = FALSE;
+
+static int  timing_start = 0;           /* used to ensure timing happens >= 1 second */
+static BOOL timing_valid = FALSE,       /* has the sound code done a valid timing */
+            timing_necessary = FALSE;   /* does the sound code need timing */
+
+/* ------------------------------------------------------------------------------------------------- */
+
+static char *get_sound_dir(char *dir, int bufsize)
+{
+    _kernel_swi_regs r;
+    r.r[0] = (int) (getenv("ARMovie$SoundDir") ? "<ARMovie$SoundDir>." : "<ARMovie$Dir>.MovingLine.");
+    r.r[1] = (int) dir;
+    r.r[2] = (int)((unsigned) bufsize | (3U<<30));
+    _kernel_swi(OS_GSTrans, &r, &r);
+    return dir;
+}
+
+static BOOL armovie__releasefn(device dev, const char *info, void *handle)
+{
+    if (sound_releasefn)
+        return sound_releasefn(info, sound_releasehandle);
+
+    return FALSE;
+    dev = dev;
+    handle = handle;
+}
+
+void armovie_setreleasefn(armovie_releasefn fn, void *handle)
+{
+    sound_releasefn = fn;
+    sound_releasehandle = handle;
+}
+
+BOOL armovie_claimsounddevice(void)
+{
+    if (sound_dev == NULL)
+    {
+        char dir[256];
+        can_claim_device = strstr(strupr(get_sound_dir(dir, sizeof(dir))), "MOVINGLINE") != NULL;
+        if (can_claim_device)
+        {
+            sound_dev = device_claim(device_Sound, 0, NULL, armovie__releasefn, NULL);
+            return sound_dev != NULL;
+        }
+    }
+    return TRUE;
+}
+
+void armovie_releasesounddevice(void)
+{
+    device_release(&sound_dev);
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+void armovie_finishtiming(void)
+{
+/* only calculate if we have started timing */
+    if (timing_start != 0)
+    {
+        timing_necessary = (soundcode->flags & arsound_NoTiming) == 0;
+
+        if (timing_necessary)
+        {
+            while (alarm_timedifference(timing_start, alarm_timenow()) < 100)
+                ;
+
+            timing_valid = (soundcode->flags & arsound_SoundSystemOff) == 0;
+        }
+
+#ifndef NDEBUG
+fprintf(stderr, "Stop timing at %d\n", alarm_timenow());
+fprintf(stderr, "poll flags %x\n", soundcode->flags);
+fprintf(stderr, "timing valid %d\n", timing_valid);
+#endif
+        arsound_stop();
+
+        timing_start = 0;
+    }
+}
+
+BOOL armovie_starttiming(void)
+{
+    if (soundcode != NULL && (sound_dev != NULL || !can_claim_device))
+    {
+        timing_start = alarm_timenow();
+#ifndef NDEBUG
+fprintf(stderr, "Start timing at %d\n", timing_start);
+#endif
+        arsound_play(1);
+        return TRUE;
+    }
+    werr(0, NO_SOUNDCODE_LOADED1);
+    return FALSE;
+}
+
+/*
+ * This function returns TRUE if either timing is successfully started
+ * or if there is no need to start timing.
+ */
+
+BOOL armovie_checktiming(void)
+{
+#ifndef NDEBUG
+fprintf(stderr, "check timing");
+#endif
+    if (timing_necessary && !timing_valid && timing_start == 0)
+        return armovie_starttiming();
+    return TRUE;
+}
+
+/*
+ * Returns TRUE if this means that the sound may not be playing correctly
+ * any more.
+ */
+
+BOOL armovie_invalidateclockrate(void)
+{
+    if (timing_necessary)
+    {
+        timing_valid = FALSE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+
+/* RMA buffer control */
+
+void armovie_releasesoundbuffers(void)
+{
+    arsound_hdr *sp = soundcode;
+    if (sp)
+    {
+        sound_free((void **)&sp->sndbufA);
+        sp->sndbufB = NULL;
+    }
+}
+
+/*
+ * An unfilled buffer may still be played (but with max attenuation), so it must be
+ * possible to read data out of it (even though the data may be crap).
+
+ * It is safe to use a temporary value for the handle because the sound_alloc functions
+ * have to be non-shifting allocators.
+ */
+
+BOOL armovie_claimsoundbuffers(const armovie_soundstr *sp, int nsamples)
+{
+    arsound_hdr *scode = soundcode;
+
+    if (scode)
+    {
+        int     bufsize = ((nsamples*sp->sndmul/8) + 15) &~ 15, 
+                size = 2*(bufsize + sizeof(arsound_buffer));
+        void    *buffer = NULL;
+
+        alloc_nextiscalled(SOUND_BUFFERS);
+
+        if (sound_alloc(&buffer, size))
+        {
+            arsound_buffer  *bpA, *bpB;
+
+            scode->sndbufA = bpA = buffer;
+            scode->sndbufB = bpB = (arsound_buffer *)((char *)buffer + bufsize + sizeof(arsound_buffer));
+
+            bpA->count = bpB->count = bufsize;
+            bpA->empty = bpB->empty = 1;            /* empty buffer */
+            bpA->start = bpB->start = 0;            /* mark that givedata hasn't been called on this buffer yet */
+
+            return TRUE;
+        }
+        else
+            oom_err(SOUND_BUFFERS1, size);
+    }
+    else
+        werr(0, NO_SOUNDCODE_LOADED);
+
+    armovie_releasesoundbuffers();
+
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+/* sound code loading/unloading */
+
+static BOOL loadsoundcode(const char *file)
+{
+    if (m_alloc((void **)&soundcode_ptr, soundcode_size + sizeof(arsound_pollstr)))
+    {
+        arsound_hdr *sp;
+
+/* setup control block pointer and set to 0 */
+        poll_addr = (arsound_pollstr *)soundcode_ptr;
+        memset(poll_addr, 0, sizeof(arsound_pollstr));
+
+/* setup ptr for actual code */
+        sp = soundcode = (arsound_hdr *)(poll_addr + 1);
+
+#ifndef NDEBUG
+        fprintf(stderr, "LoadSoundCode %s to %p, poll @ %p\n", file, sp, poll_addr);
+#endif
+        if (os_err(file_load(file, sp)) == NULL)
+        {
+            free(cache_file);
+            cache_file = strdup(file);
+
+            timing_valid = FALSE;       /* no timing established */
+            timing_necessary = TRUE;    /* presume necessary til we know */
+
+            return TRUE;
+        }
+    }
+
+    armovie_unloadsoundcode();
+    return FALSE;
+}
+
+/*
+ * Load given sound code file from its leafname.
+ * First check to see if it is already loaded.
+ */
+
+static arsound_pollstr *armovie_getsoundcode_file(const char *leafname)
+{
+    BOOL success = FALSE;
+    char s[256];
+
+    get_sound_dir(s, sizeof(s));
+    strcat(s, leafname);
+    if (cache_file && strcmp(s, cache_file) == 0)
+        success = TRUE;
+    else
+    {
+/* get rid of old code - if any */
+        armovie_unloadsoundcode();
+
+/* load file from disc */
+        if ((soundcode_size = file_size(s, NULL)) != -1)
+            success = loadsoundcode(s);
+        else
+            werr(0, NO_REPLAY_FILE, s);
+    }
+    return success ? poll_addr : NULL;
+}
+
+static char *chan_string(int nchannels)
+{
+    static char s[4];
+    if (nchannels == 1)
+        s[0] = '\0';
+    else
+        sprintf(s, "x%d", nchannels);
+    return s;
+}
+
+/*
+ * Generalised sound type code file loader.
+ */
+
+BOOL armovie_getsoundcode(const armovie_soundstr *sound)
+{
+    arsound_pollstr *poll = NULL;
+    char buffer[32];
+    switch (sound->format)
+    {
+        case replay_StandardAudio:
+            strcpy(buffer, sound->filename);
+            strcat(buffer, chan_string(sound->channels));
+            poll = armovie_getsoundcode_file(buffer);
+            break;
+
+        case replay_IndirectAudio:
+            sprintf(buffer, "%s.Play", sound->filename);
+            strcat(buffer, chan_string(sound->channels));
+            poll = armovie_getsoundcode_file(buffer);
+            break;
+
+        default:
+            werr(0, UNKNOWN_FORMAT, sound->format);
+            break;
+    }
+
+    if (poll)
+    {
+        char *s;
+        double int_part;
+        poll->frequency_frac = (int) (modf(arsnd_realsamplerate(sound), &int_part) * 0x01000000);
+        poll->frequency_int = (int) int_part;
+
+/* Has user set quality level ? */
+        s = arsnd_varval("SoundQuality");
+        poll->quality = s ? (char) strtoul(s, NULL, 10) : 0;
+
+        poll->reversed = sound->sflags & armovie_ReversedStereo ? 1 : 0;
+
+#ifndef NDEBUG
+        fprintf(stderr, "Freq %d %g\n", poll->frequency_int, (double)poll->frequency_frac/0x01000000);
+#endif
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+void armovie_unloadsoundcode(void)
+{
+    armovie_releasesoundbuffers();
+
+    m_free(&soundcode_ptr);
+    poll_addr = NULL;
+    soundcode = NULL;
+
+    free(cache_file);
+    cache_file = NULL;
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+void armovie_registersoundmemfns(mem_allocfn alloc_fn, mem_freefn free_fn)
+{
+    armovie_unloadsoundcode();
+
+    sound_alloc = alloc_fn;
+    sound_free = free_fn;
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+/* wrappers for playback code */
+
+typedef void (*arplayfn)(int sndratio, arsound_pollstr *poll);
+typedef void (*arstopfn)(void);
+typedef void (*ardatafn)(void *data, size_t size);
+
+BOOL arsound_play(int sndratio)
+{
+    if (!playing)
+    {
+        arsound_hdr *sp = soundcode;
+        sp->samples_played_int = sp->samples_played_frac = 0;
+
+/* make sure that the second buffer has valid pointers in it in case the sound
+ * code tries to access them (which it may well)
+ */
+        if (sndratio == 2)
+        {
+            arsound_buffer *bp = sp->sndbufB;
+            if (bp->start == NULL)
+                bp->start = bp + 1;
+
+            if (poll_addr->quality == 0)
+                poll_addr->quality = HIGH_QUALITY;
+/*
+                poll_addr->quality = soundcode->flags & arsound_QualityCosts ? LOW_QUALITY : HIGH_QUALITY;
+ */
+        }
+
+        ((arplayfn)(unsigned int)&sp->play_entry)(sndratio, poll_addr);
+
+        playing = TRUE;
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void arsound_stop(void)
+{
+    if (playing)
+    {
+        ((arstopfn)(int)&soundcode->stop_entry)();
+
+        playing = FALSE;
+    }
+}
+
+void arsound_data(void *data, size_t size)
+{
+    ((ardatafn)(int)&soundcode->data_entry)(data, size);
+}
+
+
+void arsound_setmute(arsound_muteflag flags)
+{
+    if (poll_addr)
+        poll_addr->flags = flags;
+}
+
+arsound_muteflag arsound_readmute(void)
+{
+    return poll_addr ? poll_addr->flags : 0;
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+/* soundcode information */
+
+int arsound_bufferstatus(void)
+{
+    return (soundcode->sndbufA->empty ? 1 : 0) | (soundcode->sndbufB->empty ? 2 : 0);
+}
+
+int arsound_samplesplayed(void)
+{
+    return soundcode->samples_played_int;
+}
+
+/* eof arsndcode.c */

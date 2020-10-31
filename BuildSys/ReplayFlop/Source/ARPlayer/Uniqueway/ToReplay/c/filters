@@ -1,0 +1,592 @@
+/* > filters.c
+
+ * © SJ Middleton, 1994
+
+ */
+
+#include "alarm.h"
+#include "coords.h"
+#include "dbox.h"
+#include "help.h"
+#include "macros.h"
+#include "msgs.h"
+#include "pane.h"
+#include "screenmode.h"
+#include "template.h"
+#include "werr.h"
+#include "wimpx.h"
+#include "win.h"
+#include "wmisc.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "file.h"
+#include "strfn.h"
+
+#include "compress.h "
+
+#define FILTERS_DIR	ARMOVIE_DIR".Tools.Filters"
+
+#define FILTERS_IDENT	"filters"
+#define PANE_IDENT		"fpane"
+
+#define OK_FIELD		0
+#define CANCEL_FIELD	1
+
+#define AVAILABLE_FIELD	2
+#define IN_USE_FIELD	3
+
+#define LEFT_OFF	12
+#define RIGHT_OFF	52
+#define TOP_OFF		12
+#define BOTTOM_OFF	12
+
+#define SCROLL_GRANULARITY	2
+#define SCROLL_THRESHOLD	16
+#define SCROLL_AMOUNT		4
+
+typedef struct
+{
+	dbox_field	backing;
+	char		help[8];
+	wimp_w		w;
+	wimp_icon	text_icon;
+	int			text_height;
+} filterpane_str;
+
+static array 	filters_available = NULL,
+				filters_inuse = NULL;
+
+#define N_AVAILABLE			(array_size(filters_available))
+#define N_IN_USE			(array_size(filters_inuse))
+#define AVAILABLE_PTR(a)	((filter_entry *)array_ptr(filters_available, (a)))
+#define IN_USE_PTR(a)		((filter_entry *)array_ptr(filters_inuse, (a)))
+
+static dbox			filters_d = NULL;
+static wimp_w		filters_w;
+
+static filterpane_str fpane[2] =
+{
+	{ AVAILABLE_FIELD, "HfpaneA" },
+	{ IN_USE_FIELD, "HfpaneB" }
+};
+
+static array filters_copy = NULL;
+
+/* --------------------------------------------------------------------------- */
+
+static void delete_icons(filterpane_str *p, array filters)
+{
+	int i, nicons = array_size(filters);
+	for (i = 0; i < nicons; i++)
+		no_err(wimp_set_icon_state(p->w, i, wimp_IDELETED, wimp_IDELETED));
+}
+
+static void create_icons(filterpane_str *p, array filters)
+{
+	wimp_icreate	ic;
+	int	i, nicons = array_size(filters);
+
+	ic.w = p->w;
+	ic.i = p->text_icon;
+	for (i = 0; i < nicons; i++)
+	{
+		wimp_i ih;
+
+		ic.i.data.indirecttext.buffer = ((filter_entry *)array_ptr(filters, i))->name;
+
+		no_err(wimp_create_icon(&ic, &ih));
+
+		ic.i.box.y0 -= p->text_height;
+		ic.i.box.y1 -= p->text_height;
+	}
+}
+
+/* --------------------------------------------------------------------------- */
+
+/*
+ * This will delete all current filters and keep the window up to date
+ * if necessary.
+ */
+
+void filters_deleteall(array filters)
+{
+	int n = array_size(filters);
+	if (n)
+	{
+		if (filters_d)
+			delete_icons(&fpane[1], filters);
+		array_extend(filters, -n);
+	}
+}
+
+static void filter_remove(int index)
+{
+	if (index < N_IN_USE && index >= 0)
+	{
+		delete_icons(&fpane[1], filters_inuse);
+
+		array_delete(filters_inuse, index, 1);
+
+		create_icons(&fpane[1], filters_inuse);
+		force_redraw_window(fpane[1].w);
+	}
+}
+
+static int filter_index(int filter)
+{
+	int i, n = N_IN_USE;
+	for (i = 0; i < n; i++)
+		if (IN_USE_PTR(i)->position == filter)
+			return i;
+	return -1;
+}
+
+static int filter_number(int index)
+{
+    return IN_USE_PTR(index)->position;
+}
+
+static int filter_findname(const char *name)
+{
+	int i, n = N_AVAILABLE;
+	for (i = 0; i < n; i++)
+		if (strcmp(AVAILABLE_PTR(i)->name, name) == 0)
+			return i;
+	return -1;
+}
+
+static void filter_addbefore(int filter, int index)
+{
+	if (index > N_IN_USE || index < 0)
+		index = N_IN_USE;
+
+	if (array_insert(filters_inuse, index, 1))
+	{
+		delete_icons(&fpane[1], filters_inuse);
+
+		*IN_USE_PTR(index) = *AVAILABLE_PTR(filter);
+
+		create_icons(&fpane[1], filters_inuse);
+		force_redraw_window(fpane[1].w);
+	}
+}
+
+static void filter_add(wimp_w w, int filter, wimp_i over, int y)
+{
+	wimp_icon icon;
+	wimp_openstr o = window_state(w);
+
+	no_err(wimp_get_icon_info(w, over, &icon));
+	coords_box_toscreen(&icon.box, (coords_cvtstr *)&o.box);
+
+	if (y > (icon.box.y1 + icon.box.y0) / 2)
+    	filter_addbefore(filter, over);
+	else
+    	filter_addbefore(filter, over + 1);
+}
+
+static void copy_filters_list(array from, array to)
+{
+	int n = array_size(from);
+	if (array_extend(to, n - array_size(to)) && n != 0)
+		memcpy(array_ptr(to, 0), array_ptr(from, 0), n*sizeof(filter_entry));
+}
+
+/* --------------------------------------------------------------------------- */
+
+static wimp_caretstr	drag__caret;
+static int				drag__fromicon;
+static filterpane_str	*drag__frompane;
+
+static void check_ptr(int called_at, void *handle)
+{
+	filterpane_str	*p = handle;
+	wimp_mousestr	m;
+	no_err(wimp_get_point_info(&m));
+
+	if (m.w == p->w)
+	{
+		wimp_openstr	o = window_state(m.w);
+		int				dy = 0;
+
+		if (abs(m.y - o.box.y0) < SCROLL_THRESHOLD)
+			dy = -SCROLL_AMOUNT;
+		else if (abs(m.y - o.box.y1) < SCROLL_THRESHOLD)
+			dy = SCROLL_AMOUNT;
+
+		if (dy)
+		{
+			o.y += dy;
+			no_err(wimp_open_wind(&o));
+		}
+	}
+
+	alarm_set(alarm_timenow() + SCROLL_GRANULARITY, check_ptr, p);
+	UNUSED(called_at);
+}
+
+static BOOL pane_dragevents(wimp_eventstr *e, void *handle)
+{
+	filterpane_str *p = handle;
+	switch (e->e)
+	{
+		case wimp_EUSERDRAG:
+		{
+			wimp_mousestr m;
+			no_err(wimp_get_point_info(&m));
+			if (m.w == fpane[1].w)
+			{
+				int from;
+				if (drag__frompane->backing == IN_USE_FIELD)
+					from = filter_number(drag__fromicon);
+				else
+					from = drag__fromicon;
+
+				filter_remove(filter_index(from));
+				if (m.i < 0)
+					filter_addbefore(from, m.i);
+				else
+					filter_add(m.w, from, m.i, m.y);
+
+				no_err(wimp_set_icon_state(drag__frompane->w, drag__fromicon, 0, wimp_ISELECTED));
+			}
+			else if (m.w == fpane[0].w)
+			{
+				if (drag__frompane->backing == IN_USE_FIELD)
+					filter_remove(drag__fromicon);
+			}
+
+/* stop drag stuff */
+			wimp_set_caret_pos(&drag__caret);
+			win_remove_unknown_event_processor(pane_dragevents, p);
+			alarm_removeallproc(check_ptr, &fpane[1]);
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static void start_drag(filterpane_str *p, wimp_mousestr *mp)
+{
+	wimp_dragstr	drag;
+	wimp_icon		icon;
+	wimp_openstr	o = window_state(p->w);
+
+	no_err(wimp_get_icon_info(p->w, mp->i, &icon));
+
+	drag.window = p->w;
+	drag.type = wimp_USER_FIXED;
+
+	drag.box = icon.box;
+	coords_box_toscreen(&drag.box, (coords_cvtstr *)&o.box);
+
+	drag.parent.x0 = drag.box.x0 - mp->x;
+	drag.parent.x1 = drag.box.x1 - mp->x + screen_Vars.oswidth;
+	drag.parent.y0 = drag.box.y0 - mp->y;
+	drag.parent.y1 = drag.box.y1 - mp->y + screen_Vars.osheight;
+
+	no_err(wimp_drag_box(&drag));
+
+	drag__frompane = p;
+	drag__fromicon = mp->i;
+
+	win_add_unknown_event_processor(pane_dragevents, p);
+	wimp_get_caret_pos(&drag__caret);
+	check_ptr(0, &fpane[1]);
+
+	{
+		wimp_caretstr cs;
+		cs.w = p->w;
+		cs.i = -1;
+		cs.y = -0x4000;
+		cs.x = -0x4000;
+		cs.height = 0;
+		wimp_set_caret_pos(&cs);
+	}
+}
+
+static void	drag_abort(void)
+{
+	wimp_drag_box((wimp_dragstr *)-1);
+	wimp_set_caret_pos(&drag__caret);
+	win_remove_unknown_event_processor(pane_dragevents, drag__frompane);
+	alarm_removeallproc(check_ptr, &fpane[1]);
+}
+
+/* --------------------------------------------------------------------------- */
+
+static void filters_events(dbox d, void *handle)
+{
+	compress_str	*cp = handle;
+	dbox_field		action = dbox_get(d);
+	switch (action)
+	{
+		case OK_FIELD:
+			if (!dbox_persist())
+				filters_dispose();
+			break;
+
+		case CANCEL_FIELD:
+		case dbox_CLOSE:
+			copy_filters_list(filters_copy, cp->o.filters);
+			if (!dbox_persist())
+				filters_dispose();
+			break;
+	}
+}
+
+static BOOL filters_rawevents(dbox d, void *event, void *handle)
+{
+	wimp_eventstr *e = event;
+	switch (e->e)
+	{
+		case wimp_EOPEN:
+			pane_check_open(&e->data.o);
+			return TRUE;
+	}
+	return FALSE;
+	UNUSED(handle);
+	UNUSED(d);
+}
+
+static void pane_events(wimp_eventstr *e, void *handle)
+{
+	filterpane_str *p = handle;
+	switch (e->e)
+	{
+		case wimp_EOPEN:
+			no_err(wimp_open_wind(&e->data.o));
+			break;
+
+		case wimp_EBUT:
+			switch (e->data.but.m.bbits)
+			{
+				case wimp_BRIGHT:
+					if (p->backing == IN_USE_FIELD)
+						filter_remove(e->data.but.m.i);
+					break;
+
+				case wimp_BDRAGLEFT:
+					if (e->data.but.m.i >= 0)
+						start_drag(p, &e->data.but.m);
+					break;
+			}
+			break;
+
+		case wimp_EKEY:
+			if (e->data.key.chcode == 27)
+				drag_abort();
+			break;
+
+		case wimp_ESEND:
+		case wimp_ESENDWANTACK:
+			if (e->data.msg.hdr.action == wimp_MHELPREQUEST)
+				help_reply(msgs_lookup(p->help));
+			break;
+	}
+}
+
+/* --------------------------------------------------------------------------- */
+
+static void fiddle_template(void)
+{
+	wimp_wind *wp;
+	wp = template_syshandle(PANE_IDENT);
+	fpane[1].text_icon = fpane[0].text_icon = *(wimp_icon *)(wp+1);
+	fpane[1].text_height = fpane[0].text_height = fpane[0].text_icon.box.y1 - fpane[0].text_icon.box.y0;
+
+	wp->nicons = 0;
+}
+
+static BOOL setup_pane(filterpane_str *p, BOOL source)
+{
+	wimp_icon	back_icon;
+	wimp_wind	*wp;
+	int			width, height;
+
+	no_err(wimp_get_icon_info(filters_w, p->backing, &back_icon));
+	width = (back_icon.box.x1 - RIGHT_OFF) - (back_icon.box.x0 + LEFT_OFF);
+	height = (back_icon.box.y1 - TOP_OFF) - (back_icon.box.y0 + BOTTOM_OFF);
+
+	wp = template_syshandle(PANE_IDENT);
+	wp->box.x0 = 0;
+	wp->box.y1 = 0;
+	wp->box.x1 = width;
+	wp->box.y0 = -height;
+	wp->ex.y0 = - N_AVAILABLE*p->text_height;
+	if (wp->ex.y0 > wp->box.y0)
+		wp->ex.y0 = wp->box.y0;
+	os_err(wimp_create_wind(wp, &p->w));
+
+	create_icons(p, source ? filters_available : filters_inuse);
+
+	pane_setpane(filters_w, p->w,
+		back_icon.box.x0 + LEFT_OFF, back_icon.box.y1 - TOP_OFF,
+		pane_AttachLogicalX | pane_AttachLeft | pane_AttachLogicalY,
+		0, 0, p);
+
+	win_register_event_handler(p->w, pane_events, p);
+	return TRUE;
+}
+
+static void check_close(filterpane_str *p)
+{
+	if (p->w)
+	{
+		pane_remove(p->w, FALSE);
+		no_err(wimp_close_wind(p->w));
+		no_err(wimp_delete_wind(p->w));
+		p->w = 0;
+	}
+}
+
+/* --------------------------------------------------------------------------- */
+
+void filters_open(compress_str *cp)
+{
+	dbox d = filters_d;
+
+	if (d == NULL)
+	{
+		if ((d = dbox_new(FILTERS_IDENT)) == NULL)
+		{
+			filters_dispose();
+			return;
+		}
+
+		filters_d = d;
+		filters_w = dbox_syshandle(d);
+
+		copy_filters_list(cp->o.filters, filters_copy);
+		filters_inuse = cp->o.filters;
+
+		if (!setup_pane(&fpane[0], TRUE) ||
+			!setup_pane(&fpane[1], FALSE))
+		{
+			filters_dispose();
+			return;
+		}
+
+		dbox_showstatic(d);
+		dbox_eventhandler(d, filters_events, cp);
+		dbox_raw_eventhandler(d, filters_rawevents, cp);
+
+	}
+
+	if (d)
+	{
+		wimp_openstr o = window_state(dbox_syshandle(d));
+		o.behind = -1;
+		pane_check_open(&o);
+	}
+}
+
+void filters_dispose(void)
+{
+	if (filters_d)
+	{
+		dbox_savepos(filters_d);
+		dbox_dispose(&filters_d);
+		filters_d = NULL;
+	}
+	check_close(&fpane[0]);
+	check_close(&fpane[1]);
+}
+
+BOOL is_filters_open(void)
+{
+	return filters_d != NULL;
+}
+
+void filters_refresh(compress_str *cp)
+{
+	dbox d = filters_d;
+	if (d)
+	{
+		delete_icons(&fpane[1], filters_inuse);
+
+		copy_filters_list(cp->o.filters, filters_copy);
+		filters_inuse = cp->o.filters;
+
+		create_icons(&fpane[1], filters_inuse);
+		force_redraw_window(fpane[1].w);
+	}
+}
+
+/* --------------------------------------------------------------------------- */
+
+static int scanfn(const char *filename, int filetype, int size, void *handle)
+{
+	array f = handle;
+	if (array_extend(f, 1))
+	{
+		int				n = array_size(f)-1;
+		filter_entry	*fep = array_ptr(f, n);
+
+		file_leaf(filename, fep->name);
+		fep->position = n;
+
+		return 1;
+	}
+	return 0;
+	UNUSED(size);
+	UNUSED(filetype);
+}
+
+void filters_init(void)
+{
+	filters_available = array_new(0, sizeof(filter_entry), h_alloc, h_free);
+	if (file_size(FILTERS_DIR, NULL) > 0)
+		file_scandir(FILTERS_DIR, FALSE, scanfn, filters_available);
+
+	filters_copy = array_new(0, sizeof(filter_entry), f_alloc, f_free);
+
+	fiddle_template();
+}
+
+BOOL is_filters_available(void)
+{
+	return N_AVAILABLE != 0;
+}
+
+/* --------------------------------------------------------------------------- */
+
+static opt_line_t filter_opts[] =
+{
+	{ "Filter", NULL, NULL, opt_String, sizeoff(filter_entry, name), offsetof(filter_entry, name) },
+	{ NULL, NULL, NULL, opt_EndOfList }
+};
+
+void filters_write(optfile of, int code, array filters)
+{
+	if (filters)
+	{
+		int i, n = array_size(filters);
+		for (i = 0; i < n; i++)
+		{
+			filter_entry *fep = array_ptr(filters, i);
+			opt_write(of, code, filter_opts, fep);
+		}
+	}
+}
+
+void filters_read(optfile of, array filters)
+{
+	filter_entry entry;
+	opt_read(of, filter_opts, &entry);
+	if ((entry.position = filter_findname(entry.name)) != -1)
+	{
+		int n = array_size(filters);
+		if (array_extend(filters, 1))
+		{
+			filter_entry *fep = array_ptr(filters, n);
+			*fep = entry;
+		}
+	}
+}
+
+/* --------------------------------------------------------------------------- */
+
+/* eof filter.c */

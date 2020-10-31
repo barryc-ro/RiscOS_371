@@ -1,0 +1,266 @@
+#include <stdio.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "osbyte.h"
+#include "osmodule.h"
+#include "osfile.h"
+#include "osfind.h"
+#include "osgbpb.h"
+#include "osargs.h"
+
+#include "ModUtils.h"
+
+os_error *Unplug(const char *module)
+{
+    char cmd[64];
+
+    sprintf(cmd, "Unplug %s", module);
+    return xos_cli(cmd);
+}
+
+os_error *UnplugSection(const char *module, osmodule_section_no section)
+{
+    char cmd[64];
+
+    sprintf(cmd, "Unplug %s %d", module, section);
+    return xos_cli(cmd);
+}
+
+os_error *UnplugOld(const char *module, int version)
+{
+    if (!RMFind(module, 0, version))
+    	return Unplug(module);
+    else
+    	return 0;
+}
+
+/*
+ * Use some intelligence - insert only the newest
+ */
+bool RMInsert(const char *module, int minversion)
+{
+    int module_no = 0;
+    osmodule_section_no section = osmodule_SECTION_SYSTEM;
+    char cmd[64];
+    char *name;
+    int version;
+    int max_version=-1;
+    osmodule_section_no best_section=0;
+    os_error *e;
+
+    // First pass - find newest, and check its OK
+    for (;;)
+    {
+        e=xosmodule_enumerate_rom_with_info(module_no, section, &module_no, &section,
+        	      	    	    	    &name, 0, 0, &version);
+        if (e)
+            break;
+
+        if (strcmp(module, name) == 0)
+        {
+            if (version > max_version)
+            {
+                max_version=version;
+                best_section=section;
+            }
+        }
+    }
+
+    module_no = 0;
+    section = osmodule_SECTION_SYSTEM;
+    // Second pass - insert newest, unplug others.
+    for (;;)
+    {
+        e=xosmodule_enumerate_rom_with_info(module_no, section, &module_no, &section,
+        	      	    	    	    &name, 0, 0, &version);
+        if (e)
+            break;
+
+        if (strcmp(module, name) == 0)
+        {
+            if (version == max_version && max_version >= minversion && section == best_section)
+            {
+                sprintf(cmd, "RMInsert %s %d", module, section);
+                Do(cmd);
+            }
+            else
+            	UnplugSection(module, section);
+        }
+    }
+
+    return max_version >= minversion;
+}
+
+os_error *Do(const char *cmd)
+{
+    return (os_error *)_kernel_oscli(cmd);
+}
+
+bool RMLoaded(const char *module)
+{
+    return xosmodule_lookup(module, 0, 0, 0, 0, 0) == 0;
+}
+
+/*
+ * Returns:   0 if not available
+ *            1 if available in ROM
+ *            2 if available on disc
+ */
+int RMFind(const char *module, const char *filename, int req_version)
+{
+    int module_no = 0;
+    osmodule_section_no section = osmodule_SECTION_SYSTEM;
+    char *name;
+    int version;
+    os_f file;
+    os_error *e = 0;
+    int ptr, i;
+    char c;
+
+    for (;;)
+    {
+    	e=xosmodule_enumerate_rom_with_info(module_no, section, &module_no, &section,
+        	      	    	    	    &name, 0, 0, &version);
+    	if (e)
+    	    break;
+
+    	if (strcmp(module, name) == 0 && version >= req_version)
+    	    return 1;
+    }
+
+    if (!filename)
+    	return 0;
+
+    e=xosfind_openin(osfind_PATH|osfind_ERROR_IF_ABSENT|osfind_ERROR_IF_DIR,
+    	    	     filename, 0, &file);
+
+    if (e)
+    	return 0;
+
+    if (xosgbpb_read_at(file, (byte *) &ptr, sizeof(int), 20, 0)) {
+    	osfind_close(file);
+    	return 0;
+    }
+
+    osargs_set_ptr(file, ptr);
+
+    do
+    {
+        os_bget(file, &c);
+    }
+    while (c != 9);
+
+    do
+    {
+        os_bget(file, &c);
+    }
+    while (c == 9);
+
+    version = c - '0';
+
+    for (;;)
+    {
+        os_bget(file, &c);
+        if (c == '.')
+            break;
+        version = (version << 4) + (c - '0');
+    }
+
+    i = 16;
+
+    for (;;)
+    {
+        os_bget(file, &c);
+        if (c < '0')
+            break;
+        version = (version << 4) + (c - '0');
+        i -= 4;
+        if (i == 0)
+            break;
+    }
+
+    osfind_close(file);
+
+    version <<= i;
+
+    if (version >= req_version)
+    	return 2;
+
+    return 0;
+}
+
+int VersionToInt(const char *s)
+{
+    int i = 16;
+    int v = 0;
+
+    while (*s >= '0' && *s <= '9')
+    {
+        v=(v<<4) + *s - '0';
+        s++;
+    }
+
+    if (*s != '.')
+        return v<<16;
+
+    s++;
+
+    while (*s >= '0' && *s <= '9')
+    {
+        v=(v<<4) + *s - '0';
+        i-=4;
+        if (i == 0)
+            break;
+        s++;
+    }
+
+    return v<<i;
+}
+
+char *VersionToString(int n)
+{
+    static char s[12];
+    char *p=s;
+
+    if (n >> 28)
+        *p++=(n >> 28) + '0';
+    n &= ~0xf0000000;
+
+    if (n >> 24)
+        *p++=(n >> 24) + '0';
+    n &= ~0x0f000000;
+
+    if (n >> 20)
+        *p++=(n >> 20) + '0';
+    n &= ~0x00f00000;
+
+    *p++=(n >> 16) + '0';
+    n &= ~0x000f0000;
+
+    *p++='.';
+
+    *p++=(n >> 12) + '0';
+    n &= ~0x0000f000;
+
+    *p++=(n >> 8) + '0';
+
+    *p = '\0';
+
+    return s;
+}
+
+bool Exists(const char *filename)
+{
+    return osfile_read_stamped(filename, 0, 0, 0, 0, 0) != fileswitch_NOT_FOUND;
+}
+
+byte readCMOS(int b)
+{
+    return osbyte2(osbyte_READ_CMOS, b, 0);
+}
+
+void writeCMOS(int b, byte v)
+{
+    osbyte(osbyte_WRITE_CMOS, b, v);
+}

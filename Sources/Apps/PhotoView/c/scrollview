@@ -1,0 +1,749 @@
+/*
+ *  c.scrollview
+ *
+ *  Routines for opening and handling 'scrollview' windows
+ *
+ *  These are partial scrolling alternatives to normal
+ *  'full' image windows for when there is not enough
+ *  memory.  Instead of a full image, we instead have
+ *  a smaller window and scroll around it, reloading
+ *  the section of image as we go.
+ *
+ */
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "werr.h"
+#include "wimpt.h"
+#include "win.h"
+#include "help.h"
+#include "template.h"
+#include "visdelay.h"
+#include "bbc.h"
+
+#include "pcdlib.h"
+
+#include "pcdovervw.h"
+
+#include "sprparam.h"
+#include "image.h"
+
+#ifdef TEMPORARY_EXPORT
+#include "export32.h"
+#endif
+
+
+
+/*--- some external status vars ---*/
+
+extern image_str  *images;
+extern menu        image_menu;
+
+extern PCDpaletteHdl  palettehdl;   /* always contains a palette suitable for the
+                                       current screen mode (defined in c.pcdovervw) */
+
+#ifdef TEMPORARY_EXPORT
+extern menu  export_res_menu;
+extern menu  export_ori_menu;
+#endif
+
+
+
+/*--- some global status vars ---*/
+
+static int   current_ovw_id = -1;
+
+static BOOL  regenerate_image;
+
+static int   last_scx;
+static int   last_scy;
+
+static int   last_wid;
+static int   last_hgt;
+
+static PCDspriteform   modeinfo;
+static BOOL            modechanged;
+
+
+/*--- some arrays for use in redraw ---*/
+
+static char    pixtrans[255];
+static int     paltemp[255];
+
+
+/* the default height to make the scrollview window */
+/* (768x512 = 'Base') */
+#define  DEF_WINDOW_WIDTH   768
+#define  DEF_WINDOW_HEIGHT  512
+
+static int     WindowWidth;
+static int     WindowHeight;
+
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+/*
+ *  scrollview_progress()
+ *
+ *  A progress function for scrollview windows.
+ *  Just displays a percent on the hourglass.
+ *
+ */
+
+
+static void  scrollview_progress(int numerator, int denominator, long userdata)
+{
+   visdelay_percent((numerator * 100)/denominator);
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+/*
+ *  scrollview_regenerate_image()
+ *
+ *  Regenerate because the window has been scrolled or
+ *  the mode has changed etc.
+ *
+ *  Only ever called from a redraw event.
+ *
+ *  Returns FALSE if there was a problem.
+ *
+ */
+
+
+static BOOL  scrollview_regenerate_image(wimp_redrawstr *r)
+{
+   PCDrect    rect;
+   PCDstatus  err = NULL;
+   BOOL       whole_thing = TRUE;
+   int        newscx, newscy;
+   int        dscx, dscy;
+   int        newwid, newhgt;
+   int        xeig = bbc_vduvar(4);
+   int        yeig = bbc_vduvar(5);
+   _kernel_swi_regs  rg;
+   sprite_area       fake_sarea;
+
+
+   newscx = r->scx / 2;
+   newscy = -(r->scy / 2);
+
+   /*--- how much have we scrolled? ---*/
+   dscx = newscx - (last_scx / 2);
+   dscy = newscy - (-last_scy / 2);
+
+   newwid = (r->box.x1 - r->box.x0)/2;
+   newhgt = (r->box.y1 - r->box.y0)/2;
+
+
+   /*--- if scroll offsets are the same and mode hasn't changed,
+         then we must have just resized the window.  If window
+         has shrunk, we can get away with just resizing the sprite ---*/
+   if ((dscx == 0) && (dscy == 0) &&
+       (newwid <= last_wid) && (newhgt <= last_hgt) &&
+       (!modechanged))
+   {
+      int    *spr;
+      int     n;
+
+      /*--- Initialise fake sprite area header ---*/
+      spr = (int *)PCDgetSpritePtr(images[current_ovw_id].sprite);
+      n = spr[0];                                                /* size of sprite */
+      fake_sarea.size    = (spr - (int *)&fake_sarea) * 4 + n;   /* offset to end of sprarea */
+      fake_sarea.number  = 1;                                    /* number of sprites in area */
+      fake_sarea.sproff  = (spr - (int *)&fake_sarea) * 4;       /* offset to sprite */
+      fake_sarea.freeoff = fake_sarea.size;                      /* offset to end of sprites */
+
+      /*--- delete the columns that are now outside the window ---*/
+      rg.r[0] = 0x200 + 58;
+      rg.r[1] = (int)&fake_sarea;    /* we need fake sprarea because call updates values */
+      rg.r[2] = PCDgetSpritePtr(images[current_ovw_id].sprite);   /* address of sprite */
+      rg.r[3] = newwid >> (xeig - 1);
+      rg.r[4] = -((last_wid - newwid) >> (xeig - 1));
+      err = (PCDstatus)_kernel_swi(OS_SpriteOp, &rg, &rg);
+
+      /*--- delete the rows that are now outside the window ---*/
+      if (err == NULL)
+      {
+         rg.r[0] = 0x200 + 57;
+         rg.r[1] = (int)&fake_sarea;    /* we need fake sprarea because call updates values */
+         rg.r[2] = PCDgetSpritePtr(images[current_ovw_id].sprite);   /* address of sprite */
+         rg.r[3] = 0;
+         rg.r[4] = -((last_hgt - newhgt) >> (yeig - 1));
+         err = (PCDstatus)_kernel_swi(OS_SpriteOp, &rg, &rg);
+      }
+
+      regenerate_image = FALSE;
+      last_wid = newwid;
+      last_hgt = newhgt;
+
+      return (err == NULL);
+   }
+
+
+   /*--- can we get away with just rereading a part of the view
+         (ie have we just scrolled a little bit)? ---*/
+
+   if ( (!modechanged) &&                                     /* mode hasn't changed */
+        (newwid == last_wid) && (newhgt == last_hgt) &&       /* size hasn't changed */
+        (!((dscx != 0) && (dscy != 0))) &&                    /* only scrolling in one direction */
+        (abs(dscx) < last_wid) && (abs(dscy) < last_hgt))     /* scrolling is within view */
+      whole_thing = FALSE;
+
+
+   regenerate_image = FALSE;
+
+   last_scx = r->scx;
+   last_scy = r->scy;
+
+   last_wid = newwid;
+   last_hgt = newhgt;
+
+
+   /*--- set up the callback functions ---*/
+   PCDsetProgress(images[current_ovw_id].pcdhdl, scrollview_progress, 0);
+   PCDsetAbort(images[current_ovw_id].pcdhdl, NULL, 0);
+
+
+   visdelay_begin();
+
+   if (!whole_thing)
+   {
+      int    *spr;
+      int     at, atx, aty;
+
+      PCDbitmapHdl      newbit;   /* handle for new bit of image */
+      sprite_id         sid;
+      sprite_state      sst;
+
+
+      /*--- Initialise fake sprite area header ---*/
+      spr = (int *)PCDgetSpritePtr(images[current_ovw_id].sprite);
+      at = spr[0];                                               /* size of sprite */
+      fake_sarea.size    = (spr - (int *)&fake_sarea) * 4 + at;  /* offset to end of sprarea */
+      fake_sarea.number  = 1;                                    /* number of sprites in area */
+      fake_sarea.sproff  = (spr - (int *)&fake_sarea) * 4;       /* offset to sprite */
+      fake_sarea.freeoff = fake_sarea.size;                      /* offset to end of sprites */
+
+
+      /*--- first we will copy the existing bit of sprite to the correct place ---*/
+      /* (we do this by inserting rows/cols at one end and deleting them from
+          the other end) */
+
+      if (dscx != 0)
+      {
+         /* we are scrolling horizontally */
+
+         int     cols = dscx >> (xeig - 1);      /* ('- 1' because our coords have already been divided by 2) */
+         int     wid = newwid >> (xeig - 1);
+
+
+         if (cols < 0)
+         {
+            /* scrolling leftwards */
+            at = wid + cols;
+            atx = 0;
+         }
+         else
+         {
+            /* scrolling rightwards */
+            at = 0;
+            atx = wid - cols;
+         }
+         aty = 0;
+
+         /* delete the columns that are scrolling off */
+         rg.r[0] = 0x200 + 58;
+         rg.r[1] = (int)&fake_sarea;    /* we need fake sprarea because call updates values */
+         rg.r[2] = PCDgetSpritePtr(images[current_ovw_id].sprite);   /* address of sprite */
+         rg.r[3] = at;
+         rg.r[4] = (cols < 0) ? cols : -cols;
+         err = (PCDstatus)_kernel_swi(OS_SpriteOp, &rg, &rg);
+
+         /* insert some columns at the other side */
+         rg.r[0] = 0x200 + 58;
+         rg.r[2] = PCDgetSpritePtr(images[current_ovw_id].sprite);   /* address of sprite */
+         rg.r[3] = atx;
+         rg.r[4] = (cols < 0) ? -cols : cols;
+         if (err == NULL)
+            err = (PCDstatus)_kernel_swi(OS_SpriteOp, &rg, &rg);
+      }
+      else
+      {
+         /* we are scrolling vertically */
+
+         int     rows = dscy >> (yeig - 1);
+         int     hgt = newhgt >> (yeig - 1);
+
+
+         if (rows > 0)
+         {
+            /* scrolling downwards */
+            at = hgt - rows;
+            aty = 0;
+         }
+         else
+         {
+            /* scrolling upwards */
+            at = 0;
+            aty = hgt + rows;
+         }
+         atx = 0;
+
+         /* delete the rows that are scrolling off */
+         rg.r[0] = 0x200 + 57;
+         rg.r[1] = (int)&fake_sarea;    /* we need fake sprarea because call updates values */
+         rg.r[2] = PCDgetSpritePtr(images[current_ovw_id].sprite);   /* address of sprite */
+         rg.r[3] = at;
+         rg.r[4] = (rows < 0) ? rows : -rows;
+         err = (PCDstatus)_kernel_swi(OS_SpriteOp, &rg, &rg);
+
+         /* insert some rows at the other side */
+         rg.r[0] = 0x200 + 57;
+         rg.r[2] = PCDgetSpritePtr(images[current_ovw_id].sprite);   /* address of sprite */
+         rg.r[3] = aty;
+         rg.r[4] = (rows < 0) ? -rows : rows;
+         if (err == NULL)
+            err = (PCDstatus)_kernel_swi(OS_SpriteOp, &rg, &rg);
+      }
+
+
+      /*--- read the new bit of sprite ---*/
+      if (dscx == 0)
+      {
+         rect.left  = newscx;
+         rect.right = newscx + newwid;
+      }
+      else
+      {
+         if (dscx < 0)
+         {
+            rect.left  = newscx;
+            rect.right = rect.left - dscx;
+         }
+         else
+         {
+            rect.right = newscx + newwid;
+            rect.left  = rect.right - dscx;
+         }
+      }
+
+      if (dscy == 0)
+      {
+         rect.top    = newscy;
+         rect.bottom = newscy + newhgt;
+      }
+      else
+      {
+         if (dscy < 0)
+         {
+            rect.top    = newscy;
+            rect.bottom = rect.top - dscy;
+         }
+         else
+         {
+            rect.bottom = newscy + newhgt;
+            rect.top    = rect.bottom - dscy;
+         }
+      }
+
+
+      /*--- read the newly-scrolled-on bit of image ---*/
+      err = PCDloadImage(images[current_ovw_id].pcdhdl, &rect, &modeinfo, &newbit);
+
+      if (err == NULL)
+      {
+         /*--- switch output to the scrollview sprite ---*/
+         sid.tag = sprite_id_addr;
+         sid.s.addr = (sprite_ptr)PCDgetSpritePtr(images[current_ovw_id].sprite);
+         err = (PCDstatus)sprite_outputtosprite(&fake_sarea, &sid, 0, &sst);
+
+         if (err == NULL)
+         {
+            /*--- plot the new bit to the current scrollview sprite ---*/
+            rg.r[0] = 0x222;    /* put sprite at user coords */
+            rg.r[1] = 42;       /* a non-zero value */
+            rg.r[2] = PCDgetSpritePtr(newbit);
+            rg.r[3] = atx << xeig;
+            rg.r[4] = aty << yeig;
+            rg.r[5] = 0;        /* plot action */
+            err = (PCDstatus)_kernel_swi(OS_SpriteOp, &rg, &rg);
+
+            /*--- switch output back again ---*/
+            sprite_restorestate(sst);
+         }
+
+         /*--- free the image bit ---*/
+         PCDfreeBitmap(newbit);
+      }
+   }
+
+
+   if ((whole_thing) && (err == NULL))
+   {
+      /*--- free the old sprite ---*/
+      if (images[current_ovw_id].sprite != 0)
+         PCDfreeBitmap(images[current_ovw_id].sprite);
+
+      /*--- create the sprite ---*/
+      rect.left   = newscx;
+      rect.top    = newscy;
+      rect.right  = rect.left + newwid;
+      rect.bottom = rect.top  + newhgt;
+
+      err = PCDloadImage(images[current_ovw_id].pcdhdl, &rect, &modeinfo, &images[current_ovw_id].sprite);
+   }
+
+
+   visdelay_end();
+
+
+   if (err != NULL)
+   {
+      /* Oh, oh... there was a problem */
+
+      wimp_redrawstr    r2;
+      int               more;
+
+
+      /*--- display the error ---*/
+      werr(FALSE, "PhotoCD error: %s", err->errmess);
+
+      /*--- clear the redraw rectangle list ---*/
+      r2.w = r->w;
+      do
+      {
+         wimp_get_rectangle(&r2, &more);
+
+      } while (more);
+
+      /*--- close the window ---*/
+      wimpt_noerr(wimp_close_wind(images[current_ovw_id].whandle));
+
+      /*--- close the Image Pac ---*/
+      PCDclose(images[current_ovw_id].pcdhdl);
+
+      /*--- tidy up array entry ---*/
+      images[current_ovw_id].whandle = 0;
+
+      current_ovw_id = -1;
+
+      return FALSE;
+   }
+
+
+   return TRUE;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+/*      Sprite/image display window event handlers                          */
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  scrollview_event_handler(wimp_eventstr *e, void *handle)
+{
+
+   switch(e->e)
+   {
+
+      case wimp_EOPEN:
+         {
+            wimp_wstate  ws;
+            int          w, h;
+
+
+            wimpt_noerr(wimp_open_wind(&e->data.o));
+
+            /*--- if window size has changed, then we need to arrange
+                  for the regeneration of the image ---*/
+            wimp_get_wind_state(e->data.o.w, &ws);
+            w = ws.o.box.x1 - ws.o.box.x0;
+            h = ws.o.box.y1 - ws.o.box.y0;
+            if ((w != WindowWidth) || (h != WindowHeight))
+            {
+               regenerate_image = TRUE;
+               WindowWidth  = w;
+               WindowHeight = h;
+            }
+         }
+         break;
+
+      /*----------*/
+
+      case wimp_ECLOSE:
+         {
+            wimpt_noerr(wimp_close_wind(e->data.o.w));
+
+            /*--- close the Image Pac ---*/
+            PCDclose(images[current_ovw_id].pcdhdl);
+
+            /*--- remove and tidy up array entry ---*/
+            PCDfreeBitmap(images[current_ovw_id].sprite);
+            images[current_ovw_id].whandle = 0;
+
+            current_ovw_id = -1;
+         }
+         break;
+
+      /*----------*/
+
+      case wimp_EREDRAW:
+         {
+            wimp_redrawstr    r;
+            int               more;
+            int               j;
+            _kernel_swi_regs  rg;
+            int              *palptr, *sp;
+            char             *ctrans;
+
+
+            r.w = e->data.o.w;
+            wimp_redraw_wind(&r, &more);
+
+
+            modechanged = pcdovervw_read_modeinfo(&modeinfo);
+
+            if (modechanged || (r.scx != last_scx) || (r.scy != last_scy))
+               regenerate_image = TRUE;
+ 
+            if (regenerate_image)
+            {
+               if (!scrollview_regenerate_image(&r))
+                  return;
+            }
+
+
+            /*--- set up colour translation table (see RO3 PRMs page 1-834) ---*/
+            ctrans = 0;
+            if (modeinfo.bpp <= 8)
+            {
+               sp = (int *)PCDgetSpritePtr(images[current_ovw_id].sprite);
+
+               for (j=0; j<256; j++)
+                  paltemp[j] = sp[11 + j*2];
+               palptr = paltemp;
+               for (j=0; j<256; j++)
+                  pixtrans[j] = j;
+               if (sp[8] == (44+2048))
+               {
+                  for (j=0; j<256; j++)
+                  {
+                     rg.r[0] = palptr[j];
+                     _kernel_swi(ColourTrans_ReturnColourNumber, &rg, &rg);
+                     pixtrans[j] = (char)rg.r[0];
+                  }
+               }
+               else
+               {
+                  rg.r[0] = -1;
+                  rg.r[1] = (int)palptr;
+                  rg.r[2] = -1;
+                  rg.r[3] = -1;
+                  rg.r[4] = (int)pixtrans;
+                  _kernel_swi(ColourTrans_SelectTable, &rg, &rg);
+               }
+               for (j=0; j<256; j++)
+               {
+                  if (pixtrans[j] != j)
+                  {
+                     ctrans = pixtrans;
+                     break;
+                  }
+               }
+            }
+
+
+            rg.r[0] = 0x234;         /* put sprite scaled */
+            rg.r[1] = 42;            /* Arthur! don't forget your towel! */
+            rg.r[2] = PCDgetSpritePtr(images[current_ovw_id].sprite);
+            rg.r[3] = r.box.x0;
+            rg.r[4] = r.box.y0;
+            rg.r[5] = 0;             /* plot action */
+            rg.r[6] = 0;             /* scale factors (unscaled) */
+            rg.r[7] = (int)ctrans;   /* colour translation */
+
+            while (more)
+            {
+               _kernel_swi(OS_SpriteOp, &rg, &rg);
+
+               wimp_get_rectangle(&r, &more);
+            }
+
+         }
+         break;
+
+   }
+
+   return;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+/*      Sprite/image display window main routine                            */
+/*--------------------------------------------------------------------------*/
+
+/* effectively a replacement for the 'image_openimage()'
+   function except with slightly different operation */
+
+
+
+BOOL  scrollview_openimage(int ovw_id, int thumbno, PCDspriteform *mi)
+{
+   template       *t;
+   wimp_w          wh;
+   wimp_wstate     ws;
+   wimp_redrawstr  wr;
+   char            str[256];
+
+
+   /*--- only one 'scrollview' open at a time ---*/
+   if (current_ovw_id != -1)
+      return FALSE;
+
+
+   /*-- ask user if they really want one of these! ---*/
+   {
+      os_error          oe;
+      _kernel_swi_regs  r;
+      char              tmpstr[256];
+
+      strncpy(oe.errmess, msgs_lookup("wantsv:Not enough memory.  Do you wish to open a scrolling partial image instead?"), 255);
+      oe.errmess[255] = '\0';
+      sprintf(tmpstr, "%s %s",msgs_lookup("messfrom:Message from"),
+                              msgs_lookup("MEicbarT:PhotoView"));
+      r.r[0] = (int)&oe;
+      r.r[1] = 0x97;        /* flags: ok/cancel/highlight cancel/no prefix/no beep */
+      r.r[2] = (int)tmpstr;
+      _kernel_swi(Wimp_ReportError, &r, &r);
+
+      if (r.r[1] == 2)    /* Cancel clicked */
+         return TRUE;     /* return TRUE - if we don't, user will get 'Not enough memory' error again */
+   }
+
+
+   /*--- create the window ---*/
+   t = template_copy(template_find("Image"));
+
+   t->window.colours[wimp_WCWKAREABACK] = 7;     /* black background */
+
+   if (wimpt_complain(wimp_create_wind(&t->window, &wh)) != NULL)
+      return FALSE;
+
+
+   current_ovw_id = ovw_id;
+
+   images[ovw_id].whandle = wh;
+   images[ovw_id].sprite  = 0;
+
+   regenerate_image = TRUE;
+   modeinfo         = *mi;
+
+   last_scx = 0;
+   last_scy = 0;
+   last_wid = 0;
+   last_hgt = 0;
+
+
+   /*--- event handler for the window ---*/
+   win_register_event_handler(wh, scrollview_event_handler, NULL);
+
+   /*--- menu etc for the window ---*/
+   /* make icon bar menu structure */
+   image_menu = menu_new(msgs_lookup("MEimageT:Image"),
+#ifdef TEMPORARY_EXPORT
+                         msgs_lookup("MEimageB:>Image info,>Save,Export,>Scale view"));
+#else
+                         msgs_lookup("MEimageB:>Image info,>Save,>Export,>Scale view"));
+#endif
+
+#ifdef TEMPORARY_EXPORT
+   {
+      menu    sm;
+
+      sm = menu_new("Export","Resolution,Orientation|>24 bit sprite");
+      menu_submenu(image_menu, 3, sm);
+
+      export_res_menu = menu_new(msgs_lookup("MEresolT"), msgs_lookup("MEresol1"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol2"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol3"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol4"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol5"));
+      menu_submenu(sm, 1, export_res_menu);
+      export_resolution = sproption_resolution;
+      menu_setflags(export_res_menu, export_resolution, TRUE,FALSE);
+
+      export_ori_menu = menu_new(msgs_lookup("MExformT"), msgs_lookup("MExform0"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform1"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform2"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform3"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform4"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform5"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform6"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform7"));
+      menu_submenu(sm, 2, export_ori_menu);
+      export_orientation = sproption_orientation;
+      menu_setflags(export_ori_menu, export_orientation+1, TRUE,FALSE);
+   }
+#else
+   menu_setflags(image_menu, 3, 0, 1);   /* temp. fade export menu item */
+#endif
+
+   menu_setflags(image_menu, 4, 0, 1);   /* fade zoom menu item - not available for scrollview windows */
+
+   /* attach the menu */
+   event_attachmenumaker(wh, image_menumaker, image_menuproc, (void *)ovw_id);
+
+
+   sprintf(str, "img%4.4d", thumbno);
+   win_settitle(wh, str);
+
+   wimpt_noerr(wimp_get_wind_state(wh, &ws));
+
+   /* set the work area size */
+   wr.w = wh;
+   PCDgetSize(images[ovw_id].pcdhdl, (PCDrect *)&wr.box);
+   images[ovw_id].width  = wr.box.x1 *= 2;
+   images[ovw_id].height = wr.box.y1 * 2;
+   wr.box.x1 = images[ovw_id].width;
+   wr.box.y0 = -images[ovw_id].height;
+   wr.box.y1 = 0;
+   wimpt_noerr(wimp_set_extent(&wr));
+
+   ws.o.behind = -1;
+   ws.o.box.x1 = ws.o.box.x0 + DEF_WINDOW_WIDTH * 2;
+   ws.o.box.y0 = ws.o.box.y1 - DEF_WINDOW_HEIGHT * 2;
+   ws.o.x = 0;
+   ws.o.y = 0;
+   wimpt_noerr(wimp_open_wind(&ws.o));
+   win_activeinc();      /* count active windows */
+
+   /*--- how big did it end up being? ---*/
+   wimpt_noerr(wimp_get_wind_state(wh, &ws));
+   WindowWidth  = ws.o.box.x1 - ws.o.box.x0;
+   WindowHeight = ws.o.box.y1 - ws.o.box.y0;
+
+
+   return TRUE;
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+

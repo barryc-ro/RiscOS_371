@@ -1,0 +1,360 @@
+
+; > Calib32
+
+
+;actually does: bright/contrast/gamma correct,
+;               under-colour removal (colour saturation) control,
+;               ink density control
+;
+;includes whitespace & grey margin detection
+;
+
+;Entry:
+;  R0 -> pixel strip (32 bpp)
+;  R1 = strip type, 8 = 32 bpp halftone, 9 = 32bpp error diffused
+;  R3 =  width of strip (pixels)
+;  R4 =  height of strip
+;  R8 = anchor word
+
+;calibration data copied from palette, such that:
+;mjsCalibrationTable ->  0*256 C table          (256)
+;                        1*256 M table          (256)
+;                        2*256 Y table          (256)
+;                        3*256 UCR,kgen table   (512)
+;                        5*256 Cismin M,Y table (512)
+;                        7*256 Mismin C,Y table (512)
+;                        9*256 Yismin C,M table (512)
+;                       11*256 grey table       (256)
+
+
+;on output, each row steals 1st 4 words (pixels) to encode margins:
+;
+;   [0] = size of left whitespace margin  (LWM)
+;   [1] = size of right whitespace margin (RWM)
+;   [2] = size of left grey margin        (LGM)
+;   [3] = size of right grey margin       (RGM)
+;
+; where 'grey' is normally any pure grey value, but restricted to black or
+; white if GreyAsColour is true (see below)
+;
+; - all sizes in pixels
+; - such that each row can be processed as: LWM LGM <colour data> RGM RWM
+; - an entire white row has margins:        <width> 0 0 0
+; - a non-colour row has margins:           LWM <width-LWM-RWM> 0 RWM
+;
+; - note that pixels of whitespace margins are *not* converted to CMYK space,
+;   since it assumed subsequent processing can skip them (pixels of grey margins
+;   are converted, to implement gamma correction etc.)
+
+
+;GreyAsColour true would fix problem over discontinuous treatment of pure grey
+;levels and almost pure grey levels (grey,colour processing gives very different
+;usage of K relative to CMY). This stops nasty visual artifacts in colour images
+;which happen to contain some pure grey levels. Disadvantage is that real grey
+;areas are processed as colour (slower, slightly impure results). Pure black
+;is still treated as grey, so that black text etc is fast and pure. This is all
+;a bit of a compromise; ideally the transformation would be smooth over colour
+;to grey transitions.
+
+    GBLL     GreyAsColour
+GreyAsColour SETL false
+
+
+cmyk_convert_strip32
+    Push    "R0-R12,LR"
+
+
+    LDR     R9,FirstStrip
+  Debug mjs,"cmyk_convert_strip32, R10,R11,R12,FirstStrip=",R10,R11,R12,R9
+    CMP     R9,#0
+    BEQ     cmyk_copy_done  ;only need to initialise from palette data for first strip
+
+;first, copy calibration data from palette data, using appropriate
+;c,m,y,grey tables for halftone or error diffused
+  Debug mjs,"cmyk_convert_strip32: copy palette data"
+    Push    "R0"
+    MOV     R0,R8
+    LDR     R2, =BlockType_Palette
+    SWI     XPDumper_Find
+    Pull    "R0"
+    Pull    "R0-R12,PC",VS
+    LDR     R8,[R2,#palette_Calib32] 
+    ADD     R2,R2,R8                 ;R2 -> new calib data in palette
+    ADR     R8,mjsCalibrationTable   ;R8 -> tables
+    LDR     R9,[R2],#4
+    STR     R9,[R8],#4               ;store ediff_density word
+    CMP     R1,#8
+    ADDEQ   R7,R2,#3*256             ;R7 -> cmy tables for halftone
+    MOVNE   R7,R2                    ;R7 -> cmy tables for error diff
+    MOV     R10,#3*256
+;copy cmy tables
+cmyk_copy1
+    LDR     R9,[R7],#4
+    STR     R9,[R8],#4
+    SUBS    R10,R10,#4
+    BNE     cmyk_copy1
+    ADD     R7,R2,#6*256
+    MOV     R10,#8*256
+;copy grey component replacement,density/balance tables
+cmyk_copy2
+    LDR     R9,[R7],#4
+    STR     R9,[R8],#4
+    SUBS    R10,R10,#4
+    BNE     cmyk_copy2
+    CMP     R1,#8
+    ADDEQ   R7,R7,#256   ;halftone table
+    MOV     R10,#256
+;copy grey table
+cmyk_copy3
+    LDR     R9,[R7],#4
+    STR     R9,[R8],#4
+    SUBS    R10,R10,#4
+    BNE     cmyk_copy3
+
+cmyk_copy_done
+    ADR     R8,mjsCalibrationTable ;R8 -> tables
+    ADD     R8,R8,#4               ;skip ediff_density word
+
+    MOV     R9,R0                  ;R9 -> next row
+    B       cmyk_go
+
+cmyk_next_row
+    SUBS    R4,R4,#1
+    Pull    "R0-R12,PC",EQ,^
+    ADD     R9,R9,R3,LSL #2
+
+cmyk_go
+    MOV     R14,#&00FFFFFF      ;= white (in RGB)
+;insist on minimun of 4 pixels left margin (4 words stolen for margin counts)
+    SUB     R5,R3,#4            ;pixels remaining counter
+    ADD     R0,R9,#16           ;pixel ptr
+
+    MOV     R6,#0
+    STR     R6,[R9,#0]
+    STR     R6,[R9,#4]
+    STR     R6,[R9,#8]
+    STR     R6,[R9,#12]         ;zero margins
+
+;(1) find left whitespace margin
+cmyk_left
+    LDMIA   R0!,{R6,R7,R11,R12} ;next 4 pixels
+    CMP     R6,R14
+    CMPEQ   R7,R14
+    CMPEQ   R11,R14
+    CMPEQ   R12,R14
+    BNE     cmyk_right
+    SUBS    R5,R5,#4
+    BNE     cmyk_left
+
+;(2) find right whitespace margin (takes precedence over left grey margin)
+cmyk_right
+    SUB     R6,R3,R5
+    STR     R6,[R9,#0]          ;save size of whitespace left margin
+    ADD     R0,R9,R3,LSL #2     ;R0 -> right hand side of row
+    MOV     R5,#0               ;right hand margin counter
+    SUBS    R1,R3,R6            ;pixels remaining
+    BEQ     cmyk_margins_done
+cmyk_right2
+    LDMDB   R0!,{R6,R7,R11,R12} ;next 4 pixels
+    CMP     R6,R14
+    CMPEQ   R7,R14
+    CMPEQ   R11,R14
+    CMPEQ   R12,R14
+    BNE     cmyk_greyleft
+    ADD     R5,R5,#4
+    CMP     R5,R1
+    BNE     cmyk_right2
+
+;(3) find left grey margin
+cmyk_greyleft
+    STR     R5,[R9,#4]          ;size of whitespace right margin
+    SUBS    R1,R1,R5            ;new pixels remaining (non whitespace)
+    MOV     R5,#0
+    BEQ     cmyk_margins_done
+    LDR     R6,[R9,#0]
+    ADD     R0,R9,R6,LSL #2     ;R0 -> pixel after left whitespace
+cmyk_greyleft2
+    LDMIA   R0!,{R6,R7,R11,R12} ;next 4 pixels
+  [ GreyAsColour
+    CMP     R6,R14
+    MOVEQ   R6,#0               ;white -> black
+    CMP     R7,R14
+    MOVEQ   R7,#0
+    CMP     R11,R14
+    MOVEQ   R11,#0
+    CMP     R12,R14
+    MOVEQ   R12,#0
+    ORR     R6,R6,R7
+    ORR     R6,R6,R11
+    ORRS    R6,R6,R12
+  |
+    EOR     R6,R6,R6,LSR #8     ;0x??BBGGRR ^ 0x00??BBGG = 0x????0000, if grey
+    MOVS    R6,R6,LSL #16
+    EOREQ   R7,R7,R7,LSR #8
+    MOVEQS  R7,R7,LSL #16
+    EOREQ   R11,R11,R11,LSR #8
+    MOVEQS  R11,R11,LSL #16
+    EOREQ   R12,R12,R12,LSR #8
+    MOVEQS  R12,R12,LSL #16
+  ]
+    BNE     cmyk_greyright
+    ADD     R5,R5,#4
+    CMP     R5,R1
+    BNE     cmyk_greyleft2;
+
+;(4) find right grey margin
+cmyk_greyright
+    STR     R5,[R9,#8]          ;size of grey left margin
+    SUBS    R1,R1,R5            ;new pixels remaining
+    MOV     R5,#0
+    BEQ     cmyk_margins_done
+    LDR     R6,[R9,#4]
+    SUB     R6,R3,R6            ;pixels to right whitespace margin
+    ADD     R0,R9,R6,LSL #2     ;R0 -> rhs of any right grey margin
+cmyk_greyright2
+    LDMDB   R0!,{R6,R7,R11,R12} ;next 4 pixels
+  [ GreyAsColour
+    CMP     R6,R14
+    MOVEQ   R6,#0               ;white -> black
+    CMP     R7,R14
+    MOVEQ   R7,#0
+    CMP     R11,R14
+    MOVEQ   R11,#0
+    CMP     R12,R14
+    MOVEQ   R12,#0
+    ORR     R6,R6,R7
+    ORR     R6,R6,R11
+    ORRS    R6,R6,R12
+  |
+    EOR     R6,R6,R6,LSR #8
+    MOVS    R6,R6,LSL #16
+    EOREQ   R7,R7,R7,LSR #8
+    MOVEQS  R7,R7,LSL #16
+    EOREQ   R11,R11,R11,LSR #8
+    MOVEQS  R11,R11,LSL #16
+    EOREQ   R12,R12,R12,LSR #8
+    MOVEQS  R12,R12,LSL #16
+    BNE     cmyk_margins_done
+    ADD     R5,R5,#4
+    CMP     R5,R1
+  ]
+    BNE     cmyk_greyright2
+
+;(5) process RGB -> CMYK between whitespace margins (grey margins need conversion)
+cmyk_margins_done
+    STR     R5,[R9,#12]       ;size of grey right margin
+;;;
+;;;  Push "R0-R3"
+;;;  LDMIA R9,{R0-R3}
+;;;  Debug mjs,"mjs_calib row ",R0,R1,R2,R3
+;;;  Pull "R0-R3"
+;;;
+    MOV     R7,#&FF           ;R7 := byte mask for r,g,b extraction
+    MOV     R10,#0            ;last converted value = white (in CMYK)
+    LDMIA   R9,{R11,R12}      ;left,right whitespace margins
+    CMP     R11,R3
+    BEQ     cmyk_next_row
+    ADD     R0,R9,R11,LSL #2
+    SUB     R5,R3,R11
+    SUB     R5,R5,R12
+    MOV     R14,#&00FFFFFF    ;= white (in RGB)
+    B       cmyk_column_go
+
+; under colour removal, combine cmyk and store
+cmyk_do_UCR
+    ADD     R10,R8,#3*256       ;R10 -> UCR,kgen table
+    LDRB    R2,[R10,R1,LSL #1]! ;R2 := UCR(k)
+    LDRB    R10,[R10,#1]        ;R10 := kgen(k) = final k
+    SUB     R6,R6,R2            ;c := c - UCR
+    SUB     R11,R11,R2
+    SUB     R12,R12,R2
+    ORR     R10,R10,R6,LSL#8
+    ORR     R10,R10,R11,LSL#16
+    ORR     R10,R10,R12,LSL#24  ;R10 := &YYMMCCKK
+cmyk_store
+    STR     R10,[R0,#-4]        ;store converted/corrected CMYK value
+    SUBS    R5,R5,#1
+    BEQ     cmyk_next_row
+
+cmyk_column_go
+    LDR     R1,[R0],#4        ;R1 := pixel (&00BBGGRR)
+    CMP     R1,R14            ;same as last value?
+    BEQ     cmyk_store        ;use cached CMYK value (in R10)
+    MOV     R14,R1            ;last value := value
+    AND     R6,R7,R1          ;R6  := red
+    AND     R11,R7,R1,LSR #8  ;R11 := green
+    AND     R12,R7,R1,LSR #16 ;R12 := blue
+;check for grey-level values
+    CMP     R6,R11
+    CMPEQ   R6,R12
+    BEQ     cmyk_process_as_grey
+cmyk_process_as_colour
+;convert to nominal cmy
+    RSB     R6,R6,#255
+    RSB     R11,R11,#255
+    RSB     R12,R12,#255
+;look-up cmy to corrected cmy (tables encode brightness,contrast,gamma correction
+    LDRB    R6,[R8,R6]        ;C table 
+    ADD     R11,R11,#256
+    LDRB    R11,[R8,R11]      ;M table
+    ADD     R12,R12,#2*256
+    LDRB    R12,[R8,R12]      ;Y table
+;consider 2-ink correction (density and balance)
+;separate into 3 cases, according to which ink is minimum
+    CMP     R6,R11
+    CMPLE   R6,R12
+    BLE     cmyk_c_is_min
+    CMP     R11,R12
+    BLE     cmyk_m_is_min
+;y is min, find 2-ink component, t = m-y if c >= m, t = c-y if m > c
+    CMP     R6,R11              
+    SUBLE   R1,R6,R12
+    SUBGT   R1,R11,R12
+    SUB     R6,R6,R1            ;c := c-t
+    SUB     R11,R11,R1          ;m := m-t
+    ADD     R10,R8,#9*256       ;R10 -> Yismin C,M table
+    LDRB    R2,[R10,R1,LSL #1]!
+    ADD     R6,R6,R2            ;c := c + c_corrected(t)
+    LDRB    R2,[R10,#1]
+    ADD     R11,R11,R2          ;m := m + m_corrected(t)
+    MOV     R1,R12              ;R1 := y = nominal k
+    B       cmyk_do_UCR
+cmyk_c_is_min
+    CMP     R11,R12
+    SUBLE   R1,R11,R6
+    SUBGT   R1,R12,R6
+    SUB     R11,R11,R1          ;m := m-t
+    SUB     R12,R12,R1          ;y := y-t
+    ADD     R10,R8,#5*256       ;R10 -> Cismin M,Y table
+    LDRB    R2,[R10,R1,LSL #1]!
+    ADD     R11,R11,R2          ;m := m + m_corrected(t)
+    LDRB    R2,[R10,#1]
+    ADD     R12,R12,R2          ;y := y + y_corrected(t)
+    MOV     R1,R6               ;R1 := c = nominal k
+    B       cmyk_do_UCR
+cmyk_m_is_min
+    CMP     R6,R12
+    SUBLE   R1,R6,R11
+    SUBGT   R1,R12,R11
+    SUB     R6,R6,R1            ;c := c-t
+    SUB     R12,R12,R1          ;y := y-t
+    ADD     R10,R8,#7*256       ;R10 -> Mismin C,Y table
+    LDRB    R2,[R10,R1,LSL #1]!
+    ADD     R6,R6,R2            ;c := c + c_corrected(t)
+    LDRB    R2,[R10,#1]
+    ADD     R12,R12,R2          ;y := y + y_corrected(t)
+    MOV     R1,R11              ;R1 := m = nominal k
+    B       cmyk_do_UCR
+
+cmyk_process_as_grey
+  [ GreyAsColour
+    CMP     R6,#0
+    CMPNE   R6,#255
+    BNE     cmyk_process_as_colour
+  ]
+    ADD     R10,R8,#11*256    ;R10 -> grey table
+    RSB     R1,R6,#255        ;nominal k
+    LDRB    R10,[R10,R1]      ;corrected k
+    B       cmyk_store
+
+    END

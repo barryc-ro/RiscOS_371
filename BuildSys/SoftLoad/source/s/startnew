@@ -1,0 +1,148 @@
+
+; startnew.s
+
+
+    GET s.Copro15Ops
+
+
+XOS_CLI          * &20005
+XOS_EnterOS      * &20016
+XOS_ServiceCall  * &20030
+
+Service_PreReset * &45
+
+SVC32_mode       * &13
+
+
+;kernel workspace in 3.7
+ARMA_Cleaner_flipflop * &178
+
+        AREA    |main|, CODE, READONLY
+
+
+        EXPORT |startnew|
+
+startnew
+      
+; in -  r0 -> where ROM image will be in phys space
+;       r1 -> L1PT
+;       r2 -> where starter code will be in phys space
+;       r3 -> command to load ROM image
+
+
+        ;the ROM/code load may wreck C stack etc, so we must never return!
+
+        MOV     r6,r0
+        MOV     r0,r3
+        SWI     XOS_CLI  ;load the ROM
+        MOV     r0,r6
+
+        MOV     R6, R2
+
+        SWI     XOS_EnterOS
+        TEQP    PC, #&FC000003
+
+        MOV     r0,r0
+        STMFD   r13!, {r0,r1}
+        MOV     r1, #Service_PreReset   ; issue Service_PreReset to turn off h/w
+        SWI     XOS_ServiceCall
+        LDMFD   r13!, {r0,r1}
+
+        TEQP    PC, #&FC000003          ; just in case
+
+        ADD     r7, r1, r0, LSR #18     ; r1 -> first L1PT entry
+        ORR     r2, r0, #(1:SHL:10)     ; svc-only access
+        ORR     r2, r2, #(1:SHL:4):OR:2 ; U~C~B, section mapped
+        STR     r2, [r7], #4            ; put in entries for 4x 1Mb for ROM
+        ADD     r2, r2, #1024*1024
+        STR     r2, [r7], #4 
+        ADD     r2, r2, #1024*1024
+        STR     r2, [r7], #4  
+        ADD     r2, r2, #1024*1024
+        STR     r2, [r7], #4 
+
+        ADD     r7, r1, r6, LSR #18
+        ORR     r2, r6, #(1:SHL:10)       ; svc-only access
+        ORR     r2, r2, #(1:SHL:4):OR:2   ; U~C~B, section mapped
+        STR     r2, [r7]
+
+;flush cache(s) and TLB(s), ARMs 6,7,StrongARM
+        STMFD   r13!,{r0-r4}
+        ARM_read_ID r4
+        AND      r4,r4,#&F000
+;flush cache
+        CMP      r4,#&A000
+        ARM67_flush_cache NE       ;if not StrongARM, assume 6,7
+        BNE      flushTLB
+;StrongARM then (and OS must be 3.7 or later)
+        MOV     r2,#ARMA_Cleaner_flipflop
+        LDR     r1,[r2]
+        EOR     r1,r1,#16*1024
+        STR     r1,[r2]       
+        ARMA_clean_DC r1,r2,r3     ;effectively, fully clean/flush wrt non-interrupt stuff
+        ARMA_drain_WB
+        ARMA_flush_IC              ;do *not* flush DC - may be interrupt stuff in it
+flushTLB
+        CMP     r4,#&A000
+        ARMA_flush_TLBs EQ
+        ARM67_flush_TLB NE         ;if not StrongARM, assume 6,7
+        LDMFD   r13!,{r0-r4}
+
+        MOV r2,r6
+
+        ADR     r3, startnew2
+        ADR     r4, endnew2
+loopnew
+        LDR     r5, [r3], #4            ; copy code
+        STR     r5, [r2], #4
+        TEQ     r3, r4
+        BNE     loopnew
+        CMP     r0, #&04000000          ; if code lives below 64M
+        MOVCC   r2, #0                  ; then we don't need to go into 32-bit mode
+        BCC     go2
+
+; switch into 32-bit mode (we're already in 32-bit config)
+        MRS     r2, CPSR
+        BIC     r2, r2, #&1F
+        ORR     r2, r2, #SVC32_mode
+        MSR     CPSR, r2
+        MOV     r2, #&30                ; MMU off, in 32-bit config
+go2
+        MOV     pc,r6
+
+startnew2
+        ARM_write_control r2            ; turn off MMU
+        LDR     r3, [r0]                ; load 1st instruction of ROM image
+        AND     r2, r3, #&FF000000
+        TEQ     r2, #&EA000000          ; is it a branch
+        BNE     notabranch              ; [no, so try something else]
+
+        MOV     r3, r3, LSL #(32-21)    ; extract offset within ROM
+        ADD     r0, r0, r3, LSR #(32-21-2)
+        ADD     pc, r0, #8
+
+notabranch
+
+; check for LDR PC, [PC, +/-#x]
+
+        MOV     r4, r3, LSR #12
+        LDR     r5, LDRPCInst
+        ORR     r4, r4, #1 :SHL: (23-12)
+        TEQ     r4, r5
+endlessloop
+        BNE     endlessloop             ; not either, so stuck
+
+        EOR     r3, r3, r4, LSL #12     ; extract offset, and up/down bit
+        TST     r3, #1 :SHL: 23         ; NE => bit was 0, so -ve
+        RSBNE   r3, r3, #1 :SHL: 23     ; get rid of bit 23 and negate
+        ADD     r3, r3, #8              ; offset in ROM we're reading
+        LDR     r3, [r0, r3]            ; address to jump to (may be in hi- or lo- ROM)
+        MOV     r3, r3, LSL #(32-21)    ; only use bits regarding offset in ROM
+        ADD     pc, r0, r3, LSR #(32-21) ; jump to it
+
+LDRPCInst
+        DCD     &E59FF
+
+endnew2
+
+        END

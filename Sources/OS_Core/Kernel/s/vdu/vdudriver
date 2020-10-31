@@ -1,0 +1,3219 @@
+; > $.Source.VduDriver
+;
+; ARTHUR OPERATING SYSTEM - Vdu Drivers
+; =======================
+;
+; Vdu driver code - Vdu queue, mode, default windows etc.
+;
+; Author R C Manby
+; Date   5.9.86
+;
+        GBLL NewStyleEcfs
+NewStyleEcfs   SETL  1=1
+
+        GBLL    DoVdu23_0_12
+DoVdu23_0_12   SETL  {FALSE}
+
+        GBLL    BleedinDaveBell
+BleedinDaveBell SETL {TRUE}
+
+        GBLL    LCDPowerCtrl
+LCDPowerCtrl    SETL {TRUE}
+
+        GET s.vdu.VduDecl
+        GET s.vdu.VduGrafDec
+
+        MACRO
+        HostVdu
+        Push    "R0,R14"
+        LDR     R0, [R0, -R0]
+        TEQ     R0, #0
+        ADREQ   R0, %FT01
+        SWIEQ   OS_CLI
+        Pull    "R0,R14"
+        B       %FT02
+01
+        =       "HOSTVDU", 0
+        ALIGN
+02
+        MEND
+
+        MACRO
+        Print   $string
+        Push    "R0,R14"
+        LDR     R0, [R0, -R0]
+        TEQ     R0, #0
+        BNE     %FT01
+        SWI     OS_WriteS
+        =       "$string", 0
+        ALIGN
+        SWI     OS_ReadC
+        Pull    "R0,R14",CS
+        SWICS   OS_BreakPt
+        SWI     OS_NewLine
+01
+        Pull    "R0,R14"
+        MEND
+
+        MACRO
+        RMVT    $var, $BW
+        [ "$BW"="B"
+        =       (wk$var-wkstart)*2
+        |
+        [ "$BW"="W"
+        =       (wk$var-wkstart)*2 +1
+        |
+        .... Invalid option on RMVT ....
+        ]
+        ]
+        MEND
+
+        MACRO
+        RVVT    $var
+        ASSERT  ($var >= 0) :LAND: ($var < &400) :LAND: (($var :AND: 3)=0)
+        =       $var :SHR: 2
+        MEND
+
+        MACRO
+        IssueService
+        BL      Issue_Service
+        MEND
+
+        MACRO
+        MALIGN  $length, $phase
+        LCLA    temp
+        LCLS    string
+temp    SETA    .-ArthurVduDriver
+        [ "$phase"=""
+string  SETS    "ALIGN $length"
+        |
+string  SETS    "ALIGN $length, $phase"
+        ]
+        $string
+temp    SETA    .-ArthurVduDriver-temp
+        [ temp=0
+        !       0, string :CC: " fitted exactly"
+        |
+        !       0, string :CC: " wasted " :CC: :STR: temp
+        ]
+        MEND
+
+ [ ModeSelectors
+
+; Macro to load up video bandwidth and video memory size
+
+        MACRO
+        GetBandwidthAndSize  $bw, $size
+  [ MEMC_Type = "IOMD"
+        MOV     $size, #0
+        LDR     $bw, [$size, #VideoBandwidth]   ; load bandwidth
+        LDR     $size, [$size, #VideoSize]      ; and total amount of video RAM
+  |
+        LDR     $bw, =38400000                  ; if no ARM600 then must be MEMC based
+        LDR     $size, =480*1024
+  ]
+        MEND
+ ]
+
+; *****************************************************************************
+
+; Vdu status bits
+
+Vdu2ModeBitPosn *       0
+Vdu2Mode        *       1 :SHL: Vdu2ModeBitPosn
+Windowing       *       1 :SHL: 3
+Shadowing       *       1 :SHL: 4
+
+; *****************************************************************************
+
+ArthurVduDriver
+
+; *****************************************************************************
+;
+; VduInit - Once only initialisation of Vdu drivers eg after Break
+; =======
+;
+VduInit ROUT
+        Push    R14
+        MOV     R0, #0
+        STRB    R0, [R0, #OsbyteVars + :INDEX: VDUqueueItems] ;purge queue
+        STRB    R0, [WsPtr, #ScreenBlankFlag]   ; not blanked
+        STR     R0, [WsPtr, #CursorCounter]
+        STR     R0, [WsPtr, #CursorDesiredState]
+        STR     R0, [WsPtr, #VduStatus]
+        STR     R0, [WsPtr, #PointerHeights]    ; zero all 4 heights
+        STRB    R0, [WsPtr, #PointerShapeNumber] ; make sure pointer off
+        STR     R0, [WsPtr, #CursorStack]       ; 0 bits => on
+        STR     R0, [WsPtr, #VduSaveAreaPtr]    ; indicate no save area yet
+        STR     R0, [WsPtr, #ClipBoxEnable]     ; no clip box calculating
+
+        LDR     R0, =RangeC+SpriteReason_SwitchOutputToSprite
+        STR     R0, [WsPtr, #SpriteMaskSelect]
+
+        MOV     R0, #InitialCursorFlags         ; TMD 25/9/86
+        STR     R0, [WsPtr, #CursorFlags]
+
+        ADRL    R0, NUL                 ; point to MOV PC,R14
+        STR     R0, [WsPtr, #WrchNbit]  ; just in case ...
+
+        ADRL    R0, ExportedHLine
+        STR     R0, [WsPtr, #HLineAddr]
+        ADD     R0, WsPtr, #FgEcfOraEor
+        STR     R0, [WsPtr, #GcolOraEorAddr]
+
+        MOV     R0, #maxmode
+        STR     R0, [WsPtr, #MaxMode]   ; constant now
+
+
+        LDROSB  R0, LastBREAK           ; is it a hard reset ?
+        TEQ     R0, #0
+        BEQ     %FT10                   ; [no, don't reset font]
+
+ [ VIDC_Type = "VIDC20"
+
+; allocate buffer for Tim's whizzy text expansion.  This now lives
+; in the system heap, unless the claim request fails.  If the request
+; fails then the pointer points at the original buffer in the Vdu
+; driver workspace.
+
+; This allows the user to access depths upto 16 bit per pixel before
+; strings things things become afoot at the Circle K.
+
+        LDR     R3, =TextExpandArea_Size
+        BL      ClaimSysHeapNode        ; allocate buffer for heap data
+        ADDVS   R2, WsPtr, #TextExpand
+        STR     R2, [WsPtr, #TextExpandArea]
+
+  [ ModeSelectors
+        LDR     R3, =ModeSelector_MaxSize+4     ; get block for two overlapping copies
+        BL      ClaimSysHeapNode                ; of mode selector, 1 word apart
+        STR     R2, [WsPtr, #KernelModeSelector]
+  ]
+
+ ]
+
+; now reset soft font from hard font
+
+        MOV     R1, #1                  ; start at character 1*32
+        STRB    R1, [WsPtr, #ScreenMemoryClaimed]
+                                        ; can't claim memory till a mode change
+        MOV     R2, #7                  ; copy 7 pages
+        BL      DoResetFont
+
+ [ VIDC_Type = "VIDC20"
+  [ GammaCorrection
+        MOV     r3, #(256+1+3)*4*4+3*256 ; logical and physical copies of both flash states
+                                        ; plus 3 lookup tables for r,g,b
+  |
+        MOV     r3, #(256+1+3)*4*2      ; soft copy of palette (2 flash states)
+  ]
+        BL      ClaimSysHeapNode        ; this had better succeed!
+        STR     r2, [WsPtr, #FirPalAddr]
+
+        ADD     r3, r2, #260*4
+        STR     r3, [WsPtr, #SecPalAddr]
+
+; now initialise entries for pointer palette so they will actually program pointer palettte
+; because VDU20 doesn't change pointer palette
+
+        MOV     r3, #&50000000
+        MOV     r4, #&60000000
+        MOV     r5, #&70000000
+
+        ADD     r2, r2, #260*4          ; store in 1st copy of logical
+        STMDB   r2, {r3-r5}             ; (last 3 entries)
+
+        ADD     r2, r2, #260*4
+        STMDB   r2, {r3-r5}             ; store in 2nd copy of logical
+
+ [ GammaCorrection
+        ADD     r2, r2, #260*4
+        STMDB   r2, {r3-r5}             ; store in 1st copy of physical
+
+        ADD     r2, r2, #260*4
+        STMDB   r2, {r3-r5}             ; store in 2nd copy of physical
+
+; r2 now points off end of all 4 copies, ie start of rgb tables
+; initialise red, green and blue transfer function tables to 1-1 mapping
+
+        MOV     r0, #0
+05
+        STRB    r0, [r2, #&200]                 ; store in blue table
+        STRB    r0, [r2, #&100]                 ; store in green table
+        STRB    r0, [r2], #1                    ; store in red table, and advance
+        ADD     r0, r0, #1
+        CMP     r0, #256
+        BCC     %BT05
+  ]
+ ]
+10
+        BL      SpriteInit
+
+        LDR     R0, [WsPtr, #TotalScreenSize]
+        RSB     R0, R0, #ScreenEndAdr
+        STR     R0, [WsPtr, #DisplayStart]
+        STR     R0, [WsPtr, #DisplayScreenStart]
+        STR     R0, [WsPtr, #ScreenStart]
+        STR     R0, [WsPtr, #CursorAddr]
+        STR     R0, [WsPtr, #InputCursorAddr]
+
+        Pull    PC
+
+        LTORG
+
+; *****************************************************************************
+;
+;       InitialiseMode - Select mode number given by ModeNo variable
+;
+;       Called by MOS once before initialisation, and then afterwards
+;       before printing "RISC OS ..."
+;
+; in:   -
+; out:  All registers may be corrupted (except R13_svc !)
+;
+
+InitialiseMode ENTRY
+ [ SoftResets
+        MOV     r0, #&FD                ; read last reset type
+        MOV     r1, #0
+        MOV     r2, #&FF
+        SWI     XOS_Byte
+        CMP     r1, #SoftReset
+        LDREQ   r0, =VduDriverWorkSpace+ModeNo
+        LDREQ   r0, [r0]                ; use previous mode if a soft reset
+        MOVNE   r0, #1                  ; otherwise read configured mode
+        SWINE   XOS_ReadSysInfo
+ |
+        MOV     r0, #1                  ; no need to check for soft reset,
+        SWI     XOS_ReadSysInfo         ; always use configured value
+ ]
+ [ ModeSelectors
+        MOV     r1, r0
+        MOV     r0, #ScreenModeReason_SelectMode
+        SWI     XOS_ScreenMode
+        EXIT    VC
+ |
+        SWI     XOS_WriteI+22
+        SWIVC   XOS_WriteC
+        EXIT    VC
+ ]
+
+        MOV     r0, #114                ; failed, so get rid of any shadow
+        MOV     r1, #1
+        SWI     XOS_Byte
+        SWI     XOS_WriteI+22
+        SWIVC   XOS_WriteI+0            ; and if we can't get mode 0, we're really fooked!!!
+        EXIT
+
+;
+;------------------------------------------------------------------------------
+;
+; Vdu -  Main VDU driver entry point
+; ===    Queue up bytes and dispatch via JVec
+;
+; in:   R0 = character to be printed
+;
+; out:  C=1 <=> send character to printer if enabled
+;
+
+Vdu     ROUT
+        MOV     R11, #0                 ; NB used later in Vdu07 as well
+        LDRB    R10, [R11, #OsbyteVars + :INDEX: VDUqueueItems]
+        MOVS    R9, R10, LSL #24        ; move up to top byte (for sign extend)
+        BEQ     Vdu07                   ; not queueing, then start Vdu sequence
+
+; *****Comment made by DJS: Changing this to fall through if not queueing
+; and branch if queueing might be a good idea - it would speed up all
+; printable characters and simple cursor movements.
+
+        LDR     R8, [WsPtr, #QOffset]
+        STRB    R0, [R8, R9, ASR #24]   ; add byte to queue
+
+        ADD     R10, R10, #1            ; move on pointer
+        STRB    R10, [R11, #OsbyteVars + :INDEX: VDUqueueItems]
+
+        CMP     R10, #&100              ; finished sequence ?
+        MOVCC   PC, R14                 ; no, then return (no printing)
+
+        Push    "R0, R14"
+        BL      PreWrchCursor           ; exits with R6 = CursorFlags
+        Pull    "R0"
+05
+        MOV     R14, PC
+        ADD     R14, R14, #(VduPrintExit-%BT05-8) ; push address of SEC exit
+                                                  ; (with flags)
+        Push    R14
+        BL      Vdu05
+        BL      PostWrchCursor
+        CLC                             ; also clears V
+        Pull    "R14,PC"
+
+VduPrintExit                             ; exit used if print required
+        BL      PostWrchCursor
+        SEC                             ; also clears V
+        Pull    PC
+
+; *****************************************************************************
+
+Vdu05   ROUT
+        TST     R6, #VduDisabled        ; VDU enabled ?
+        LDREQ   PC, [WsPtr, #JVec]      ; yes, then do it (no printing)
+
+; Queue sequence has just completed, but VDU is disabled
+; Only interesting case is VDU 1 (SOH), which must still print
+; the character if the printer is enabled
+
+        LDR     R10, [WsPtr, #JVec]
+        ADR     R11, SOH
+        TEQ     R10, R11                ; JVec -> SOH ?
+        MOVNE   PC, R14                 ; no, then return (no printing)
+SOH
+        LDR     R1, [WsPtr, #VduStatus]  ; in VDU 2 mode ?
+        TST     R1, #Vdu2Mode
+        MOVEQ   PC, R14                 ; no, then return
+
+        Push    R14
+        BL      MOSDoPrint
+        Pull    PC, VC                  ; good exit, so return
+
+        Pull    R14                     ; bad exit, return with error
+        B       VduBadExit
+
+; *****************************************************************************
+
+Vdu07   ROUT
+        AND     R0, R0, #&FF            ; Only look at bottom byte!
+
+        CMP     R0,#127                 ;If DELETE, change R0 to 32 and
+        MOVEQ   R0,#32                  ;  drop through to control char code
+        CMPNE   R0,#31                  ;Otherwise, branch to printable char
+        BHI     Vdu20                   ;  code if not a control char
+
+; *****Further desirable change: Make printable characters fall through,
+; control characters take the branch - speeding up printable characters is
+; important!
+
+        ADR     R10, VduJTb             ; Address of beginning of jump table
+        LDR     R9, [R10, R0, LSL #2]   ; Get routine address from VduJTB
+        STR     R9, [WsPtr, #JVec]      ; save address
+
+        ADD     R10, R10, #(VduQTb-VduJTb)
+
+        LDRB    R9, [R10, R0]           ; Pick up QQ + length of queue
+        RSBS    R10, R9, #QQ            ; -(length of queue) & test if none
+
+        STRNEB  R10, [R11, #OsbyteVars + :INDEX: VDUqueueItems]
+                                        ; yes, then set up Osbyte variable
+        ADDNE   R9, R9, WsPtr
+        STRNE   R9, [WsPtr, #QOffset]   ; and QOffset
+        MOVNE   PC, R14
+
+        Push    "R0,R14"
+        BL      PreWrchCursor           ; exits with R6 = CursorFlags
+        Pull    "R0"
+10
+        MOV     R14, PC
+        ADD     R14, R14, #(VduPrintExit-%BT10-8) ; push address of SEC exit
+                                                  ; (with flags)
+        Push    R14
+        BL      Vdu10
+        BL      PostWrchCursor
+        CLC                             ; also clears V
+        Pull    "R14,PC"
+
+;
+; This is the only byte of a single byte Vdu sequence
+;
+;       R6 = CursorFlags
+;       R11 = 0 (used to index VDUqueueItems)
+;
+
+Vdu10   ROUT
+        TST     R6, #CursorsSplit       ; are we cursor editing ?
+        BNE     Vdu15
+Vdu10Continue
+
+; TMD 31/7/87; bug fixed here - chars 8 to 13 should still go to printer if
+; enabled, even if VDU is disabled
+
+        CMP     R0, #8                  ; is char in range 8-13 ?
+        RSBCSS  R1, R0, #13             ; if so then we want to print it
+        LDRCS   R1, [WsPtr, #VduStatus]
+        MOVCSS  R1, R1, LSR #(Vdu2ModeBitPosn +1) ; providing printer enabled
+        Pull    R14, CS                 ; so pull old R14
+
+        TST     R6, #VduDisabled        ; are we disabled
+        LDREQ   PC, [WsPtr, #JVec]      ; enabled, so go get em floyd !
+
+        TEQ     R0, #6                  ; disabled, so is it ACK (enable VDU)
+        BICEQ   R6, R6, #VduDisabled
+        STREQ   R6, [WsPtr, #CursorFlags]
+
+NUL ;Does nothing
+ESC ;Does nothing
+        MOV     PC, R14                 ; return anyway
+
+; *****************************************************************************
+
+Vdu15
+        TEQ     R0, #13                 ; and is it a carriage return ?
+        BNE     Vdu10Continue
+
+        Push    "R0, R14"
+        BIC     R6, R6, #CursorsSplit   ; then stop cursor editing
+        STR     R6, [WsPtr, #CursorFlags]
+        MOV     R1, #1                  ; restore old Reg10Copy
+        BL      CursorOnOff
+        Pull    "R0, R14"
+        B       Vdu10Continue
+
+; *****************************************************************************
+
+Vdu20   ROUT
+        Push    "R0,R14"
+        BL      PreWrchCursor           ; exits with R6 = CursorFlags
+        Pull    "R0"
+05
+        MOV     R14, PC
+        ADD     R14, R14, #(VduPrintExit-%BT05-8) ; push address of SEC exit
+                                                  ; (with flags)
+        Push    R14
+        BL      TimWrch
+        BL      PostWrchCursor
+        CLC                             ; also clears V
+        Pull    "R14,PC"
+
+; *****************************************************************************
+
+VduJTb                  ; Table of addresses
+ & NUL                          ; Does nothing
+ & SOH                          ; Next char to printer only
+ & STX                          ; Enable printer
+ & ETX                          ; Disable printer
+ & EOT                          ; Write text at text cursor
+ & ENQ                          ; Write text at graphics cursor
+ & NUL                          ; Enable VDU drivers
+ & BEL                          ; Beep
+ & BS                           ; Cursor left
+ & HT                           ; Cursor right
+ & VduLF                        ; Cursor down
+ & VT                           ; Cursor up
+ & FF                           ; Clear text area (CLS)
+ & VduCR                        ; Carriage return
+ & SO                           ; Page mode on
+ & SI                           ; Page mode off
+ & DLE                          ; Clear graphics area (CLG)
+ & DC1                          ; Define text colour (COLOUR)
+ & DC2                          ; Define graphics colour and action (GCOL)
+ & DC3                          ; Define logical colour
+ & VDU20                        ; Restore default logical colours
+ & NAK                          ; Disable VDU drivers
+ & SYN                          ; Select screen mode (MODE)
+ & ETB                          ; Reprogram display character (VDU23,...)
+ & CAN                          ; Define graphics window
+ & EM                           ; (PLOT k,x,x,y,y)
+ & DefaultWindows               ; Restore default windows
+ & ESC                          ; Does nothing
+ & FS                           ; Define text window
+ & GS                           ; Define graphics origin
+ & RS                           ; Home cursor to "top left"
+ & US                           ; Move text cursor (TAB x,y)
+ & Delete                       ; Delete character (127)
+
+        ASSERT  QQ+9 < 256
+
+VduQTb          ; QQ + length of queue for each of the above
+        DCB     QQ+0, QQ+1, QQ+0, QQ+0, QQ+0, QQ+0, QQ+0, QQ+0
+        DCB     QQ+0, QQ+0, QQ+0, QQ+0, QQ+0, QQ+0, QQ+0, QQ+0
+        DCB     QQ+0, QQ+1, QQ+2, QQ+5, QQ+0, QQ+0, QQ+1, QQ+9
+        DCB     QQ+8, QQ+5, QQ+0, QQ+0, QQ+4, QQ+4, QQ+0, QQ+2
+        DCB     QQ+0 ; (delete)
+        ALIGN
+
+; *****************************************************************************
+
+WrchNbitTab
+        &       Wrch1bit-WrchNbitTab
+        &       Wrch2bit-WrchNbitTab
+        &       Wrch4bit-WrchNbitTab
+        &       Wrch8bit-WrchNbitTab
+        &       Wrch16bit-WrchNbitTab
+        &       Wrch32bit-WrchNbitTab
+WrchNbitDoubleTab
+        &       Wrch1bitDouble-WrchNbitDoubleTab
+
+CursorNbitTab
+        &       Cursor1bit-CursorNbitTab
+        &       Cursor2bit-CursorNbitTab
+        &       Cursor4bit-CursorNbitTab
+        &       Cursor8bit-CursorNbitTab
+        &       Cursor16bit-CursorNbitTab
+        &       Cursor32bit-CursorNbitTab
+
+; *****************************************************************************
+;
+;       SYN - Perform MODE change
+;
+;       External routine
+;
+; in:   Vdu queue contains mode number
+;
+
+SYN     ROUT                            ; Select screen mode (MODE)
+        Push    lr
+        LDRB    R2, [WsPtr, #QQ]        ; Read mode number from queue
+        BL      ModeChangeSub
+        Pull    lr
+        MOVVC   pc, lr                  ; if no error, exit to Vdu
+                                        ; (which calls PostWrchCursor)
+; else drop thru into ...
+
+VduBadExit                              ; jumped to if an error in VDU code
+        Push    R0                      ; save error pointer
+        BL      PostWrchCursor
+        SETV
+        Pull    "R0, R14,PC"
+
+ModeChangeSub ROUT
+        Push    lr
+        MOV     r1, #0
+        STRB    r1, [r1, #LCD_Active]   ;Default to non-lcd active, single panel (mainly for Stork power-saving info)
+        MOV     R1, #Service_PreModeChange
+        IssueService
+        TEQ     R1, #0                  ; was service claimed ?
+        BNE     %FT03                   ; no, so continue
+
+        CMP     R0, #0                  ; service claimed; generate error ?
+        Pull    PC, EQ                  ; no, just exit (V=0 from CMP)
+        B       %FT07                   ; yes, then generate error
+03
+        MOV     R0, R2                  ; put mode (possibly changed) in R0
+        MOV     R2, R0, LSR #7          ; R2 = 0/1 if bit 7 of mode clear/set
+ [ ModeSelectors
+        CMP     r2, #2                  ; if mode number >= 256 then mode selector
+        MOVCS   r2, #0                  ; so no shadow
+ ]
+        LDROSB  R1, Shadow
+        TEQ     R1, #0                  ; if shadow 0 then force shadow mode
+        MOVEQ   R2, #1
+
+        BL      FindOKMode              ; out: R1 = mode we are going to use
+        BVS     %FT07
+
+        TEQ     R0, R1                  ; if substitute mode
+        MOVNE   R2, #0                  ; then don't use shadow
+
+ [ ModeSelectors
+        CMP     r1, #&100
+        BICCC   r10, r1, #&80
+        MOVCS   r10, r1
+ |
+        BIC     R10, R1, #&80
+ ]
+        MOV     R11, R10
+        BL      PushModeInfo
+        BVS     %FT07                   ; [probably duff mode selector]
+
+        LDR     R11, [R13, #wkScreenSize] ; get screen size for this mode
+        LDR     R9, [WsPtr, #TotalScreenSize] ; maximum allowed amount
+
+        Push    R1                      ; save proper mode
+        RSBS    R1, R9, R11, LSL R2     ; extra amount we need
+        BLS     %FT08                   ; enough memory, so skip
+
+; try to extend the amount of screen memory
+
+        MOV     R0, #2                  ; expand screen memory
+        SWI     XOS_ChangeDynamicArea
+        BVC     %FT08
+
+        ADD     R13, R13, #PushedInfoSize + 1*4 ; junk stacked info + mode no.
+        ADR     R0, ErrorBlock_BadMODE
+      [ International
+        BL      TranslateError
+      ]
+07
+        SETV                            ; indicate error
+        Pull    PC
+
+; valid mode and enough memory
+
+08
+        Pull    R0                      ; restore mode we are using
+ [ ModeSelectors
+        CMP     r0, #&100               ; if not mode selector
+        BICCC   r0, r0, #&80            ; then knock off shadow bit
+        BCC     %FT12
+
+; it's a mode selector, so copy it to our static mode selector block
+
+        LDR     r1, [WsPtr, #KernelModeSelector] ; point at block
+
+        SUBS    r3, r0, r1              ; if r0 -> 1st mode block position
+        TEQNE   r3, #4                  ; or r0 -> 2nd mode block position
+        MOVEQ   r1, r0                  ; then use it in place
+        BEQ     %FT09
+
+        LDR     r3, [WsPtr, #DisplayModeNo] ; else check if current mode is a mode selector
+        SUB     r3, r3, r1              ; r3 = offset from start of block
+        CMP     r3, #8                  ; if 0 or 4
+        EORCC   r3, r3, #4              ; then make 4 or 0 (ie toggle between them)
+        ADDCC   r1, r1, r3              ; and add on base
+
+        ASSERT  (ModeSelector_ModeVars+4) :AND: 7 = 0
+09
+        MOV     r3, #0
+10
+        LDR     r6, [r0, r3]            ; copy 1st word - after fixed bit this will be previous var value
+        STR     r6, [r1, r3]
+        ADD     r3, r3, #4
+        LDR     r6, [r0, r3]            ; copy 2nd word - after fixed bit this will be next var index
+        STR     r6, [r1, r3]
+        ADD     r3, r3, #4
+        CMP     r3, #ModeSelector_ModeVars + 4  ; only exit if we've done the essential bit
+        CMPCS   r6, #-1                 ; AND we've had a -1 as the var index (NOT as the value)
+        CMPCC   r3, #ModeSelector_MaxSize ; OR we've gone off the end of our block
+        BCC     %BT10                   ; [we haven't, so loop]
+
+        CMP     r3, #ModeSelector_MaxSize       ; if we did go off the end
+        MOVCS   r6, #-1
+        STRCS   r6, [r1, #ModeSelector_MaxSize-4] ; then terminate it properly
+
+        MOV     r0, r1                  ; point at static block
+12
+ |
+        BIC     R0, R0, #&80            ; knock out shadow bit
+ ]
+        STR     R0, [WsPtr, #DisplayModeNo] ; store the new display mode
+
+; now issue Service_ModeChanging
+
+        MOV     R1, #Service_ModeChanging
+        BL      IssueModeService
+
+
+        [ LCDPowerCtrl
+        ;Switch LCD off here if it is _not_ an LCD mode
+        MOV     R3, #0
+        LDRB    R3, [R3, #LCD_Active]
+        ANDS    R0, R3, #&7F            ;Pick out the lcd mode bits, ignoring the single/dual panel bit
+        Push    "r0-r1"
+        MOVEQ   R0, #0
+        LDREQ   R1, =:NOT:(PortableControl_LCDEnable :OR: PortableControl_BacklightEnable)
+        SWIEQ   XPortable_Control
+        Pull    "r0-r1"
+        ]
+
+; R13 -> mode variables
+
+13      LDR     R3, [R13, #wkScreenSize]
+        STR     R3, [WsPtr, #ScreenSize] ; store screensize BEFORE calling
+                                        ; ConvertBankToAddress (was a bug!)
+
+        TEQ     R2, #0                  ; Shadowing or not ?
+        LDR     R3, [WsPtr, #VduStatus]
+        BICEQ   R3, R3, #Shadowing
+        ORRNE   R3, R3, #Shadowing
+        STR     R3, [WsPtr, #VduStatus]
+
+        STRB    R2, [WsPtr, #ScreenMemoryClaimed] ; only allow ADFS to claim
+                                        ; if non-shadow (simplifies things!)
+
+        BL      ConvertBankToAddress    ; R3 := default start for this bank
+        STR     R3, [WsPtr, #DriverBankAddr]
+        STR     R3, [WsPtr, #DisplayBankAddr]
+
+        MOV     R6, #0
+        STRB    R6, [R6, #OsbyteVars + :INDEX:MemDriver]  ; indicate default
+        STRB    R6, [R6, #OsbyteVars + :INDEX:MemDisplay] ; for both of these
+
+        LDR     R6, [R13, #wkModeFlags]
+        STR     R6, [WsPtr, #DisplayModeFlags]
+
+        MOV     R2, #wkend-wkdispstart  ; number of bytes to do
+        ADD     R1, R13, #wkdispstart
+
+        ADD     R4, WsPtr, #PalIndex    ; first display mode variable
+15
+        LDR     R3, [R1], #4            ; copy variables
+        STR     R3, [R4], #4
+        SUBS    R2, R2, #4              ; loop until all done
+        BNE     %BT15
+
+; now set up other mode variables by calling SwitchOutput
+
+        ADD     R3, WsPtr, #VduSaveArea+InitFlag
+        STR     R2, [R3]                ; indicate uninitialised (R2=0)
+        TST     R6, #Flag_Teletext
+        MOVNE   R3, #0                  ; if teletext, then no save area
+        MOVEQ   R3, #1                  ; else MOS's save area
+        MOV     R1, #0                  ; just in case
+        MOV     R0, #SpriteReason_SwitchOutputToSprite
+        SWI     XOS_SpriteOp
+
+; now create other variables from simple ones
+
+        LDR     R3, [WsPtr, #NColour]
+        STR     R3, [WsPtr, #DisplayNColour]
+
+        ASSERT  YWindLimit = XWindLimit +4
+        ASSERT  DisplayYWindLimit = DisplayXWindLimit +4
+        ADD     R0, WsPtr, #XWindLimit
+        LDMIA   R0, {R3, R4}
+        ADD     R0, WsPtr, #DisplayXWindLimit
+        STMIA   R0, {R3, R4}
+
+        ASSERT  YEigFactor = XEigFactor +4
+        ASSERT  DisplayYEigFactor = DisplayXEigFactor +4
+        ADD     R0, WsPtr, #XEigFactor
+        LDMIA   R0, {R3, R4}
+        ADD     R0, WsPtr, #DisplayXEigFactor
+        STMIA   R0, {R3, R4}
+
+        ASSERT  Log2BPP = Log2BPC +4
+        ADD     R0, WsPtr, #Log2BPC
+        LDMIA   R0, {R0, R1}                    ; R0 = Log2BPC; R1 = Log2BPP
+        SUB     R3, R3, R0                      ; adjust XEig for double pixels
+        ADD     R3, R3, R1
+        STR     R3, [WsPtr, #PointerXEigFactor]
+
+; finished doing other variables
+
+ [ VIDC_Type = "VIDC20"
+        LDROSB  R2, TVInterlace
+        TST     R2, #1
+        MOVNE   R4, #0
+        MOVEQ   R4, #CR_Interlace
+ |
+        BL      ReadSyncType            ; out: r4 = configured sync (0 or 1) and NE if 1
+        MOVNE   R4, #CompSync
+
+        LDROSB  R2, TVInterlace
+        TST     R2, #1
+        ORREQ   R4, R4, #CR_Interlace   ; 0 or &40
+ ]
+
+        LDROSB  R5, TVVertical
+        MOV     R5, R5, LSL #24         ; sign extend to 32 bits
+ [ VIDC_Type = "VIDC20"
+        MOV     R5, R5, ASR #24-3       ; and multiply by 8
+ |
+        MOV     R5, R5, ASR #24-3-14    ; and multiply by 8*(2^14)
+ ]
+        LDR     R1, [WsPtr, #ModeFlags]
+        TST     R1, #Flag_GapMode       ; gap mode ?
+        ADDNE   R5, R5, R5, ASR #2      ; add on 2 rows if so
+        TST     R1, #Flag_DoubleVertical ; if double vertical
+        ADDNE   R5, R5, R5              ; then double it
+
+        ADD     R0, R13, #wkwordsize    ; R0 -> table of VIDC parms
+        MOV     R7, R0                  ; keep copy for if we go wrong
+
+ [ VIDC_Type = "VIDC20"
+        LDR     R1, [R0, #(PseudoRegister_DPMSState:SHR:22)-&80*4] ; get DPMS state if specified
+        CMP     R1, #-1                 ; if not specified
+        MOVEQ   R1, #0                  ; then use zero
+        ANDNE   R1, R1, #3              ; else only use bits 0 and 1
+        STRB    R1, [WsPtr, #ScreenBlankDPMSState]
+
+        MOV     R1, #0                  ; always select 24MHz clock to feed into VIDC, and normal syncs
+ |
+; now set up the VIDC clock latch, before we program any VIDC registers
+; and also set up the sync polarity while we're at it
+
+        LDR     R1, [R0, #(&E0-&80)]    ; get CR with clock+sync bits
+        EOR     R1, R1, R4              ; adjust vertical/composite flag
+        TST     R1, #CompSync           ; if doing composite sync
+        BICNE   R1, R1, #SyncControlMask ; then ensure normal syncs
+
+        AND     R1, R1, #ClockControlMask :OR: SyncControlMask
+
+        ASSERT  SyncControlShift = ClockControlShift+2
+
+        MOV     R1, R1, LSR #ClockControlShift
+ ]
+ [ IO_Type <> "IOMD"
+        LDR     R3, =VIDCClockSelect
+        STRB    R1, [R3]
+ ]
+
+ [ {FALSE}                              ; TMD 02-Sep-92: This bit removed - no production h/w has this latch
+        BL      ReadMonitorType         ; now mute sound pin if not monitortype 0 (sound pin = VGA test pin)
+        TEQ     R3, #0                  ; if monitortype 0 then program 0
+        MOVNE   R3, #1                  ; else program 1
+        LDR     R1, =IOEB_SoundSuppress
+        STRB    R3, [R1]                ; OK to do this on old machines
+ ]
+
+        MOV     R3, #VIDC               ; point to VidC
+18
+ [ VIDC_Type = "VIDC20"
+        MOV     R1, #124*4              ; number of bytes to do (register &FC is the pseudo one to tell
+                                        ; the OS the real VIDC clock rate)
+ |
+        MOV     R1, #31*4               ; number of bytes to do (register &FC is the pseudo one to tell
+                                        ; the OS the real VIDC clock rate)
+ ]
+
+   [ {FALSE}   ;DEBUGGING CODE - DUMPS THE VIDC REGISTER TABLE TO A FILE (DONE FOR LCDSUPPORT)
+
+        Push    "r0-r12"
+
+        MOV     r10, #0
+        LDRB    r10, [r10, #LCD_Active]
+        CMP     r10, #2
+
+        Pull    "r0-12", NE
+        BNE     %FT20
+
+        MOV     r10, r0
+        MOV     r11, r1
+
+        ! 0, "**** WARNING: VIDC List debugging assembled in ****"
+
+        MOV     r0, #&80
+        ADR     r1, DbgFilename
+        SWI     XOS_Find
+
+        Pull    "r0-r12", VS
+        BVS     %FT20
+
+        MOV     r1, r0
+        MOV     r0, #2
+        MOV     r2, r10
+        MOV     r3, r11
+        SWI     XOS_GBPB
+
+        MOV     r0, #0
+        SWI     XOS_Find
+
+        Pull    "r0-r12"
+
+DbgFilename
+        =       "$.VIDCData", 0
+        ALIGN
+
+   ]
+
+
+20
+        LDR     R2, [R0], #4            ; Get data from table
+
+        CMP     R2, #-1                 ; unprogrammed register ?
+        BEQ     %FT80                   ; then skip
+
+        AND     R6, R2, #&FF000000
+
+        TEQ     R6, #HorizDisplayStart
+        STREQ   R2, [WsPtr, #CursorFudgeFactor] ; save for later !
+
+25
+        CMP     R6, #VertiBorderStart
+        RSBCSS  R14, R6, #VertiCursorEnd
+        BCC     %FT40                   ; not a vertical register
+
+; programming one of the registers affected by *TV
+
+        SUB     R8, R2, R5              ; subtract offset
+        TEQ     R6, #VertiDisplayStart  ; test for display start
+        BICEQ   R14, R8, #&FF000000     ; get rid of register bits
+        STREQ   R14, [WsPtr, #VertAdjust] ; save for pointer programming
+
+        EOR     R14, R8, R2             ; see if now programming different reg
+        MOVS    R14, R14, LSR #24       ; zero if OK
+
+        MOVNE   R5, #0                  ; we've gone wrong, so set 0 adjust
+        MOVNE   R0, R7                  ; and go back to the beginning
+        BNE     %BT18
+
+        MOV     R2, R8                  ; otherwise update register
+40
+ [ VIDC_Type = "VIDC20"
+        TEQ     R6, #HorizSyncWidth             ; if h.sync width register
+        STREQ   R2, [WsPtr, #HSWRSoftCopy]      ; then save for DPMS stuff
+        TEQ     R6, #VertiSyncWidth             ; likewise v.sync width
+        STREQ   R2, [WsPtr, #VSWRSoftCopy]
+
+        TEQ     R6, #VIDCExternal       ; check for external register (which contains syncs)
+        BNE     %FT50
+
+        Push    "r4"
+        BL      ReadSyncType
+        Pull    "r4"
+        BICNE   R2, R2, #(Ext_HSYNCbits :OR: Ext_VSYNCbits)     ; if composite sync then don't invert syncs
+        ORRNE   R2, R2, #Ext_InvertCompVSYNC :OR: Ext_InvertCompHSYNC ; and force both syncs to be composite (because of lack of
+                                                                ; swap in A540 VIDC card)
+        B       %FT75
+50
+        TEQ     R6, #VIDCFSyn
+        BNE     %FT60
+
+        LDR     R8, =FSyn_ResetValue    ; set test bits on, and r > v
+        STR     R8, [R3]
+
+; we may need some delay in here...
+
+        LDR     R8, =FSyn_ClearR :OR: FSyn_ClearV :OR: FSyn_ForceLow :OR: FSyn_ForceHigh
+        ORR     R2, R2, R8
+        BIC     R2, R2, #FSyn_ForceHigh ; force test bits on, except this one
+        STR     R2, [R3]
+
+; we may also need some delay in here...
+
+        BIC     R2, R2, R8              ; remove test bits
+        B       %FT75
+
+60
+  [ MEMC_Type = "IOMD"
+        TEQ     r6, #VIDCDataControl
+        BNE     %FT65
+
+        BIC     r2, r2, #DCR_BusBits
+        MOV     r14, #0
+        LDR     r14, [r14, #VRAMWidth]
+        CMP     r14, #2                 ; if using 64-bit wide VRAM
+        ORRCS   r2, r2, #DCR_Bus63_0    ; then data on all 64 bits
+        ORRCC   r2, r2, #DCR_Bus31_0    ; else for 32-bit wide VRAM or DRAM-only,
+                                        ; data is on low 32 bits
+        BCC     %FT65
+
+; dual-bank VRAM, so HDWR value needs to be halved
+
+        MOV     r14, r2, LSL #(31-10)   ; get HDWR bits at top - NB allow bit 10 to be used here!
+        BIC     r2, r2, r14, LSR #(31-10) ; knock off bits
+        TST     r14, #1 :SHL: (31-10)   ; see if bottom bit would get knocked off
+        ORRNE   r2, r2, #DCR_HDis       ; if so, then disable HDis mechanism (for eg mode 29)
+        ORREQ   r2, r2, r14, LSR #(31-9) ; otherwise, put bits back one bit further down
+
+65
+  ]
+ ]
+        TEQ     R6, #VIDCControl        ; if control register
+        BNE     %FT75
+
+; programming control register, so EOR sync/interlace bits, save in soft copy
+; then work out CursorFudgeFactor from HorizDisplayStart (in CursorFudgeFactor)
+; and bits-per-pixel in control register
+
+        EOR     R2, R2, R4              ; then EOR sync/interlace bits
+
+ [ VIDC_Type = "VIDC20"
+  [ MorrisSupport
+    ;    MOV     R10, #IOMD_Base
+    ;    LDRB    R9, [R10, #IOMD_ID0]
+    ;    CMP     R9, #&E7
+    ;    LDRB    R9, [R10, #IOMD_ID1]
+    ;    CMPEQ   R9, #&D4
+    ;    MOVNE   R9, #32000              ;Morris clocks VIDC20L at 32Mhz
+    ;    LDREQ   R9, =24000              ;RISC PC clocks VIDC20 at 24MHz
+        MOV     R9, #0
+        LDRB    R9, [R9, #IOSystemType]
+        TST     R9, #IOST_7500
+        LDREQ   R9, =24000              ;RISC PC clocks VIDC20 at 24MHz
+        MOVNE   R9, #32000              ;Morris clocks VIDC20L at 32Mhz                         ;
+  |
+        LDR     R9, =24000
+  ]
+        STR     R9, [WsPtr, #VIDCClockSpeed]
+  [ {FALSE}
+
+; The following code computes the actual pixel rate used, but we don't actually
+; need to know this!
+
+        AND     R8, R2, #3
+        CMP     R8, #1
+        MOVEQ   R9, #0                  ; dunno what HCLK is, so assume 0
+        MOVCS   R8, #1                  ; r-modulus not used, so 1
+        BCS     %FT71                   ; PLL not used
+
+        LDR     R10, [R7, #(&D0-&80)*4] ; get FreqSyn register
+        MOV     R8, R10, LSR #8
+        AND     R8, R8, #63
+        ADD     R8, R8, #1              ; r8 = v-modulus
+        MUL     R9, R8, R9
+
+        AND     R8, R10, #63
+        ADD     R8, R8, #1              ; r8 = r-modulus
+71
+        MOV     R10, R2, LSR #2
+        AND     R10, R10, #7
+        ADD     R10, R10, #1            ; r10 = clock divider
+        MUL     R8, R10, R8             ; r8 = global divider
+        DivRem  R10, R9, R8, R11        ; r10 = pixel rate in kHz
+  ]
+        STR     R2, [WsPtr, #VIDCControlCopy] ; and save in copy
+
+  [ MEMC_Type = "IOMD"
+; now compute FSIZE properly
+        LDR     R10, [R7, #(&94-&80)*4] ; get vertidisplayend
+        BIC     R10, R10, #&FF000000
+        LDR     R8, [R7, #(&93-&80)*4]  ; get vertidisplaystart
+        BIC     R8, R8, #&FF000000
+        SUB     R10, R10, R8            ; verti displayed
+        LDR     R8, [R7, #(&90-&80)*4]  ; verti total
+        BIC     R8, R8, #&FF000000
+        SUB     R10, R8, R10
+        ADD     R10, R10, #1            ; vidc parms are n-2, we want n-1
+        MOV     R8, #IOMD_Base
+        STRB    R10, [R8, #IOMD_FSIZE]
+  ]
+
+        LDR     R14, [WsPtr, #CursorFudgeFactor] ; R14 = horiz display start (-18)
+        BIC     R14, R14, #&FF000000
+        ADD     R14, R14, #(18-17)      ; horiz cursor start is programmed with n-17
+        STR     R14, [WsPtr, #CursorFudgeFactor]
+ |
+
+; new algorithm for working out DMA request values from MemorySpeed,
+; bits/pixel, pixel rate, and VIDC clock rate
+; value n to program is >= (25-11v/m)/8
+; therefore n = 3-INT((11v/m-1)/8), forced into range 0..3,
+; where m=memory rate (in kHz)
+;       v=screen memory rate (in kbytes/second (NOT Kbytes/second))
+;        = <vc=VIDC clock>*<vs=value out of MemorySpeedTab>/48
+;
+; ie n = 3-INT((vc*vs*11/(48*m)-1)/8)
+
+        LDR     R9, [R7, #&FC-&80]      ; see if the module has told us the real VIDC clock
+        CMP     R9, #-1
+        BNE     %FT71
+        AND     R8, R2, #ClockControlMask ; extract VIDC clock bits
+        ADR     R9, VIDCClockSpeeds
+        LDR     R9, [R9, R8, LSR #ClockControlShift-2]  ; R9 = vc (in kHz)
+71
+        STR     R9, [WsPtr, #VIDCClockSpeed] ; store away for reading by RVV
+        AND     R8, R2, #15             ; pixel rate in 0,1, bits/pixel in 2,3
+        ADR     R10, MemorySpeedTab     ; now load memory rate relative to 24M
+        LDRB    R8, [R10, R8]           ; R8 = vs
+        MUL     R8, R9, R8              ; R8 = vc*vs
+        ADD     R9, R8, R8, LSL #2      ; R9 = vc*vs*5
+        ADD     R8, R8, R9, LSL #1      ; R8 = vc*vs*11
+        MOV     R9, #0
+        LDR     R9, [R9, #MemorySpeed]  ; memory speed in kHz in bottom 16 bits
+        BIC     R9, R9, #&FF000000
+        BIC     R9, R9, #&00FF0000      ; R9 = m
+        ADD     R9, R9, R9, LSL #1      ; R9 = m*3
+        MOV     R9, R9, LSL #4          ; R9 = m*48
+        DivRem  R10, R8, R9, R11        ; R10 = vc*vs*11/(48*m)
+        SUB     R10, R10, #1            ; R10 = vc*vs*11/(48*m)-1
+        MOVS    R10, R10, ASR #3        ; R10 = (vc*vs*11/(48*m)-1)/8
+        MOVMI   R10, #0                 ; if going to be > 3 then make 3
+        RSBS    R10, R10, #3            ; R10 = 3-(vc*vs*11/(48*m)-1)/8
+        MOVMI   R10, #0                 ; if -ve then make 0
+        BIC     R2, R2, #(3:SHL:4) :OR: ClockControlMask
+                                        ; knock out FIFO + clock bits
+        ORR     R2, R2, R10, LSL #4     ; put result in bits 4,5
+        STR     R2, [WsPtr, #VIDCControlCopy] ; and save in copy
+
+        LDR     R14, [WsPtr, #CursorFudgeFactor] ; R14 = horiz display start
+        BIC     R14, R14, #&FF000000    ; lbpp = 0, 1, 2, 3
+        MOV     R14, R14, LSR #14       ; R14 = (m-19, m-11, m-7, m-5)/2
+
+        MOV     R8, R2, LSR #2          ; put bits 2,3 (lbpp) into bits 0,1
+        AND     R8, R8, #3              ; just look at these bits
+        RSB     R8, R8, #3              ; R8 = 3, 2, 1, 0
+        MOV     R9, #1
+        ADD     R14, R14, R9, LSL R8    ; R14 = (m-3, m-3, m-3, m-3)/2
+        MOV     R14, R14, LSL #1        ; R14 = m-3
+        SUB     R14, R14, #3            ; R14 = m-6
+        STR     R14, [WsPtr, #CursorFudgeFactor]
+ ]
+75
+
+ [ {FALSE} ; *** debugging
+        Push    "r0"
+        MOV     r0, r2
+        BL      TubeDumpR0
+        Pull    "r0"
+        TubeString r8, r9, r10, " ",cc ; pad out to 10 chars
+ ]
+
+  [ StorkPowerSave
+        TEQ     R6, #VIDCExternal
+        STREQ   R2, [WsPtr, #VIDCExternalSoftCopy]
+        TEQ     R6, #VIDCFSyn
+        STREQ   R2, [WsPtr, #VIDCFSynSoftCopy]
+        TEQ     R6, #VIDCControl
+        STREQ   R2, [WsPtr, #VIDCControlSoftCopy]
+  ]
+
+        STR     R2, [R3]                ; stuff it into VidC
+80
+        SUBS    R1, R1, #4
+        BNE     %BT20
+
+        ADD     R13, R13, #PushedInfoSize       ; junk stacked data
+
+        MOV     R0, #(1 :SHL: 10)       ; enable video DMA
+        ORR     R1, R0, #(1 :SHL: 9)    ; refresh only in vflyback
+        SWI     XOS_UpdateMEMC
+
+        MOV     R0, #VertiCursorStart + 0       ; program cursor start and end
+        STR     R0, [R3]
+        MOV     R0, #VertiCursorEnd + 0         ; to zero
+        STR     R0, [R3]
+
+        BL      SetVendDefault                  ; set to ScreenEndAdr-16
+
+        MOV     R1, #ScreenEndAdr               ; need to reload cos corrupt
+        LDR     R2, [WsPtr, #TotalScreenSize]
+        SUB     R0, R1, R2                      ; R0 = Vstart
+        BL      SetVstart
+        MOV     R0, #0
+        STRB    R0, [WsPtr, #PointerShapeNumber]
+        STR     R0, [WsPtr, #TeletextOffset]
+        STR     R0, [WsPtr, #CursorStack]       ; restore cursor on a mode
+
+        BL      PalInit                 ; set default palette
+        BL      UnblankScreen
+        BL      SetMouseRectangle
+        BL      FF
+
+        [ LCDPowerCtrl
+        ;Switch the LCD on if LCD mode
+        Push    "r0"
+        MOV     R1, #0
+        LDRB    R1, [R1, #LCD_Active]
+        ANDS    R1, R1, #&7F            ;Check the LCD mode bits only, not the single/dual panel bit
+        LDRNE   R0, =(PortableControl_LCDEnable :OR: PortableControl_BacklightEnable)
+        LDRNE   R1, =:NOT:(PortableControl_LCDEnable :OR: PortableControl_BacklightEnable)
+        SWINE   XPortable_Control
+        Pull    "r0"
+        ]
+
+        MOV     R1, #Service_ModeChange
+        BL      IssueModeService
+
+        CLRV                            ; indicate no error
+        Pull    PC                      ; return to caller
+
+        MakeErrorBlock BadMODE
+
+        LTORG
+
+ [ :LNOT: (VIDC_Type = "VIDC20")
+MemorySpeedTab
+        =       2, 3, 4, 6,  4, 6, 8, 12,  8, 12, 16, 24,  16, 24, 32, 48
+        ALIGN
+
+VIDCClockSpeeds
+        &       24000
+        &       25175
+        &       36000
+        &       00000
+ ]
+
+; The following symbols, apart from being used in NColourTable,
+; are also used in constructing mode selectors for mode numbers in VduModes
+
+NColour_0       *       1
+NColour_1       *       3
+NColour_2       *       15
+NColour_3       *       63
+NColour_4       *       &FFFF
+NColour_5       *       &FFFFFFFF
+
+        GET     s.vdu.VduModes
+
+; *****************************************************************************
+;
+;       IssueModeService - Issue service (either ModeChanging or ModeChange)
+;
+; in:   R1 = service code
+;
+; out:  R1 corrupted
+;
+
+IssueModeService ENTRY "r2,r3"
+        BL      ReadMonitorType
+        LDR     r2, [WsPtr, #DisplayModeNo]
+        IssueService
+        EXITS
+
+; *****************************************************************************
+;
+;       PushModeInfo - Push appropriate mode table and VIDC parms
+;       onto stack, having generated it by possibly issuing service
+;
+; in:   R10 = mode to try for (issue service if not in range 0..20,22..23)
+;       R11 = mode to use if service not claimed
+;       R10 and R11 should have bit 7 CLEAR
+;
+; out:  If r10 is an invalid mode selector or invalid new format sprite word then
+;         V=1
+;         r0 -> error
+;         stack flat
+;       else
+;         V=1
+;         Stack holds a mode table (size wkwordsize) and VIDC parms (size 32*4)
+;         (total size PushedInfoSize)
+;       endif
+;       All other registers preserved
+;
+
+PushModeInfoAnyMonitor ROUT
+        SUB     sp, sp, #PushedInfoSize
+        Push    "r2-r4,r7-r11, lr"
+        MOV     r3, #-1
+        MOV     r7, #-1                 ; indicate no VIDC stuff necessary
+ [ ModeSelectors
+        CMP     r10, #&100              ; is it a mode selector
+        BCS     PushModeInfoCommonNoService
+ ]
+        BranchIfKnownMode r10, PushModeInfoCommonNoService
+        B       PushModeInfoCommon
+
+PushModeInfo ROUT
+        SUB     sp, sp, #PushedInfoSize
+        Push    "r2-r4,r7-r11, lr"
+        MOV     r7, #0                  ; indicate VIDC stuff IS necessary
+        BL      ReadMonitorType
+PushModeInfoCommon
+        MOV     r2, r10                 ; r2 = original mode
+        BL      OfferModeExtension
+ [ ModeSelectors
+        BEQ     %FT30                   ; [service claimed]
+
+        CMP     r2, #&100               ; service not claimed - check if mode selector
+        MOVCC   r10, r11                ; unrecognised mode number, so use substitute
+        BCC     PushModeInfoCommonNoService
+
+; service not claimed and it's a mode selector - return error "Screen mode not available"
+
+        ADR     r0, ErrorBlock_ModeNotAvailable
+  [ International
+        BL      TranslateError
+  ]
+        B       %FT40
+
+        MakeErrorBlock ModeNotAvailable
+
+30
+        TEQ     r4, #0                  ; if r4 returned zero, then a mode selector was used
+                                        ; either initially or after translation from mode number
+        BEQ     %FT35                   ; so no ws list
+        LDR     r2, [r4, #4]!           ; else if claimed, then find ws base mode
+        CMP     r2, #&100               ; if ws base mode is a mode selector, it's invalid
+        ANDCC   r2, r2, #&7F            ; else knock off shadow bit
+        BCC     %FT35
+        MOV     r10, r11                ; invalid ws base mode, so pretend service not responded to
+
+; and drop thru to PushModeInfoCommonNoService
+
+ |
+        MOVNE   r10, r11                ; not claimed, so use substitute
+        BNE     PushModeInfoCommonNoService
+        LDR     r2, [r4, #4]!           ; if claimed, then find ws base mode
+        AND     r2, r2, #&7F            ; no funny business
+        B       %FT35
+ ]
+PushModeInfoCommonNoService
+        MOV     r2, r10                 ; else use provided mode
+        MOV     r3, #0
+        MOV     r4, #0
+35
+        ADD     r9, sp, #9*4            ; adjust for pushed registers
+ [ ModeSelectors :LOR: {TRUE}           ; mode selectors or sprite mode words
+        CMP     r2, #&100
+        BCC     %FT45
+        BL      GenerateModeSelectorVars ; also copes with new sprite mode word
+        BVC     %FT55
+
+; we got an error
+
+40
+        SETV
+        Pull    "r2-r4,r7-r11,lr"       ; restore registers
+        ADD     sp, sp, #PushedInfoSize ; junk stack frame
+        MOV     pc, lr                  ; exit VS, r0 -> error
+
+45
+ ]
+47
+        ADRL    r14, Vwstab
+        LDR     r10, [r14, r2, LSL #2]
+        ADD     r14, r14, r10           ; r14 -> mode table
+        MOV     r10, #wkwordsize-4
+50
+        LDR     r2, [r14, r10]
+        STR     r2, [r9, r10]
+        SUBS    r10, r10, #4
+        BCS     %BT50
+
+; now change any variables specified in workspace block or mode selector overrides
+
+55
+        TEQ     r4, #0                  ; if service was claimed
+        ADDNE   r4, r4, #4              ; then skip ws base mode
+        BLNE    ProcessModeVarPairs
+
+; hopefully, R7 is still set from up there to be NZ if no VIDC stuff necessary
+
+        CMP     r7, #0
+        Pull    "r2-r4,r7-r11, pc", NE  ; if no VIDC stuff required, exit (NB V=0 from CMP)
+
+; now set up VIDC table, first from MOS table, then changes from module
+
+; first clear out all 32 (or 128) VIDC entries with -1
+
+        ADD     R14, R9, #wkwordsize
+        MOV     R10, #VIDCParmsSize
+        MOV     R8, #-1
+60
+        STR     R8, [R14], #4
+        SUBS    R10, R10, #4
+        BNE     %BT60
+
+; now copy over MOS's table
+
+        ADD     R9, R9, #wkwordsize-VIDCParmsSize
+
+        TEQ     R3, #0                  ; if no module claimed service
+        MOVEQ   R2, R11                 ; then use provided mode
+        BEQ     %FT62
+ [ VIDCListType3
+        LDR     r2, [r3, #0]
+        TEQ     r2, #3                  ; if VIDC list type 3
+        BEQ     ProcessVIDCListType3    ; then don't copy any MOS data into table, just process list
+ ]
+        LDR     r2, [r3, #4]            ; else just load VIDC list base mode, and copy MOS's table for that
+
+62
+        Push    R3
+        BL      ReadMonitorType         ; get monitor type in R3
+        CMP     R3, #NumMonitorTypes    ; monitor type must be in range
+        CMPCC   R2, #NumModes           ; and mode must be in range
+        MOVCC   R11, #NumModes
+        MLACC   R11, R3, R11, R2        ; then form monitortype*numberofmodes + modenumber
+        MOVCS   R11, #0                 ; if illegal then use mode 0 monitortype 0
+        ADRL    R14, BigVIDCTable       ; point to big table
+        LDR     R11, [R14, R11, LSL #2] ; and load offset
+        CMP     R11, #-1                ; if table offset is valid
+        ADDCC   R11, R14, R11           ; then add to table address
+        BLCC    UpdateVIDCTable         ; and fetch data
+        Pull    R3
+
+ [ VIDC_Type = "VIDC20"
+        TEQ     R3, #0
+        LDRNE   R2, [R3, #0]            ; get VIDC table type
+        TSTNE   R2, #2                  ; test for VIDC20 compatible table
+        ADDNE   R11, R3, #8             ; if exists
+        BLNE    UpdateVIDCTable         ; then modify parameters
+
+        CLRV
+        Pull    "R2-R4,R7-R11, PC"      ; ignore any second list for the time being (it's all coded in main list)
+ |
+
+; now copy modules changes
+
+        TEQ     R3, #0
+        ADDNE   R11, R3, #8             ; if module list exists, then
+        BLNE    UpdateVIDCTable         ; modify the table
+
+        LDRNE   R2, [R3, #0]            ; get VIDC table type
+        TSTNE   R2, #1                  ; bit 0 set if has second list
+        BNE     %FT70                   ; has 2nd list
+65
+        CLRV
+        Pull    "R2-R4,R7-R11, PC"      ; if no module table, or no second list
+                                        ; then exit
+70
+        LDR     R2, [R11], #4
+        CMP     R2, #-1
+        BEQ     %BT65                   ; exit VC if found end of list
+
+        MOV     R7, R2, LSR #24         ; R7=type of data (0=pixel rate,1=sync, 2=real VIDC clock)
+        BIC     R2, R2, R7, LSL #24     ; knock out data type
+
+; now the change to allow the real VIDC clock rate to be declared by the module
+
+        CMP     R7, #2
+        STREQ   R2, [R13, #9*4+wkwordsize+&FC-&80] ; store in pseudo-register &FC
+        BEQ     %BT70
+        CMP     R7, #1
+        BHI     %BT70                   ; if > 1 then unknown, so skip
+        BEQ     %FT90                   ; if 1 then sync polarity specification
+
+; R2 is requested pixel rate in kHz - scan through available pixel rates to
+; find match
+
+        MOV     R3, #-1                 ; least error so far
+        MOV     R4, #(0 :SHL: ClockControlShift) :OR: 3
+                                        ; clock and internal pixel rates merged
+                                        ; bits 9 and 10 are clock rate
+                                        ; bits 0 and 1 are internal pixel rate
+                                        ; 0 => n/3, 1 => n/2, 2 => 2n/3, 3 => n
+75
+        ADRL    R9, VIDCClockSpeeds     ; point at table of available rates
+        LDR     R9, [R9, R4, LSR #ClockControlShift-2]  ; get clock rate
+        TST     R4, #2
+        MOVNE   R9, R9, LSL #1          ; if bit 1 set then multiply by 2
+        TST     R4, #1
+        MOVNE   R10, R9, LSR #1         ; if bit 0 set then divide by 2
+        BNE     %FT80                   ; and skip
+        MOV     R7, #3
+        DivRem  R10, R9, R7, R14        ; if bit 0 clear then divide by 3
+80
+        SUBS    R14, R10, R2            ; difference between desired and actual
+        MOVEQ   R8, R4
+        BEQ     %FT85                   ; found exact match, so use it
+        RSBMI   R14, R14, #0            ; get absolute error
+        CMP     R14, R3                 ; if less than least error
+        MOVCC   R3, R14                 ; then R3 = new least error
+        MOVCC   R8, R4                  ; and R8 = best fit
+        TST     R4, #3                  ; if not just tried pixel rate 0
+        SUBNE   R4, R4, #1              ; then try next pixel rate
+        BNE     %BT75
+        ADD     R4, R4, #1 :SHL: ClockControlShift ; move to next clock rate
+        TEQ     R4, #4 :SHL: ClockControlShift  ; if not finished
+        ORRNE   R4, R4, #3              ; then set internal pixel rate to 3
+        BNE     %BT75                   ; and loop
+
+; R8 is best fit, so store it in the VIDC list
+
+85
+        ADD     R9, R13, #9*4+wkwordsize+&E0-&80 ; point at control register
+        LDR     R10, [R9]               ; get previously specified CR
+        BIC     R10, R10, #ClockControlMask ; knock out clock select
+        BIC     R10, R10, #3            ; and pixel rate select
+        ORR     R10, R10, R8
+        STR     R10, [R9]
+        B       %BT70                   ; go back and see if any more
+
+; R2 = sync polarity specification
+; bit 0 set => -ve Hsync
+; bit 1 set => -ve Vsync
+
+90
+        ADD     R9, R13, #9*4+wkwordsize+&E0-&80 ; point at control register
+        LDR     R10, [R9]               ; get previously specified CR
+        BIC     R10, R10, #SyncControlMask ; knock out sync selects
+        ORR     R10, R10, R2, LSL #SyncControlShift ; and insert new ones
+        STR     R10, [R9]
+        B       %BT70                   ; go back and see if any more
+
+ ]
+
+; *****************************************************************************
+;
+;       GenerateModeSelectorVars - Work out mode variables from mode selector
+;                                    or new format sprite mode word
+;
+; Note: the algorithms used to generate these variables are duplicated in
+; s.vdu.vduswis in the OS_ReadModeVariable code.
+
+; in:   r2 = new format sprite word or pointer to mode selector
+;       r9 -> stack frame to store vars in
+;
+; out:  If valid then
+;           V=0
+;           r0 preserved
+;       else
+;           V=1
+;           r0 -> error
+;       endif
+;       All other registers preserved
+;
+
+GenerateModeSelectorVars ENTRY "r0,r1,r3-r8,r10-r12"
+ [ ModeSelectors
+        ASSERT  ModeSelector_Flags = 0
+        ASSERT  ModeSelector_XRes = 4
+        ASSERT  ModeSelector_YRes = 8
+        ASSERT  ModeSelector_PixelDepth = 12
+ ]
+        TST     r2, #1                          ; is it a new format sprite mode word?
+        BNE     %FT50                           ; [yes, so skip]
+ [ ModeSelectors
+        MOV     r0, r2
+        BL      ValidateModeSelector
+        BVS     %FT95                           ; invalid - return error
+        LDMIB   r2, {r4-r6}                     ; r4 = xres; r5 = yres; r6 = pixdepth
+
+        STR     r6, [r9, #wkLog2BPC]            ; log2bpc = log2bpp = pixdepth
+        STR     r6, [r9, #wkLog2BPP]
+        ADR     lr, NColourTable
+        LDR     lr, [lr, r6, LSL #2]            ; load NColour value
+        STR     lr, [r9, #wkNColour]
+        ADR     lr, PalIndexTable
+        LDRB    lr, [lr, r6]
+        STR     lr, [r9, #wkPalIndex]
+        ADR     lr, ECFIndexTable
+        LDRB    lr, [lr, r6]
+        STR     lr, [r9, #wkECFIndex]
+
+        MOV     lr, #0
+        STR     lr, [r9, #wkYShftFactor]        ; yshftfactor = 0 (obsolete)
+        STR     lr, [r9, #wkModeFlags]          ; modeflags = 0
+
+ [ RogerEXEY
+; TMD 09-Dec-93
+; New algorithms for xeig, yeig from Roger:
+;       xeig = 1: yeig = 1
+;       if yres<xres/2 OR yres<400 then yeig = 2
+;       if (xres<<xeig)<(yres<<yeig) then xeig = 2
+
+        CMP     r5, r4, LSR #1                  ; if yres < xres/2
+        CMPCS   r5, #400                        ; or yres < 400
+        MOVCC   r7, #2                          ; then yeig = 2
+        MOVCS   r7, #1                          ; else yeig = 1
+        STR     r7, [r9, #wkYEigFactor]
+
+        MOV     r7, r5, LSL r7                  ; r7 = yres << yeig
+        CMP     r7, r4, LSL #1                  ; if (xres<<1) < (yres<<yeig)
+        MOVHI   r7, #2                          ; then xeig = 2
+        MOVLS   r7, #1                          ; else xeig = 1
+        STR     r7, [r9, #wkXEigFactor]
+
+        MOV     lr, #1
+ |
+        MOV     lr, #1
+        STR     lr, [r9, #wkXEigFactor]         ; xeig = 1
+        CMP     r5, r4, LSR #1                  ; if yres < xres/2
+        MOVCC   r7, #2                          ; then yeig = 2
+        MOVCS   r7, #1                          ; else yeig = 1
+        STR     r7, [r9, #wkYEigFactor]
+ ]
+        RSB     r7, lr, r4, LSR #3              ; scrrcol = (xres >> 3) -1
+        STR     r7, [r9, #wkScrRCol]
+        RSB     r7, lr, r5, LSR #3              ; scrbrow = (yres >> 3) -1
+        STR     r7, [r9, #wkScrBRow]
+
+        SUB     r7, r4, #1
+        STR     r7, [r9, #wkXWindLimit]         ; xwindlimit = xres-1
+        SUB     r7, r5, #1
+        STR     r7, [r9, #wkYWindLimit]         ; ywindlimit = yres-1
+
+        MOV     r7, r4, LSL r6                  ; r7 = xres << pixdepth
+        MOV     lr, r7, LSR #3
+        STR     lr, [r9, #wkLineLength]         ; linelen = (xres << pixdepth) >> 3
+
+        MUL     r7, r5, r7                      ; r7 = (xres * yres) << pixdepth
+        MOV     lr, r7, LSR #3
+        STR     lr, [r9, #wkScreenSize]         ; screensize = ((xres * yres) << pixdepth) >> 3
+
+        ADD     r4, r2, #ModeSelector_ModeVars  ; now do pairs of mode variables
+        BL      ProcessModeVarPairs
+
+        CLRV
+        EXIT
+
+ |
+        B       %FT90                           ; it's not a new format sprite word, and mode selectors not enabled
+                                                ; so return error
+ ]
+
+; store info for new format sprite word in stack frame
+
+50
+        MOV     r0, #0
+        STR     r0, [r9, #wkYShftFactor]        ; yshftfactor = 0
+        STR     r0, [r9, #wkModeFlags]          ; modeflags = 0
+
+        MOV     r0, r2, LSR #27                 ; get type
+        CMP     r0, #SpriteType_MAX             ; check for legality - NB type 0 is illegal because r2>=&100
+        MOVCS   r0, #SpriteType_Substitute      ; substitute if unknown
+        ADRL    lr, NSM_bpptable-4
+        LDR     r0, [lr, r0, LSL #2]            ; get the bpp from table
+
+        STR     r0, [r9, #wkLog2BPC]
+        STR     r0, [r9, #wkLog2BPP]
+
+        ADR     r1, NColourTable
+        LDR     r1, [r1, r0, LSL #2]
+        STR     r1, [r9, #wkNColour]
+
+        ADR     r1, PalIndexTable
+        LDRB    r1, [r1, r0]
+        STR     r1, [r9, #wkPalIndex]
+
+        ADR     r1, ECFIndexTable
+        LDRB    r1, [r1, r0]
+        STR     r1, [r9, #wkECFIndex]
+
+        MOV     r1, r2, LSL #(31-13)
+        MOV     r1, r1, LSR #(31-13)+1          ; extract xdpi (bits 1..13)
+
+        TEQ     r1, #180                        ; 180 => xeig=0
+        MOVEQ   r1, #0
+        BEQ     %FT70
+
+        TEQ     r1, #22                         ; 22/23 => xeig=3
+        TEQNE   r1, #23
+        MOVEQ   r1, #3
+        BEQ     %FT70
+
+        TEQ     r1, #(45 :SHL: 2), 2            ; check if 45   (EQ,CC if so)
+        CMPNE   r1, #90                         ; or 90         (EQ,CS if so)
+        BNE     %FT80
+        MOVCC   r1, #2                          ; 45 => xeig=2
+        MOVCS   r1, #1                          ; 90 => xeig=1
+70
+        STR     r1, [r9, #wkXEigFactor]
+
+        MOV     r1, r2, LSL #(31-26)
+        MOV     r1, r1, LSR #(31-26)+14         ; extract ydpi (bits 14..26)
+
+        TEQ     r1, #180                        ; 180 => yeig=0
+        MOVEQ   r1, #0
+        BEQ     %FT71
+
+        TEQ     r1, #22                         ; 22/23 => yeig=3
+        TEQNE   r1, #23
+        MOVEQ   r1, #3
+        BEQ     %FT71
+
+        TEQ     r1, #(45 :SHL: 2), 2            ; check if 45   (EQ,CC if so)
+        CMPNE   r1, #90                         ; or 90         (EQ,CS if so)
+        BNE     %FT80
+        MOVCC   r1, #2                          ; 45 => yeig=2
+        MOVCS   r1, #1                          ; 90 => yeig=1
+71
+        STR     r1, [r9, #wkYEigFactor]
+
+        CLRV
+        EXIT
+
+80
+        ADR     r0, ErrorBlock_Sprite_BadDPI
+90
+ [ International
+        BL      TranslateError
+ ]
+95
+        STR     r0, [sp]                        ; update saved r0
+        SETV                                    ; indicate error
+        EXIT
+
+NColourTable    &       NColour_0, NColour_1, NColour_2
+                &       NColour_3, NColour_4, NColour_5
+PalIndexTable   =       0, 1, 2, 3, 6, 7
+        ALIGN                                   ; makes ECFIndexTable more accessible
+ECFIndexTable   =       4, 2, 3, 5, 5, 5
+        ALIGN
+
+        MakeErrorBlock  BadPixelDepth
+        MakeErrorBlock  Sprite_BadDPI
+
+ [ ModeSelectors
+; *****************************************************************************
+;
+;       ValidateModeSelector - Check a mode selector is valid
+;
+; in:   r0 -> mode selector
+;
+; out:  If OK, then
+;         V=0
+;         All registers preserved
+;       else
+;         V=1
+;         r0 -> error
+;         All other registers preserved
+;       endif
+;
+
+ValidateModeSelector ENTRY
+        LDR     lr, [r0, #ModeSelector_Flags]
+        AND     lr, lr, #ModeSelectorFlags_FormatMask
+        TEQ     lr, #ModeSelectorFlags_ValidFormat
+        ADRNE   r0, ErrorBlock_BadMSFlags
+        BNE     %FT90
+        LDR     lr, [r0, #ModeSelector_PixelDepth]
+        CMP     lr, #6
+        ADRCS   r0, ErrorBlock_BadPixelDepth
+        BCS     %FT90
+        CLRV
+        EXIT
+
+90
+  [ International
+        BL      TranslateError
+  ]
+        SETV
+        EXIT
+
+        MakeErrorBlock BadMSFlags
+
+ ]
+
+; *****************************************************************************
+;
+;       ProcessModeVarPairs - Modify stacked variable info from
+;                              mode variable (index, value) pairs
+;
+;       Internal routine used to do Service_ModeExtension workspace lists and
+;        mode selectors
+;
+; in:   r4 -> first pair (may be none)
+;       r9 -> stack frame
+;
+; out:  All registers preserved
+
+ProcessModeVarPairs ENTRY "r4, r8, r10"
+        ADRL    r14, RMVTab
+10
+        LDR     r10, [r4], #4           ; get next entry in ws table
+        CMP     r10, #-1
+        EXIT    EQ                      ; no more to do
+        CMP     r10, #(SWIRVVTabModeEnd-SWIRVVTab) ; is it a mode variable ?
+        BCS     %BT10                   ; no, then ignore
+        LDRB    r10, [r14, r10]         ; load index out of RMVTab
+        MOVS    r10, r10, LSR #1        ; shift byte/word flag into carry
+        LDR     r8, [r4], #4            ; load value
+        STRCCB  r8, [r9, r10]           ; either store byte
+        STRCS   r8, [r9, r10]           ; or store word
+        B       %BT10
+
+ [ VIDCListType3
+
+                                ^       4
+VIDCList3_PixelDepth            #       4
+VIDCList3_HorizSyncWidth        #       4
+VIDCList3_HorizBackPorch        #       4
+VIDCList3_HorizLeftBorder       #       4
+VIDCList3_HorizDisplaySize      #       4
+VIDCList3_HorizRightBorder      #       4
+VIDCList3_HorizFrontPorch       #       4
+VIDCList3_VertiSyncWidth        #       4
+VIDCList3_VertiBackPorch        #       4
+VIDCList3_VertiTopBorder        #       4
+VIDCList3_VertiDisplaySize      #       4
+VIDCList3_VertiBottomBorder     #       4
+VIDCList3_VertiFrontPorch       #       4
+VIDCList3_PixelRate             #       4
+VIDCList3_SyncPol               #       4
+VIDCList3_ControlList           #       0
+
+; Indices in control list
+
+                                ^       1
+ControlList_LCDMode             #       1
+ControlList_LCDDualPanelMode    #       1
+ControlList_LCDOffset0          #       1
+ControlList_LCDOffset1          #       1
+ControlList_HiResMode           #       1
+ControlList_DACControl          #       1
+ControlList_RGBPedestals        #       1
+ControlList_ExternalRegister    #       1
+ControlList_HClockSelect        #       1
+ControlList_RClockFrequency     #       1
+ControlList_DPMSState           #       1
+ControlList_InvalidReason       #       0
+
+;
+;       ProcessVIDCListType3 - Convert type3 VIDC list into VIDC20 parameters
+;
+; in:   r3 -> VIDC list (type 3)
+;       r9 -> VIDC table (where R9!(nn << 2) holds parameter for register nnxxxxxx
+;              for nn=80 to FF
+;       stacked r2-r4, r7-r11, lr
+
+ProcessVIDCListType3 ROUT
+        LDR     r2, [r3, #VIDCList3_HorizSyncWidth]
+        BIC     r2, r2, #1              ; must be even
+        SUB     r2, r2, #8              ; horiz parameters start off at n-8
+        ORR     r14, r2, #HorizSyncWidth
+        STR     r14, [r9, #HorizSyncWidth :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_HorizBackPorch]
+        ADD     r2, r2, r4
+        BIC     r2, r2, #1
+        SUB     r2, r2, #4              ; HBSR is N-12
+        ORR     r14, r2, #HorizBorderStart
+        STR     r14, [r9, #HorizBorderStart :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_HorizLeftBorder]
+        ADD     r2, r2, r4
+        BIC     r2, r2, #1
+        SUB     r2, r2, #6              ; HDSR is N-18
+        ORR     r14, r2, #HorizDisplayStart
+        STR     r14, [r9, #HorizDisplayStart :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_HorizDisplaySize]
+        BIC     r4, r4, #1
+        LDR     r7, [r3, #VIDCList3_PixelDepth]
+        MOV     r10, r4, LSL r7         ; number of bits in one displayed raster (not needed later any more)
+
+        ANDS    r8, r10, #31            ; if line length not multiple of 32
+        MOVNE   r8, #DCR_HDis           ; then set HDis bit
+        ORR     r8, r8, r10, LSR #5     ; OR in number of words per line
+
+; Note - the DCR_Bus bits get overridden and the HDWR bits modified further down the line by the mode change code
+; on the basis of how much VRAM we've got, and on whether we have a dual-panel LCD or not...
+
+ [ MEMC_Type = "IOMD"
+        ORR     r8, r8, #DCR_VRAMOff :OR: DCR_Bus31_0 :OR: DCR_Sync
+ |
+        ORR     r8, r8, #DCR_VRAMOff :OR: DCR_Bus31_0
+ ]
+        ORR     r8, r8, #VIDCDataControl
+        STR     r8, [r9, #VIDCDataControl :SHR: 22]
+
+        ADD     r2, r2, r4              ; HDER is also N-18
+        ORR     r14, r2, #HorizDisplayEnd
+        STR     r14, [r9, #HorizDisplayEnd :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_HorizRightBorder]
+        ADD     r2, r2, r4
+        ADD     r2, r2, #6              ; HBER is N-12
+        BIC     r2, r2, #1
+        ORR     r14, r2, #HorizBorderEnd
+        STR     r14, [r9, #HorizBorderEnd :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_HorizFrontPorch]
+        ADD     r2, r2, r4
+        ADD     r2, r2, #4              ; HCR is N-8
+        BIC     r2, r2, #3              ; must be mult of 4
+        ORR     r14, r2, #HorizCycle
+        STR     r14, [r9, #HorizCycle :SHR: 22]
+
+        ADD     r2, r2, #8              ; HIR is N/2
+        MOV     r2, r2, LSR #1
+        ORR     r14, r2, #HorizInterlace
+        STR     r14, [r9, #HorizInterlace :SHR: 22]
+
+        LDR     r2, [r3, #VIDCList3_VertiSyncWidth]
+        SUB     r2, r2, #2              ; vertical registers are N-2
+        ORR     r14, r2, #VertiSyncWidth
+        STR     r14, [r9, #VertiSyncWidth :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_VertiBackPorch]
+        ADD     r2, r2, r4
+        ORR     r14, r2, #VertiBorderStart
+        STR     r14, [r9, #VertiBorderStart :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_VertiTopBorder]
+        ADD     r2, r2, r4
+        ORR     r14, r2, #VertiDisplayStart
+        STR     r14, [r9, #VertiDisplayStart :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_VertiDisplaySize]
+        ADD     r2, r2, r4
+        ORR     r14, r2, #VertiDisplayEnd
+        STR     r14, [r9, #VertiDisplayEnd :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_VertiBottomBorder]
+        ADD     r2, r2, r4
+        ORR     r14, r2, #VertiBorderEnd
+        STR     r14, [r9, #VertiBorderEnd :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_VertiFrontPorch]
+        ADD     r2, r2, r4
+        ORR     r14, r2, #VertiCycle
+        STR     r14, [r9, #VertiCycle :SHR: 22]
+
+        LDR     r4, [r3, #VIDCList3_SyncPol]
+        MOV     r14, #VIDCExternal
+        TST     r4, #1
+        ORRNE   r14, r14, #Ext_InvertHSYNC
+        TST     r4, #2
+        ORRNE   r14, r14, #Ext_InvertVSYNC
+        ORR     r14, r14, #Ext_DACsOn
+        ORR     r14, r14, #Ext_ERegExt
+        STR     r14, [r9, #VIDCExternal :SHR: 22]
+
+        Push    "r0, r1"
+        LDR     r0, [r3, #VIDCList3_PixelRate]  ; get pixel rate
+        MOV     r10, r0, LSL r7                 ; peak mem b/w (x 1E3 bits/sec) - save for FIFO calculation
+
+ [ MorrisSupport
+   ;     MOV     R14, #IOMD_Base
+   ;     LDRB    R1, [R14, #IOMD_ID0]
+   ;     CMP     R1, #&E7
+   ;     LDRB    R1, [R14, #IOMD_ID1]
+   ;     CMPEQ   R1, #&D4
+   ;     MOVNE   R1, #32000              ;Morris clocks VIDC20L at 32Mhz
+   ;     LDREQ   R1, =24000              ;RISC PC clocks VIDC20 at 24MHz
+        MOV     R1, #0
+        LDRB    R1, [R1, #IOSystemType]
+        TST     R1, #IOST_7500
+        LDREQ   R1, =24000              ;RISC PC clocks VIDC20 at 24MHz
+        MOVNE   R1, #32000              ;Morris clocks VIDC20L at 32Mhz
+;>>>RCM says can we replace the above by
+;>>>    LDR     R1, [WsPtr, #VIDCClockSpeed]
+ |
+        LDR     r1, =rclk       ; eventually will need to replace this if specified in control list
+ ]
+        BL      ComputeModuli   ; out: r0 = FSync bits, r1 = CR bits
+        ORR     r0, r0, #VIDCFSyn
+        STR     r0, [r9, #VIDCFSyn :SHR: 22]
+
+        TEQ     r7, #5          ; if 32 bpp, then stick in 6 not 5
+        MOVEQ   r7, #6
+        ORR     r0, r1, r7, LSL #5
+
+; now work out FIFO load position - r10 is b/w in thousands of bytes/sec
+
+ [ {TRUE}
+
+; do it by means of a binary chop on 3 bits
+
+        ADR     r4, FIFOLoadTable
+        LDR     r2, [r4, #4*4]                  ; load 0-3/4-7 split
+        CMP     r10, r2
+        MOVLS   r7, #0                          ; if <=, then bottom half
+        MOVHI   r7, #4                          ; else top half
+        ADDHI   r4, r4, #4*4                    ; and advance table pointer
+
+        LDR     r2, [r4, #2*4]
+        CMP     r10, r2
+        ORRHI   r7, r7, #2
+        ADDHI   r4, r4, #2*4
+
+        LDR     r2, [r4, #1*4]
+        CMP     r10, r2
+        ORRHI   r7, r7, #1
+ |
+        CMP     r10, #&10000 :SHL: 3            ; this value (65.536 Mbytes/sec) lies above the point at which 7 works
+                                                ; and below the point at which 7 is needed
+        MOVCC   r7, #6
+        MOVCS   r7, #7
+ ]
+
+        ORR     r0, r0, r7, LSL #CR_FIFOLoadShift
+        ORR     r0, r0, #VIDCControl
+        STR     r0, [r9, #VIDCControl :SHR: 22]
+
+; Now go through VIDC control parameters list (not all indices can be handled yet)
+
+        ADD     r3, r3, #VIDCList3_ControlList-8  ; point at 1st entry -8
+50
+        LDR     r4, [r3, #8]!                   ; load next index
+        CMP     r4, #-1                         ; if -1 then end of list
+        BEQ     %FT60                           ; so skip
+
+        CMP     r4, #0                          ; if non-zero (CS if zero)
+        CMPNE   r4, #ControlList_InvalidReason  ; and if known reason
+        LDRCC   r2, [r3, #4]                    ; then load value
+        BLCC    ProcessControlListItem          ; and process this item
+        B       %BT50                           ; go onto next item in list
+
+ [ {TRUE}
+FIFOLoadTable
+  [ {TRUE}      ; put a minimum of 4, cos 800 x 600 x 1bpp don't work otherwise
+        &       0                               ; dummy entry (not used)
+        &       0                               ; never use 0
+        &       0                               ; use 1 up to (and including) here
+        &       0                               ; use 2 up to (and including) here
+        &       0                               ; use 3 up to (and including) here
+        &       60000 :SHL: 3                   ; use 4 up to (and including) here
+        &       75000 :SHL: 3                   ; use 5 up to (and including) here
+        &       90000 :SHL: 3                   ; use 6 up to (and including) here
+                                                ; else use 7
+  |
+        &       0                               ; dummy entry (not used)
+        &       0                               ; never use 0
+        &       12000 :SHL: 3                   ; use 1 up to (and including) here
+        &       24000 :SHL: 3                   ; use 2 up to (and including) here
+        &       36000 :SHL: 3                   ; use 3 up to (and including) here
+        &       60000 :SHL: 3                   ; use 4 up to (and including) here
+        &       75000 :SHL: 3                   ; use 5 up to (and including) here
+        &       90000 :SHL: 3                   ; use 6 up to (and including) here
+                                                ; else use 7
+  ]
+ ]
+
+
+60
+
+; Now, for debugging purposes, output data to a file
+
+ [ {FALSE}
+
+        ! 0, "**** WARNING: Mode change debugging assembled in ****"
+
+        MOV     r0, #0
+        LDRB    r0, [r0, #LCD_Active]
+        CMP     r0, #2
+        Pull    "r0, r1, r2-r4, r7-r11, pc", NE
+
+
+        MOV     r0, #&80
+        ADR     r1, ModeFilename
+        SWI     XOS_Find
+
+        Pull    "r0, r1, r2-r4, r7-r11, pc", VS
+
+        MOV     r1, r0
+        MOV     r0, #2
+        ADD     r2, r9, #VIDCParmsSize  ; r2 -> data
+        MOV     r3, #VIDCParmsSize
+        SWI     XOS_GBPB
+
+        MOV     r0, #0
+        SWI     XOS_Find
+
+        Pull    "r0, r1, r2-r4, r7-r11, pc"
+
+ModeFilename
+        =       "$.ModeData", 0
+        ALIGN
+ |
+        Pull    "r0, r1, r2-r4, r7-r11, pc"
+ ]
+
+; *****************************************************************************
+;
+;       ProcessControlListItem
+;
+; in:   r2 = value for item
+;       r4 = index for item (guaranteed in range)
+;       r9 -> VIDC register array
+;
+; out:  r0-r2, r4, r7, r8, r10, r11 may be corrupted
+;       r3, r9, r12 must be preserved
+
+ProcessControlListItem ENTRY
+        LDR     pc, [pc, r4, LSL #2]
+        NOP
+        &       ProcessControlListNOP                   ; 0 - NOP
+        &       ProcessControlListLCDMode               ; 1 - LCD mode
+        &       ProcessControlListLCDDualPanelMode      ; 2 - LCD dual-panel mode
+        &       ProcessControlListLCDOffsetRegister0    ; 3 - LCD offset register 0
+        &       ProcessControlListLCDOffsetRegister1    ; 4 - LCD offset register 1
+        &       ProcessControlListHiResMode             ; 5 - Hi-res mode
+        &       ProcessControlListDACControl            ; 6 - DAC control
+        &       ProcessControlListRGBPedestals          ; 7 - RGB pedestal enables
+        &       ProcessControlListExternalRegister      ; 8 - External register
+        &       ProcessControlListNOP                   ; 9 - HClk select/specify
+        &       ProcessControlListNOP                   ; 10 - RClk frequency
+        &       ProcessControlListDPMSState             ; 11 - DPMS state
+
+ProcessControlListLCDMode
+        MOV     r0, #0
+        LDRB    r1, [r0, #LCD_Active]           ;Read the existing value
+        AND     r1, r1, #&80                    ;Clear all but the single/dual bit, 'cos this might have been set already
+        ORR     r1, r1, r2                      ;Bung our new lcdmode into the byte, and....
+        STRB    r1, [r0, #LCD_Active]           ;...store in the KernelWS which LCD mode we are in.
+        MOV     r1, #Ext_ECKOn                  ;Set the ECLK on
+
+        CMP     r2, #3                          ;Was (is) it active-matrix?
+        ORRNE   r1, r1, #Ext_LCDGrey            ;If not, set the LCD greyscaler 'on'
+05
+        MOV     r0, #VIDCExternal
+10
+        MOV     r7, r1
+        TEQ     r2, #0                          ; if value non-zero
+        MOVNE   r2, r1                          ; then use value in r1
+15
+        AND     r2, r2, r7                      ; ensure only relevant bits set
+        LDR     lr, [r9, r0, LSR #22]           ; load word from register bank
+        BIC     lr, lr, r7                      ; knock out bits in mask
+        ORR     lr, lr, r2                      ; OR in new bits
+        STR     lr, [r9, r0, LSR #22]           ; and store in array
+
+ProcessControlListNOP
+        EXIT
+
+ProcessControlListHiResMode
+        MOV     r1, #Ext_HiResMono              ; bit of a misnomer, it's not nec. mono
+        B       %BT05
+
+ProcessControlListDACControl
+        MOV     r1, #Ext_DACsOn
+        B       %BT05
+
+ProcessControlListRGBPedestals
+        MOV     r0, #VIDCExternal
+        MOV     r2, r2, LSL #Ext_PedsShift
+        MOV     r7, #Ext_PedsOn
+        B       %BT15
+
+ProcessControlListExternalRegister
+        MOV     r0, #VIDCExternal
+        MOV     r7, #&FF
+        B       %BT15
+
+ProcessControlListLCDDualPanelMode
+        MOV     r0, #0
+        LDRB    r1, [r0, #LCD_Active]
+        ORR     r1, r1, #&80                    ;Set the top bit & leave the rest as-is
+        STRB    r1, [r0, #LCD_Active]           ;Store in the KernelWS that we are in dual-panel LCD mode.
+        LDR     r0, [r9, #VIDCDataControl :SHR: 22]
+        MOV     r1, r0, LSL #(31-10)            ;Put HDWR bits to the top
+        BIC     r0, r0, r1, LSR #(31-10)        ;knock off bits
+        ORR     r0, r0, r1, LSR #(31-11)        ;Put back one bit further up (ie mul by 2)
+        STR     r0, [r9, #VIDCDataControl :SHR: 22]
+
+        LDR     r0, [r9, #VertiDisplayEnd :SHR: 22]
+        LDR     r1, [r9, #VertiDisplayStart :SHR: 22]
+        BIC     r0, r0, #VertiDisplayEnd
+        BIC     r1, r1, #VertiDisplayStart
+        SUB     r0, r0, r1                      ;R0 = Vres
+        ADD     r1, r1, r0, LSR #1              ;R1 = Vres/2 + VDSR
+        ORR     r1, r1, #VertiDisplayEnd
+        STR     r1, [r9, #VertiDisplayEnd :SHR: 22]
+
+        LDR     r1, [r9, #VertiCycle :SHR: 22]
+        BIC     r1, r1, #VertiCycle
+        SUB     r1, r1, r0, LSR #1
+        ORR     r1, r1, #VertiCycle
+        STR     r1, [r9, #VertiCycle :SHR: 22]
+
+        LDR     r1, [r9, #VertiBorderEnd :SHR: 22]
+        BIC     r1, r1, #VertiBorderEnd
+        SUB     r1, r1, r0, LSR #1
+        ORR     r1, r1, #VertiBorderEnd
+        STR     r1, [r9, #VertiBorderEnd :SHR: 22]
+
+        LDR     r1, [r9, #VIDCExternal :SHR: 22]
+        BIC     r1, r1, #Ext_ERegExt
+        ORR     r1, r1, #Ext_ERegGreen
+        STR     r1, [r9, #VIDCExternal :SHR: 22]
+
+        MOV     r0, #VIDCControl
+        MOV     r1, #CR_DualPanel
+        B       %BT10
+
+ProcessControlListLCDOffsetRegister0
+        MOV     r0, #LCDOffsetRegister0
+20
+        ORR     r2, r2, r0                      ; put high bits of register at top
+        STR     r2, [r9, r0, LSR #22]           ; and store in array
+        MOV     r0, #VIDC                       ;ACTUALLY PROGRAM VIDC (I know I shouldn't but I don't care - I've got a cold)
+        STR     r2, [r0]
+        EXIT
+
+ProcessControlListLCDOffsetRegister1
+        MOV     r0, #LCDOffsetRegister1
+        B       %BT20
+
+ProcessControlListDPMSState
+        MOV     r0, #PseudoRegister_DPMSState   ; pseudo-register holding DPMS state
+        ORR     r2, r2, r0                      ; form combined value
+        STR     r2, [r9, r0, LSR #22]           ; store in register
+        EXIT
+
+
+; *****************************************************************************
+;
+;       ComputeModuli - Work out VCO moduli for a given frequency
+;
+; in:   r0 = desired frequency (kHz)
+;       r1 = rclk frequency (kHz) (normally 24000)
+;
+; out:  r0 = bits to put in bits 0..15 of Frequency Synthesizer Register
+;       r1 = bits to put in bits 0..4 of Control Register
+
+rclk    *       24000           ; Reference clock into VIDC20 (in kHz)
+VCO_Min *       55000           ; minimum VCO frequency (in kHz)
+VCO_Max *      110000           ; maximum VCO frequency (in kHz)
+
+fpshf   *       11              ; Shift value for fixed point arithmetic
+
+        ^       0, sp
+
+BestDInOrOutOfRange     #       4
+BestRInOrOutOfRange     #       4
+BestVInOrOutOfRange     #       4
+BestDInRange            #       4
+BestRInRange            #       4
+BestVInRange            #       4
+BestRangeError          #       4
+ComputeModuliStack      *       :INDEX: @
+
+ComputeModuli ENTRY "r2-r12", ComputeModuliStack
+        MOV     r12, #-1                ; smallest error for values in or out of VCO range
+        MOV     r11, #-1                ; smallest error for values in VCO range
+        STR     r11, BestDInRange
+        STR     r11, BestVInRange
+        STR     r11, BestRInRange
+        STR     r11, BestDInOrOutOfRange
+        STR     r11, BestVInOrOutOfRange
+        STR     r11, BestRInOrOutOfRange
+        STR     r11, BestRangeError
+        MOV     r5, r1                  ; r5 = rclk frequency, normally 24000 (32000 on Morris)
+        LDR     r1, =VCO_Min            ; r1 = minimum VCO frequency (in kHz)
+        LDR     r2, =VCO_Max            ; r2 = maximum VCO frequency (in kHz)
+        MOV     r3, #1                  ; r3 = D
+10
+        MOV     r4, #1                  ; r4 = R
+15
+        MUL     r6, r0, r3              ; r6 = xD
+        MUL     r7, r6, r4              ; r7 = xRD
+        ADD     r7, r7, r5, LSR #1      ; r7 = xRD + vref/2
+        DivRem  r8, r7, r5, r9          ; r8 = (xRD + vref/2) DIV vref = V value
+
+        TEQ     r4, #1                  ; if R=1 then V must be 1, else it's no good
+        BNE     %FT20
+        TEQ     r8, #1
+        BNE     %FT50
+        BEQ     %FT25
+20
+        CMP     r8, #2                  ; if R<>1 then V must be in range 2..64
+        RSBCSS  r7, r8, #64
+        BCC     %FT50                   ; V out of range, so skip
+25
+        MUL     r7, r5, r8              ; r7 = V * vref
+        MOV     r7, r7, LSL #fpshf      ; r7 = (V * vref) << fixedpointshift
+        DivRem  r9, r7, r4, r14         ; r9 = ((V * vref) << fixedpointshift)/R = VCO frequency << fixedpointshift
+        MOV     r6, r9
+        DivRem  r7, r9, r3, r14         ; r7 = output frequency << fixedpointshift
+        SUBS    r7, r7, r0, LSL #fpshf
+        RSBCC   r7, r7, #0              ; r7 = absolute error << fixedpointshift
+
+        TEQ     r4, #1                  ; if R=1 then no need to check VCO range
+        BEQ     %FT27                   ; because VCO won't be used, so it's a 1st class citizen
+
+        CMP     r6, r1, LSL #fpshf      ; test if VCO freq >= min
+        RSBCSS  r14, r6, r2, LSL #fpshf ; and <= max
+        BCC     %FT40                   ; not in range, so not a first class citizen
+27
+        CMP     r7, r11
+        BHI     %FT40                   ; worse than the best case for in VCO range, so ignore
+        BCC     %FT30                   ; is definitely better than the best case for in or out
+
+        LDR     r14, BestRInRange       ; is equal best for in, so check R value
+        CMP     r4, r14                 ; is newR < bestR
+        BCS     %FT40                   ; is greater or equal R value (ie not higher comp. freq., so not best)
+30
+        MOV     r11, r7
+        STR     r3, BestDInRange
+        STR     r4, BestRInRange
+        STR     r8, BestVInRange
+        MOV     r14, #0
+        B       %FT45
+
+40
+        RSBS    r14, r6, r1, LSL #fpshf ; r14 = min-this, if this<min
+        SUBCC   r14, r6, r2, LSL #fpshf ; else r14 = this-max, ie r14 = how much this is outside range
+
+        CMP     r7, r12
+        BHI     %FT50                   ; worse than the best case for in or out of VCO range, so ignore
+        BCC     %FT45                   ; is definitely better than the best case for in or out
+
+        LDR     r9, BestRangeError      ; is equal best for in or out, so check error
+        CMP     r14, r9
+        BCS     %FT50                   ; not lower error, so skip
+45
+        MOV     r12, r7
+        STR     r3, BestDInOrOutOfRange
+        STR     r4, BestRInOrOutOfRange
+        STR     r8, BestVInOrOutOfRange
+        STR     r14, BestRangeError
+50
+        ADD     r4, r4, #1
+        CMP     r4, #16                 ; R goes from 2 to 16 (was 2 to 64)
+        BLS     %BT15
+
+        ADD     r3, r3, #1
+        CMP     r3, #8                  ; D goes from 1 to 8
+        BLS     %BT10
+
+        ADR     r2, BestDInRange
+        LDR     r3, [r2]
+        CMP     r3, #-1
+        ADDEQ   r2, r2, #BestDInOrOutOfRange - BestDInRange
+        LDREQ   r3, [r2]                ; r3 = Best D
+        LDR     r4, [r2, #BestRInRange - BestDInRange]  ; r4 = Best R
+        LDR     r5, [r2, #BestVInRange - BestDInRange]  ; r5 = Best V
+
+        SUBS    r4, r4, #1              ; values in FSyn are n-1
+  [ VCOstartfix
+        ;do *not* do the very slow trick - this will stall the VCO and it may not restart
+        ;properly later (we don't give a fig for power consumption)
+        MOVEQ   r4, #3
+        MOVEQ   r5, #8                  ; after sub below, (7+1)/(3+1) so VCO runs at twice ref clock
+  |
+        MOVEQ   r4, #63                 ; if R=V=1 then use max R
+        MOVEQ   r5, #2                  ; and min V to make VCO go really slow
+  ]
+
+        SUB     r5, r5, #1              ; for both v and r
+        ASSERT  FSyn_RShift = 0
+        ORR     r0, r4, r5, LSL #FSyn_VShift
+
+        SUB     r3, r3, #1              ; D is also stored as n-1
+        MOV     r1, r3, LSL #CR_PixelDivShift
+        ASSERT  CR_VCLK = 0
+        ORREQ   r1, r1, #CR_RCLK        ; if using VCO then set for VCLK, else RCLK
+
+        EXIT
+
+ ]
+
+; *****************************************************************************
+;
+;       UpdateVIDCTable - Add changes to a pushed VIDC table
+;
+; in:   R9 + nn        -> entry on stack for register nn000000
+;    or R9 + (nn << 2) -> ditto, for VIDC20
+;       R11 -> change table, terminated with -1
+;
+; out:  R11 -> word after -1 terminator
+;       All other registers preserved (including PSR)
+;
+ [ MorrisSupport
+UpdateVIDCTable ROUT
+        Push    "R0,R14"
+        MOV     R0, #0
+        LDRB    R0, [R0, #IOSystemType]
+        TST     R0, #IOST_7500
+        MOVEQ   R0, #1                          ;if rclk is 24MHz, stop at first -1
+        MOVNE   R0, #2                          ;if rclk is 32MHz, overwrite clock dividers with different data
+10
+        LDR     R14, [R11], #4
+        CMP     R14, #-1
+        LDREQ   R14, [R11], #4                  ;EQ, on terminator, so skip it
+        SUBEQS  R0, R0, #1
+        Pull    "R0,PC",EQ,^                    ;EQ, quit on first (iff rclk=24MHz) or second terminator (iff rclk=32MHz)
+
+        CMP     R14, #&80000000                 ; must be in range &80..&FF
+        STRCS   R14, [R9, R14, LSR #22]         ; NB bits 23 and 22 are assumed to be zero
+        B       %BT10
+ |
+UpdateVIDCTable ROUT
+        Push    "R14"
+10
+        LDR     R14, [R11], #4
+        CMP     R14, #-1
+        Pull    "PC",EQ,^
+        CMP     R14, #&80000000                 ; must be in range &80..&FF
+  [ VIDC_Type = "VIDC20"
+        STRCS   R14, [R9, R14, LSR #22]         ; NB bits 23 and 22 are assumed to be zero
+  |
+        STRCS   R14, [R9, R14, LSR #24]
+  ]
+        B       %BT10
+ ]
+
+; *****************************************************************************
+;
+;       OfferModeExtension - Issue mode extension service
+;
+; in:   R2 = mode specifier
+;
+; out:  EQ => service claimed, R3 -> VIDC list, R4 -> workspace list
+;       NE => service not claimed, R3,R4 preserved
+;       All other registers preserved
+;
+
+OfferModeExtensionAnyMonitor ROUT
+        MOV     r3, #-1
+OfferModeExtension ROUT
+ [ ModeSelectors
+        Push    "r1,r2,r4,r5,r14"
+
+; TMD 10-Jan-94 - added code here to check for erroneous passing in of a sprite mode word.
+; This prevents data aborts when modules try to index off a stupid address.
+;
+; We could have done OS_ValidateAddress, but that would be rather slow, and mode selectors
+; are of indeterminate length.
+;
+; If we detect one of these, we pretend the service wasn't claimed. Hopefully this should
+; ensure that the mode change returns an error.
+
+; Fixes bug MED-00483.
+
+        BICS    r14, r2, #&FF                   ; NE if not a mode number
+        TSTNE   r2, #3                          ; NE if not a mode number, but invalid mode selector
+        Pull    "r1,r2,r4,r5,pc", NE            ; so exit NE, pretending that service not claimed
+
+        GetBandwidthAndSize     r4, r5
+        MOV     r1, #Service_ModeExtension
+        IssueService
+        TEQ     r1, #0                          ; if service claimed
+        CMPNE   r3, #-1                         ; or if "don't care" monitortype
+        BEQ     %FT90                           ; then we can't do any more
+
+        CMP     r2, #&100                       ; if it's a mode selector
+        BCS     %FT90                           ; then we can't help them either
+        BranchIfNotKnownMode r2, %FA90          ; if we don't recognise screen mode number we can't either
+
+; it is a known numbered mode, so create a mode selector on the stack that we can pass to service
+
+        Push    "r6,r7"
+        SUB     sp, sp, #ModeSelector_ModeVars+4        ; make room for block including terminator
+        MOV     r6, #ModeSelectorFlags_ValidFormat
+        STR     r6, [sp, #ModeSelector_Flags]
+        ADRL    r6, FrameRateTable
+        LDRB    r6, [r6, r2]
+        STR     r6, [sp, #ModeSelector_FrameRate]
+
+        ADRL    r6, Vwstab
+        LDR     r14, [r6, r2, LSL #2]
+        ADD     r6, r6, r14
+        LDR     r14, [r6, #wkLog2BPP]
+        STR     r14, [sp, #ModeSelector_PixelDepth]     ; pixdepth = log2bpp
+
+        LDR     r7, [r6, #wkLog2BPC]
+        SUB     r14, r7, r14                            ; r14 = log2bpc-log2bpp
+
+        LDR     r7, [r6, #wkXWindLimit]
+        ADD     r7, r7, #1
+        MOV     r7, r7, LSL r14
+        STR     r7, [sp, #ModeSelector_XRes]
+
+        LDR     r7, [r6, #wkYWindLimit]
+        ADD     r7, r7, #1
+        STR     r7, [sp, #ModeSelector_YRes]
+
+        MOV     r7, #-1
+        STR     r7, [sp, #ModeSelector_ModeVars]
+
+        MOV     r2, sp
+        IssueService
+        TEQ     r1, #0
+        BEQ     %FT10                                   ; service was claimed
+
+; not claimed, so try again with -1 as frame rate
+
+        MOV     r7, #-1
+        STR     r7, [sp, #ModeSelector_FrameRate]
+        IssueService
+        TEQ     r1, #0
+10
+        ADD     sp, sp, #ModeSelector_ModeVars+4        ; junk mode selector
+        Pull    "r6, r7"
+90
+        CMP     r2, #&100                               ; if we started or ended up with a mode selector
+        MOVCS   r4, #0                                  ; then return r4 = 0 (if claimed)
+
+        TEQ     r1, #0
+        STREQ   r4, [sp, #2*4] ; if service claimed, then return r4 from service, else preserve it
+        Pull    "r1,r2,r4,r5,pc"
+ |
+        Push    "r1, lr"
+        MOV     r1, #Service_ModeExtension
+        IssueService
+        TEQ     r1, #0
+        Pull    "r1, pc"
+ ]
+
+; *****************************************************************************
+;
+; ETB - Redefine character
+; ===   & other stuff
+;
+;       VDU 23,0,r,v,0|         Talk to 6845 !
+;       VDU 23,1,n,m,r,g,b|     Program cursor
+;       VDU 23,2,n1..n8         Ecf pattern 1
+;       VDU 23,3,n1..n8         Ecf pattern 2
+;       VDU 23,4,n1..n8         Ecf pattern 3
+;       VDU 23,5,n1..n8         Ecf pattern 4
+;       VDU 23,6,n1..n8         Dot dash line style
+;       VDU 23,7,m,d,z|         Scroll window directly
+;       VDU 23,8,t1,t2,x1,y1,x2,y2|     Clear block
+;       VDU 23,9,n|             Set 1st flash time
+;       VDU 23,10,n|            Set 2nd flash time
+;       VDU 23,11|              Default Ecf patterns
+;       VDU 23,12,n1..n8        Ecf pattern 1 (simple setting)
+;       VDU 23,13,n1..n8        Ecf pattern 2 (simple setting)
+;       VDU 23,14,n1..n8        Ecf pattern 3 (simple setting)
+;       VDU 23,15,n1..n8        Ecf pattern 4 (simple setting)
+;       VDU 23,16,x,y|          Cursor movement control
+;       VDU 23,17,c,t|          Set colour tints, ECF info, char sizes
+;
+;
+ETB
+        LDRB    R0, [WsPtr, #QQ+0]
+        CMP     R0, #32         ; defining a normal character ?
+        BCS     DefineChar
+        LDR     R2, [PC, R0, LSL #2]
+        ADD     PC, PC, R2      ; enters routine with R0 => byte after 23
+
+
+ETBtab
+        &       Vdu23_0-ETBtab-4
+        &       Vdu23_1-ETBtab-4
+        &       ComplexEcfPattern-ETBtab-4
+        &       ComplexEcfPattern-ETBtab-4
+        &       ComplexEcfPattern-ETBtab-4
+        &       ComplexEcfPattern-ETBtab-4
+        &       LineStyle-ETBtab-4
+        &       Vdu23_7-ETBtab-4
+        &       Vdu23_8-ETBtab-4
+        &       Vdu23_9-ETBtab-4
+        &       Vdu23_10-ETBtab-4
+        &       DefaultEcfPattern-ETBtab-4
+        &       SimpleEcfPattern-ETBtab-4
+        &       SimpleEcfPattern-ETBtab-4
+        &       SimpleEcfPattern-ETBtab-4
+        &       SimpleEcfPattern-ETBtab-4
+        &       Vdu23_16-ETBtab-4
+        &       Vdu23_17-ETBtab-4
+        &       Vdu23_18-ETBtab-4
+        &       Vdu23_19-ETBtab-4
+        &       Vdu23_20-ETBtab-4
+        &       Vdu23_21-ETBtab-4
+        &       Vdu23_22-ETBtab-4
+        &       Vdu23_23-ETBtab-4
+        &       Vdu23_24-ETBtab-4
+        &       Vdu23_25-ETBtab-4
+        &       Vdu23_26-ETBtab-4
+        &       Vdu23_27-ETBtab-4
+        &       Vdu23_28-ETBtab-4
+        &       Vdu23_29-ETBtab-4
+        &       Vdu23_30-ETBtab-4
+        &       Vdu23_31-ETBtab-4
+
+; NB All other labels for Vdu23 are in TMD files so I don't have to pester RCM
+
+Vdu23_18
+Vdu23_19
+Vdu23_20
+Vdu23_21
+Vdu23_22
+Vdu23_23
+Vdu23_24
+Vdu23_25
+Vdu23_26
+; Vdu23_27      ; Assigned to Richard (well some of it, anyway)
+Vdu23_28
+Vdu23_29
+Vdu23_30
+Vdu23_31
+UnknownVdu23
+
+; R0 already contains first parameter to VDU23
+
+        MOV     R10, #UKVDU23V
+        Push    "WsPtr, R14"            ; calling a vector corrupts R12
+        BL      VduQQVec                ; so we have to preserve it
+        Pull    "WsPtr, PC", VC         ; before we return to PostWrchCursor
+
+; error in UKVDU23 vector, so go to vdu error exit
+
+        Pull    "WsPtr, R14"
+        B       VduBadExit
+
+; *****************************************************************************
+;
+; DLE
+; CLG - Clear graphics window
+; ===
+;
+; On exit, R0..R11 corrupt
+;
+DLE
+CLG     ROUT
+        GraphicsMode R0
+        MOVNE   PC,LR                   ; check for graphics mode (changed by DDV 15/9/92)
+
+        ADD     R0, WsPtr, #BgEcfOraEor ; point at background colour
+        STR     R0, [WsPtr, #GColAdr]
+        ADD     R11, WsPtr, #GWLCol     ; load window coordinates into
+        LDMIA   R11, {R0-R3}            ; RectFill's parameter space
+
+        LDR     R6, [WsPtr, #CursorFlags] ; if clip box is not enabled
+        TST     R6, #ClipBoxEnableBit   ; then goto code directly
+        BEQ     RectFillA
+
+        Push    R14                     ; else merge graphics window (in R0-R3)
+        BL      MergeClipBox            ; with clip box
+        Pull    R14
+        B       RectFillA
+
+; *****************************************************************************
+;
+; DC2
+; GCol - Set Graphics action and colour
+; ====
+;
+; On entry, R0 holds GCol action
+;           R1 holds GCol colour, 0..127 means program fg
+;                                 128..255 means program bg
+;
+; In 256-colour modes, the extra colours are accessed via TINT
+;
+DC2
+GCol    ROUT
+        LDRB    R0, [WsPtr, #QQ+0]      ; GCol action, eg store, eor etc.
+        LDRB    R1, [WsPtr, #QQ+1]      ; GCol colour
+        LDR     R2, [WsPtr, #NColour]   ; number of colours-1
+        TST     R1, #&80
+        AND     R1, R1, R2              ; limit colour to range available
+
+        STREQ   R0, [WsPtr, #GPLFMD]    ; GCOL(a,0..127) is foreground
+        STREQ   R1, [WsPtr, #GFCOL]
+
+        STRNE   R0, [WsPtr, #GPLBMD]    ; GCOL(a,128..255) is background
+        STRNE   R1, [WsPtr, #GBCOL]
+                                        ; drop into SetColour to....
+
+; SetColour - Setup FgEcf & BgEcf, used after GCOL or setting of Ecfs
+; =========   or default palette (does a gcol).
+
+SetColour
+        Push    R14
+        LDR     R1, [WsPtr, #GPLFMD]    ; setup FgEcf, maybe solid or Ecf
+        LDR     R0, [WsPtr, #GFCOL]
+        ADD     R2, WsPtr, #FgEcf
+        LDR     R3, [WsPtr, #GFTint]    ; tint only used in 256 colour modes
+        ADD     R4, WsPtr, #FgPattern   ; used if OS_SetColour call
+        BL      SetCol10
+
+        LDR     R1, [WsPtr, #GPLBMD]    ; and BgEcf
+        LDR     R0, [WsPtr, #GBCOL]
+        ADD     R2, WsPtr, #BgEcf
+        LDR     R3, [WsPtr, #GBTint]
+        ADD     R4, WsPtr, #BgPattern   ; used if OS_SetColour call
+        BL      SetCol10
+
+        ADD     R0, WsPtr, #FgEcf       ; setup FgEcfOraEor
+        ADD     R1, WsPtr, #BgEcf
+        ADD     R2, WsPtr, #FgEcfOraEor
+        LDR     R3, [WsPtr, #GPLFMD]
+        BL      SetCol60
+
+        ADD     R0, WsPtr, #BgEcf       ; and BgEcfOraEor
+        ADD     R1, WsPtr, #FgEcf
+        ADD     R2, WsPtr, #BgEcfOraEor
+        LDR     R3, [WsPtr, #GPLBMD]
+        BL      SetCol60
+
+        ADD     R0, WsPtr, #BgEcf       ; and BgEcfStore
+        ADD     R1, WsPtr, #FgEcf
+        ADD     R2, WsPtr, #BgEcfStore
+        MOV     R3, #0
+        BL      SetCol60
+
+        Pull    PC
+
+; SetCol10 - Internal to SetColour
+;          Build up an Ecf, given action and colour numbers
+;
+; On entry, R0 holds colour (0..255, where 127..255 means 0..127)
+;           R1 holds action (may indicate ecf)
+;           R2 holds address to write data (FgEcf or BgEcf)
+;           R3 holds tint information (only used in 256 colour modes)
+;           R4 holds pointer to suitable pattern table for OS_SetColour call
+
+SetCol10 ROUT
+        ANDS    R1, R1, #&F0            ; actions >=16 mean Ecf
+        BNE     SetCol30
+
+        Push    R14
+        LDR     R4, [WsPtr, #NColour]   ; else use given colour number
+        AND     R0, R0, R4
+        AND     R0, R0, #63             ; another bodge in the house of bodges
+        TST     R4, #&F0                ; if 256 colour (ie 8bpp)
+        BLNE    AddTintToColour         ; then combine tint with colour
+
+; R0 contains colour number for current mode
+
+        LDR     LR, [WsPtr, #BitsPerPix]
+10
+        TEQ     LR, #32
+        ORRNE   R0, R0, R0, LSL LR      ; replicate again
+        MOVNE   LR, LR, LSL #1          ; doubling the shift for each pass
+        BNE     %BT10
+
+        STR     R0, [R2]
+        STR     R0, [R2, #4]
+        STR     R0, [R2, #8]
+        STR     R0, [R2, #12]
+        STR     R0, [R2, #16]
+        STR     R0, [R2, #20]
+        STR     R0, [R2, #24]
+        STR     R0, [R2, #28]
+
+        Pull    "PC"
+
+; R1 = ecf number as 16,32,48,64,80,96
+; R2 -> destination
+; R4 -> pattern block (if R1 =96!)
+
+SetCol30
+        CMP     R1, #96                 ; special internal plot?
+        MOVCS   R0, R4                  ; yes, so point at pattern to be copied
+        MOVCS   R3, #1                  ; col step =1
+        MOVCS   R4, #0                  ; row step =0 (already there!)
+        BCS     SetCol35
+
+        CMP     R1, #80                 ; 80 => giant ecf (>80 does same)
+        ADDCS   R0, WsPtr, #Ecf1        ; then point at ecf0
+        MOVCS   R3, #8                  ; col step=8
+        MOVCS   R4, #(1-8*4)            ; row step, back to 1st ecf on 1 byte
+        BCS     SetCol35
+
+        ADD     R0, WsPtr, #(Ecf1-8)
+        ADD     R0, R0, R1, LSR #1      ; else point R0 at Ecf1,2,3 or 4
+
+        LDR     R4, [WsPtr, #BitsPerPix] ; if BitsPerPix <> 'fudged' BitsPerPix
+        LDR     R5, [WsPtr, #BytesPerChar]
+        TEQ     R4, R5
+        BNE     SetCol52                ; then double up the pixels
+                                        ; else its a normal Ecf
+        MOV     R3, #0                  ; col step=0, same byte each coloum
+        MOV     R4, #1                  ; row step=1
+SetCol35
+        MOV     R5, #8                  ; do 8 rows
+SetCol40
+        MOV     R6, #4                  ; of 4 columns
+SetCol50
+        LDRB    R7, [R0], R3            ; read from source & move by col step
+        STRB    R7, [R2], #1            ; write to dest, update dest pointer
+        SUBS    R6, R6, #1
+        BNE     SetCol50
+        ADD     R0, R0, R4              ; step source pointer to next row
+        SUBS    R5, R5, #1
+        BNE     SetCol40
+        MOV     PC, R14
+
+; Double up the pixels for Mode2 etc
+;
+; R0 points to Ecf(n)
+; R2 points to destination
+;
+; Uses
+;
+;     R3  - NColour used as PixMsk
+;     R4  - BitsPerPix
+;     R5  - BytesPerChar (unused)
+;     R6  - byte cntr 7..0
+;     R7  - source byte
+;     R8  - ExtrtShftFact
+;     R9  - InsrtShftFact
+;     R10 - result word
+;     R11 - temp
+
+SetCol52
+        LDR     R3, [WsPtr, #NColour]   ; mask for extracting pixels from ecf
+        TST     R3, #&F0                ; ** if 256 colour mode
+        MOVNE   R3, #&FF                ; ** then use &FF (TMD 25-Mar-87)
+        LDR     R4, [WsPtr, #BitsPerPix]
+        MOV     R6, #7                  ; 8 bytes/rows to do
+SetCol54
+        LDRB    R7, [R0, R6]            ; get byte of Ecf(n)
+        RSB     R8, R4, #8
+        RSB     R9, R4, #32
+        MOV     R10, #0                 ; clear result word
+SetCol57
+        AND     R11, R3, R7, ROR R8     ; extract 1 pixel from Ecf
+        ORR     R10, R10, R11, LSL R9   ; double it into result word
+        SUB     R9, R9, R4
+        ORR     R10, R10, R11, LSL R9
+
+        SUB     R8, R8, R4
+        AND     R8, R8, #7
+
+        SUBS    R9, R9, R4
+        BGE     SetCol57                ; process next pixel in result word
+
+        STR     R10, [R2, R6, LSL #2]   ; write expanded word to (Fg/Bg)Ecf
+
+        SUBS    R6, R6, #1
+        BGE     SetCol54                ; process next row/byte
+        MOV     PC, R14
+
+; Tables of full colours for 2,4 & 16 colour modes (256 colour modes
+; use colour number directly).
+;
+; N.B. these are tables of bytes
+
+TBFullCol
+        =       &FF                     ; not used - remove sometime
+                                        ; (DJS comment: don't bother!)
+        =       &00, &FF                ; 2 colour mode
+        =       &00, &55, &AA, &FF      ; 4 colour mode
+
+        =       &FF, &FF, &FF, &FF      ; not used but cannot be removed
+        =       &FF, &FF, &FF, &FF      ; (8 colour mode!)
+
+        =       &00, &11, &22, &33      ; 16 colour mode
+        =       &44, &55, &66, &77
+        =       &88, &99, &AA, &BB
+        =       &CC, &DD, &EE, &FF
+
+        ALIGN
+
+; *****************************************************************************
+;
+;       SetCol60 - Build up an ecf, ORed and EORed appropriate to GCOL action
+;
+;       Internal to SetColour
+;
+; in:   R0 -> ecf colour (FgEcf/BgEcf)
+;       R1 -> transparent colour (BgEcf/FgEcf)
+;       R2 -> destination FgEcfOraEor/BgEcfOraEor/BgEcfStore
+;       R3 = gcol action number (may indicate ecf)
+;
+; uses: R4 = index into ecf (7..0)
+;       R5 = ecf colour word
+;       R6 = transparency mask, set to &FFFFFFFF for NO transparency
+;       R7 -> zgoo..zgee for gcol action
+;       R8 = mask for pixel under examination
+;       R9 = shift factor to move mask to next pixel (BytesPerChar)
+;       R10, R11 temporary
+;
+
+SetCol60 ROUT
+        MOV     R4, #7                          ; 7..0 words to process
+        AND     R3, R3, #&F                     ; extract action bits
+        AND     R11, R3, #7                     ; 0-7 Store etc
+                                                ; 8-15 ditto with transparency
+        MOV     R11, R11, LSL #2                ; 4 bits for each
+        LDR     R7, =TBscrmasks
+        MOV     R7, R7, ROR R11                 ; relevant bits are in top 4
+        AND     R7, R7, #&F0000000              ; isolate these bits (N,Z,C,V)
+SetCol70
+        LDR     R5, [R0, R4, LSL #2]            ; get ecf word
+        TST     R3, #8                          ; if action < 8
+        MOVEQ   R6, #&FFFFFFFF
+        BEQ     SetCol90                        ; then not transparent
+                                                ; else build transparency mask
+        LDR     R8, [WsPtr, #RAMMaskTb]         ; fetch mask for leftmost pixel
+        LDR     R9, [WsPtr, #BytesPerChar]      ; shift factor for next pixel
+        LDR     R6, [R1, R4, LSL #2]            ; get 'transparent' colour
+        EOR     R6, R6, R5
+SetCol80
+        TST     R6, R8                          ; if pixels the same,
+                                                ; then it's transparent
+        ORRNE   R6, R6, R8                      ; else set mask to plot it
+        MOVS    R8, R8, LSL R9
+        BNE     SetCol80
+
+SetCol90
+        TEQP    R7, #SVC_mode                   ; put bits into N, Z, C, V
+                                                ;              OO,EO,OE,EE
+
+        MOVCC   R10, R5                         ; if ORing with &00000000
+        MOVCS   R10, #&FFFFFFFF                 ; if ORing with &FFFFFFFF
+        MVNVS   R10, R10                        ; if EORing with &FFFFFFFF
+
+;       MOVPL   R5, R5                          ; if ORing with &00000000
+        MOVMI   R5, #&FFFFFFFF                  ; if ORing with &FFFFFFFF
+        MVNEQ   R5, R5                          ; if EORing with &FFFFFFFF
+
+; now R5 = OR mask, R10 = EOR mask
+
+        AND     R5, R5, R6                      ; then clear 'transparent'
+        AND     R10, R10, R6                    ; pixels
+
+        LDR     R11, [WsPtr, #ECFShift]
+        MOV     R5, R5, ROR R11                 ; rotate OR and EOR masks
+        MOV     R10, R10, ROR R11               ; to correct for ECF X origin
+
+        LDR     R11, [WsPtr, #ECFYOffset]
+        ADD     R11, R11, R4                    ; add on ECF Y offset
+        AND     R11, R11, #7                    ; and wrap
+
+        ADD     R11, R2, R11, LSL #3
+        STMIA   R11, {R5, R10}                  ; write to (Fg/Bg)EcfOraEor
+
+        SUBS    R4, R4, #1
+        BCS     SetCol70
+
+        MOV     PC, R14
+
+; *****************************************************************************
+;
+;       AddTintToColour - in 256 colour modes
+;
+;       Internal to SetColour (derived from TMD's FudgeColour)
+;
+; in:   R0 = colour (0..255), where 6 LSBits are used
+;       R3 = tint
+;
+; out:  R0 holds colour byte with tint added
+;       R1-R3 preserved
+;       R4 undefined
+;       PSR preserved
+;
+
+        !       0,"WARNING: AddTintToColour returns > 8 bit values now, check ECF handling!"
+
+AddTintToColour
+        Push    "R3,LR"
+        AND     R0, R0, #63             ; extract suitable set of bits
+        AND     R3, R3, #192            ; and another set
+        ORR     R0, R0, R3
+        BL      ConvertGCOLToColourNumber
+        Pull    "R3,PC"
+
+; *****************************************************************************
+;
+;       CAN - Define graphics window
+;
+;       External routine
+;
+; in:   The window is given by bytes in the vdu queue, as follows :-
+;         QQ+0 = leftLo
+;         QQ+1 = leftHi
+;         QQ+2 = bottomLo
+;         QQ+3 = bottomHi
+;         QQ+4 = rightLo
+;         QQ+5 = rightHi
+;         QQ+6 = topLo
+;         QQ+7 = topHi
+;
+;       These are relative to the current graphics origin.
+;       The resultant window must obey the following rules :-
+;         RCol >= LCol
+;         TRow >= BRow
+;         LCol >= 0
+;         BRow >= 0
+;         YWindLimit >= TRow
+;         XWindLimit >= RCol
+;
+
+CAN     ROUT
+        Push    R14
+        ADD     R8, WsPtr, #GCsX        ; save ECursor away, cos EIG changes it
+        LDMIA   R8, {R6, R7}            ; and we don't want it to!
+
+; *****Change made by DJS
+; Original code was:
+;        LDRB    R0, [WsPtr, #QQ+5]      ; rightHi
+;        LDRB    R1, [WsPtr, #QQ+4]      ; rightLo
+;        PackXtnd R0,R0,R1               ; pack 2 bytes and sign extend
+;
+;        LDRB    R1, [WsPtr, #QQ+7]      ; topHi
+;        LDRB    R2, [WsPtr, #QQ+6]      ; topLo
+;        PackXtnd R1,R1,R2               ; pack 2 bytes and sign extend
+
+        LoadCoordPair R0, R1, WsPtr, QQ+4 ;Get top right point
+
+; *****End of change made by DJS
+
+        MOV     R2, #&FF                ; convert external-to-internal
+        BL      EIG                     ; as absolute coordinates
+
+        MOV     R4, R0                  ; move internal version of top right
+        MOV     R5, R1                  ; out of harm's way
+
+; *****Change made by DJS
+; Original code was:
+;        LDRB    R0, [WsPtr, #QQ+1]      ; leftHi
+;        LDRB    R1, [WsPtr, #QQ+0]      ; leftLo
+;        PackXtnd R0,R0,R1               ; pack 2 bytes and sign extend
+;
+;        LDRB    R1, [WsPtr, #QQ+3]      ; bottomHi
+;        LDRB    R2, [WsPtr, #QQ+2]      ; bottomLo
+;        PackXtnd R1,R1,R2               ; pack 2 bytes and sign extend
+
+        LoadCoordPair R0, R1, WsPtr, QQ+0 ;Get bottom left point
+
+; *****End of change made by DJS
+
+        MOV     R2, #&FF                ; convert external-to-internal
+        BL      EIG                     ; as absolute coordinates
+
+; For a valid window, the following must be true
+
+        CMP     R4, R0                          ;  RCol >= LCol
+        CMPGE   R5, R1                          ;  TRow >= BRow
+        CMPGE   R0, #0                          ;  LCol >= 0
+        CMPGE   R1, #0                          ;  BRow >= 0
+        LDRGE   R2, [WsPtr, #YWindLimit]        ;  YWindLimit >= TRow
+        CMPGE   R2, R5
+        LDRGE   R2, [WsPtr, #XWindLimit]        ;  XWindLimit >= RCol
+        CMPGE   R2, R4
+
+        ADD     R2, WsPtr, #GWLCol
+        STMGEIA R2, {R0,R1, R4,R5}      ; if the new window is OK, update it
+
+        STMIA   R8, {R6, R7}            ; restore ECursor (EIG corrupted it)
+        Pull    PC
+
+; *****************************************************************************
+;
+;       DefaultWindows - Restore default windows
+;
+;       External routine, and called by mode change + switch output to sprite
+;
+;       Set default text and graphics windows,
+;       Clear graphics origin and both cursors
+;
+
+DefaultWindows ROUT
+        Push    R14
+        MOV     R0, #0
+        MOV     R1, #0
+        ADD     R4, WsPtr, #GWLCol
+
+        ASSERT  YWindLimit = XWindLimit +4
+
+        ADD     R2, WsPtr, #XWindLimit
+        LDMIA   R2, {R2,R3}     ; R2 := XWindLimit; R3 := YWindLimit
+        STMIA   R4, {R0-R3}     ; zero GWLCol, GWBRow
+                                ; GWRCol:=XWindLimit; GWTRow:=YWindLimit
+        MOV     R3, #0
+        LDR     R1, [WsPtr, #ScrBRow]
+        LDR     R2, [WsPtr, #ScrRCol]
+        ADD     R4, WsPtr, #TWLCol      ; zero TWLCol, TWTRow
+        STMIA   R4!, {R0-R3}            ; TWRCol := ScrRCol; TWBRow := ScrBRow
+
+        MOV     R1, #0
+        MOV     R2, #0
+        STMIA   R4!, {R0-R3}    ; zero OrgX, OrgY, GCsX, GCsY
+        STMIA   R4!, {R0-R3}    ; zero OlderCsX, OlderCsY, OldCsX, OldCsY
+        STMIA   R4!, {R0-R3}    ; zero GCsIX, GCsIY, NewPtX, NewPtY
+
+        LDR     R0, [WsPtr, #ModeFlags]
+        TST     R0, #Flag_HardScrollDisabled
+
+        LDR     R0, [WsPtr, #VduStatus]         ; if not outputting to sprite
+        BICEQ   R0, R0, #Windowing              ; then indicate no text window
+        ORRNE   R0, R0, #Windowing              ; else indicate is text window
+        STR     R0, [WsPtr, #VduStatus]
+
+        BL      HomeVdu4                        ; home TEXT cursor
+                                                ; (even in VDU 5 mode)
+        Pull    PC
+
+; *****************************************************************************
+;
+;       GS - Define graphics origin
+;
+;       External routine
+;
+; in:   The origin is given by bytes in the vdu queue, as follows :-
+;         QQ+0 = xLo
+;         QQ+1 = xHi
+;         QQ+2 = yLo
+;         QQ+3 = yHi
+;
+;       The coordinates are in external 16 bit form.
+;       This does not move the windows, but does move the graphics cursor
+;
+
+GS      ROUT
+        Push    R14
+
+; *****Change made by DJS
+; Original code was:
+;        LDRB    R0, [WsPtr, #QQ+1]      ; xHi
+;        LDRB    R1, [WsPtr, #QQ+0]      ; xLo
+;        PackXtnd R0,R0,R1               ; pack 2 bytes and sign extend
+;        LDRB    R1, [WsPtr, #QQ+3]      ; yHi
+;        LDRB    R2, [WsPtr, #QQ+2]      ; yLo
+;        PackXtnd R1,R1,R2               ; pack 2 bytes and sign extend
+
+        LoadCoordPair R0, R1, WsPtr, QQ+0
+
+; *****End of change made by DJS
+
+        ADD     R2, WsPtr, #OrgX
+        STMIA   R2, {R0,R1}             ; write the new origin
+        BL      IEG                     ; update external cursor
+        Pull    PC
+
+        LTORG
+
+;------------------------------------------------------------------------------
+;
+; OS_SetColour implementation
+; ------------
+;
+; This call can be used to change the current GCOL/pattern table used for
+; plotting with the VDU primitives.
+;
+; in    R0 = flags / logical operation
+;               bit 0-3 = logical operation
+;               bit 4   = set => bg, else fg flag
+;               bit 5   = set => pattern block supplied
+;               bit 6   = set => set text colour
+;               bit 7   = set => read colour
+;       R1 = colour number / -> pattern block to use
+; out   -
+;
+;------------------------------------------------------------------------------
+
+setcol_LogicOpMask      * &0F
+setcol_FgBgFlag         * &10
+setcol_PatternFlag      * &20
+setcol_TextColour       * &40
+setcol_ReadFlag         * &80
+
+        ASSERT  WsPtr > 9
+
+SWISetColour ROUT
+
+        Push    "R0-R9,WsPtr,R14"
+
+        VDWS    WsPtr                           ; Obtain base of the VDU driver workspace
+
+        TST     R0, #setcol_ReadFlag            ; Are we reading?
+        BNE     %FT75
+
+        TST     R0, #setcol_TextColour          ; Are we changing the text colour?
+        BNE     %FT70
+
+        AND     R2, R0, #setcol_LogicOpMask     ; Get the logical operation
+        ORR     R2, R2, #&60                    ; Mark as being a special kind of pattern
+
+        TST     R0, #setcol_FgBgFlag
+        STREQ   R2, [WsPtr, #GPLFMD]            ; Store the relevant logical operation away for fg/bg
+        STRNE   R2, [WsPtr, #GPLBMD]
+        ADDEQ   R3, WsPtr, #FgPattern
+        ADDNE   R3, WsPtr, #BgPattern           ; Setup the pointer to a store for the pattern
+
+        TST     R0, #setcol_PatternFlag         ; Did the caller specify a pattern block?
+        BNE     %FT50                           ; Yes so don't try to expand colour value to pattern
+
+        MOV     R2, #1
+        LDR     R4, [WsPtr, #Log2BPP]           ; Get the Log2 depth of the mode
+        MOV     R4, R2, ASL R4                  ; R4 = bits per pixel
+        RSB     R2, R2, R2, LSL R4              ; Get a mask to extract only meaningful bits from word
+        AND     R1, R1, R2                      ; Extract bits suitable for this depth of mode
+10
+        TEQ     R4, #32                         ; Do we need to do any more replication
+        ORRNE   R1, R1, R1, LSL R4              ; Yes so or word with itself shifted
+        MOVNE   R4, R4, LSL #1                  ; and double amount to shift next time
+        BNE     %BT10
+
+        MOV     R2, #8
+20
+        STR     R1, [R3], #4                    ; now copy word 8 times into block
+        SUBS    R2, R2, #1
+        BNE     %BT20
+        B       %FT60
+
+50
+        LDMIA   R1,{R0,R2,R4-R9}
+        STMIA   R3,{R0,R2,R4-R9}                ; Copy the pattern into the buffer (assumes word aligned)
+60
+        BL      SetColour                       ; And then setup the internal GCOL tables
+65
+        Pull    "R0-R9,WsPtr,R14"
+        ExitSWIHandler
+70
+        TST     R0, #setcol_FgBgFlag            ; Store the foreground or background colour?
+        STREQ   R1, [WsPtr, #TextFgColour]
+        STRNE   R1, [WsPtr, #TextBgColour]
+
+        LDR     R0, [WsPtr, #CursorFlags]       ; Indicate the text colour needs re-computing!
+        ORR     R0, R0, #TEUpdate
+        STR     R0, [WsPtr, #CursorFlags]
+
+        B       %BT65                           ; Leave gracefully ....
+
+75
+        ; Reading the colour...
+        TST     R0, #setcol_TextColour
+        BEQ     %FT80
+
+        ; Reading text colour
+        TST     R0, #setcol_FgBgFlag
+        LDREQ   R1, [WsPtr, #TextFgColour]
+        LDRNE   R1, [WsPtr, #TextBgColour]
+        BIC     R0, R0, #setcol_PatternFlag :OR: setcol_ReadFlag
+
+77
+        ; Standard exit for reading the colour
+        STMIA   SP, {R0,R1}
+        B       %BT65
+
+80
+        ; Reading graphics colour
+        TST     R0, #setcol_FgBgFlag
+        LDREQ   R2, [WsPtr, #GPLFMD]            ; Get the relevant logical operation for fg/bg
+        LDRNE   R2, [WsPtr, #GPLBMD]
+
+        ; SetColour setting - copy block
+        ADDEQ   R3, WsPtr, #FgEcf
+        ADDNE   R3, WsPtr, #BgEcf
+
+        ; Copy the pattern to the user's buffer
+        LDMIA   R3,{R0,R3,R4-R9}
+        STMIA   R1,{R0,R3,R4-R9}
+
+        ; Construct a suitable reason code
+        AND     R0, R2, #setcol_LogicOpMask
+        ORRNE   R0, R0, #setcol_FgBgFlag
+        ORR     R0, R0, #setcol_PatternFlag
+        B       %BT77
+
+        END

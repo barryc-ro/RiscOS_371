@@ -1,0 +1,1667 @@
+; > Sources.MsgTrans
+
+;;----------------------------------------------------------------------------
+;; MessageTrans module
+;;
+;; Change List
+;; -----------
+;;  2-Nov-89    0.01    File created
+;;  7-Nov-89    0.02    Return R1->token terminator from MessageTrans_Lookup
+;;                      Also allow <=32, "," or ")" as token terminators
+;;  8-Nov-89            Report error if file is opened more than once
+;;  8-Nov-89    0.03    Fix bug: R1 was returned as a byte from Lookup!
+;; 13-Nov-89    0.04    Skip comment lines correctly
+;; 22-Feb-90    0.05    Change to look for fsnumber_resourcefs (not deskfs)
+;; 23-Feb-90    0.06    Allow "token:default" in case messages unavailable
+;; 10-Jan-91            Implement MessageTrans_EnumerateTokens
+;; 11-Jan-91    0.07    Fix bug: Die entry wasn't in module header!
+;; 05-Mar-91    0.08    Added MessageTrans_ErrorLookup
+;;                      Added workspace allocation
+;; 14-Mar-91    0.09    Added MessageTrans_GSLookup.
+;; 14-Mar-91    0.10    Added Global messages file.
+;;                      Added Message file for MessageTrans errors
+;;              0.11    Addd 'token' to message token not found message.
+;; 31-May-91    0.12    Fixed bug in Service_TerritoryLoaded
+;; 04-Jul-91    0.13    (WStoye) Optimised message lookup - 3.5* faster.
+;;              0.14    Copy error number last in error lookup.
+;; 26-Aug-91    0.15    Increased number of error buffers to 10.
+;; 19-Nov-91    0.16    Allow for lines ending in 0's as well as 10's when
+;;                      looking up tokens - the client can do this if it wants.
+;;                      Allow 13's as well (consistency only)
+;; 24-Jan-92    0.17    Add new SWI; MessageTrans_CopyError
+;; 29-Jan-92    0.18    General tidy up, removed all version-conditional
+;;                      assembly, ensured that the Service entry was fast,
+;;                      made wp constant through out the entire module (i.e.
+;;                      it is never used for anything else, removed the funny
+;;                      sav_token code by a proper passed pointer so that
+;;                      recursion is not a problem, includes initialising it
+;;                      from EnumerateTokens so that there isn't an address
+;;                      exception after the last token.
+;; 04-Feb-92    0.19    Fix bugs in new work.
+;; 17-Feb-92    0.20    2 X speed improvement on MessageTrans_Lookup
+;; 26-Feb-92    0.21    Handle workspace allocation on initialisation correctly.
+;; 11-Mar-92    0.22    Put a limit on the number of internal_fileinfos that can
+;;                      be current at any one time.
+;; 19-Jul-93    0.24    ECN:
+;;                      Add SWI MessageTrans_Dictionary
+;;                      Expand messages when looking up into a buffer using
+;;                      OS_PrettyPrint style detokenisation.
+;;                      Allow Tab (9), Hard space (31) and <ESC><N> in messages.
+;; 09-Aug-93    0.25    Bruce Cockburn;
+;;                      Fixed stack imbalance problem in GSLookup.
+;; 02-Sep-93    0.26    ECN:
+;;                      Fixed token expansion so <ESC>0 substitutes the string pointed
+;;                      to by R4. Similar to %0 substitution.
+;; 01-Feb-94    0.27    JSR:
+;;                      Increased number of foreground message buffers to 16 (was 10)
+;; 01-Mar-94    0.28    amg:
+;;                      Defer the call to MessageTrans_Dictionary in the token expansion
+;;                      until it is actually needed. The overhead of the call was making
+;;                      it run unacceptably slowly on 3.10.
+;;
+;;----------------------------------------------------------------------------
+
+Module_BaseAddr
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:Symbols
+        GET     Hdr:System
+        GET     Hdr:ModHand
+        GET     Hdr:FSNumbers
+        GET     Hdr:HighFSI
+        GET     Hdr:NewErrors
+        GET     Hdr:WimpSpace
+        GET     Hdr:Messages
+        GET     Hdr:Proc
+        GET     Hdr:Services
+        GET     Hdr:MsgTrans
+        GET     Hdr:NDRDebug
+        GET     Hdr:PublicWS
+        GET     Hdr:Squash
+
+        GET     Version
+
+        GBLL    debug
+        GBLL    debugxx
+        GBLL    debugenum                               ; For MessageTrans_EnumerateTokens
+        GBLL    debugservice
+        GBLL    debugerr                                ; For MessageTrans_ErrorLookup
+        GBLL    debugintr                               ; For internationalisation
+        GBLL    debugFSW
+
+debug           SETL   false
+debugxx         SETL   debug :LAND: false
+debugenum       SETL   debug :LAND: false
+debugservice    SETL   debug :LAND: false
+debugerr        SETL   debug :LAND: false
+debugintr       SETL   debug :LAND: false
+debugFSW        SETL   debug :LAND: true
+
+        GBLL    hostvdu
+hostvdu SETL    false
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Workspace layout
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+                                ^       0, wp
+wsorigin                        #       0
+link_header                     #       4
+current_ForegroundBuffer        #       4
+current_IRQBuffer               #       4
+MessageFile_block               #       5*4
+GlobalMessageFile_block         #       5*4
+Dictionary                      #       4
+ThreadNess                      #       4
+MaxThreadNess * 2
+
+        ASSERT  (link_header-wsorigin)=0
+
+ForegroundBuffersNo             *       16
+
+IRQBuffersNo                    *       2
+
+Buffersize                      *       &100
+
+ForegroundBuffers               #       Buffersize*ForegroundBuffersNo
+IRQBuffers                      #       Buffersize*IRQBuffersNo
+
+workspace_size  * @-wsorigin
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Module header
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        LEADR   Module_LoadAddr
+
+        ASSERT  (.=Module_BaseAddr)
+
+        DCD     0                                       ; Start
+        DCD     Init             - Module_BaseAddr
+        DCD     Die              - Module_BaseAddr
+        DCD     Service          - Module_BaseAddr
+        DCD     TitleString      - Module_BaseAddr
+        DCD     HelpString       - Module_BaseAddr
+        DCD     0                                       ; CommandTable
+        DCD     MessageTransSWI_Base
+        DCD     MySWIDecode      - Module_BaseAddr
+        DCD     MySWINames       - Module_BaseAddr
+        DCD     0
+        DCD     0
+        DCD     0
+
+TitleString     DCB     "MessageTrans", 0
+HelpString      DCB     "MessageTrans", 9, "$VString ($Date)", 0
+                ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; File control block format
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+                ^       0
+fcb_link        #       4                               ; only linked in if not client buffer
+fcb_flags       #       4
+fcb_fileptr     #       4                               ; pointer to file data: 0 => not loaded
+fcb_filename    #       4                               ; pointer to filename
+fcb_size        #       0
+
+flg_inresourcefs        *       1 :SHL: 0               ; file data is in resourcefs, else RMA
+flg_ourbuffer           *       1 :SHL: 1               ; means that on closing we must free the buffer
+flg_addtolist           *       1 :SHL: 2               ; means treat seeing as opening
+flg_sqshinresourcefs    *       1 :SHL: 31              ; means a squashed file in resourcefs
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Init entry - claim and initialise workspace.
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Init    ENTRY
+
+        LDR     r2, [r12]
+        TEQ     r2,#0
+        BNE     %FT01
+
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =workspace_size
+        SWI     XOS_Module
+        EXIT    VS
+
+        STR     r2, [ r12 ]
+01      MOV     wp, r2
+
+        MOV     r0, #0
+        STR     r0, link_header
+        STR     r0, current_ForegroundBuffer
+        STR     r0, current_IRQBuffer
+        STR     r0, MessageFile_block
+        STR     r0, GlobalMessageFile_block
+        STR     r0, Dictionary
+        STR     r0, ThreadNess
+
+; Try to open message files
+        BL      AttemptOpenMessagesFiles
+
+        EXITS
+
+MessagesFileName         DCB     "Resources:$.Resources.MsgTrans.Messages", 0
+GlobalMessagesFileName   DCB     "Resources:$.Resources.Global.Messages", 0
+        ALIGN
+
+; --------------------------------------------------------------------------------
+;
+; AttemptOpenMessagesFiles
+;
+; Attempt to open ours and the global messages files.
+; Error not returned - failure simply means they're not open.
+;
+
+AttemptOpenMessagesFiles Entry "r0-r2"
+
+        LDR     r0, MessageFile_block
+        TEQ     r0, #0
+        BNE     %FT50
+        ADR     r0, MessageFile_block + 4
+        ADR     r1, MessagesFileName
+        MOV     r2, #0
+        BL      SWIMessageTrans_OpenFile
+        MOVVS   r0, #0
+        STR     r0, MessageFile_block                   ; Either 0 or the correct address
+
+50
+        LDR     r0, GlobalMessageFile_block
+        TEQ     r0, #0
+        EXITS   NE
+        ADR     r0, GlobalMessageFile_block + 4
+        ADR     r1, GlobalMessagesFileName
+        MOV     r2, #0
+        BL      SWIMessageTrans_OpenFile
+        MOVVS   r0, #0
+        STR     r0, GlobalMessageFile_block             ; Either 0 or the correct address
+        Debug   xx,"Global file opened ",r0
+
+        EXITS
+
+        LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Die entry - throw away all blocks without telling anybody
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        ;       If the block is a normal ResourceFS block then zero fcb_fileptr
+        ;       and set the flg_addtolist so we can restart it OK.
+        ;       If the block is buffered by us then zero fcb_fileptr, and set
+        ;       the flg_addtolist so we can restart it OK, and free the buffer.
+        ;       The module workspace is freed by the kernel on exit.
+
+
+Die     ENTRY
+
+        ; Don't bother closing our own messages files because we're going to
+        ; reopen them anyway on initialisation.
+
+        LDR     wp, [ r12 ]
+DieLoop
+        LDR     r6, link_header
+        TEQ     r6, #0
+        EXITS   EQ
+        LDR     r14, [ r6, #fcb_link ]                  ; Delete block from chain
+        STR     r14, link_header
+
+        LDR     r14, [ r6, #fcb_flags ]                 ; Check to see if there is a buffer to release
+        ORR     r14, r14, #flg_addtolist                ; Magic to cope with a new MessageTrans
+        STR     r14, [ r6, #fcb_flags ]
+        TST     r14, #flg_ourbuffer
+        LDR     r2, [ r6, #fcb_fileptr ]                ; Old pointer (in case we want to free it)
+        STR     r2,  [ r6, #fcb_link ]                  ; Save in case of re-start
+        MOV     r0, #0
+        STR     r0, [ r6, #fcb_fileptr ]                ; Mark it as 'no valid data'
+        BEQ     DieLoop
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+        B       DieLoop
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Service call handling
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Service
+        Debug   service,"Service call entry: R0,R1,R2 =", r0, r1, r2
+
+        TEQ     r1, #Service_ResourceFSDying
+        TEQNE   r1, #Service_TerritoryStarted
+        TEQNE   r1, #Service_ResourceFSStarted
+        MOVNE   pc, lr
+        ;       It is possible that the contents of ResourceFS has now
+        ;       changed.  We must now mark all message files that used
+        ;       ResourceFS as being invalid i.e. the data pointer must be
+        ;       set to zero so that when data is required the address of the
+        ;       data will be re-computed.  If the service was either
+        ;       TerritoryStarted or ResourceFSStarted then it is also
+        ;       important to tell any clients that they must re-cache any
+        ;       pointers into the message file and that they must re-open
+        ;       any menu structures built from the message file, to do this
+        ;       the service call Service_MessageFileClosed is issued.
+        ;       All blocks remain "Open" and on the list.
+
+        Push    "r0-r1, lr"
+        LDR     wp, [ r12 ]
+        MOV     r1, #Service_Serviced                   ; Keep a flag to see if any files have changed
+        LDR     r14, link_header                        ; Look at the head of the chain
+ResourceFSLoop
+        TEQ     r14, #0
+        BEQ     FinishResourceFS
+        LDR     r0, [ r14, #fcb_flags ]
+        TST     r0, #flg_inresourcefs                   ; Is it in the ROM?
+        MOVNE   r1, #Service_MessageFileClosed          ; Flag for later service call
+        MOVNE   r0, #0
+        STRNE   r0, [ r14, #fcb_fileptr ]               ; Mark data as 'not there'
+        LDR     r14, [ r14, #fcb_link ]
+        B       ResourceFSLoop
+
+FinishResourceFS
+        LDR     r14, [ sp, #4 ]                         ; Get the actual service call type
+        TEQ     r14, #Service_ResourceFSDying
+        MOVNE   r0, #0                                  ; Don't prod clients on ResourceFS death
+        [       debugservice
+        BEQ     %76
+        Debug   service,"Service_MessageFileClosed: in ",r0,r1
+        SWI     XOS_ServiceCall                         ; can't return error
+        Debug   service,"Service_MessageFileClosed: out",r0,r1
+76
+        |
+        SWINE   XOS_ServiceCall                         ; can't return error
+        ]
+
+        ; just in case we hadn't got them open already, lets try again...
+        LDR     r14, [sp, #4]
+        TEQ     r14, #Service_ResourceFSStarted
+        BLEQ    AttemptOpenMessagesFiles
+
+ExitServiceResourceFS
+        Pull    "r0-r1, pc"
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI decoding: R11 = SWI index to call
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        MACRO
+$lab    MySWI   $swiname
+        ASSERT  MessageTransSWI_Base+(.-jptable)/4 = $swiname
+$lab    B       SWI$swiname
+        MEND
+
+MySWIDecode ROUT
+        CMP     r11, #maxswi
+        LDRCC   wp, [ r12 ]                             ; De-reference to workspace
+        ADDCC   pc, pc, r11, LSL #2
+        B       error_badswi
+
+; jump table must follow immediately
+
+jptable
+        MySWI   MessageTrans_FileInfo                   ; &041500
+        MySWI   MessageTrans_OpenFile                   ; &041501
+        MySWI   MessageTrans_Lookup                     ; &041502
+        MySWI   MessageTrans_MakeMenus                  ; &041503
+        MySWI   MessageTrans_CloseFile                  ; &041504
+        MySWI   MessageTrans_EnumerateTokens            ; &041505
+        MySWI   MessageTrans_ErrorLookup                ; &041506
+        MySWI   MessageTrans_GSLookup                   ; &041507
+        MySWI   MessageTrans_CopyError                  ; &041508
+        MySWI   MessageTrans_Dictionary                 ; &041509
+
+maxswi  *       (.-jptable)/4
+
+MySWINames
+        DCB     MessageTransSWI_Name, 0
+        DCB     "FileInfo", 0
+        DCB     "OpenFile", 0
+        DCB     "Lookup", 0
+        DCB     "MakeMenus", 0
+        DCB     "CloseFile", 0
+        DCB     "EnumerateTokens", 0
+        DCB     "ErrorLookup", 0
+        DCB     "GSLookup", 0
+        DCB     "CopyError", 0
+        DCB     "Dictionary", 0
+        DCB     0
+        ALIGN
+
+error_badswi
+        Push    "r1,r2,r4,lr"
+        ADR     r0, ErrorBlock_NoSuchSWI
+        MOV     r1, #0
+        MOV     r2, #0
+        ADR     r4, TitleString
+        SWI     XMessageTrans_ErrorLookup
+        Pull    "r1,r2,r4,pc"
+
+        MakeInternatErrorBlock NoSuchSWI,,BadSWI
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI definitions
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+; SWI MessageTrans_FileInfo
+; In    R1 -> filename
+; Out   R0 = flag word:
+;            bit 0 set => this file is in Resources: (can be accessed directly)
+;            bits 1..31 reserved (ignore them)
+;       R1   Preserved
+;       R2 = size of buffer required to hold file
+;            if R0 bit 0 set, the buffer is not required for read-only access
+
+SWIMessageTrans_FileInfo ENTRY "r3"
+
+        BL      internal_fileinfo
+        BICVC   r0, r0, #flg_sqshinresourcefs           ; flag not for external consumption
+        MOVVC   r2, r3                                  ; R2 = size of buffer required
+
+        EXIT
+
+; .............................................................................
+
+; In    R1 -> filename
+; Out   R0 = flag word:
+;            bit 0 set => this file is in Resources: (can be accessed directly)
+;            bits 1..31 reserved (ignore them)
+;       R1   Preserved
+;       R2 = address of file data minus 4 (if resourcefs)
+;       R3 = size of buffer that would be required to hold file data
+
+ErrorBlock_Recurse
+        DCD     ErrorNumber_MessageTrans_Recurse
+        DCB     "Recursion in MessageTrans",0
+        ALIGN
+
+internal_fileinfo ENTRY "r1,r4-r6"
+
+        LDR     lr, ThreadNess
+        CMP     lr, #MaxThreadNess
+        XError  Recurse, HS
+        EXIT    VS
+        ADD     lr, lr, #1
+        STR     lr, ThreadNess
+
+        DebugS  xx,"MessageTrans_FileInfo", r1
+        DebugS  FSW,"MessageTrans:OSFind_ReadFile",r1
+
+        MOV     r0, #OSFind_ReadFile
+        SWI     XOS_Find
+        BVS     %FT99
+        MOV     r1, r0                                  ; R1 = file handle
+
+        Debug   FSW,"Handle=",r0
+
+        MOV     r3, r1                                  ; save for a moment
+        MOV     r0, #FSControl_ReadFSHandle
+        SWI     XOS_FSControl
+        ANDVC   r4, r2, #&FF                            ; R4 = filing system number
+        SUBVC   r5, r1, #4                              ; R5 -> file size, data
+        MOVVC   r1, r3
+
+        MOVVC   r0, #OSArgs_ReadEXT
+        SWIVC   XOS_Args                                ; R2 = extent of file
+        ADDVC   r3, r2, #4                              ; R3 = file size + 4
+        BVS     %FT95
+
+        TEQ     r4, #fsnumber_resourcefs
+        MOVNE   r0, #0
+        MOVNE   r2, #0
+        BNE     %FT95
+
+        MOV     r2, r5
+
+        ; It's in resourcefs - check for squashed file
+        LDR     lr, SQSHTag
+        LDR     r0, [r2, #4]                            ; 'SQSH' tag at start of squash files
+        TEQ     r0, lr
+        LDREQ   lr, =&ffffff00                          ; filetype_text in load address
+        LDREQ   r0, [r2, #12]
+        BICEQ   r0, r0, #&ff
+        TEQEQ   r0, lr
+
+        MOVNE   r0, #flg_inresourcefs
+        MOVEQ   r0, #flg_sqshinresourcefs
+        LDREQ   r3, [r2, #8]                            ; Unsquashed size
+        ADDEQ   r3, r3, #4
+
+95      MOV     r5, pc
+        MOV     r6, r0
+        MOV     r0, #0
+        SWI     XOS_Find                                ; close file even if error
+        MOVVC   r0, r6
+        TEQVCP  r5, #0
+
+        Debug   xx,"Result: r0, r2 =", r0, r2
+
+99
+        Debug   FSW,"Out"
+        LDR     lr, ThreadNess
+        SUB     lr, lr, #1
+        STR     lr, ThreadNess
+
+        EXIT
+
+SQSHTag DCB     "SQSH"
+        ALIGN
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_OpenFile
+; In    R0 -> 4-word data structure
+;             must be held in the RMA if R2=0 on entry
+;       R1 -> filename, held in the RMA if R2=0 on entry
+;       R2 -> buffer to hold file data
+;             0 => allocate some space in the RMA,
+;                  or use the file directly if it's in Resources:
+
+SWIMessageTrans_OpenFile Entry "r0-r6"
+
+        Debug   xx,"MessageTrans_OpenFile",r0,r1,r2
+        DebugS  xx,"Filename =",r1
+
+        LDR     r14, link_header                        ; Check if the block is already in the list
+OpenScanLoop
+        TEQ     r14, r0
+        BEQ     err_alreadyopen
+        TEQ     r14, #0
+        LDRNE   r14, [ r14, #fcb_link ]
+        BNE     OpenScanLoop
+
+        BL      internal_fileinfo                       ; R0 = flags, R2 -> data, R3 = size
+        BVS     ExitOpenFile
+
+        LDR     r4, stk_filedesc                        ; R4 -> file descriptor
+        STR     r0, [ r4, #fcb_flags ]
+        STR     r1, [ r4, #fcb_filename ]
+
+        LDR     r14, stk_buffer
+        TEQ     r14, #0                                 ; If client buffer supplied,
+        BNE     UseSuppliedBuffer
+
+        TST     r0, #flg_inresourcefs
+        BEQ     FileNotDirectROM                        ; If it isn't in ResourceFS
+        STR     r2, [ r4, #fcb_fileptr ]                ; R2 -> message data
+
+ExitOpenFile
+        LDRVC   r14, link_header                        ; If not an error, then link in to list
+        STRVC   r14, [ r4, #fcb_link ]
+        STRVC   r4, link_header
+ExitOpenFile_NoLink
+        STRVS   r0, [ sp, #0 ]                          ; If error store in exit frame
+        EXIT
+
+UseSuppliedBuffer                                       ; Doesn't matter which FS its from
+        BIC     r0, r0, #flg_inresourcefs               ; flg_inresourcefs means we're pointing
+        STR     r0, [ r4, #fcb_flags ]                  ; at resourcefs now
+        STR     r14, [ r4, #fcb_fileptr ]               ; Put its address in the block
+        MOV     r5, r2
+        MOV     r2, r14
+        BL      OpenFile_LoadIntoBuffer
+        B       ExitOpenFile_NoLink
+
+FileNotDirectROM
+        ; r0=flags
+        ; r1=filename
+        ; r2=resourcefs address
+        ; r3=size needed
+        ; r4=messagefile block
+        MOV     r6, r0
+        MOV     r0, #ModHandReason_Claim                ; R3 is still size to claim
+        SWI     XOS_Module
+        MOVVC   r0, r6
+        BLVC    OpenFile_LoadIntoBuffer
+        LDRVC   r14, [ r4, #fcb_flags ]
+        ORRVC   r14, r14, #flg_ourbuffer                ; Mark this as ours so we free it on Close
+        STRVC   r14, [ r4, #fcb_flags ]
+        STRVC   r2, [ r4, #fcb_fileptr ]                ; Put its address in the block
+        BVC     ExitOpenFile
+        MOV     r4, r0                                  ; Keep the error
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+        MOV     r0, r4
+        SETV
+        B       ExitOpenFile
+
+err_alreadyopen
+        Push    "r1, r2"
+        ADR     r0, ErrorBlock_FileOpen
+        LDR     r1, MessageFile_block                   ; Either 0 or the block address
+        MOV     r2, #0
+        SWI     XMessageTrans_ErrorLookup
+        Pull    "r1, r2"
+        B       ExitOpenFile
+
+; Subroutine for MessageTrans_OpenFile
+;
+; In  r0 = flags
+;     r1 = filename
+;     r2 = destination buffer
+;     r3 = length
+;     r5 = resourcefs source address (if relevant)
+; Out r0 corrupt
+OpenFile_LoadIntoBuffer Entry "r1-r5"
+
+        ; Store buffer length at start of buffer
+        STR     r3, [r2], #4
+
+        TST     r0, #flg_sqshinresourcefs
+        BEQ     %FT50
+
+        MOV     r4, r2                                  ; destination
+
+        ; Claim decompression workspace
+        MOV     r0, #&8                                 ; how much workspace do we need?
+        SWI     XSquash_Decompress
+        EXIT    VS
+
+        MOV     r3, r0
+        MOV     r0, #ModHandReason_Claim
+        SWI     XOS_Module
+        EXIT    VS
+
+        ; Do the decompression
+        MOV     r0, #0                                  ; decompress slow (with limits)
+        MOV     r1, r2                                  ; workspace
+        MOV     r2, r5                                  ; input
+        LDR     r3, [r2], #24                           ; inbytes (and skip the SQSH header)
+        SUB     r3, r3, #24                             ; discount the squash header
+        LDR     r5, [r2, #-16]                          ; outbytes
+        SWI     XSquash_Decompress
+
+        ; Free the decompression workspace, ignoring errors
+        Push    "r0,pc"
+
+        MOV     r2, r1
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+
+        Pull    "r0,lr"
+        TEQP    pc, lr
+
+        EXIT
+
+50
+        ; Load file without faff
+        MOV     r0, #OSFile_Load
+        MOV     r3, #0
+        SWI     XOS_File
+
+        EXIT
+
+
+ErrorBlock_FileOpen
+        DCD     ErrorNumber_MessageTrans_FileOpen
+        DCB     "FilOpen", 0
+        ALIGN
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_GSLookup
+; In    R0 -> 4-word data structure passed to MessageTrans_LoadFile
+;       R1 -> token, terminated by 0, 10 or 13, or "token:default"
+;       R2 -> buffer to hold result (0 => don't copy it)
+;       R3 = buffer size (if R2 non-0)
+;       R4 -> parameter 0 (0 => don't substitute for "%0")
+;       R5 -> parameter 1 (0 => don't substitute for "%1")
+;       R6 -> parameter 2 (0 => don't substitute for "%2")
+;       R7 -> parameter 3 (0 => don't substitute for "%3")
+; Out   R0,R1 -> preserved.
+;       R2 -> result string (read-only with no parameter substitution if R2=0 on entry)
+;       R3 = size of result before terminator (character 10 if R2=0 on entry, else 0)
+
+;       Same as MessageTrans_Lookup, only string is GSTransed before you get it back,
+;       This needs an intermediate buffer, and so will fail if one cannot be allocated
+;       from the RMA.
+
+SWIMessageTrans_GSLookup
+
+        Push    "r0-r1, r4-r7, r8-r10, lr"
+
+;       If R2 = 0 this SWI is identical to MessageTrans_Lookup.
+
+        CMP     r2, #0
+        SWIEQ   XMessageTrans_Lookup
+        STRVS   r0, [ sp, #0 ]
+        Pull    "r0-r1, r4-r7, r8-r10, pc", VS
+        Pull    "r0-r1, r4-r7, r8-r10, pc", EQ
+
+;       Else ...
+
+        MOV     r9, r2                                  ; Keep the user's buffer
+        MOV     r10, r3
+
+;       First allocate a buffer to hold the result to be the same
+;       length as the buffer provided by the client.
+
+        MOV     r0, #ModHandReason_Claim
+        SWI     XOS_Module
+        STRVS   r0, [ sp, #0 ]
+        Pull    "r0-r1, r4-r7, r8-r10, pc", VS
+
+        MOV     r8, r2                                  ; Keep address of claimed buffer for later freeing
+        LDMIA   sp, { r0, r1 }                          ; Restore entry values of R0 and R1
+
+;       Now all registers are as on entry, but R2/R3 describes the new buffer
+
+        SWI     XMessageTrans_Lookup                    ; Go find the message
+        MOVVC   r0, r2                                  ; Output of lookup
+        MOVVC   r1, r9                                  ; User's buffer pointer
+        MOVVC   r2, r10                                 ; User's buffer length
+        SWIVC   XOS_GSTrans                             ; Now GSTrans the result
+        BVS     FreeGSBufferAndExit
+
+;       Free the buffer and return.
+
+        Push    "r0, r1, r2"
+        MOV     r0, #ModHandReason_Free
+        MOV     r2, r8
+        SWI     XOS_Module
+        STRVS   r0, [ sp, #0 ]
+        Pull    "r0, r2, r3"
+        STRVS   r0, [ sp, #0 ]
+        Pull    "r0-r1, r4-r7, r8-r10, pc", VS
+        Pull    "r0-r1, r4-r7, r8-r10, pc",, ^
+
+FreeGSBufferAndExit
+        STR     r0, [ sp, #0 ]                          ; Shove error into stack
+        MOV     r0, #ModHandReason_Free
+        MOV     r2, r8
+        SWI     XOS_Module
+        SETV                                            ; Force error, cleared by SWI
+        Pull    "r0-r1, r4-r7, r8-r10, pc"
+
+GSTransIsOK
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_ErrorLookup
+; In    R0 -> Error block (Word aligned) containing error number , token, terminated by 0 or error number , "token:default"
+;       R1 -> 4-word data structure passed to MessageTrans_LoadFile
+;       R2 -> buffer to hold result (0 => Use internal buffer)
+;       R3 =  buffer size (if R2 non-0)
+;       R4 -> parameter 0 (0 => don't substitute for "%0")
+;       R5 -> parameter 1 (0 => don't substitute for "%1")
+;       R6 -> parameter 2 (0 => don't substitute for "%2")
+;       R7 -> parameter 3 (0 => don't substitute for "%3")
+; Out   R0 -> Error buffer used
+;       V Set
+
+SWIMessageTrans_ErrorLookup Entry "r1-r8"
+
+; Set things up for MessageTrans_Lookup
+
+; First find a buffer to use:
+
+        CMP     r2,#0
+        BNE     %FT01                                   ; There is a buffer supplied
+
+        MOV     r14, #0
+        LDR     r14, [ r14, #IRQsema ]
+        CMP     r14, #0
+        ADREQ   r2, ForegroundBuffers
+        ADRNEL  r2, IRQBuffers
+        LDREQ   r14, current_ForegroundBuffer
+        LDRNE   r14, current_IRQBuffer
+        ADD     r2, r2, r14, ASL #8                     ; Point at correct buffer to use
+        ADD     r14, r14, #1
+        MOVEQ   r8, #ForegroundBuffersNo
+        MOVNE   r8, #IRQBuffersNo
+        CMP     r14, r8
+        MOVGE   r14, #0
+        MOV     r8, #0
+        LDR     r8, [ r8, #IRQsema ]
+        CMP     r8, #0
+        STREQ   r14, current_ForegroundBuffer
+        STRNE   r14, current_IRQBuffer                  ; And set new buffer number.
+        MOV     r3, #Buffersize
+
+        Debug   err,"Using buffer at ",r2
+01
+        ;       Now R2 -> Buffer to use
+        ;       R3 =  Buffer Size
+        LDR     r14, [ r0 ], #4                         ; Copy error number.
+        ADD     r2, r2, #4                              ; Point at text start.
+        Push    "r14"                                   ; Stack error number.
+        MOV     r8, r0
+        MOV     r0, r1                                  ; 4 word data structure
+        MOV     r1, r8                                  ; Pointer to the error token
+        SUB     r3, r3, #4                              ; Adjust output buffer size, because we have already changed R2
+
+; Now
+;       R0 -> File block
+;       R1 -> Token
+;       R2 -> Where to put translation
+;       R3 -> Buffer size - 4 for error number.
+;       R4 .. R7 as on entry.
+
+        SWI     XMessageTrans_Lookup                    ; Get the translation
+        SUBVC   r0, r2, #4                              ; Point back at the error number
+        Pull    "r14"
+        STRVC   r14, [ r0 ]                             ; Store error number last.
+        Debug   err, "R0 is ", r0
+
+        SETV                                            ; Always exit with V set
+        EXIT
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_CopyError
+; In    R0 -> Error block (Word aligned) containing error number ,and error text terminated by 0
+; Out   R0 -> Error buffer used
+;       V Set
+
+SWIMessageTrans_CopyError Entry "r9"
+
+; First find a buffer to use:
+
+        MOV     r14, #0
+        LDR     r14, [ r14, #IRQsema ]
+        CMP     r14, #0
+        ADREQ   r9, ForegroundBuffers
+        ADRNEL  r9, IRQBuffers
+        LDREQ   r10, current_ForegroundBuffer
+        LDRNE   r10, current_IRQBuffer
+        ADD     r9, r9, r10, ASL #8                     ; Point at correct buffer to use
+        ADD     r10, r10, #1
+        MOVEQ   r11, #ForegroundBuffersNo
+        MOVNE   r11, #IRQBuffersNo
+        CMP     r10, r11
+        MOVGE   r10, #0
+        CMP     r14, #0
+        STREQ   r10, current_ForegroundBuffer
+        STRNE   r10, current_IRQBuffer                  ; And set new buffer number.
+        MOV     r10, #Buffersize - 4
+
+; Now R9 -> Buffer to use
+;     R10 ~= Buffer Size
+
+        Debug   err,"Using buffer at ", r9
+
+        MOV     r11, r9
+        LDR     r14, [ r0 ], #4                         ; Copy error number.
+        STR     r14, [ r11 ], #4
+
+CopyErrorLoop
+        DECS    r10
+        STREQB  r10, [ r11 ]                            ; Terminate when buffer is about to overflow
+        LDRNEB  r14, [ r0 ], #1
+        STRNEB  r14, [ r11 ], #1
+        TEQNE   r14, #0
+        BNE     CopyErrorLoop
+
+        SETV
+        MOV     r0, r9
+
+        EXIT
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_EnumerateTokens
+; In    R0 -> 4-word data structure passed to MessageTrans_OpenFile
+;       R1 -> token, terminated by 0, 10, 13 or ":"
+;             wildcards: ? = match 1 char, * = match 0 or more chars
+;       R2 -> buffer to hold result
+;       R3 = buffer size
+;       R4 = place marker (0 for first call)
+; Out   R2 -> buffer, containing next token if found, with terminator copied from input
+;             R2=0 => no more tokens found (we've finished)
+;       R3 = length of result excluding terminator (if R2<>0)
+;       R4 = place marker for next call (non-0)
+
+                ^       0, sp
+stk_filedesc    #       4               ; r0            ; R0-R3 as for MessageTrans_Lookup
+stk_token       #       4               ; r1
+stk_buffer      #       4               ; r2
+stk_buffersize  #       4               ; r3
+stk_place       #       4               ; r4
+
+SWIMessageTrans_EnumerateTokens Entry "r0-r9"
+
+        Debug   enum,"MessageTrans_EnumerateTokens", r0, r1, r2, r3, r4
+        DebugS  enum,"Token to match =",r1
+
+        MOV     r9, r1                                  ; Save a pointer to the client's token
+        BL      EnsureFileIsOpen
+        BVS     ExitEnumerateTokens
+
+        LDR     r14, stk_place
+        ADD     r3, r3, r14                     ; r3 -> where to scan from
+
+; search each line of the file in turn, looking for <token>:
+
+matchtoken
+        MOV     r1, r9                                  ; R1 -> token to match with
+        MOV     r5, r3                                  ; R5 -> token in file
+02
+        BL      get_R0_R1                               ; R0 := [ R1 ], #1  and  LS => it's a terminator
+        BLS     %FT03
+
+        BL      getbyte                                 ; R8 = next char from file
+        BVS     FinishEnumerateTokens
+
+        CMP     r8, #"#"                                ; ignore comment lines completely
+        BEQ     skipline2
+
+        TEQ     r0, #"*"                                ; just match whole of rest of token for now
+        BEQ     matchrest
+
+        CMP     r8, #"/"                                ; stop if reached end of token
+        CMPNE   r8, #10
+        CMPNE   r8, #":"                                ; if followed by ":", skip to end of line
+        BEQ     skiptoken2
+
+        CMP     r8, #"?"                                ; wildcard
+        CMPNE   r0, r8
+        CMPNE   r0, #"?"                                ; input token can also be wildcarded on this call
+        BEQ     %BT02
+
+; skip to next token on line, or skip line if no more tokens
+
+skiptoken2
+        BL      skiptonexttoken                         ; R3 -> next char, R8 = current char
+        BVC     matchtoken
+
+skipline2
+        BLVC    skiptonextline
+        BVC     matchtoken
+
+; error => EOF, so indicate that we've finished
+
+FinishEnumerateTokens
+        SUBS    r14, r14, r14                           ; R14=0, clear V
+        STR     r14, stk_buffer                         ; buffer ptr = 0 on exit => no more found
+ExitEnumerateTokens
+        STRVS   r0, [ sp, #0 ]
+        EXIT
+
+; "*" encountered in match token - currently this must be the last char
+
+matchrest
+        BL      get_R0_R1
+        BLS     EnumerateFoundToken                     ; found it!
+        ADR     r0, ErrorBlock_Syntax
+        LDR     r1, MessageFile_block                   ; Either 0 or the block address
+        MOV     r2, #0
+        MOV     r4, r9
+        SWI     XMessageTrans_ErrorLookup
+        B       ExitEnumerateTokens
+
+ErrorBlock_Syntax
+        DCD     ErrorNumber_MessageTrans_Syntax
+        DCB     "Syntax", 0
+        ALIGN
+
+; reached end of token - matched if next char is ":", "/" or linefeed
+
+03      BL      getbyte
+        BVS     FinishEnumerateTokens
+        CMP     r8, #"/"                                ; "/" or newline => alternatives
+        CMPNE   r8, #10
+        CMPNE   r8, #":"                                ; token must be followed by ":"
+        BNE     skiptoken2
+
+31      CMP     r8, #":"                                ; skip to ":", where message is
+        BEQ     EnumerateFoundToken
+        BL      getbyte
+        BVC     %BT31
+        B       FinishEnumerateTokens
+
+EnumerateFoundToken
+        ; Found token - R0 = terminator of match token copy the
+        ; found token into the supplied buffer, and terminate with R0
+
+        MOV     r3, r5                                  ; R3 -> start of token in file
+        LDR     r2, stk_buffer                          ; R2 -> output buffer
+        LDR     r6, stk_buffersize                      ; R6 = counter
+
+35      BL      getbyte                                 ; error here => corrupt file
+        BVS     ExitEnumerateTokens
+        SUBS    r6, r6, #1                              ; watch for buffer overflow
+        BLLT    err_buffoverflow
+        BVS     ExitEnumerateTokens
+        CMP     r8, #"/"                                ; finished if "/", ":" or newline
+        CMPNE   r8, #":"
+        CMPNE   r8, #10
+        STRNEB  r8, [ r2 ], #1
+        BNE     %BT35
+        STRB    r0, [ r2 ]                              ; R2 -> terminator (use same one as input)
+
+        LDR     r6, stk_buffer
+        SUBS    r5, r2, r6                              ; R5 = number of bytes copied, excluding terminator
+        BEQ     skiptoken2                              ; ignore null tokens (R8 = terminator)
+
+        BL      skiptonexttoken                         ; ignore errors (EOF), since that's for next time
+
+        LDR     r0, stk_filedesc
+        LDR     r0, [ r0, #fcb_fileptr ]
+        ADD     r0, r0, #4                              ; R0 -> start of file data (ignore size field)
+        SUB     r3, r3, r0                              ; R3 = offset within file for next time
+        STR     r3, stk_place                           ; place marker for next call
+        STR     r5, stk_buffersize                      ; length of token excluding terminator
+
+        CLRV
+        B       ExitEnumerateTokens                     ; DON'T return V flag
+
+;.....................................................................................
+
+EnsureFileIsOpen
+        ; In    R0 -> data structure
+        ; Out   R3 -> pointer to data
+        ;       R4 -> pointer to byte after data
+        ;       R1, R2 Trashed
+        LDR     r3, [ r0, #fcb_fileptr ]
+        CMP     r3, #0                                  ; Clears V
+        LDRNE   r4, [ r3 ], #4                          ; R4 = size of file + 4
+        ADDNE   r4, r4, r3
+        SUBNE   r4, r4, #4                              ; R4 -> byte after end of file
+        MOVNE   pc, lr                                  ; Return fast in easy case
+
+        ;       Here there is no file, it is one of four possible cases
+        ;       The data has been removed by a Service_ResourceFS(Dying|Started)
+        ;       If this is the case then just look it up again, this will have the
+        ;       Flag set flg_inresourcefs=1, flg_ourbuffer=0, flg_addtolist=0.
+        ;       The other three cases all have the flg_addtolist=1
+
+FileIsNotHere
+        Push    "r0, lr"
+        LDR     r14, [ r0, #fcb_flags ]
+        TST     r14, #flg_addtolist
+        BNE     ReOpenBlock
+        LDR     r1, [ r0, #fcb_filename ]
+        BL      internal_fileinfo                       ; load file if not already done
+        LDRVC   r0, [ sp, #0 ]                          ; Pointer to data structure
+        MOVVC   r3, r2                                  ; Address of data - 4
+        STRVC   r3, [ r0, #fcb_fileptr ]                ; R2 -> message data
+FileNowOpen
+        LDRVC   r4, [ r3 ], #4                          ; R4 = size of file + 4
+        ADDVC   r4, r4, r3
+        SUBVC   r4, r4, #4                              ; R4 -> byte after end of file
+        STRVS   r0, [ sp, #0 ]
+        Pull    "r0, pc"
+
+ReOpenBlock
+        TST     r14, #(flg_inresourcefs :OR: flg_ourbuffer)
+        LDREQ   r2, [ r0, #fcb_link ]
+        MOVNE   r2, #0
+        LDR     r1, [ r0, #fcb_filename ]
+        BL      SWIMessageTrans_OpenFile
+        LDRVC   r3, [ r0, #fcb_fileptr ]
+        B       FileNowOpen
+
+;.....................................................................................
+
+; In    R1 -> input token
+; Out   R0 = next character in token
+;       R1 -> character after that
+;       LS => R0 is a terminator
+
+get_R0_R1 ROUT
+        LDRB    r0, [ r1 ], #1                          ; token is terminated by 0, 10, 13 or ":"
+        CMP     r0, #","                                ; terminate on ","
+        CMPNE   r0, #")"                                ; terminate on ")"
+        CMPNE   r0, #":"                                ; terminate on ":"
+        CMPNE   r0, #" "                                ; terminate on ctrl-char or space
+        MOV     pc, lr
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_Lookup
+; In    R0 -> 4-word data structure passed to MessageTrans_LoadFile
+;       R1 -> token, terminated by 0, 10 or 13, or "token:default"
+;       R2 -> buffer to hold result (0 => don't copy it)
+;       R3 = buffer size (if R2 non-0)
+;       R4 -> parameter 0 (0 => don't substitute for "%0")
+;       R5 -> parameter 1 (0 => don't substitute for "%1")
+;       R6 -> parameter 2 (0 => don't substitute for "%2")
+;       R7 -> parameter 3 (0 => don't substitute for "%3")
+; Out   R1 -> token terminator
+;       R2 -> result string (read-only with no parameter substitution if R2=0 on entry)
+;       R3 = size of result before terminator (character 10 if R2=0 on entry, else 0)
+
+                ^       4*4, sp         ; r0-r3 as for MessageTrans_EnumerateTokens
+stk_parameter0  #       4               ; r4
+stk_parameter1  #       4               ; r5
+stk_parameter2  #       4               ; r6
+stk_parameter3  #       4               ; r7
+stk_endpars     #       0
+
+SWIMessageTrans_Lookup
+        Push    "lr"
+
+        DebugS  FSW,">>",r1
+
+        CMP     r0, #0                                  ; Were we given a message block?
+        BEQ     DoGlobalLookup                          ; No, skip straight to global lookup
+        Push    "r1-r3"                                 ; Preserve the inputs in case it fails
+        BL      internal_lookup
+        ADDVC   sp, sp, #12                             ; Remove the stored input values R1-R3
+        Pull    "pc", VC                                ; Match found so return
+        Pull    "r1-r3"                                 ; Restore the stored input values R1-R3
+DoGlobalLookup
+        LDR     r0, GlobalMessageFile_block
+        Debug   xx,"Global file : ", r0
+        CMP     r0, #0                                  ; Clears V
+        BEQ     NoGlobalMessageFile                     ; What an unlikely thing
+        BL      internal_lookup                         ; Look it up again
+        Pull    "pc"
+
+NoGlobalMessageFile
+        XError  TokenNotFound
+        Pull    "pc"
+
+internal_lookup ENTRY "r0-r9"
+
+        Debug   xx,"MessageTrans_Lookup",r0,r1,r2,r3,r4,r5
+        DebugS  xx,"Token =",r1
+
+        MOV     r9, r1                                  ; Pointer to the token for error insertion
+        BL      EnsureFileIsOpen
+        BVS     %FT98
+
+; search each line of the file in turn, looking for <token>:
+
+findtoken
+        MOV     r1, r9                                  ; R1 -> token
+
+02      BL      get_R0_R1                               ; LS => terminator
+        BLS     %FT03
+
+        BL      getbyte
+        BVS     %FT98
+
+        CMP     r8, #"#"                                ; ignore comment lines completely
+        BEQ     skipline
+
+        CMP     r8, #"/"                                ; also stop if reached end of token
+        CMPNE   r8, #10
+        CMPNE   r8, #":"                                ; if followed by ":", skip to end of line
+        BEQ     skiptokens
+
+        CMP     r8, #"?"                                ; wildcard
+        CMPNE   r0, r8
+        BEQ     %BT02
+
+; skip to next token on line, or skip line if no more tokens
+
+skiptokens
+        BL      skiptonexttoken
+        BVC     findtoken
+
+skipline
+        BLVC    skiptonextline
+        BVC     findtoken
+
+; if error, see if there was a default value after the token
+
+98
+        LDR     r3, stk_token
+51
+        DebugS  intr,"token is: ", r3
+        LDRB    r14, [ r3 ], #1
+        CMP     r14, #":"                               ; look for ":"
+        BEQ     %FT52
+        CMP     r14, #32
+        BHS     %BT51
+        SETV                                            ; no default - report error
+        B       %FT99
+
+
+52
+        Debug   intr,"default found in string"
+        MOV     r4, r3                                  ; R3 -> start of default value
+53      LDRB    r14, [ r4 ], #1
+        CMP     r14, #10
+        CMPNE   r14, #13
+        CMPNE   r14, #0
+        BNE     %BT53
+        MOV     r1, r4                                  ; update R1
+        DebugS  intr,"default is ", r3
+        B       dosubstit                               ; and do parameter substitution
+
+99
+        STRVS   r0, [ sp, #0 ]
+        EXIT
+
+; reached end of token - matched if next char is ":", "/" or linefeed
+
+03
+        BL      getbyte
+        BVS     %BT98
+        CMP     r8, #"/"                                ; "/" or newline => alternatives
+        CMPNE   r8, #10
+        CMPNE   r8, #":"                                ; token must be followed by ":"
+        BNE     skiptokens
+
+31      CMP     r8, #":"                                ; skip to ":", where message is
+        BEQ     %FT32
+        BL      getbyte
+        BVC     %BT31
+        B       %BT98
+32
+
+; found token - read the rest of the line into the output buffer
+; r1 -> one after terminator of token supplied
+
+dosubstit
+
+        SUB     r1, r1, #1                              ; return R1 -> token terminator
+        STR     r1, stk_token
+
+        ASSERT  :INDEX: stk_token = 4
+        ASSERT  :INDEX: stk_buffer = 8
+        ASSERT  :INDEX: stk_buffersize = 12
+
+        LDMIB   sp, { r0-r1, r5 }                       ; R5 = counter
+        CMP     r1, #0                                  ; if no buffer supplied,
+        BNE     decode_string                           ; return a pointer to the string
+        STR     r3, stk_buffer
+33      BL      getbyte
+        BVS     %BT99
+        CMP     r8, #&1b
+        ADDEQ   r3, r3, #1
+        CMP     r8, #10
+        CMPNE   r8,#13
+        CMPNE   r8,#0
+        BNE     %BT33
+
+        SUB     r3, r3, #1                              ; R3 -> terminator
+        LDR     r14, stk_buffer
+        SUB     r3, r3, r14
+        STR     r3, stk_buffersize
+        B       %BT99
+
+decode_string
+
+        ;amg: don't call MessageTrans_Dictionary - just set R9=0 to indicate that
+        ;     we don't have the value yet
+
+        MOV     r9, #0
+;        BL      SWIMessageTrans_Dictionary
+;        MOV     r9, r0                                  ; R9 points to kernel dictionary
+
+04      BL      getbyte
+        BVS     %BT99
+        CMP     r8, #"%"
+        BEQ     %FT05
+        CMP     r8, #&1b
+        BEQ     expand_tok
+41      CMP     r8, #10                                 ; stop on linefeed
+        CMPNE   r8, #0
+        CMPNE   r8, #13
+        SUBNES  r5, r5, #1
+        MOVEQ   r8, #0                                  ; terminate with 0
+        STRB    r8, [ r1 ], #1
+        BNE     %BT04
+42
+        LDR     r14, stk_buffer
+        SUB     r14, r1, r14                            ; R14 = length of string
+        SUB     r14, r14, #1                            ; excluding terminator
+        STR     r14, stk_buffersize
+        B       %BT99
+
+; just read "%" - if next character is "0", expand parameter
+
+05      BL      getbyte                                 ; R8 = "0" or "1" (hopefully)
+        BVS     %BT99
+        SUB     r14, r8, #"0"
+        CMP     r14, #4                                 ; parameters 0..3 allowed
+        BLO     %FT06
+        CMP     r14, #"%"-"0"
+        SUBNE   r3, r3, #1                              ; "%%" => "%", else "%x" => "%x"
+51      MOV     r8, #"%"
+        B       %BT41
+
+; expand parameter into output buffer
+
+06
+        ADR     r0, stk_parameter0
+        LDR     r0, [ r0, r14, LSL #2 ]                 ; R0 -> parameter
+        CMP     r0, #0                                  ; if none, don't substitute
+        SUBEQ   r3, r3, #1
+        BEQ     %BT51
+07      LDRB    r14, [ r0 ], #1
+        CMP     r14, #0                                 ; stop on 0
+        CMPNE   r14, #10                                ; or linefeed
+        CMPNE   r14, #13                                ; or carriage return
+        SUBNES  r5, r5, #1
+        STRNEB  r14, [ r1 ], #1
+        BNE     %BT07
+        CMP     r5, #0                                  ; if buffer not full,
+        BNE     %BT04                                   ; continue
+        MOV     r14, #0                                 ; terminate with 0
+        STRB    r14, [ r1 ], #1
+        B       %BT42                                   ; else stop now
+
+expand_tok
+        LDR     r6, stk_parameter0
+        BL      getbyte
+        BL      expand_tok1
+        B       %BT04
+
+expand_tok1
+        STMDB   sp!, {r0, lr}
+
+        ;amg : ok, I give up. We need to make the call to SWIMessageTrans_Dictionary if
+        ;      we've not done it already. Moving it to here ensure that it doesn't get
+        ;      called when there's no need to call it.
+
+        MOVS    r0, r9
+        BLEQ    SWIMessageTrans_Dictionary
+        MOVEQ   r9, r0                                  ; R9 points to kernel dictionary
+
+explp   SUBS    r8, r8, #1
+        LDRHIB  r14, [r0]
+        ADDHI   r0, r0, r14
+        BHI     explp
+        SUBCCS  r0, r6, #1
+        LDMCCIA sp!, {r0, pc}^
+explp1  LDRB    r8, [r0, #1]!
+        CMP     r8, #0
+        LDMEQIA sp!, {r0, pc}^
+        CMP     r8, #&1b
+        STRNEB  r8, [r1], #1
+        LDREQB  r8, [r0, #1]!
+        BLEQ    expand_tok1
+        B       explp1
+
+;..............................................................................
+
+; In    r3 -> next byte in message file
+;       r4 -> end-of-file
+; Out   r8 = last char read, r3 -> next possible token
+;       "Message token not found" error if read past EOF
+
+        ; This version, of the same routines, is considerably faster.
+        ; It's important to optimise these routines because when searching
+        ; for a token, we spend a great deal of time here skipping over
+        ; blank lines.
+        ; The following two loops are almost identical - one looks for
+        ; newline, the other for newline-or-slash.
+
+skiptonexttoken
+        CMP     r8, #"/"
+        CMPNE   r8, #&1f
+        BLS     skiptonextline4
+        CMP     r8, #":"
+        LDRB    r8, [r3], #1
+        BNE     skiptonexttoken
+
+skiptonextline
+        CMP     r8, #&20
+        BCC     skiptonextline3
+skiptonextline0
+        TST     r3, #3
+        LDRNEB  r8, [r3], #1
+        BNE     skiptonextline
+        LDRB    r8, [r3], #1
+        B       skiptonextline
+skiptonextline1
+        LDR     r8, [r3], #4
+        CMP     r8, #&20000000
+        BIC     r8, r8, #&ff000000
+        CMPCS   r8, #&200000
+        BIC     r8, r8, #&ff0000
+        CMPCS   r8, #&2000
+        BIC     r8, r8, #&ff00
+        CMPCS   r8, #&20
+        BCS     skiptonextline1
+        SUB     r3, r3, #3
+skiptonextline2
+        CMP     r8, #&20
+        LDRCSB  r8, [r3], #1
+        BCS     skiptonextline2
+skiptonextline3
+        CMP     r8, #&1b          ; Skip over ESC <token>
+        ADDEQ   r3, r3, #1        ; Must never have ESC <EOF>!
+        CMPNE   r8, #9            ; Tabs allowed in messages
+        CMPNE   r8, #31           ; Also hard space
+        BEQ     skiptonextline0
+skiptonextline4
+        CMP     r3, r4
+        MOVCCS  pc, lr
+        B       getbyte
+
+;..............................................................................
+ErrorBlock_TokenNotFound
+        DCD     ErrorNumber_MessageTrans_TokenNotFound
+        [       False
+        DCB     "TokenNotFound", 0
+        |
+        DCB     "TokNFnd", 0
+        ]
+        ALIGN
+
+; In    R3 -> next byte in message file
+;       R4 -> end-of-file
+;       R9 -> pointer to the token we are trying to find (for the error message)
+; Out   R3 updated
+;       R8 = next byte,
+;       "Message token not found" error if read past EOF
+
+getbyte                                                 ; This version does not push LR in the normal non-end-of-file case.
+        CMP     r3, r4                                  ; Check we are within the file
+        LDRLOB  r8, [ r3 ], #1                          ; Yes, so read the byte
+        BICLOS  pc, lr, #VFlag                          ; Then return with V clear
+        Push    "r7, lr"                                ; It's an error, get the error message
+        ADR     r0, ErrorBlock_TokenNotFound
+        ;       R9 is the token to be inserted into the error message
+        ;       If a ":" follows the token then don't insert the token
+        ;       in the error message.
+        DebugS  intr,"Saved token is ",r9
+        MOV     r7, r9                                  ; Copy the token pointer
+01
+        LDRB    r14, [ r7 ], #1
+        CMP     r14, #" "                               ; Check for terminating condition
+        BLT     %FT02
+        CMP     r14, #":"                               ; Check for a ":"
+        BNE     %BT01                                   ; Keep scanning if neither happened
+        Debug   intr,": in token return"
+        SETV
+        Pull    "r7, pc"
+
+02
+        Debug   intr,"no : in token"
+        Push    "r1-r6"                                 ; Return frame is now R1-R7, PC
+        LDR     r1, MessageFile_block                   ; Either 0 or the block address
+        MOV     r2, #0                                  ; No supplied buffer
+        MOV     r3, #0
+        MOV     r4, r9                                  ; The token to insert as %0
+        MOV     r5, #0                                  ; No more supplied parameters
+        MOV     r6, #0
+        MOV     r7, #0
+        SWI     XMessageTrans_ErrorLookup
+        [       debugintr
+        ADD     r1, r0, #4
+        DebugS  intr, "error lookup returns ", r1
+        ]
+        Pull    "r1-r7, pc"
+
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_CloseFile
+; In    R0 -> 4-word data structure passed to MessageTrans_OpenFile
+
+SWIMessageTrans_CloseFile ENTRY "r0-r2"
+
+        Debug   xx,"MessageTrans_CloseFile",r0
+
+        ADR     r11, link_header - fcb_link
+CloseFileLoop
+        LDR     r1, [ r11, #fcb_link ]
+        TEQ     r1, #0
+        EXITS   EQ                                      ; ignore it if unknown
+        TEQ     r1, r0
+        MOVNE   r11, r1
+        BNE     CloseFileLoop
+
+        LDR     r2, [ r0, #fcb_fileptr ]
+        MOV     r14, #0
+        STR     r14, [ r0, #fcb_fileptr ]
+        LDR     r14, [ r0, #fcb_link ]                  ; delete block from chain
+        STR     r14, [ r11, #fcb_link ]
+
+        TEQ     r2, #0                                  ; no file data to delete
+        EXIT    EQ
+
+        LDR     r14, [ r0, #fcb_flags ]                 ; delete file block if allocated
+        TST     r14, #flg_ourbuffer                     ; client buffers not included
+        MOVNE   r0, #ModHandReason_Free
+        SWINE   XOS_Module
+
+        STRVS   r0, [ sp, #0 ]
+        EXIT
+
+; -----------------------------------------------------------------------------
+
+; SWI MessageTrans_MakeMenus
+; In    R0 -> 4-word data structure passed to MessageTrans_OpenFile
+;       R1 -> menu definition (see below)
+;       R2 -> RAM buffer to hold menu structure
+;       R3 = size of RAM buffer
+; Out   [R1..] = menu data
+;       R2 -> end of menu structure
+;       R3 = bytes remaining in buffer (should be 0 if you got it right)
+;       "Buffer overflow" error if buffer is too small
+
+SWIMessageTrans_MakeMenus ENTRY "r1, r4-r11"
+
+        Debug   xx,"MessageTrans_MakeMenus", r0, r1, r2, r3
+
+loop1   LDRB    r14, [ r1 ]                             ; reached end if title token null
+        TEQ     r14, #0
+        EXIT    EQ
+
+        CMP     r3, #m_headersize
+        BLT     menuerr_buffoverflow
+
+        MOV     r9, r2                                  ; R9 -> start of this menu
+
+        MOV     r4, r3
+        BL      int_lookup_nopars                       ; R4-R7 set to 0 automatically
+        EXIT    VS
+
+        ADD     r2, r2, #m_ti_fg_colour                 ; R2 -> next bit
+        SUB     r8, r3, #3                              ; R8 = current max width (-3 for borders)
+
+        ADD     r1, r1, #1                              ; skip token terminator
+
+        LDRB    r14, [ r1 ], #1                         ; title fg
+        STRB    r14, [ r2 ], #1
+        LDRB    r14, [ r1 ], #1                         ; title bg
+        STRB    r14, [ r2 ], #1
+        LDRB    r14, [ r1 ], #1                         ; work fg
+        STRB    r14, [ r2 ], #1
+        LDRB    r14, [ r1 ], #1                         ; work bg
+        STRB    r14, [ r2 ], #1 + 4                     ; (skip item width for now)
+        ASSERT  m_itemheight = m_itemwidth + 4
+        LDRB    r14, [ r1 ], #1                         ; height of items
+        STR     r14, [ r2 ], #4
+        LDRB    r14, [ r1 ], #1                         ; gap between items
+        STR     r14, [ r2 ], #4
+        ASSERT  m_headersize = m_ti_fg_colour + 16
+
+        SUB     r3, r4, #m_headersize                   ; R3 = space left in buffer
+
+loop2   CMP     r3, #mi_size
+        BLT     menuerr_buffoverflow
+
+        Push    "r1"
+        BL      skiptoken                               ; R1 -> byte after token
+        ADD     r1, r1, #3
+        BIC     r6, r1, #3                              ; word-align (use R6 for later)
+        Pull    "r1"
+
+        LDMIA   r6!, { r5, r10, r11 }                   ; R5 = item flags for this item
+                                                        ; R10 = submenu offset
+                                                        ; R11 = icon flags
+        Push    "r2, r3"
+        TST     r5, #mi_it_writeable                    ; if writeable and indirected,
+        TSTNE   r11, #if_indirected                     ; icon data set up already
+        LDRNE   r3, [ r2, #mi_icondata + 8 ]            ; R3 = buffer size
+        LDRNE   r2, [ r2, #mi_icondata + 0 ]            ; R2 -> buffer
+        BNE     %FT01
+        TST     r11, #if_indirected
+        MOVEQ   r3, #12                                 ; 12 bytes allowed if direct
+        ADDEQ   r2, r2, #mi_icondata
+        MOVNE   r2, #0                                  ; else look up token in place
+01      BL      int_lookup_nopars
+        MOV     r4, r2                                  ; R4 -> text string
+        MOV     r7, r3                                  ; R7 = text length
+        Pull    "r2,r3"
+        EXIT    VS
+
+        MOV     r1, r6                                  ; R1 -> input data
+
+        CMP     r10, #0
+        ADDNE   r10, r9, r10                            ; make submenu pointer absolute
+
+        STMIA   r2!, { r5, r10, r11 }                   ; itemflags, submenu, iconflags
+
+        ADD     r2, r2, #12                             ; skip icondata
+
+        TST     r11, #if_indirected                     ; done if not indirected
+        BEQ     %FT02
+
+        TST     r5, #mi_it_writeable
+        STREQ   r4, [ r2, #-12 ]                        ; text string
+        MOVEQ   r14, #0
+        STREQ   r14, [ r2, #-8 ]                        ; no validation string
+        ADDEQ   r14, r7, #1
+        STREQ   r14, [ r2, #-4 ]                        ; length (with terminator)
+
+02      CMP     r7, r8
+        MOVGT   r8, r7
+
+        TST     r5, #mi_it_lastitem
+        BEQ     loop2
+
+        MOV     r8, r8, LSL #4                          ; multiply by 16
+        ADD     r8, r8, #12                             ; and add 12
+        STR     r8, [ r9, #m_itemwidth ]                ; fill this in last
+
+        B       loop1                                   ; continue until null token found
+
+        EXIT
+
+menuerr_buffoverflow
+        BL      err_buffoverflow
+        EXIT
+
+
+err_buffoverflow
+        ADR     r0, ErrorBlock_BuffOverflow
+        Push    "r1, r2, lr"
+        MOV     r1, #0                                  ; Force the global case
+        MOV     r2, #0
+        SWI     XMessageTrans_ErrorLookup
+        Pull    "pc"
+
+ErrorBlock_BuffOverflow
+        DCD     ErrorNumber_CDATBufferOverflow
+        DCB     "BufOFlo", 0
+        ALIGN
+
+;.....................................................................................
+
+; In    r1 -> start of token
+; Out   r1 -> byte after end of token
+
+skiptoken ENTRY
+
+01      LDRB    r14, [ r1 ], #1                         ; skip the token
+        CMP     r14, #","
+        CMPNE   r14, #")"
+        CMPNE   r14, #3
+2
+        BHI     %BT01
+
+        EXIT
+
+;.....................................................................................
+
+; int_lookup_nopars: lookup with no parameters
+; In    R0 -> 4-word data structure passed to MessageTrans_LoadFile
+;       R1 -> token, terminated by <=32, "," or ")"
+;       R2 -> buffer to hold result (0 => don't copy it)
+;       R3 = buffer size (if R2 non-0)
+; Out   R1 -> token terminator
+;       R2 -> terminator (character 10 if R2=0 on entry, 0 otherwise)
+;       R3 = size of result, excluding terminator
+
+int_lookup_nopars ENTRY "r4-r7"
+
+        MOV     r4, #0
+        MOV     r5, #0
+        MOV     r6, #0
+        MOV     r7, #0
+        SWI     XMessageTrans_Lookup
+
+        EXIT
+
+DictionaryFileName       DCB     "Resources:$.Resources.Kernel.Dictionary", 0
+        ALIGN
+
+SWIMessageTrans_Dictionary
+        STMDB   sp!, {r1, r2, r3, lr}
+        LDR     r2, Dictionary
+        CMP     r2, #0
+        ADREQ   r1, DictionaryFileName
+        BLEQ    internal_fileinfo
+        MOVVC   r0, r2
+        STRVC   r0, Dictionary
+        ADDVC   r0, r0, #4
+        LDMIA   sp!, {r1, r2, r3, pc}
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Debugging routines
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+      [ debug
+        InsertNDRDebugRoutines
+      ]
+
+        END
+

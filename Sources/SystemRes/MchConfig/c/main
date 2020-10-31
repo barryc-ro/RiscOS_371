@@ -1,0 +1,1163 @@
+/*mchconfig.c - copy global configuration to local*/
+
+/*From CLib*/
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+/*From OSLib*/
+#include "fileraction.h"
+#include "fslock.h"
+#include "help.h"
+#include "macros.h"
+#include "os.h"
+#include "osbyte.h"
+#include "osfile.h"
+#include "osfscontrol.h"
+#include "osgbpb.h"
+#include "osmodule.h"
+#include "osreadsysinfo.h"
+#include "messagetrans.h"
+#include "wimp.h"
+
+/*From Support*/
+#include "application.h"
+#include "callback.h"
+#include "icon.h"
+#include "lookup.h"
+#include "m.h"
+#include "resource.h"
+#include "riscos.h"
+#include "svc.h"
+#include "task.h"
+#include "trace.h"
+#include "win.h"
+#include "x.h"
+
+/*Local*/
+#include "main.h"
+#include "saveas.h"
+
+/*
+ * Global application state: either doing nothing, copying files with
+ * Filer_Action, or setting access (by adding world read access).
+ */
+static enum {NO_ACTION, COPYING, SETTING_ATTR, DELETING} State =
+      NO_ACTION;
+
+static wimp_t Filer_Action_T;
+
+/*
+ * The directory name given by the user (in the saveas box).
+ */
+static char Dir [os_FILE_NAME_LIMIT + 1];
+
+static char *App;
+
+static bool Quit_On_Close;
+
+static char *Set_Choices = "/<Boot$Dir>.Utils.SetChoices";
+
+lookup_t main_messages, main_templates;
+
+wimp_w main_mchconfig_w;
+char *main_mchconfig_data;
+
+wimp_w main_saveas_w;
+char *main_saveas_data;
+
+int main_xlimit, main_ylimit;
+
+static os_error *Set_Shaded (bool shaded)
+
+{  wimp_window_info info;
+   os_error *error = NULL;
+   wimp_i i;
+
+   tracef ("Set_Shaded\n");
+   info.w = main_mchconfig_w;
+   if ((error = xwimp_get_window_info_header_only (&info)) != NULL)
+      goto finish;
+
+   for (i = 0; i < info.icon_count; i++)
+      if ((error = xwimp_set_icon_state (main_mchconfig_w, i,
+            shaded? wimp_ICON_SHADED: NONE, wimp_ICON_SHADED)) != NULL)
+         goto finish;
+
+finish:
+   return error;
+}
+
+static os_error *Help (void *ss, void *d, bool *unclaimed)
+
+   /*Called for interactive help.*/
+
+{  os_error *error = NULL;
+   wimp_message *message = (wimp_message *) d;
+   help_message_request *request =
+         (help_message_request *) &message->data;
+   char token [16 + 1], *reply;
+   wimp_selection selection;
+   int i;
+
+   NOT_USED (ss)
+   NOT_USED (unclaimed)
+
+   tracef ("Help\n");
+   if ((error = xwimp_get_menu_state (wimp_GIVEN_WINDOW_AND_ICON,
+         &selection, request->w, request->i)) != NULL)
+      goto finish;
+
+   if (selection.items [0] == -1)
+   {  if (request->w == main_mchconfig_w)
+         strcpy (token, "MchConfig");
+      else if (request->w == main_saveas_w)
+         strcpy (token, "SaveAs");
+      else
+         strcpy (token, "Unknown");
+
+      if ((error = icon_name (request->w, request->i,
+            token + strlen (token))) != NULL)
+         goto finish;
+   }
+   else
+   {  strcpy (token, "Menu");
+
+      for (i = 0; selection.items [i] != -1; i++)
+         sprintf (token + strlen (token), "%d", selection.items [i]);
+   }
+
+   tracef ("looking up token \"%s\"\n" _ token);
+   if ((error = lookup (main_messages, token, (void **) &reply)) != NULL)
+   {  if (error->errnum != os_GLOBAL_NO_ANY)
+         goto finish;
+      error = NULL;
+      reply = NULL;
+   }
+   /*|reply| is possibly 13-terminated, possibly in read-only memory.*/
+
+   if (reply != NULL)
+   {  tracef ("sending reply \"%.*s\"\n" _ riscos_strlen (reply) _ reply);
+      if ((error = task_send_user_message (message->sender,
+            message->my_ref, message_HELP_REPLY, reply,
+            ALIGN (riscos_strlen (reply) + 1))) != NULL)
+         goto finish;
+   }
+
+finish:
+   return error;
+}
+
+static os_error *Close_Down (void *ss, void *d, bool *unclaimed)
+
+   /*Called when a task (any task) exits.*/
+
+{  os_error *error = NULL;
+   wimp_message *close_down = (wimp_message *) d;
+   bits psr;
+   fileswitch_attr attr, value, mask;
+   int used, coll, obj_type, context;
+   char s [os_FILE_NAME_LIMIT + 1], t [os_FILE_NAME_LIMIT + 1],
+      *choices;
+
+   NOT_USED (ss)
+   NOT_USED (unclaimed)
+
+   tracef ("Close_Down\n");
+   if (close_down->sender == Filer_Action_T)
+   {  tracef ("child task has died\n");
+      switch (State)
+      {  case COPYING:
+            tracef ("COPYING\n");
+            /*Compare the directory given us by the user with the one we
+               originally set. If they are the same, redefine the
+               Choices variables (assuming that the task finished
+               o k).*/
+            if ((error = xos_gs_trans ("<Boot$Dir>.MchConfig.<Boot$Unique>",
+                  s, os_FILE_NAME_LIMIT, &used, &psr)) != NULL)
+               goto finish;
+            if ((psr & _C) != NONE)
+            {  error = riscos_error_lookup (os_GLOBAL_BUF_OFLO, "BufOFlo");
+               goto finish;
+            }
+            s [used] = '\0';
+
+            if ((error = xterritory_collate (territory_CURRENT, Dir, s,
+                  territory_IGNORE_CASE, &coll)) != NULL)
+               goto finish;
+
+            if (coll == 0)
+            {  tracef ("changing choices variables\n");
+               choices = "<Boot$Dir>.Utils.RO<Boot$OSVersion>Hook.Boot";
+               if ((error = xosfile_read_stamped_no_path (choices,
+                     &obj_type, NULL, NULL, NULL, NULL, NULL)) != NULL)
+                  goto finish;
+
+               if (obj_type == osfile_NOT_FOUND)
+                  choices = "<Boot$Dir>.Choices";
+
+               sprintf (t, "%s.,%s.", s, choices);
+
+               if ((error = xos_set_var_val ("Choices$Path", (byte *) t,
+                     strlen (t), 0, os_VARTYPE_STRING, NULL, NULL)) !=
+                     NULL)
+                  goto finish;
+               tracef ("Choices$Path \"%s\"\n" _ t);
+
+               if ((error = xos_set_var_val ("Choices$Dir", (byte *) s,
+                     strlen (s), 0, os_VARTYPE_STRING, NULL, NULL)) !=
+                     NULL)
+                  goto finish;
+               tracef ("Choices$Dir \"%s\"\n" _ s);
+
+               if ((error = xos_set_var_val ("Choices$Write",
+                     (byte *) s, strlen (s), 0, os_VARTYPE_STRING, NULL,
+                     NULL)) != NULL)
+                  goto finish;
+               tracef ("Choices$Write \"%s\"\n" _ s);
+            }
+
+            /*Start a new task to add world-read access to all the new
+               files.*/
+            if ((error = xwimp_start_task ("Filer_Action",
+                  &Filer_Action_T)) != NULL)
+               goto finish;
+
+            if (Filer_Action_T == NULL)
+            {  error = riscos_error_lookup (os_GLOBAL_NO_WIMP,
+                  "NoWimp");
+               goto finish;
+            }
+
+            tracef ("fileraction_send_selected_directory (%s)\n" _
+                  Dir);
+            if ((error = xfileraction_send_selected_directory
+                  (Filer_Action_T, Dir)) != NULL)
+               goto finish;
+
+            context = 0;
+            while (TRUE)
+            {  if ((error = xosgbpb_dir_entries (Dir,
+                     (osgbpb_string_list *) s, 1, context, sizeof s,
+                     "*", NULL, &context)) != NULL)
+                  goto finish;
+               if (context == osgbpb_NO_MORE) break;
+
+               tracef ("fileraction_send_selected_file (%s)\n" _ s);
+               if ((error = xfileraction_send_selected_file
+                     (Filer_Action_T, s)) != NULL)
+                  goto finish;
+            }
+
+            value = fileswitch_ATTR_OWNER_READ |
+                           fileswitch_ATTR_OWNER_WRITE |
+                           fileswitch_ATTR_WORLD_READ;
+            mask = fileswitch_ATTR_OWNER_SPECIAL |
+                           fileswitch_ATTR_WORLD_SPECIAL;
+            attr = value | mask << 16;
+            tracef ("fileractionsendstartoperation_access (0x%X)\n" _
+                  attr);
+            if ((error = xfileractionsendstartoperation_access
+                  (Filer_Action_T, fileraction_VERBOSE |
+                  fileraction_RECURSE, (int *) &attr)) != NULL)
+               goto finish;
+
+            State = SETTING_ATTR;
+         break;
+
+         case DELETING:
+            tracef ("DELETING\n");
+            /*Restore Choices variables to their alternative values. This code
+               must match the code in !Boot.!Run, or everything is hopelessly
+               hopeless.*/
+            choices = "<Boot$Dir>.Utils.RO<Boot$OSVersion>Hook.Boot";
+            if ((error = xosfile_read_stamped_no_path (choices,
+                  &obj_type, NULL, NULL, NULL, NULL, NULL)) != NULL)
+               goto finish;
+
+            if (obj_type == osfile_NOT_FOUND)
+               choices = "<Boot$Dir>.Choices";
+
+            sprintf (t, "%s.", choices);
+
+            if ((error = xos_set_var_val ("Choices$Dir",
+                  (byte *) choices, strlen (choices), 0,
+                  os_VARTYPE_STRING, NULL, NULL)) != NULL)
+               goto finish;
+            tracef ("Choices$Dir \"%s\"\n" _ choices);
+
+            if ((error = xos_set_var_val ("Choices$Write",
+                  (byte *) choices, strlen (choices), 0,
+                  os_VARTYPE_STRING, NULL, NULL)) != NULL)
+               goto finish;
+            tracef ("Choices$Write \"%s\"\n" _ choices);
+
+            if ((error = xos_set_var_val ("Choices$Path",
+                  (byte *) t, strlen (t), 0, os_VARTYPE_STRING, NULL,
+                  NULL)) != NULL)
+               goto finish;
+            tracef ("Choices$Path \"%s\"\n" _ t);
+         /*FALL THROUGH*/
+
+         case SETTING_ATTR:
+            tracef ("SETTING_ATTR\n");
+            Filer_Action_T = NULL;
+
+            if ((error = Set_Shaded (FALSE)) != NULL)
+               goto finish;
+
+            State = NO_ACTION;
+
+            if (Quit_On_Close)
+            {  application_quit = TRUE;
+               *unclaimed = FALSE;
+            }
+         break;
+   }  }
+
+finish:
+   return error;
+}
+
+static int Module_Version (char *module)
+
+   /*Return the version number of a ROM module.*/
+
+{  int v = 0, m, s;
+   char *name;
+   os_error *e;
+
+   tracef ("Module_Version\n");
+   m = 0, s = -1;
+   /*Bizarrely, this call only stops when it gets an error ...*/
+   while ((e = xosmodule_enumerate_rom_with_info (m, s, &m, &s, &name,
+         NULL, NULL, &v)) == NULL)
+      if (strcmp (name, module) == 0)
+         break;
+
+   return v >> 8;
+}
+
+static os_error *Mode_Vars (void *s, void *d, bool *unclaimed)
+
+{  int xlt, ylt, xeig, yeig;
+   os_error *error = NULL;
+
+   NOT_USED (s)
+   NOT_USED (d)
+   NOT_USED (unclaimed)
+
+   tracef ("Mode_Vars\n");
+   if
+   (  (error = xos_read_mode_variable (os_CURRENT_MODE,
+            os_MODEVAR_XWIND_LIMIT, &xlt, NULL)) != NULL ||
+      (error = xos_read_mode_variable (os_CURRENT_MODE,
+            os_MODEVAR_YWIND_LIMIT, &ylt, NULL)) != NULL ||
+      (error = xos_read_mode_variable (os_CURRENT_MODE,
+            os_MODEVAR_XEIG_FACTOR, &xeig, NULL)) != NULL ||
+      (error = xos_read_mode_variable (os_CURRENT_MODE,
+            os_MODEVAR_YEIG_FACTOR, &yeig, NULL)) != NULL
+   )
+      goto finish;
+
+   /*Keep these as exclusive on the right for ease of coding outline
+      drags - otherwise, the icon bar won't scroll in the last pixel.*/
+   main_xlimit = xlt << xeig;
+   main_ylimit = ylt << yeig;
+
+finish:
+   return error;
+}
+
+os_error *main_set (void *s, void *d, bool *unclaimed)
+      {NOT_USED (d) NOT_USED (unclaimed) tracef ("main_set\n");
+      *(bool *) s = TRUE; return NULL;}
+
+os_error *main_clear (void *s, void *d, bool *unclaimed)
+      {NOT_USED (d) NOT_USED (unclaimed) tracef ("main_clear\n");
+      *(bool *) s = FALSE; return NULL;}
+
+static os_error *Opener (void *s, void *d, bool *unclaimed)
+
+{  os_error *error = NULL;
+
+   NOT_USED (s)
+   NOT_USED (unclaimed)
+
+   tracef ("Opener\n");
+   if ((error = xwimp_open_window ((wimp_open *) d)) != NULL)
+      goto finish;
+
+finish:
+   return error;
+}
+
+static os_error *Saver (saveas_d ss, void *handle)
+
+   /*The actual file saving code.*/
+
+{  bool save_files, save_memory;
+   bits psr;
+   byte cmos [240];
+   char s [os_FILE_NAME_LIMIT + 1], src_dir [os_FILE_NAME_LIMIT + 1],
+      src_path [os_FILE_NAME_LIMIT + 1], *p, t [os_FILE_NAME_LIMIT + 1];
+   int i, b, context, coll, used;
+   os_error *error = NULL;
+   wimp_icon_state state;
+
+   NOT_USED (ss)
+   NOT_USED (handle)
+
+   tracef ("Saver\n");
+   state.w = main_mchconfig_w;
+   state.i = main_MCHCONFIG_MEMORY;
+   if ((error = xwimp_get_icon_state (&state)) != NULL)
+      goto finish;
+   save_memory = (state.icon.flags & wimp_ICON_SELECTED) != NONE;
+
+   state.w = main_mchconfig_w;
+   state.i = main_MCHCONFIG_FILES;
+   if ((error = xwimp_get_icon_state (&state)) != NULL)
+      goto finish;
+   save_files = (state.icon.flags & wimp_ICON_SELECTED) != NONE;
+
+   if (!(save_memory || save_files))
+   {  error = main_error_lookup (1, "NoSave");
+      goto finish;
+   }
+
+   /*Get the directory name from the icon.*/
+   state.w = main_saveas_w;
+   state.i = main_SAVEAS_DIRNAME;
+   if ((error = xwimp_get_icon_state (&state)) != NULL)
+      goto finish;
+   riscos_strcpy (Dir, icon_TEXT (&state.icon));
+
+   /*Ensure it exists.*/
+   if ((error = xosfile_create_dir (Dir, 0)) != NULL)
+      goto finish;
+   if ((error = xosfile_write_attr (Dir, fileswitch_ATTR_OWNER_READ |
+         fileswitch_ATTR_OWNER_WRITE | fileswitch_ATTR_WORLD_READ)) !=
+         NULL)
+      goto finish;
+
+   if (save_memory)
+   {  /*Read the CMOS.*/
+      for (i = 0; i < sizeof cmos; i++)
+      {  if ((error = xos_byte (osbyte_READ_CMOS, i, SKIP, NULL, &b)) !=
+               NULL)
+            goto finish;
+
+         cmos [i] = (byte) b;
+      }
+
+      strcat (strcpy (t, Dir), ".!RO<Boot$OSVersion>CMOS");
+
+      tracef ("saving cmos to %s\n" _ t);
+      if ((error = xosfile_save_stamped (t, osfile_TYPE_CONFIG, cmos,
+            cmos + sizeof cmos)) != NULL)
+         goto finish;
+
+      if ((error = xosfile_write_attr (t, fileswitch_ATTR_OWNER_READ |
+            fileswitch_ATTR_OWNER_WRITE | fileswitch_ATTR_WORLD_READ)) != NULL)
+         goto finish;
+   }
+
+   /*Copy the files, if necessary.*/
+   if (save_files)
+   {  if ((error = xos_read_var_val ("Choices$Path", src_path,
+            os_FILE_NAME_LIMIT, 0, os_VARTYPE_EXPANDED, &used, NULL, NULL))
+            != NULL)
+         goto finish;
+      src_path [used] = '\0';
+      tracef ("copying files from path %s\n" _ src_path);
+      strcpy (t, src_path); /*use a copy of src_path coz we need it later and
+            strtok() destroys it*/
+
+      for (p = strtok (t, ","); p != NULL; p = strtok (NULL, ","))
+      {  /*Translate each path element in case it contains a reference to
+            Choices$Dir, which we are going to change shortly.*/
+         if ((error = xos_gs_trans (p, src_dir, os_FILE_NAME_LIMIT, &used,
+               &psr)) != NULL)
+            goto finish;
+         if ((psr & _C) != NONE)
+         {  error = riscos_error_lookup (os_GLOBAL_BUF_OFLO, "BufOFlo");
+            goto finish;
+         }
+
+         tracef ("GSTrans says there are %d chars in the output\n" _ used);
+         src_dir [used - 1] = '\0'; /*lose the final dot*/
+         tracef ("copying files from dir %s\n" _ src_dir);
+
+         if ((error = xterritory_collate (territory_CURRENT, src_dir,
+               Dir, territory_IGNORE_CASE, &coll)) != NULL)
+            goto finish;
+
+         if (coll == 0)
+            /*This destination is in the source path. Skip it.*/
+            break;
+
+         if ((error = xwimp_start_task ("Filer_Action",
+               &Filer_Action_T)) != NULL)
+            goto finish;
+         if (Filer_Action_T == NULL)
+         {  error = riscos_error_lookup (os_GLOBAL_NO_WIMP, "NoWimp");
+            goto finish;
+         }
+
+         tracef ("fileraction_send_selected_directory (%s)\n" _ src_dir);
+         if ((error = xfileraction_send_selected_directory
+               (Filer_Action_T, src_dir)) != NULL)
+            goto finish;
+
+         context = 0;
+         while (TRUE)
+         {  if ((error = xosgbpb_dir_entries (src_dir,
+                  (osgbpb_string_list *) s, 1, context, sizeof s, "*",
+                  NULL, &context)) != NULL)
+               goto finish;
+            if (context == osgbpb_NO_MORE) break;
+
+            tracef ("fileraction_send_selected_file (%s)\n" _ s);
+            if ((error = xfileraction_send_selected_file
+                  (Filer_Action_T, s)) != NULL)
+               goto finish;
+         }
+
+         tracef ("fileractionsendstartoperation_copy (%s)\n" _ Dir);
+         if ((error = xfileractionsendstartoperation_copy
+               (Filer_Action_T, fileraction_VERBOSE | fileraction_FORCE
+               | fileraction_NEWER, Dir, strlen (Dir) + 1)) != NULL)
+            goto finish;
+
+         if ((error = Set_Shaded (TRUE)) != NULL)
+            goto finish;
+
+         State = COPYING;
+      }
+   }
+
+finish:
+   return error;
+}
+
+static os_error *Closer (saveas_d s, void *handle)
+
+{  os_error *error = NULL;
+   wimp_caret caret;
+
+   NOT_USED (handle)
+
+   tracef ("Closer\n");
+   /*If the menu has the caret now, we'll claim it back again when it's
+      closed.*/
+   if ((error = xwimp_get_caret_position (&caret)) != NULL)
+      goto finish;
+
+   if ((error = saveas_close (NONE, s)) != NULL)
+      goto finish;
+
+   if ((error = resource_delete_window (main_saveas_w, main_saveas_data)) !=
+         NULL)
+      goto finish;
+
+   if (caret.w == main_saveas_w)
+      if ((error = xwimp_set_caret_position (main_mchconfig_w,
+            wimp_ICON_WINDOW, SKIP, SKIP, SKIP, SKIP)) != NULL)
+         goto finish;
+
+   if (Quit_On_Close && State == NO_ACTION)
+      application_quit = TRUE;
+
+finish:
+   return error;
+}
+
+static os_error *Prequit (void *s, void *d, bool *unclaimed)
+
+{  os_error *error = NULL;
+   int click;
+   wimp_message *pre_quit = (wimp_message *) d;
+
+   NOT_USED (s)
+   NOT_USED (d)
+   NOT_USED (unclaimed)
+
+   tracef ("Prequit\n");
+   if (State != NO_ACTION)
+   {  if ((error = xwimp_report_error (main_error_lookup (1, "InProg"),
+            wimp_ERROR_BOX_OK_ICON | wimp_ERROR_BOX_CANCEL_ICON,
+            App, &click)) != NULL)
+         goto finish;
+
+      if (click == wimp_ERROR_BOX_SELECTED_OK)
+      {  if ((error = task_send_user_message (Filer_Action_T, 0,
+               message_QUIT)) != NULL)
+            goto finish;
+      }
+      else
+      {  /*Object to the Prequit.*/
+         if ((error = task_send_user_message_acknowledge
+               (pre_quit->sender, pre_quit->my_ref,
+               message_PREQUIT)) != NULL)
+            goto finish;
+   }  }
+   else
+   {  application_quit = TRUE;
+      *unclaimed = FALSE;
+   }
+
+finish:
+   return error;
+}
+
+static os_error *Quit (void *s, void *d, bool *unclaimed)
+
+{  NOT_USED (s)
+   NOT_USED (d)
+   NOT_USED (unclaimed)
+
+   tracef ("Quit\n");
+   application_quit = TRUE;
+   *unclaimed = FALSE;
+
+   return NULL;
+}
+
+static os_error *Save_As (void *s, void *d, bool *unclaimed)
+
+{  os_error *error = NULL;
+   saveas_dialogue dialogue;
+   char text [os_FILE_NAME_LIMIT + 1];
+   bits psr;
+   resource_template *saveas;
+   int used, xmove, ymove;
+   os_box visible;
+   wimp_window_state state;
+
+   NOT_USED (s)
+   NOT_USED (d)
+   NOT_USED (unclaimed)
+
+   tracef ("Save_As\n");
+   if ((error = lookup (main_templates, "SaveAs", (void **) &saveas)) !=
+         NULL)
+      goto finish;
+
+   if ((error = resource_create_window (saveas, &main_saveas_w,
+         &main_saveas_data)) != NULL)
+      goto finish;
+
+   /*Centre the saveas in the MchConfig window.*/
+   state.w = main_mchconfig_w;
+   if ((error = xwimp_get_window_state (&state)) != NULL)
+      goto finish;
+
+   visible = saveas->window.visible;
+   xmove = ((state.visible.x0 + state.visible.x1) -
+         (visible.x0 + visible.x1))/2;
+   ymove = ((state.visible.y0 + state.visible.y1) -
+         (visible.y0 + visible.y1))/2;
+   visible.x0 += xmove;
+   visible.y0 += ymove;
+   visible.x1 += xmove;
+   visible.y1 += ymove;
+
+   if ((error = xos_gs_trans ("<Boot$Dir>.MchConfig.<Boot$Unique>", text,
+         os_FILE_NAME_LIMIT, &used, &psr)) != NULL)
+      goto finish;
+   if ((psr & _C) != NONE)
+   {  error = riscos_error_lookup (os_GLOBAL_BUF_OFLO, "BufOFlo");
+      goto finish;
+   }
+   text [used] = '\0';
+   tracef ("initial file name is %s\n" _ text);
+
+   if ((error = icon_set_text (main_saveas_w, main_SAVEAS_DIRNAME, text)) !=
+         NULL)
+      goto finish;
+
+   dialogue.w         = main_saveas_w;
+   dialogue.ok        = main_SAVEAS_SAVE;
+   dialogue.cancel    = main_SAVEAS_CANCEL;
+   dialogue.file_name = main_SAVEAS_DIRNAME;
+   dialogue.file_icon = main_SAVEAS_DIRICON;
+   dialogue.visible   = visible;
+   dialogue.saver     = &Saver;
+   dialogue.closer    = &Closer;
+   dialogue.handle    = NULL;
+
+   if ((error = saveas_open (NONE, &dialogue, NULL)) != NULL)
+      goto finish;
+
+finish:
+   return error;
+}
+
+static os_error *Delete_From (void *s, void *d, bool *unclaimed)
+
+{  os_error *error = NULL;
+   wimp_error_box_selection click;
+   wimp_icon_state state;
+   bool default_memory, default_files;
+   osgbpb_INFO (os_FILE_NAME_LIMIT + 1) info;
+   int context;
+
+   NOT_USED (s)
+   NOT_USED (d)
+   NOT_USED (unclaimed)
+
+   tracef ("Delete_From\n");
+   state.w = main_mchconfig_w;
+   state.i = main_MCHCONFIG_MEMORY;
+   if ((error = xwimp_get_icon_state (&state)) != NULL)
+      goto finish;
+   default_memory = (state.icon.flags & wimp_ICON_SELECTED) != NONE;
+
+   state.w = main_mchconfig_w;
+   state.i = main_MCHCONFIG_FILES;
+   if ((error = xwimp_get_icon_state (&state)) != NULL)
+      goto finish;
+   default_files = (state.icon.flags & wimp_ICON_SELECTED) != NONE;
+
+   if (!(default_memory || default_files))
+   {  error = main_error_lookup (1, "NoDel");
+      goto finish;
+   }
+
+   if (default_memory)
+      /*Fix MED-5044: do not give error if no file. JRC 30th Mar 1995*/
+      xosfscontrol_wipe ("<Boot$Dir>.MchConfig.<Boot$Unique>."
+            "!RO<Boot$OSVersion>CMOS", osfscontrol_WIPE_FORCE, SKIP,
+            SKIP, SKIP, SKIP);
+
+   if (default_files)
+   {  if ((error = xwimp_report_error (main_error_lookup (1, "WarnDel"),
+            wimp_ERROR_BOX_OK_ICON | wimp_ERROR_BOX_CANCEL_ICON, App,
+            &click)) != NULL)
+         goto finish;
+
+      if (click == wimp_ERROR_BOX_SELECTED_OK)
+      {  if ((error = xwimp_start_task ("Filer_Action",
+               &Filer_Action_T)) != NULL)
+            goto finish;
+
+         if (Filer_Action_T == NULL)
+         {  error = riscos_error_lookup (os_GLOBAL_NO_WIMP, "NoWimp");
+            goto finish;
+         }
+
+         tracef ("fileraction_send_selected_directory (%s)\n" _
+               "<Boot$Dir>.MchConfig.<Boot$Unique>");
+         if ((error = xfileraction_send_selected_directory
+               (Filer_Action_T, "<Boot$Dir>.MchConfig.<Boot$Unique>")) !=
+               NULL)
+            goto finish;
+
+         context = 0;
+         while (TRUE)
+         {  tracef ("osgbpb_dir_entries_info\n");
+            if ((error = xosgbpb_dir_entries_info
+                  ("<Boot$Dir>.MchConfig.<Boot$Unique>",
+                  (osgbpb_info_list *) &info, 1, context, sizeof info,
+                  "*", NULL, &context)) != NULL)
+               goto finish;
+            if (context == osgbpb_NO_MORE) break;
+
+            if (info.obj_type == osfile_IS_DIR)
+            {  tracef ("fileraction_send_selected_file (\"%s\")\n" _
+                     info.name);
+               if ((error = xfileraction_send_selected_file
+                     (Filer_Action_T, info.name)) != NULL)
+                  goto finish;
+         }  }
+
+         tracef ("fileractionsendstartoperation_delete\n");
+         if ((error = xfileractionsendstartoperation_delete
+               (Filer_Action_T, fileraction_VERBOSE |
+               fileraction_FORCE)) != NULL)
+            goto finish;
+
+         if ((error = Set_Shaded (TRUE)) != NULL)
+            goto finish;
+
+         State = DELETING;
+   }  }
+
+finish:
+   return error;
+}
+
+static os_error *Key (void *s, void *d, bool *unclaimed)
+
+{  NOT_USED (s)
+   NOT_USED (unclaimed)
+
+   tracef ("Key\n");
+   return xwimp_process_key (((wimp_key *) d)->c);
+}
+
+static os_error *Start_Dialogue (void)
+
+{  os_error *error = NULL;
+   resource_template *dialogue;
+   wimp_open open;
+   wimp_window_state state;
+   int xmove, ymove, locked;
+   bits config;
+   bool protected, done_create_window = FALSE;
+   char *en, *dis, *un;
+   callback_l app_l = application_list; /*cache*/
+
+   tracef ("Start_Dialogue\n");
+   if ((error = lookup (main_templates, "MchConfig", (void **) &dialogue)) !=
+         NULL)
+      goto finish;
+
+   if ((error = resource_create_window (dialogue, &main_mchconfig_w,
+         &main_mchconfig_data)) != NULL)
+      goto finish;
+   done_create_window = TRUE;
+
+   state.w = main_mchconfig_w;
+   if ((error = xwimp_get_window_state (&state)) != NULL)
+      goto finish;
+
+   xmove = (main_xlimit - state.visible.x0 - state.visible.x1)/2;
+   ymove = (main_ylimit - state.visible.y0 - state.visible.y1)/2;
+
+   open.w          = main_mchconfig_w;
+   open.visible    = state.visible;
+   open.visible.x0 += xmove;
+   open.visible.y0 += ymove;
+   open.visible.x1 += xmove;
+   open.visible.y1 += ymove;
+   open.xscroll    = 0;
+   open.yscroll    = 0;
+   open.next       = wimp_TOP;
+
+   if ((error = lookup (main_messages, "en", (void **) &en)) !=
+         NULL)
+      goto finish;
+   if ((error = lookup (main_messages, "dis", (void **) &dis)) !=
+         NULL)
+      goto finish;
+   if ((error = lookup (main_messages, "un", (void **) &un)) !=
+         NULL)
+      goto finish;
+   tracef ("en %.*s, dis %.*s\n" _ riscos_strlen (en) _ en _
+         riscos_strlen (dis) _ dis);
+
+   if (Module_Version ("UtilityModule") >= 0x350)
+   {  tracef ("Set icons to their initial values - software lock\n");
+      if ((error = xfslock_status (&locked, NULL)) != NULL)
+         goto finish;
+      tracef ("lock status %d\n" _ locked);
+      if ((error = icon_set_text (main_mchconfig_w, main_MCHCONFIG_SOFTWARE,
+            locked == fslock_STATUS_LOCKED? en: dis)) != NULL)
+         goto finish;
+
+      tracef ("Set icons to their initial values - hardware lock\n");
+      if ((error = xosreadsysinfo_machine_id (&config, NULL, NULL, NULL,
+            NULL)) != NULL)
+         goto finish;
+      switch (config & osreadsysinfo_IO_CONTROL)
+      {  case osreadsysinfo_IO_CONTROL_IOC << osreadsysinfo_IO_CONTROL_SHIFT:
+            protected = FALSE;
+         break;
+
+         case osreadsysinfo_IO_CONTROL_IOMD <<
+               osreadsysinfo_IO_CONTROL_SHIFT:
+            tracef ("SVC mode\n");
+            svc_enter ();
+            protected = (*(bits *) 0x3310000 & 0x80u) == NONE;
+            svc_exit ();
+            tracef ("USR mode\n");
+         break;
+
+         default:
+            /*Some strange architecture ...*/
+            protected = FALSE;
+         break;
+      }
+      if ((error = icon_set_text (main_mchconfig_w, main_MCHCONFIG_HARDWARE,
+            protected? en: dis)) != NULL)
+         goto finish;
+   }
+   else
+   {  if ((error = icon_set_text (main_mchconfig_w, main_MCHCONFIG_SOFTWARE,
+            un)) != NULL)
+         goto finish;
+      if ((error = icon_set_text (main_mchconfig_w, main_MCHCONFIG_HARDWARE,
+            un)) != NULL)
+         goto finish;
+   }
+
+   tracef ("open window\n");
+   if ((error = xwimp_open_window (&open)) != NULL)
+      goto finish;
+
+   /*Give it the caret.*/
+   if ((error = xwimp_set_caret_position (main_mchconfig_w, wimp_ICON_WINDOW,
+         SKIP, SKIP, SKIP, SKIP)) != NULL)
+      goto finish;
+
+   if
+   (  /*We are quite happy for any window to be reopened where the Wimp wants
+         it.*/
+      (error = callback_register (app_l, &Opener, NULL, 1,
+            wimp_OPEN_WINDOW_REQUEST)) != NULL ||
+
+      /*Pass all key presses on.*/
+      (error = callback_register (app_l, &Key, NULL, 1, wimp_KEY_PRESSED)) !=
+            NULL ||
+
+      (error = callback_register (app_l, &Mode_Vars, NULL, 2,
+            wimp_USER_MESSAGE, message_MODE_CHANGE)) != NULL ||
+
+      /*Click SELECT on Save - start saving, quit on close.*/
+      (error = callback_register (app_l, &Save_As, NULL, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_SELECT, NONE,
+            main_mchconfig_w, main_MCHCONFIG_SAVE)) != NULL ||
+      (error = callback_register (app_l, &main_set, &Quit_On_Close, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_SELECT, NONE,
+            main_mchconfig_w, main_MCHCONFIG_SAVE)) != NULL ||
+
+      /*Click SELECT on Quit - quit.*/
+      (error = callback_register (app_l, &Quit, NULL, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_SELECT, NONE,
+            main_mchconfig_w, main_MCHCONFIG_CANCEL)) != NULL ||
+
+      /*Click ADJUST on Save - start saving, DON'T quit on close.*/
+      (error = callback_register (app_l, &Save_As, NULL, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_ADJUST, NONE,
+            main_mchconfig_w, main_MCHCONFIG_SAVE)) != NULL ||
+      (error = callback_register (app_l, &main_clear, &Quit_On_Close, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_ADJUST, NONE,
+            main_mchconfig_w, main_MCHCONFIG_SAVE)) != NULL ||
+
+      /*Click SELECT on Default - start deleting stuff, quit on close.*/
+      (error = callback_register (app_l, &Delete_From, NULL, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_SELECT, NONE,
+            main_mchconfig_w, main_MCHCONFIG_DEFAULT)) != NULL ||
+      (error = callback_register (app_l, &main_set, &Quit_On_Close, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_SELECT, NONE,
+            main_mchconfig_w, main_MCHCONFIG_DEFAULT)) != NULL ||
+
+      /*Click ADJUST on Default - start deleting stuff, DON'T quit on
+         close.*/
+      (error = callback_register (app_l, &Delete_From, NULL, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_ADJUST, NONE,
+            main_mchconfig_w, main_MCHCONFIG_DEFAULT)) != NULL ||
+      (error = callback_register (app_l, &main_clear, &Quit_On_Close, 5,
+            wimp_MOUSE_CLICK, wimp_CLICK_ADJUST, NONE,
+            main_mchconfig_w, main_MCHCONFIG_DEFAULT)) != NULL ||
+
+      /*Press RETURN - start saving, quit on close.*/
+      (error = callback_register (app_l, &Save_As, NULL, 4,
+            wimp_KEY_PRESSED, wimp_KEY_RETURN,
+            main_mchconfig_w, wimp_ICON_WINDOW)) != NULL ||
+      (error = callback_register (app_l, &main_set, &Quit_On_Close, 4,
+            wimp_KEY_PRESSED, wimp_KEY_RETURN,
+            main_mchconfig_w, wimp_ICON_WINDOW)) != NULL ||
+
+      /*Press ESCAPE - quit.*/
+      (error = callback_register (app_l, &Prequit, NULL, 4,
+            wimp_KEY_PRESSED, wimp_KEY_ESCAPE,
+            main_mchconfig_w, wimp_ICON_WINDOW)) != NULL
+   )
+      goto finish;
+
+finish:
+   if (error != NULL)
+   {  if (done_create_window)
+      {  os_error *error1 = resource_delete_window (main_mchconfig_w,
+               main_mchconfig_data);
+         if (error == NULL) error = error1;
+      }
+   }
+
+   return error;
+}
+
+int main (void)
+
+{  os_error *error = NULL, *e;
+   wimp_MESSAGE_LIST (5) messages =
+      {  message_DATA_SAVE_ACK,
+         message_HELP_REQUEST,
+         message_TASK_CLOSE_DOWN,
+         message_PREQUIT,
+         message_QUIT
+      };
+   bool done_new_messages = FALSE, done_new_templates = FALSE,
+      done_initialise = FALSE, done_messages_alloc = FALSE,
+      done_templates_alloc = FALSE;
+   callback_l app_l; /*cache*/
+
+   if ((error = trace_initialise ("Trace$To")) != NULL)
+      goto finish;
+
+   if ((error = lookup_new (&main_messages, 4)) != NULL)
+      goto finish;
+   done_new_messages = TRUE;
+
+   if ((error = lookup_new (&main_templates, 3)) != NULL)
+      goto finish;
+   done_new_templates = TRUE;
+
+   if ((error = resource_messages_alloc (main_messages,
+         "<MchConfig$Dir>.Messages")) != NULL)
+      goto finish;
+   done_messages_alloc = TRUE;
+
+   if ((error = resource_templates_alloc (main_templates,
+         "<MchConfig$Dir>.Templates")) != NULL)
+      goto finish;
+   done_templates_alloc = TRUE;
+
+   if ((error = lookup (main_messages, "App", (void **) &App)) != NULL)
+      goto finish;
+
+   if ((error = application_initialise (App, (wimp_message_list *)
+         &messages)) != NULL)
+      goto finish;
+   done_initialise = TRUE;
+
+   if ((e = xos_read_var_val ("Boot$Unique", NULL, 0, 0, os_VARTYPE_EXPANDED,
+         NULL, NULL, NULL)) != NULL && e->errnum == error_VAR_CANT_FIND)
+   {  error = main_error_lookup (1, "NoBoot");
+      goto finish;
+   }
+
+   /*Always create <Boot$Dir>.MchConfig, so it can be dragged to if desired.*/
+   if ((error = xosfile_create_dir ("<Boot$Dir>.MchConfig", 0)) != NULL)
+   {  error = main_error_lookup (1, "NotFound", "<Boot$Dir>.MchConfig");
+      goto finish;
+   }
+   if ((error = xosfile_write_attr ("<Boot$Dir>.MchConfig",
+         fileswitch_ATTR_OWNER_READ | fileswitch_ATTR_OWNER_WRITE |
+         fileswitch_ATTR_WORLD_READ)) != NULL)
+      goto finish;
+
+   /*If there are no Choices$* variables, set them up from the current
+      Boot$* variables. J R C 18th Aug 1995*/
+   if ((e = xos_read_var_val ("Choices$*", NULL, 0, 0,
+         os_VARTYPE_EXPANDED, NULL, NULL, NULL)) != NULL && e->errnum ==
+         error_VAR_CANT_FIND)
+      if ((error = xwimp_start_task (Set_Choices, NULL)) != NULL)
+         goto finish;
+
+   app_l = application_list;
+
+   if ((error = callback_register (app_l, &Quit, NULL, 2,
+            wimp_USER_MESSAGE, message_QUIT)) != NULL ||
+      (error = callback_register (app_l, &Quit, NULL, 2,
+            wimp_USER_MESSAGE_RECORDED, message_QUIT)) != NULL ||
+      (error = callback_register (app_l, &Prequit, NULL, 2,
+            wimp_USER_MESSAGE, message_PREQUIT)) != NULL ||
+      (error = callback_register (app_l, &Prequit, NULL, 2,
+            wimp_USER_MESSAGE_RECORDED, message_PREQUIT)) != NULL ||
+      (error = callback_register (app_l, &Close_Down, NULL, 2,
+            wimp_USER_MESSAGE, message_TASK_CLOSE_DOWN)) != NULL ||
+      (error = callback_register (app_l, &Help, NULL, 2,
+            wimp_USER_MESSAGE_RECORDED, message_HELP_REQUEST)) != NULL)
+      goto finish;
+
+   if ((error = Mode_Vars (SKIP, SKIP, NULL)) != NULL)
+      goto finish;
+
+   m_SUMMARY ();
+
+   /*Basic setup done - open the window.*/
+   if ((error = Start_Dialogue ()) != NULL)
+      goto finish;
+
+   application ();
+
+finish:
+   if (done_initialise)
+   {  os_error *error1 = application_terminate ();
+      if (error == NULL) error = error1;
+   }
+
+   if (done_templates_alloc)
+   {  os_error *error1 = resource_templates_free (main_templates);
+      if (error == NULL) error = error1;
+   }
+
+   if (done_messages_alloc)
+   {  os_error *error1 = resource_messages_free (main_messages);
+      if (error == NULL) error = error1;
+   }
+
+   if (done_new_templates)
+   {  os_error *error1 = lookup_delete (main_templates);
+      if (error == NULL) error = error1;
+   }
+
+   if (done_new_messages)
+   {  os_error *error1 = lookup_delete (main_messages);
+      if (error == NULL) error = error1;
+   }
+
+   trace_terminate ();
+
+   m_SUMMARY ();
+
+   if (error != NULL)
+      xwimp_report_error (error, NONE, App, NULL);
+
+   return 0;
+}
+
+os_error *main_error_lookup (bits errnum, char *token, ...)
+
+{  va_list list;
+   char *p [4], *msg, *cc;
+   int i;
+   os_error *error = NULL, *error1, error_block;
+
+   tracef ("main_error_lookup\n");
+   /*Assume that 4 args are always given.*/
+   va_start (list, token);
+   for (i = 0; i < 4; i++) p [i] = va_arg (list, char *);
+   va_end (list);
+
+   if ((error = lookup (main_messages, token, (void **) &msg)) != NULL)
+      goto finish;
+
+   /*We have to do the substitution of arguments ourselves, since there's no
+      MessageTrans call to do it, and os_substitute_args() takes a
+      space-separated string.*/
+   error_block.errnum = errnum;
+   i = 0;
+   for (cc = msg; *cc >= 32; cc++)
+      if (*cc != '%' || !('0' <= *++cc && *cc < '4'))
+      {  if (i + 1 >= os_ERROR_LIMIT) break;
+         error_block.errmess [i++] = *cc;
+      }
+      else
+      {  /*We have %0, %1, %2 or %3.*/
+         char *dd;
+
+         if ((dd = p [*cc - '0']) != NULL)
+            while (*dd >= 32)
+            {  if (i + 1 >= os_ERROR_LIMIT) break;
+               error_block.errmess [i++] = *dd++;
+            }
+         else
+         {  if (i + 2 >= os_ERROR_LIMIT) break;
+            error_block.errmess [i++] = '%',
+            error_block.errmess [i++] = *cc;
+      }  }
+   error_block.errmess [i] = '\0';
+
+   if ((error = xmessagetrans_copy_error (&error_block, &error1)) != NULL)
+      goto finish;
+
+   error = error1;
+
+finish:
+   return error;
+}

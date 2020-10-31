@@ -1,0 +1,1990 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/ShareFS/remotefs.c:networking  1.3  $
+ * $Source: /ax/networking:Starling/ShareFS/ShareFS/remotefs.c: $
+ *
+ * Copyright (c) 1995 ANT Ltd., Cambridge, England
+ *
+ * $Log:	remotefs.c,v $
+ * Revision 1.3  95/02/27  16:41:58  pwain
+ * All existing malloc() calls changed to use rmalloc().
+ * This is because ShareFS uses a different module entry
+ * code which means that its stack is kept in RMA. DO NOT
+ * USE MALLOC IN ShareFS CODE.
+ * 
+ * Revision 1.2  95/01/17  09:04:18  pwain
+ * Removed compilation warning messages.
+ * 
+ * Revision 1.1  95/01/09  13:53:08  kwelton
+ * Initial revision
+ * 
+ */
+
+/* $Id: c.remotefs 2.20 93/11/16 23:07:31 brian Exp $ */
+
+/*{{{  compile options*/
+#define TIMEOUT 20		/* seconds for cached directories */
+#define UPCALLINSERT		/* generate upcall on missing shared
+				 * volumes */
+
+/*{{{  includes*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "debug.h"
+#include "FS.h"
+#include "visdelay.h"
+#include "swis.h"
+
+#include "msgproc.h"
+#include "remote.h"
+#include "remswis.h"
+#include "econetv.h"
+#include "evil.h"
+#include "ralloc.h"
+#include "ticker.h"
+#include "freeway.h"
+#include "resourcefs.h"
+#include "modface.h"
+
+/*{{{  errs*/
+#ifndef LOOKUPERR
+static DEFERR(NotYet, ERRNotYet, MSGNotYet);
+static DEFERR(NotDir, ERRNotDir, MSGNotDir);
+static DEFERR(NotFile, ERRNotFile, MSGNotFile);
+static DEFERR(UKTran, ERRUKTran, MSGUKTran);
+static DEFERR(NoMem, ERRNoMem, MSGNoMem);
+static DEFERR(NoVol, ERRNoVol, MSGNoVol);
+static DEFERR(NotVol, ERRNotVol, MSGNotVol);
+static DEFERR(AmbVol, ERRAmbVol, MSGAmbVol);
+static DEFERR(rename, ERRrename, MSGrename);
+static DEFERR(badref, ERRbadref, MSGbadref);
+static DEFERR(NotServ, ERRNotServ, MSGNotServ);
+static DEFERR(Version, ERRVersion, MSGVersion);
+static DEFERR(Recurse, ERRRecurse, MSGRecurse);
+#endif
+
+/*{{{  fs name support*/
+char FilingSystemName[] = FSNAME;
+int FilingSystemInformationWord = 0x8A800000 | RemoteFSNumber;
+
+/*{{{  vars*/
+#ifdef USEFREEWAY
+
+/*{{{  struct connection ptr is just an inet address, CALLSWI is just inet_msg*/
+struct connection;
+#define CMAXDATA(c)     65536
+#define CNAME(c)        "-"
+extern msgproc inet_msg;
+#define CALLSWI(c,m,len,p,n,retlen) inet_msg((int)(c),m,len,p,n,0,retlen)
+#define CHOTUPDATE(c)   1	/* always hot */
+/*}}}  */
+#else
+/*{{{  struct connection buffers transport swi, handle, maxdata; CALLSWI calls the swi.*/
+struct connection
+{
+    char name[30];
+    int swi;
+    int handle;
+    int maxdata;
+    int hotupdate:1;
+    struct connection *next;
+};
+#define CMAXDATA(c)     (c->maxdata)
+#define CNAME(c)        (c->name)
+#define CALLSWI(c,m,len,p,n,retlen) _swix(c->swi,_INR(0,7)|_OUT(2),c->handle,m,len,p,n,0,0,0,retlen)
+#define CHOTUPDATE(c)   (c->hotupdate)
+static struct connection *theconnections;
+static error *connect(char *name, struct connection ** ret);
+
+/*{{{  struct volume buffers the connection for our own list of imports*/
+struct volume
+{
+    char *name;
+    struct connection *connection;
+    struct volume *next;
+};
+static struct volume *thevolumes;
+
+#endif
+ /*{{{  */ struct FileEntry	/* structure corresponding to fs
+				 * handles */
+{
+    struct connection *c;
+    int handle;			/* server handle */
+    int when;			/* last time handle was accepted by
+				 * server */
+    FileDesc d;
+    int allocated;		/* Amount known allocated */
+    char *path;			/* full path of this including volume
+				 * name */
+    WHICH which;		/* What sort of open used */
+    int uses;
+    int oshandle;		/* handle os uses for this, so we can
+				 * close it */
+    FileEntry *next;		/* Master chain */
+};
+
+static FileEntry *theFileEntrys;
+ /*{{{  */ typedef struct CacheEntry	/* used to build directory
+					 * cache */
+{
+    struct connection *c;
+    int handle;			/* server handle */
+    int when;			/* last time handle was accepted by
+				 * server */
+    FileDesc d;
+    char *path;			/* full path of this including volume
+				 * name */
+    int invalid:1;		/* this cache entry is invalid and
+				 * will die */
+    int upcalled:1;		/* we have upcalled this cacheentry */
+    char *contents;		/* Directory contents in gbpb 10
+				 * format */
+    int contentslength;
+    struct CacheEntry *next;	/* Master chain */
+} CacheEntry;
+
+static CacheEntry *theCacheEntrys;
+#define CACHEENTRY_CHECKTIME 3000	/* recheck with server after
+					 * 30 secs */
+#define CACHEENTRY_UPCALLTIME 6000	/* upcall directories every
+					 * 60 sec */
+#define CACHEENTRY_DISCARDTIME 12000	/* discard cached directories
+					 * after 2 min */
+static int wearequitting = 0;
+static int dirtime;
+static int invalidtime;
+
+/*{{{  static server state variables */
+static int feinuse = 0;
+#define LOCK if (feinuse) return ERR(Recurse); else feinuse=1
+#define UNLOCK (error*)(feinuse=0)
+#define TESTLOCK (feinuse || (feinuse=1,0))
+static union Message message;
+static char fullpath[256];
+static error *MsgErr;
+#define SPECSIZE(s)     (5+strlen(s.path))
+#define PATHCMDSIZE (sizeof(struct path)-sizeof(struct filespec)+SPECSIZE(message.path.spec))
+#define PATHINTCMDSIZE (sizeof(struct pathint)-sizeof(struct filespec)+SPECSIZE(message.pathint.spec))
+
+/*{{{  prototypes*/
+static void killinvalid(void);
+
+static error *DoMsg(struct connection *d, int len)	/**/
+{
+    int retlen;			/* P:342 */
+    char *msg_buf;		/* used to avoid warnings - PSW 12/1/95 */
+    message.base.err = 'N';	/* tell transport no data */
+#ifndef USEFREEWAY
+  retry:
+#endif
+    DEBUGf("Msg(%p):%d:", d, message.base.op);	/* P:26 */
+    MsgErr = CALLSWI(d, &message, len, 0, 0, &retlen);
+#ifdef DEBUG
+    if (MsgErr)
+    {
+	DEBUGf("***Error return %d %s\n", MsgErr->errnum, MsgErr->errmess);	/* P:3 */
+    }
+    else
+    {
+	DEBUGf("Returns %d bytes\n", retlen);	/* P:367 */
+    }
+#endif
+#ifndef USEFREEWAY
+    if (MsgErr->errnum == ERRConn)
+    {
+	MsgErr = connect(d->name, &d);
+	if (!MsgErr)
+	    goto retry;
+    }
+#endif
+    if (MsgErr)
+    {
+	int k = (char *) MsgErr - (char *) &message;	/* P:2 */
+	if (k >= 0 && k < sizeof(message))	/* P:2 */
+	{
+	    k = MsgErr->errnum;	/* P:2 */
+	    msg_buf=(char *)MsgErr->errmess; /* PSW start */
+	    *--msg_buf = ':';
+	    MsgErr = lookuperr(k, msg_buf);  /* END */
+	}
+    }
+    return MsgErr;		/* P:342 */
+}
+
+static error *DoMsgData(struct connection * d, int len, char *p,
+			int n, int clue)	/**/
+{
+    int retlen;			/* P:266 */
+    char *msg_buf;		/* pointer into message buffer -- PSW */
+    message.base.err = clue;	/* tell transport what's happening */
+#ifndef USEFREEWAY
+
+  retry:
+#endif
+    DEBUGf("MsgData(%p):%d:", d, message.base.op);	/* P:11 */
+    MsgErr = CALLSWI(d, &message, len, p, n, &retlen);
+#ifdef DEBUG
+    if (MsgErr)
+    {
+	DEBUGf("***Error return %d %s\n", MsgErr->errnum, MsgErr->errmess);	/* P:28 */
+    }
+    else
+    {
+	DEBUGf("Returns %d bytes\n", retlen);	/* P:275 */
+    }
+#endif
+#ifndef USEFREEWAY
+    if (MsgErr->errnum == ERRConn)
+    {
+	MsgErr = connect(d->name, &d);
+	if (!MsgErr)
+	    goto retry;
+    }
+#endif
+    if (MsgErr)
+    {
+	int k = (char *) MsgErr - (char *) &message;	/* P:26 */
+	if (k >= 0 && k < sizeof(message))	/* P:26 */
+	{
+	    k = MsgErr->errnum;	/* P:26 */
+	    msg_buf=MsgErr->errmess;		/* PSW Start */
+	    *--msg_buf = ':';
+	    MsgErr = lookuperr(k, msg_buf);	/* PSW end */
+	}
+    }
+    return MsgErr;		/* P:266 */
+}
+
+#ifndef USEFREEWAY
+static error *connect(char *name, struct connection ** ret)	/**/
+{
+    struct connection *c;
+    error *err;
+    for (c = theconnections; c; c = c->next)
+	if (!stricmp(c->name, name))
+	    goto gotone;
+    c = rmalloc(sizeof(struct connection));
+    if (!c)
+	return ERR(NoMem);
+    c->swi = 0;
+    c->next = theconnections;
+    strcpy(c->name, name);
+    theconnections = c;
+
+  gotone:
+    if (!c->swi)
+    {
+	int k, version;
+	DEBUGf("Connection %s...", c->name);
+	err = _swix(OS_ServiceCall, _INR(0, 1) | _OUTR(0, 4), c->name,
+		    Service_TransportOpen,
+		    &c->handle, &k, &c->swi, &c->maxdata, &version);
+	if (err)
+	    return err;
+	if (k)
+	    return ERR(UKTran);
+	if (!c->swi)
+	    return (error *) c->handle;
+	c->hotupdate = !!(version & TRANSPORTFLAGS_HOTUPDATE);
+	version &= TRANSPORTFLAGS_VERSION;
+	if (!version)
+	    return ERR(NotServ);
+	if (version < SERVER_VERSION)
+	    return ERR(Version);
+	DEBUGf("swi=%x,ch=%x,maxch=%x\n", c->swi, c->handle, c->maxdata);
+    }
+    *ret = c;
+    return NULL;
+}
+
+static error *getvol(char *name, struct connection *c,
+		     struct volume **ret, int ro)	/**/
+{
+    struct volume *v, **vp, *v1;
+    ro = ro;
+    DEBUGf("getvol(%s,%s)\n", name, c ? c->name : "NULL");
+    for (v1 = NULL, vp = &thevolumes; NULL != (v = *vp); vp = &v->next)
+	if (!stricmp(v->name, name))
+	{
+	    if (c)
+	    {
+		if (c == v->connection)
+		{
+		    *ret = v;
+		    return NULL;
+		}
+	    }
+	    else
+	    {
+		if (!v1)
+		    v1 = v;
+		else
+		    return ERR(AmbVol);
+	    }
+	}
+
+    if (!c)
+    {
+	if (v1)
+	{
+	    *ret = v1;
+	    return NULL;
+	}
+	return ERR(AmbVol);
+    }
+    v = rmalloc(sizeof(struct volume));
+    if (!v)
+	return ERR(NoMem);
+    v->name = strdup(name);
+    v->connection = c;
+    v->next = *vp;
+    *vp = v;
+    *ret = v;
+    _swix(OS_ServiceCall, _IN(1), Service_RemoteFSVolume);
+    return NULL;
+}
+
+static error *getconnection(char *special_field, char *volume,
+			    struct connection **ret)	/**/
+{
+    struct volume *v;
+    error *err = 0;
+    if (special_field)
+    {
+	err = connect(special_field, ret);
+	if (err)
+	    return err;
+    }
+    else
+	*ret = NULL;
+    err = getvol(volume, *ret, &v, 0);
+    if (!err)
+	*ret = v->connection;
+    return err;
+}
+
+static struct connection *findconnection(int handle)	/* find connection from
+							 * a handle */
+{
+    struct connection *c;
+    for (c = theconnections; c; c = c->next)
+	if (c->handle == handle)
+	    break;
+    return c;
+}
+
+#else
+static error *getconnection(char *special_field, char *volume,
+			    struct connection **ret)	/**/
+{
+    char descriptor;		/* P:4617 */
+    error *err = 0;
+#ifdef UPCALLINSERT
+    int undo = 0;
+
+  retry:				/* P:4618 */
+#endif
+    special_field = special_field;
+    err = _swix(Freeway_Read, _INR(0, 4) | _OUT(5), 0, DOMAIN_DISCS,
+		volume, sizeof(descriptor), &descriptor, ret);
+
+#ifdef AACLIENT
+    if (!err && !(descriptor & ATTRIBUTE_READONLY))
+	err = (error *) - 1;
+#endif
+
+    if (err)
+#ifdef UPCALLINSERT
+    {
+	for (;;)		/* P:4 */
+	{
+	    int ret = -1;	/* P:2 */
+	    _swix(OS_UpCall, _INR(0, 6) | _OUT(0), 2, RemoteFSNumber,
+		  volume, -1, 0, 100, lookup("media", 0, 0), &ret);
+	    undo = 1;
+	    if (ret == -1)
+	    {
+		_swix(OS_UpCall, _IN(0), 4);	/* P:1 */
+		return ERR(NotVol);	/* P:1 */
+	    }
+	    if (!ret)
+		goto retry;	/* P:1 */
+	}
+    }
+    if (undo)
+	_swix(OS_UpCall, _IN(0), 4);	/* P:0 */
+#else
+	return ERR(NotVol);
+#endif
+    DEBUGf("Freeway_Read(%s)=%p\n", volume, *ret);	/* P:228 */
+    return 0;			/* P:4616 */
+}
+
+static struct connection *findconnection(int handle)	/* find connection from
+							 * a handle */
+{
+     return (struct connection *) handle;	/* P:426 */
+}
+
+#endif
+
+static error *makefilespec(FileEntry * dir, char *special_field, char *name,
+			   struct connection **ret, struct filespec *path)
+{
+    struct connection *c;	/* P:4617 */
+    char *p;
+    int n;
+    error *err;
+    special_field = special_field;
+    DEBUGf("makefilespec(%s,%s)", FileEntry_Name(dir), name);	/* P:228 */
+    if (name[0] != ':')
+    {
+	if (dir)		/* P:0 */
+	{
+	    c = dir->c;		/* P:0 */
+	    strcpy(fullpath, dir->path);
+	    if (name && name[0])/* P:0 */
+	    {
+		strcat(fullpath, ".");	/* P:0 */
+		strcat(fullpath, name);
+	    }
+	    *ret = c;
+	    path->dirhandle = dir->handle;
+	    strcpy(path->path, name);
+	    return NULL;	/* P:0 */
+	}
+	else
+	    return ERR(NoVol);	/* P:0 */
+    }
+    dir = NULL;
+    p = strchr(name + 1, '.');
+    n = p ? p - (name + 1) : strlen(name + 1);
+    strncpy(fullpath, name + 1, n);
+    fullpath[n] = 0;
+    err = getconnection(special_field, fullpath, ret);
+    if (err)
+	return err;		/* P:2 */
+    if (p && p[1] == '$')	/* P:2340 */
+	p += 2;			/* P:1545 */
+
+#ifndef USEFREEWAY
+    if (!stricmp(fullpath, "ALL"))
+    {
+	fullpath[0] = 0;
+	if (p && p[0] == '.')
+	    p++;
+    }
+#endif
+
+    if (p)
+	strcat(fullpath, p);	/* P:2340 */
+    path->dirhandle = 0;
+    strcpy(path->path, fullpath);
+    return NULL;		/* P:4616 */
+}
+
+static void fulldirchange(void)	/* Mark invalid dirs
+				 * affected by fullpath */
+{
+    CacheEntry *fe;		/* P:200 */
+    char *q;
+    int n;
+    DEBUGf("(change)");		/* P:14 */
+    q = strrchr(fullpath, '.');
+    if (!q)
+	return;			/* P:0 */
+    n = q - fullpath;
+    for (fe = theCacheEntrys; fe; fe = fe->next)	/* P:2472 */
+    {
+	if (!fe->invalid && !strnicmp(fe->path, fullpath, n) && !fe->path[n])
+	    fe->invalid = 1;	/* P:188 */
+    }
+}
+
+static void fulldirkill()	/* lose cache entries for
+				 * fullpath */
+{
+    CacheEntry *fe;		/* P:3 */
+    DEBUGf("(kill)");		/* P:1 */
+    for (fe = theCacheEntrys; fe; fe = fe->next)	/* P:24 */
+    {
+	if (!fe->invalid && !stricmp(fe->path, fullpath))	/* P:18 */
+	    fe->invalid = 1;	/* P:1 */
+    }
+}
+
+error *fs_receive(int c, char *p, int n)	/* Handle broadcasts
+						 * from servers */
+{
+    union Message *m = (union Message *) p;	/* P:213 */
+    int i;
+    CacheEntry *ce;
+    struct connection *conn = findconnection(c);
+    switch (n)			/* P:213 */
+    {
+      case -1:			/* server arrives *//* P:28 */
+	if (p)			/* we can refresh this disc now */
+	{
+	    n = strlen(p);	/* P:25 */
+	    for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:50 */
+		if (!ce->invalid && !strnicmp(ce->path, p, n) && (ce->path[n] == 0 || ce->path[n] == '.'))	/* P:0 */
+		    ce->invalid = 1;	/* P:0 */
+	    break;
+	}
+	/* fall through */
+
+      case -2:			/* server departs *//* P:0 */
+	for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:0 */
+	    if (!ce->invalid && ce->c == conn)	/* P:0 */
+		ce->handle = -1;/* P:0 */
+	break;
+
+      case -3:
+	invalidtime = MONOTIME;
+	killinvalid();
+	break;
+
+      default:			/* P:185 */
+	if (m && n > 0)
+	    switch (m->base.op)	/* P:370 */
+	{
+	      case RDEADHANDLES:	/* P:185 */
+		DEBUGf("%d=", n);	/* P:44 */
+		n = (n - 8) / sizeof(int);
+		DEBUGf("%d handles..", n);	/* P:44 */
+		for (i = 0; i < n; i++)	/* P:992 */
+		{
+		    DEBUGf("%x:", m->handletable.handles[i]);	/* P:714 */
+		    for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:6512 */
+			if (!ce->invalid &&
+			    ce->handle == m->handletable.handles[i] &&
+			    ce->c == conn)	/* P:5312 */
+			{
+			    ce->invalid = 1;	/* P:30 */
+			    DEBUGf("%s,", ce->path);	/* P:3 */
+			}
+		}
+		DEBUGf("ok\n");	/* P:44 */
+		break;
+	}
+    }
+    return 0;			/* P:213 */
+}
+
+static void upcalldir(CacheEntry * fe)	/* Generate a fake
+					 * upcall delete for a
+					 * directory */
+{
+    char buf[256], *p;		/* P:193 */
+    strcpy(buf, ":");
+    if (!fe->path[0])
+	strcat(buf, "ALL.$");	/* P:0 */
+    else
+    {
+	p = strchr(fe->path, '.');	/* P:193 */
+	if (p)
+	{
+	    *p = 0;
+	    strcat(buf, fe->path);
+	    *p = '.';		/* P:144 */
+	    strcat(buf, ".$");
+	    strcat(buf, p);
+	}
+	else
+	{
+	    strcat(buf, fe->path);	/* P:193 */
+	    strcat(buf, ".$");
+	}
+    }
+    strcat(buf, ".FakeDelete");
+#ifdef NOSPECIALFIELDS
+    _swix(OS_UpCall, _IN(0) | _IN(1) | _IN(6) | _IN(8) | _IN(9), 3, buf, 0, FilingSystemInformationWord, 6);
+#else
+    _swix(OS_UpCall, _IN(0) | _IN(1) | _IN(6) | _IN(8) | _IN(9), 3, buf, fe->c->name, FilingSystemInformationWord, 6);
+#endif
+}
+
+static error *refreshfe(FileEntry * fe)	/* Reopen a stale file
+					 * handle. */
+{
+    if (!fe)			/* P:0 */
+	 return MsgErr = ERR(badref);	/* P:0 */
+
+  retry:				/* P:0 */
+    switch (fe->which)		/* P:0 */
+    {
+      case CREATE:
+	message.base.op = ROPENUP;
+	break;			/* P:0 */
+
+      default:			/* P:0 */
+      case OPENIN:
+	message.base.op = ROPENIN;
+	break;			/* P:0 */
+
+      case OPENUP:
+	message.base.op = ROPENUP;
+	break;			/* P:0 */
+    }
+
+    message.path.spec.dirhandle = 0;
+    strcpy(message.path.spec.path, fe->path);
+    if (DoMsg(fe->c, PATHCMDSIZE))
+    {
+	if (MsgErr->errnum == ERRStale)	/* P:0 */
+	    goto retry;		/* P:0 */
+	return MsgErr;		/* P:0 */
+    }
+    fe->d = message.status.FileDesc;
+    fe->handle = message.status.handle;
+    fe->when = MONOTIME;
+    return NULL;		/* P:0 */
+}
+
+static void killinvalid(void)	/* Scan for timed out
+				 * dirs */
+{
+    CacheEntry *fe, **fe1;	/* P:12808 */
+    for (fe1 = &theCacheEntrys; 0 != (fe = *fe1); fe1 = &fe->next)	/* P:135856 */
+    {
+lp:
+	if (!fe->invalid)
+	{
+	    if (!CHOTUPDATE(fe->c))
+	    {
+		if (!fe->upcalled)
+		{
+		    if (MONOTIME - fe->when > CACHEENTRY_UPCALLTIME &&
+			fe->handle != -1)	/* P:108395 */
+		    {
+			fe->upcalled = 1;	/* P:46 */
+			upcalldir(fe);
+		    }
+		    continue;
+		}
+		if (MONOTIME - fe->when < CACHEENTRY_DISCARDTIME)	/* P:197178 */
+		    continue;
+	    }
+	    else
+		continue;
+	}
+	DEBUGf("Cache %x %s dies\n", fe->handle, fe->path);	/* P:157 */
+	if (fe->contents)
+	    upcalldir(fe);
+	free(fe->path);
+	free(fe->contents);
+	*fe1 = fe->next;
+	free(fe);
+	if (0 == (fe = *fe1))
+	    break;
+	goto lp;
+    }
+}
+
+static void ticker(void)	/* Scan for timed out dirs if
+				 * not done recently */
+{
+    if (feinuse)
+	 return;
+    if (MONOTIME - invalidtime > 500)
+	killinvalid();
+}
+
+static error *readdir(FileEntry * dir, CacheEntry ** rce)	/* Read directory
+								 * contents. */
+{
+    char *buf, *p2;		/* P:11377 */
+    CacheEntry *ce;
+    int size;
+    int pos, bpos, len;
+    DEBUGf("(readdir %s..", dir->path);	/* P:504 */
+
+    for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:64692 */
+	if (!ce->invalid && (dir->handle == -1 ||
+			     ce->handle == -1 ?
+			     !stricmp(dir->path, ce->path) :
+			     (dir->handle == ce->handle && dir->c == ce->c)))
+	{
+	    if (CHOTUPDATE(dir->c) || MONOTIME - ce->when < CACHEENTRY_CHECKTIME)
+	    {
+		*rce = ce;
+		DEBUGf("Found %p still valid)", ce);	/* P:495 */
+		return NULL;
+	    }
+	    DEBUGf("Found %p check..", ce);
+	    goto gotce;
+	}
+
+    ce = rmalloc(sizeof(CacheEntry));
+    if (!ce)
+	return ERR(NoMem);	/* P:0 */
+    DEBUGf("Create %p..", ce);
+    ce->c = dir->c;
+    ce->handle = dir->handle;
+    ce->when = MONOTIME;
+    ce->path = strdup(dir->path);
+    ce->invalid = 0;
+    ce->upcalled = 0;
+    ce->next = theCacheEntrys;
+    ce->contents = 0;
+    ce->contentslength = 0;
+    theCacheEntrys = ce;
+
+  gotce:
+    buf = rmalloc(size = ROPENDIRSIZE);
+    if (!buf)
+    {
+	ce->invalid = 1;
+	DEBUGf("NoMem)");
+	return ERR(NoMem);
+    }				/* P:0 */
+    _swix(OS_CallAVector, _IN(0) | _IN(1) | _IN(9),
+	  NetFS_StartGetBytes, 100, EconetV);
+
+  restart:			/* P:190 */
+    bpos = 0;
+    message.base.op = ROPENDIR;	/* P:143 */
+    message.pathint.spec.dirhandle = 0;
+    strcpy(message.pathint.spec.path, dir->path);
+    message.pathint.val = ce->contents ? ce->handle : -1;
+    if (DoMsgData(dir->c, PATHINTCMDSIZE, buf, size, 'R'))
+    {
+	if (MsgErr->errnum == ERRStale)
+	    goto restart;
+	if (MsgErr->errnum != ERRdirok)
+	    goto reterr;
+	DEBUGf("OK)");
+	free(buf);
+	*rce = ce;
+	dir->handle = ce->handle;
+	dir->d = ce->d;
+	ce->when = MONOTIME;
+	dir->when = MONOTIME;
+	ce->upcalled = 0;
+	MsgErr = 0;
+	goto ret;
+    }
+    dir->handle = message.statusres.handle;
+    dir->d = message.statusres.FileDesc;
+    pos = message.statusres.newpos;
+    len = message.statusres.length;
+    if (ce->contents)
+    {
+	free(ce->contents);
+	ce->contents = 0;
+    }
+    goto goon;
+    for (pos = 0; pos != -1;)	/* P:211 */
+    {
+	message.base.op = RREADDIR;	/* P:47 */
+	message.filedetails.handle = dir->handle;
+	message.filedetails.offset = pos;
+	if (bpos + ROPENDIRSIZE > size)
+	{
+	    size = bpos + ROPENDIRSIZE;	/* P:0 */
+	    p2 = realloc(buf, size);
+	    if (!p2)
+	    {
+		MsgErr = ERR(NoMem);	/* P:0 */
+		goto reterr;
+	    }
+	    buf = p2;
+	}
+	message.filedetails.length = size - bpos;
+	if (DoMsgData(dir->c, sizeof(struct filedetails),
+		      &buf[bpos], size - bpos, 'R'))
+	{
+	    if (MsgErr->errnum == ERRStale)	/* P:22 */
+		goto restart;
+	    goto reterr;
+	}
+	pos = message.res.newpos;
+	len = message.res.length;
+
+      goon:				/* P:164 */
+	DEBUGf("(%x+%x)", pos, len);	/* P:9 */
+	bpos += len;
+	_swix(OS_CallAVector, _IN(0) | _IN(1) | _IN(9),
+	      NetFS_PartGetBytes, pos, EconetV);
+    }
+    MsgErr = NULL;
+    buf = realloc(buf, bpos);
+    ce->contents = buf;
+    ce->contentslength = bpos;
+    ce->handle = dir->handle;
+    ce->d = dir->d;
+    ce->upcalled = 0;
+    ce->when = MONOTIME;
+    dir->when = MONOTIME;
+    *rce = ce;
+    DEBUGf("%d bytes cached)", bpos);	/* P:9 */
+
+  ret:				/* P:168 */
+    _swix(OS_CallAVector, _IN(0) | _IN(9), NetFS_FinishGetBytes, EconetV);
+    return MsgErr;		/* P:168 */
+
+  reterr:
+    free(buf);
+    ce->invalid = 1;
+    DEBUGf("Error:%s)", MsgErr->errmess);
+    goto ret;
+}
+
+error *Initialise_FileEntrys(void)	/**/
+{
+#ifndef USEFREEWAY
+    thevolumes = NULL;
+    theconnections = NULL;
+#endif
+    theFileEntrys = NULL;	/* P:3 */
+    theCacheEntrys = NULL;
+    wearequitting = 0;
+    UNLOCK;
+    _swix(OS_ServiceCall, _IN(1), Service_RemoteFSVolume);
+    dirtime = TIMEOUT;
+    invalidtime = MONOTIME;
+    CallEvery(ticker, 100);
+    return NULL;		/* P:3 */
+}
+
+void ShutDown_FileEntrys(void)	/**/
+{
+    CacheEntry *ce, *ce1;	/* P:0 */
+    DEBUGf("ShutDown_FileEntrys:");	/* P:0 */
+#ifndef DEBUG
+#define rcheckall()
+#endif
+    rcheckall();
+    for (ce = theCacheEntrys, theCacheEntrys = NULL; ce; ce = ce1)	/* P:0 */
+    {
+	if (ce->contents)	/* P:0 */
+	    free(ce->contents);	/* P:0 */
+	free(ce->path);
+	ce1 = ce->next;
+	free(ce);
+    }
+    DEBUGf("OK\n");
+    rcheckall();		/* P:0 */
+}
+
+void Terminate_FileEntrys(void)	/**/
+{
+    FileEntry *fe, *fe1;	/* P:0 */
+#ifndef USEFREEWAY
+    struct volume *v, *v1;
+    struct connection *c, *c1;
+#endif
+    fe1 = NULL;
+    DEBUGf("Terminate_FileEntrys...");
+    rcheckall();		/* P:0 */
+    wearequitting = 1;
+
+  lp:				/* P:0 */
+    for (fe = theFileEntrys; fe; fe = fe->next)	/* P:0 */
+	if (fe->oshandle)	/* P:0 */
+	{
+	    if (fe != fe1)	/* P:0 */
+	    {
+		fe1 = fe;	/* P:0 */
+		DEBUGf("Close %p - %d..", fe, fe->oshandle);	/* P:0 */
+		_swix(OS_Find, _INR(0, 1), 0, fe->oshandle);
+		goto lp;
+	    }
+	    DEBUGf("Skip %p..", fe);	/* P:0 */
+	    fe->oshandle = 0;
+	}
+    DEBUGf("Killticking..");
+    rcheckall();		/* P:0 */
+    RemoveCallEvery(ticker);
+    DEBUGf("Shutdown...");
+    rcheckall();		/* P:0 */
+    ShutDown_FileEntrys();
+
+#ifndef USEFREEWAY
+    for (v = thevolumes, thevolumes = NULL; v; v = v1)
+    {
+	v1 = v->next;
+	free(v->name);
+	free(v);
+    }
+    DEBUGf("vols,");
+    rcheckall();
+    for (c = theconnections, theconnections = NULL; c; c = c1)
+    {
+	c1 = c->next;
+	_swix(c->swi, _INR(0, 1), c->handle, 0);
+	free(c);
+    }
+    DEBUGf("conns,");
+    rcheckall();
+    _swix(OS_ServiceCall, _IN(1), Service_RemoteFSVolume);
+#endif
+    DEBUGf("OK\n");
+    rcheckall();		/* P:0 */
+}
+
+/*{{{  FileEntry_..using names*/
+error *FileEntry_DirScan(FileEntry * dir, int i, FileDesc * d, char **name)	/**/
+{
+    error *err;			/* P:8134 */
+    CacheEntry *ce;
+    int n;
+    if (2 != dir->d.type)
+	return ERR(NotDir);	/* P:0 */
+    LOCK;			/* P:8134 */
+    err = readdir(dir, &ce);
+    if (err)
+	return UNLOCK, err;	/* P:4 */
+    DEBUGf("DirScan %s(%x at %p) %d..", ce->path, ce->contentslength, ce->contents, i);	/* P:342 */
+    n = 0;
+    while (n < ce->contentslength && i-- > 0)	/* P:121045 */
+	n += 20 + ((strlen(&ce->contents[n + 20]) + 4) & ~3);	/* P:48560 */
+    if (n >= ce->contentslength)
+    {
+	DEBUGf("**Not Found!\n");	/* P:502 */
+	return UNLOCK, ERR(NotFound);	/* P:471 */
+    }
+    *d = *(FileDesc *) & ce->contents[n];
+    *name = &ce->contents[n + 20];
+    DEBUGf("== %.20s (%x %x)\n", *name, d->length, d->type);	/* P:311 */
+    UNLOCK;
+    return NULL;		/* P:7661 */
+}
+
+error *FileEntry_Find(FileEntry * dir, char *special_field,
+		      char *name, FileDesc *d)	/**/
+{
+    error *err;			/* P:1245 */
+    struct connection *v;
+    FileEntry *fe;
+    CacheEntry *ce;
+    char dirname[256];
+    char *k, *m;
+    int i;
+    DEBUGf("Find %s(%s) from %s\n", name ? name : "NULL",	/* P:55 */
+	   special_field ? special_field : "NULL", dir ? dir->path : "NULL");
+    normalise(&dir, &name);
+    LOCK;			/* P:1245 */
+retry:				/* P:1245 */
+    err = makefilespec(dir, special_field, name, &v, &message.path.spec);
+    UNLOCK;
+    if (err)
+    {
+
+      erk:				/* P:0 */
+	DEBUGf("Error %d %s\n", err->errnum, err->errmess);	/* P:0 */
+	return err;		/* P:0 */
+    }
+
+    for (fe = theFileEntrys; fe; fe = fe->next)	/* P:2546 */
+    {
+	if (fe->c == v && !stricmp(fe->path, fullpath))	/* P:112 */
+	{
+	    *d = fe->d;		/* P:0 */
+	    return NULL;	/* P:0 */
+	}
+    }
+
+    for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:11955 */
+    {
+	if (!ce->invalid && ce->c == v && !stricmp(ce->path, fullpath))	/* P:15490 */
+	{
+	    *d = ce->d;		/* P:418 */
+	    return NULL;	/* P:418 */
+	}
+    }
+    strcpy(dirname, ":");
+    strcat(dirname, fullpath);
+    k = strrchr(dirname, '.');
+    if (!k)
+	goto old;		/* P:0 */
+    *k = 0;
+    err = FileEntry_Open(NULL, special_field, dirname, OPENDIR, &dir);
+    if (err)
+    {
+	if (err->errnum == ERRNotDir)
+	    err = ERR(NotFound);
+	goto erk;
+    }				/* P:0 */
+    for (i = 0;; i++)		/* P:7148 */
+    {
+	m = 0;			/* P:7148 */
+	err = FileEntry_DirScan(dir, i, d, &m);
+	DEBUGf("DirScan says %s;%s..\n", err ? err->errmess : "", m ? m : "");	/* P:278 */
+	if (err && err->errnum == ERRNotFound)	/* P:77 */
+	    break;		/* P:327 */
+	if (err || !stricmp(k + 1, m))	/* P:6821 */
+	{
+	    FileEntry_Close(dir);
+	    DEBUGf("Closed found\n");
+	    return err;
+	}			/* P:1015 */
+    }
+    FileEntry_Close(dir);
+    DEBUGf("Closed not found\n");	/* P:17 */
+    if (err && err->errnum == ERRNotDir)	/* P:77 */
+	err = ERR(NotFound);	/* P:0 */
+    return err;			/* P:327 */
+#if 0
+    err = makefilespec(dir, name, &v, &message.path.spec);
+    if (err)
+	goto erk;
+#endif
+
+  old:				/* P:0 */
+    LOCK;			/* P:0 */
+    message.base.op = RFIND;
+    if (DoMsg(v, PATHCMDSIZE))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(dir))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    if (dir)
+	dir->when = MONOTIME;	/* P:0 */
+    *d = message.desc.FileDesc;
+    UNLOCK;
+    return NULL;		/* P:0 */
+}
+
+error *FileEntry_Open(FileEntry * dir, char *special_field,
+		      char *name, WHICH which, FileEntry **rfe)	/**/
+{
+    error *err;			/* P:3316 */
+    FileEntry *fe;
+    CacheEntry *ce;
+    struct connection *v;
+#ifdef DEBUG
+    static char *opentype[] = {"CREATE", "CREATEDIR", "OPENIN", "OPENUP", "OPENDIR"};
+    DEBUGf("%s #%s:%s from %s...",	/* P:170 */
+	   opentype[which], special_field ? special_field : "NULL", name ? name : "NULL", FileEntry_Name(dir));
+#endif
+    normalise(&dir, &name);
+    LOCK;			/* P:3318 */
+retry:				/* P:3314 */
+    err = makefilespec(dir, special_field, name, &v, &message.path.spec);
+    if (err)
+	return UNLOCK, err;	/* P:2 */
+    DEBUGf("Open, connection=%s, fullpath=%s\n", CNAME(v), fullpath);	/* P:169 */
+    for (fe = theFileEntrys; fe; fe = fe->next)	/* P:6758 */
+    {
+	if (fe->c == v && !stricmp(fe->path, fullpath))	/* P:268 */
+	{
+	    if (2 == fe->d.type)/* P:2 */
+	    {
+		if (which == OPENIN || which == OPENDIR || which == CREATEDIR)
+		{
+		    *rfe = fe;	/* P:0 */
+		    fe->uses++;
+		    UNLOCK;
+		    return NULL;/* P:0 */
+		}
+		else
+		    return UNLOCK, ERR(NotFile);
+	    }
+	    break;		/* return ERR(inuse); */
+	}
+    }
+    for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:18907 */
+	if (!ce->invalid && !stricmp(ce->path, fullpath))	/* P:15384 */
+	{
+	    if (which == OPENIN || which == OPENDIR || which == CREATEDIR)
+		which = OPENDIR;
+	    else
+		return UNLOCK, ERR(NotFile);
+	    message.status.handle = ce->handle;	/* P:3103 */
+	    message.status.FileDesc = ce->d;
+	    goto gotit;
+	}
+    if (which == OPENDIR)
+	message.status.handle = -1;	/* P:119 */
+    else
+    {
+	message.base.op = (
+	    which == OPENIN ? ROPENIN :	/* P:208 */
+	    which == OPENUP ? ROPENUP :
+	    which == CREATE ? RCREATE :
+	    which == CREATEDIR ? RCREATEDIR :
+	    (enum op) -1 );
+#ifdef DEBUG
+	if (message.base.op == -1)
+	    return UNLOCK, ERR(BadParm);	/* P:0 */
+#endif
+	if (DoMsg(v, PATHCMDSIZE))
+	{
+	    if (MsgErr->errnum == ERRStale && !refreshfe(dir))	/* P:2 */
+		goto retry;	/* P:0 */
+	    return UNLOCK, MsgErr;	/* P:2 */
+	}
+	if (dir)
+	    dir->when = MONOTIME;	/* P:0 */
+	if (which == CREATE || which == CREATEDIR)	/* P:73 */
+	    fulldirchange();	/* P:17 */
+    }
+
+  gotit:				/* P:3311 */
+    fe = calloc(1, sizeof(FileEntry));
+    if (!fe)
+	return UNLOCK, ERR(NoMem);	/* P:0 */
+    fe->d = message.status.FileDesc;
+    fe->allocated = fe->d.length + 1023 & ~1023;
+    fe->handle = message.status.handle;
+    fe->which = which;
+    fe->path = strdup(fullpath);
+    fe->c = v;
+    fe->uses = 1;
+    if (message.status.handle == -1 || 2 == fe->d.type)	/* P:3192 */
+    {
+	err = readdir(fe, &ce);	/* Might as well read contents while
+	 * openning it *//* P:3243 */
+	if (err)
+	{
+	    free(fe->path);
+	    free(fe);
+	    UNLOCK;
+	    return err;
+	}
+    }
+    else
+    if (which == CREATEDIR)	/* P:3311 */
+	fe->which = OPENDIR;	/* P:0 */
+    fe->next = theFileEntrys;
+    theFileEntrys = fe;
+    fe->oshandle = (int) *rfe;
+    *rfe = fe;
+    UNLOCK;
+    return NULL;		/* P:3311 */
+}
+
+error *FileEntry_Close(FileEntry * fe)	/**/
+{
+    error *err = NULL;		/* P:3311 */
+    DEBUGf("Close %s %x(%d)\n", FileEntry_Name(fe), fe ? fe->handle : 0, fe ? fe->uses : 0);	/* P:168 */
+    LOCK;			/* P:3311 */
+    if (fe)
+    {
+	if (!--fe->uses)	/* P:3311 */
+	{
+	    FileEntry **fe1;	/* P:3311 */
+	    for (fe1 = &theFileEntrys; *fe1; fe1 = &(*fe1)->next)	/* P:6754 */
+		if (*fe1 == fe)	/* P:3311 */
+		{
+		    *fe1 = fe->next;	/* P:3311 */
+		    if (!*fe1)
+			break;	/* P:3179 */
+		}
+	    free(fe->path);
+	    if (fe->handle && fe->handle != -1 && fe->d.type != 2 && !wearequitting)	/* P:6688 */
+	    {
+		message.base.op = RCLOSE;	/* P:68 */
+		message.handle.handle = fe->handle;
+		err = DoMsg(fe->c, sizeof(struct handle));
+		if (err && err->errnum == ERRStale)	/* P:0 */
+		    err = NULL;	/* P:0 */
+	    }
+	    free(fe);
+	}
+    }
+    UNLOCK;
+    return err;			/* P:3311 */
+}
+
+error *FileEntry_Delete(FileEntry * dir, char *special_field,
+			char *name, FileDesc *d)	/**/
+{
+    struct connection *v;	/* P:3 */
+    error *err;
+    DEBUGf("Delete %s from %s\n", name, FileEntry_Name(dir));	/* P:1 */
+    normalise(&dir, &name);
+    LOCK;			/* P:3 */
+
+  retry:			/* P:3 */
+    err = makefilespec(dir, special_field, name, &v, &message.path.spec);
+    if (err)
+	return UNLOCK, err;	/* P:0 */
+    message.base.op = RDELETE;
+    if (DoMsg(v, PATHCMDSIZE))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(dir))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    *d = message.desc.FileDesc;
+    fulldirkill();
+    fulldirchange();
+    UNLOCK;
+    return NULL;		/* P:3 */
+}
+
+error *FileEntry_Access(FileEntry * dir, char *special_field,
+			char *name, int attr)	/**/
+{
+    struct connection *v;	/* P:55 */
+    error *err;
+    DEBUGf("Access %s from %s %x\n", name, FileEntry_Name(dir), attr);	/* P:3 */
+    normalise(&dir, &name);
+    LOCK;			/* P:55 */
+
+  retry:			/* P:55 */
+    err = makefilespec(dir, special_field, name, &v, &message.pathint.spec);
+    if (err)
+	return UNLOCK, err;	/* P:0 */
+    message.base.op = RACCESS;
+    message.pathint.val = attr;
+    if (DoMsg(v, PATHINTCMDSIZE))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(dir))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    if (dir)
+	dir->when = MONOTIME;	/* P:0 */
+    fulldirchange();
+    UNLOCK;
+    return NULL;		/* P:55 */
+}
+
+error *FileEntry_Rename(FileEntry * dir, char *special_field, char *name,
+			FileEntry *newdir, char *newspecial_field,
+			char *newname)	/**/
+
+{
+    struct connection *v, *nv;	/* P:0 */
+    struct filespec newspec;
+    error *err;
+    normalise(&dir, &name);
+    LOCK;			/* P:0 */
+
+  retry:			/* P:0 */
+    err = makefilespec(dir, special_field, name, &v, &message.pathint.spec);
+    if (err)
+	return UNLOCK, err;	/* P:0 */
+    fulldirkill();
+    fulldirchange();
+    normalise(&newdir, &newname);
+    err = makefilespec(newdir, newspecial_field, newname, &nv, &newspec);
+    if (err)
+	return UNLOCK, err;	/* P:0 */
+    if (v != nv)
+	return UNLOCK, ERR(rename);	/* P:0 */
+    message.base.op = RRENAME;
+    message.pathint.val = SPECSIZE(newspec);
+
+    if (DoMsgData(v, PATHINTCMDSIZE, (char *)&newspec,
+		  message.pathint.val, 'W'))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(dir) && !refreshfe(newdir))	/* P:0 */
+	    goto retry;		/* P:0 */
+
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+
+    if (dir)
+	dir->when = MONOTIME;	/* P:0 */
+
+    if (newdir)
+	newdir->when = MONOTIME;/* P:0 */
+
+    fulldirchange();
+    UNLOCK;
+    return NULL;		/* P:0 */
+}
+
+/*{{{  FileEntry_..actions on files*/
+error *FileEntry_GetBytes(FileEntry *fe, char *p, int o, int n,
+			  int *newpos, int *len)	/**/
+{
+    int l, o1 = o;		/* P:8 */
+    int m = 0;
+    if (!fe || fe->d.type != 1)	/* P:8 */
+	return ERR(NotFile);	/* P:0 */
+    LOCK;			/* P:8 */
+    DEBUGf("GetBytes(%s,%p,%x+%x)(c=%s)\n", fe->path, p, o, n, CNAME(fe->c));	/* P:0 */
+    _swix(OS_CallAVector, _IN(0) | _IN(1) | _IN(9),
+	  NetFS_StartGetBytes, n, EconetV);
+
+    while (n > 0)		/* P:24 */
+    {
+	l = n;			/* P:10 */
+	if (l > CMAXDATA(fe->c))
+	    l = CMAXDATA(fe->c);/* P:0 */
+
+      retry:			/* P:10 */
+	message.base.op = RREAD;
+	message.filedetails.handle = fe->handle;
+	message.filedetails.offset = o;
+	message.filedetails.length = l;
+	if (DoMsgData(fe->c, sizeof(struct filedetails), p, l, 'R'))
+	{
+	    if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+		goto retry;	/* P:0 */
+	    goto reterr;
+	}
+	l = message.res.length;
+	o = message.res.newpos;
+	fe->when = MONOTIME;
+	if (!l)
+	    break;		/* P:2 */
+	m += l;
+	n -= l;
+	p += l;
+	_swix(OS_CallAVector, _IN(0) | _IN(1) | _IN(9),
+	      NetFS_PartGetBytes, o - o1, EconetV);
+    }
+
+    *newpos = o;
+    *len = m;
+
+  reterr:			/* P:8 */
+    _swix(OS_CallAVector, _IN(0) | _IN(9), NetFS_FinishGetBytes, EconetV);
+    UNLOCK;
+    return MsgErr;		/* P:8 */
+}
+
+error *FileEntry_GetByte(FileEntry *fe, int *b)	/**/
+{
+    char c;			/* P:0 */
+    LOCK;			/* P:0 */
+
+retry:				/* P:0 */
+    message.base.op = RREAD;
+    message.filedetails.handle = fe->handle;
+    message.filedetails.offset = -1;
+    message.filedetails.length = 1;
+    if (DoMsgData(fe->c, sizeof(struct filedetails), &c, 1, 'R'))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	goto reterr;
+    }
+    fe->when = MONOTIME;
+    *b = message.res.length == 1 ? c : EOF;
+
+  reterr:			/* P:0 */
+    UNLOCK;
+    return MsgErr;		/* P:0 */
+}
+
+error *FileEntry_PutBytes(FileEntry *fe, char *p, int o, int n, int *newpos)
+{
+    int l, o1 = o;		/* P:66 */
+    if (!fe || fe->d.type != 1)	/* P:66 */
+	return ERR(NotFile);	/* P:0 */
+    LOCK;			/* P:66 */
+    DEBUGf("PutBytes(%s,%p,%x+%x)(c=%s)\n", fe->path, p, o, n, CNAME(fe->c));	/* P:0 */
+    _swix(OS_CallAVector, _IN(0) | _IN(1) | _IN(9),
+	  NetFS_StartPutBytes, n, EconetV);
+
+    while (n > 0)		/* P:198 */
+    {
+	l = n;			/* P:66 */
+	if (l > CMAXDATA(fe->c))
+	    l = CMAXDATA(fe->c);/* P:0 */
+
+      retry:			/* P:66 */
+	message.base.op = RWRITE;
+	message.filedetails.handle = fe->handle;
+	message.filedetails.offset = o;
+	message.filedetails.length = l;
+	if (DoMsgData(fe->c, sizeof(struct filedetails), p, l, 'W'))
+	{
+	    if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+		goto retry;	/* P:0 */
+	    goto reterr;
+	}
+	o = message.res.newpos;
+	fe->when = MONOTIME;
+	n -= l;
+	p += l;
+	_swix(OS_CallAVector, _IN(0) | _IN(1) | _IN(9),
+	      NetFS_PartPutBytes, o - o1, EconetV);
+    }
+    *newpos = o;
+    if (o > fe->d.length)
+	fe->d.length = o;
+
+  reterr:			/* P:66 */
+    _swix(OS_CallAVector, _IN(0) | _IN(9), NetFS_FinishPutBytes, EconetV);
+    UNLOCK;
+    return MsgErr;		/* P:66 */
+}
+
+error *FileEntry_PutByte(FileEntry * fe, int c)	/**/
+{
+    int pos;			/* P:0 */
+    return FileEntry_PutBytes(fe, (char *) &c, -1, 1, &pos);	/* P:0 */
+}
+
+error *FileEntry_PutZeros(FileEntry * fe, int o, int n)	/**/
+{
+  retry:			/* P:0 */
+    message.base.op = RZERO;
+    message.filedetails.handle = fe->handle;
+    message.filedetails.offset = o;
+    message.filedetails.length = n;
+    if (DoMsg(fe->c, sizeof(struct filedetails)))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return MsgErr;		/* P:0 */
+    }
+    return NULL;		/* P:0 */
+}
+
+error *FileEntry_EnsureSize(FileEntry * fe, int size)	/**/
+{
+    if (fe->allocated < fe->d.length)
+	 fe->allocated = fe->d.length + 1023 & ~1023;
+    size = size + 1023 & ~1023;
+    if (size <= fe->allocated)	/* P:12 */
+	return NULL;		/* P:0 */
+    LOCK;			/* P:12 */
+
+  retry:			/* P:12 */
+    message.base.op = RENSURE;
+    message.handleint.handle = fe->handle;
+    message.handleint.val = size;
+    if (DoMsg(fe->c, sizeof(struct handleint)))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    fe->allocated = message.ptr.seqptr;
+    fe->when = MONOTIME;
+    fulldirchange();
+    UNLOCK;
+    return NULL;		/* P:12 */
+}
+
+error *FileEntry_SetLength(FileEntry *fe, int length)	/**/
+{
+    LOCK;			/* P:60 */
+
+  retry:			/* P:30 */
+    message.base.op = RSETLENGTH;
+    message.handleint.handle = fe->handle;
+    message.handleint.val = length;
+    if (DoMsg(fe->c, sizeof(struct handleint)))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    fe->d.length = message.ptr.seqptr;
+    fe->when = MONOTIME;
+    fulldirchange();
+    UNLOCK;
+    return NULL;		/* P:30 */
+}
+
+error *FileEntry_SetInfo(FileEntry *fe, Information_Fields info)	/**/
+{
+     LOCK;			/* P:166 */
+
+   retry:			/* P:83 */
+    message.base.op = RSETINFO;
+    message.filedetails.handle = fe->handle;
+    *(Information_Fields *) & message.filedetails.offset = info;
+    if (DoMsg(fe->c, sizeof(struct filedetails)))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    fe->d = message.desc.FileDesc;
+    fe->when = MONOTIME;
+    fulldirchange();
+    UNLOCK;
+    return NULL;		/* P:83 */
+}
+
+error *FileEntry_Flush(FileEntry *fe)	/* dummy */
+{
+    fe = fe;			/* P:16 */
+    return NULL;		/* P:16 */
+}
+
+error *FileEntry_SetSeqPtr(FileEntry *fe, int seqptr)	/**/
+{
+    LOCK;			/* P:0 */
+
+  retry:			/* P:0 */
+    message.base.op = RSETSEQPTR;
+    message.handleint.handle = fe->handle;
+    message.handleint.val = seqptr;
+    if (DoMsg(fe->c, sizeof(struct handleint)))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    fe->when = MONOTIME;
+    UNLOCK;
+    return NULL;		/* P:0 */
+}
+
+error *FileEntry_FreeSpace(FileEntry *fe, struct freespace * b)	/**/
+{
+    if (!fe)			/* P:0 */
+	 return ERR(NotFound);	/* P:0 */
+    LOCK;			/* P:0 */
+
+  retry:			/* P:0 */
+    message.base.op = RFREESPACE;
+    message.path.spec.dirhandle = fe->handle;
+    message.path.spec.path[0] = 0;
+    if (DoMsg(fe->c, PATHCMDSIZE))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, MsgErr;	/* P:0 */
+    }
+    *b = message.free.freespace;
+    fe->when = MONOTIME;
+    UNLOCK;
+    return NULL;		/* P:0 */
+}
+
+int FileEntry_SeqPtr(FileEntry *fe)	/**/
+{
+    if (TESTLOCK)
+	 return -1;		/* P:0 */
+
+  retry:			/* P:0 */
+    message.base.op = RGETSEQPTR;
+    message.handle.handle = fe->handle;
+    if (DoMsg(fe->c, sizeof(struct handle)))
+    {
+	if (MsgErr->errnum == ERRStale && !refreshfe(fe))	/* P:0 */
+	    goto retry;		/* P:0 */
+	return UNLOCK, -1;	/* P:0 */
+    }
+    fe->when = MONOTIME;
+    return UNLOCK, message.ptr.seqptr;	/* P:0 */
+}
+
+/*{{{  FileEntry_..read info*/
+void FileEntry_FileInfoObject(FileEntry *fe)	/**/
+{
+    printf("%-30s %-10s %8p %8p %8x %8x %d (%7p %d %d %d %d ago)\n\r",
+	   fe->path,
+	   CNAME(fe->c),
+	   fe->d.info.load_exec.load_address,
+	   fe->d.info.load_exec.execute_address,
+	     fe->d.length,
+	   fe->d.attr,
+	   fe->d.type,
+	   fe,
+	     fe->uses,
+	   fe->oshandle,
+	   fe->which,
+	   MONOTIME - fe->when);
+}
+
+char *FileEntry_DiscName(FileEntry *fe)	/**/
+{
+    char *p;			/* P:2244 */
+    if (!fe)
+	return "\"Unset\"";	/* P:0 */
+    if (!fe->path[0])
+	return "ALL";		/* P:0 */
+    p = strchr(fe->path, '.');
+    if (!p)
+	p = &fe->path[strlen(fe->path)];	/* P:2244 */
+    strncpy(fullpath, fe->path, p - fe->path);
+    fullpath[p - fe->path] = 0;
+    return fullpath;		/* P:2244 */
+}
+
+char *FileEntry_SpecialField(FileEntry *fe)	/**/
+{
+#ifdef NOSPECIALFIELDS
+     fe = fe;			/* P:2244 */
+    return NULL;		/* P:2244 */
+#else
+    if (!fe)
+	 return NULL;
+    return fe->c->name;
+#endif
+}
+
+char *FileEntry_Name(FileEntry *fe)	/**/
+{
+    return fe ? leaf(fe->path) : "\"Unset\"";	/* P:1184 */
+}
+
+FileDesc FileEntry_Desc(FileEntry *fe)	/**/
+{
+    return fe->d;		/* P:580 */
+}
+
+int FileEntry_Allocated(FileEntry *fe)	/**/
+{
+    if (fe->allocated < fe->d.length)
+	 fe->allocated = fe->d.length;
+    fe->allocated = fe->allocated + 1023 & ~1023;
+    return fe->allocated;	/* P:56 */
+}
+
+#define CMOSBASE 0x52		/* defining this uses CMOS locations
+				 * to save discs */
+#define CMOSSIZE 25		/* &52..&6A inclusive */
+#define CMOSKEYLOC 0x51
+#define CMOSKEYMASK 15
+#define CMOSKEYVAL 15
+#define WAITINT  5
+#define MAXWAIT  45
+extern int time(int t);
+
+error *FileEntry_Boot(void)	/**/
+{
+    int x, i, ret, lasttime, nsecs = 0;
+    char cmos[CMOSSIZE + 1], *v, descriptor;
+    char bootit[64];
+    error *err;
+    _swix(OS_Byte, _INR(0, 1) | _OUT(2), 161, CMOSKEYLOC, &x);
+    if ((x & CMOSKEYMASK) == CMOSKEYVAL)
+    {
+	for (x = 0; x < CMOSSIZE; x++)	/* P:81 */
+	    _swix(OS_Byte, _INR(0, 1) | _OUT(2), 161,
+		  CMOSBASE + x, &i), cmos[x] = i;	/* P:75 */
+	cmos[x] = 0;
+	if (cmos[0] == 0)
+	    return 0;
+	for (v = cmos; *v; v++)
+	    if (*v == '#')
+	    {
+		*v = 0;
+		break;
+	    }
+	v = cmos;
+	lasttime = time(0);
+	do
+	{
+	    err = _swix(Freeway_Read, _INR(0, 4) | _OUT(5), 0, DOMAIN_DISCS,
+			v, sizeof(descriptor), &descriptor, &ret);
+	    if (!err)
+		break;
+	    dropper();
+	    if (time(0) < lasttime + WAITINT)
+		continue;
+	    nsecs += WAITINT;
+	    printf("Shared disc '%s' not yet seen; time to wait = %2d secs\r",
+		   v, MAXWAIT - nsecs);
+	    if (nsecs >= MAXWAIT)
+		return 0;
+	    lasttime = time(0);
+	} while (1);
+	sprintf(bootit, "dir share::%s.$", v);
+	_swix(OS_CLI, _IN(0), bootit);
+	sprintf(bootit, "run share::%s.$.!shareboot", v);
+	_swix(OS_CLI, _IN(0), bootit);
+    }
+    return 0;
+}
+
+int setshareboot(char *str)	/**/
+{
+    int x, i;
+    char *cp, cmos[CMOSSIZE + 1];
+    memset(cmos, 0, sizeof(cmos));
+    _swix(OS_Byte, _INR(0, 1) | _OUT(2), 161, CMOSKEYLOC, &x);
+    if ((int) str == 0)
+    {
+	printf("Shareboot  <discname>\n");
+	return NULL;
+    }
+    if ((int) str == 1)
+    {
+	if ((x & CMOSKEYMASK) == CMOSKEYVAL)
+	{
+	    for (x = 0; x < CMOSSIZE; x++)	/* P:81 */
+		_swix(OS_Byte, _INR(0, 1) | _OUT(2), 161,
+		      CMOSBASE + x, &i), cmos[x] = i;	/* P:75 */
+	    cmos[x] = 0;
+	    for (x = 0; x < CMOSSIZE; x++)
+	    {
+		if (cmos[x] == '#')
+		{
+		    cmos[x] = 0;
+		    break;
+		}
+	    }
+	    if (x == CMOSSIZE)
+		cmos[0] = 0;
+	}
+	if (cmos[0] != 0)
+	    printf("ShareBoot  %s\n", cmos);
+	return NULL;
+    }
+    for (cp = str; *cp; cp++)
+    {
+	if (*cp == '\r')
+	{
+	    *cp = '\0';
+	    break;
+	}
+    }
+    strcpy(cmos, str);
+    cmos[strlen(cmos)] = '#';
+    for (i = 0; i < CMOSSIZE; i++)	/* P:0 */
+	_swix(OS_Byte, _INR(0, 2), 162, CMOSBASE + i, cmos[i]);	/* P:0 */
+    return NULL;
+}
+
+extern int WINDOWSIZE;
+
+error *DoCommand(int cmd_no, int argc, char *argv[])	/**/
+{
+#ifndef USEFREEWAY /* It appears that these are only needed if we */
+		   /* are not using Freeway -- PSW */
+    error *err=0;			/* P:0 */
+    struct volume *v, **vp;
+    struct connection *c;
+#endif
+
+#ifdef DEBUG
+    /* {{{  DEBUG, rallocDEBUG, rcheckall, status */
+    if (argc >= 2 && !stricmp(argv[1], "DEBUG"))	/* P:0 */
+    {
+	debug = atoi(argv[2]);	/* P:0 */
+	return NULL;		/* P:0 */
+    }
+    else
+    if (argc >= 2 && !stricmp(argv[1], "rallocDEBUG"))	/* P:0 */
+    {
+	rallocdebug = atoi(argv[2]);	/* P:0 */
+	return NULL;		/* P:0 */
+    }
+    else
+    if (argc >= 1 && !stricmp(argv[1], "rcheckall"))	/* P:0 */
+    {
+	rcheckall();		/* P:0 */
+	return NULL;		/* P:0 */
+    }
+    if (argc >= 1 && !stricmp(argv[1], "status"))	/* P:0 */
+    {
+	FileEntry *fe;		/* P:0 */
+	CacheEntry *ce;
+	for (fe = theFileEntrys; fe; fe = fe->next)	/* P:0 */
+	    FileEntry_FileInfoObject(fe);	/* P:0 */
+	for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:0 */
+	    if (!ce->invalid)
+		printf("%p %x %s %d bytes\n",
+		       ce->c, ce->handle, ce->path, ce->contentslength);
+
+#ifndef USEFREEWAY
+	{
+	    struct connection *c;
+	    for (c = theconnections; c; c = c->next)
+		printf("%p %s %x %x %x\n",
+		       c, c->name, c->swi, c->maxdata, c->handle);
+	}
+#endif				/* !defined(USEFREEWAY) */
+	return NULL;		/* P:0 */
+    }
+#endif				/* DEBUG */
+
+#ifdef PROFILING
+    /* {{{  mapstore */
+    else
+    if (argc >= 2 && !stricmp(argv[1], "mapstore"))	/* P:0 */
+    {
+	_fmapstore(argv[2]);	/* P:0 */
+	return NULL;		/* P:0 */
+    }
+    /* }}}  */
+#endif				/* PROFILING */
+
+    switch (cmd_no)		/* P:0 */
+    {
+      case 0:	/* *FSname *//* P:0 */
+	return _swix(OS_FSControl, _INR(0, 1), FSControl_SelectFilingSystem,
+		     FilingSystemName);	/* P:0 */
+
+      case 1:	/* *Free *//* P:0 */
+	return reportusage(argc > 0 ? argv[1] : "");	/* P:0 */
+
+#ifdef USEFREEWAY
+      case 2:	/* *Dismount *//* P:0 */
+	{
+	    char *p = argv[1];
+	    FileEntry *fe, *fe1 = 0;
+	    CacheEntry *ce;
+	    int n;
+	    if (*p == ':')
+		p++;		/* P:0 */
+	    n = strlen(p);
+	    DEBUGf("Dismount %s:\n", p);	/* P:0 */
+	  lp:			/* P:0 */
+	    for (fe = theFileEntrys; fe; fe = fe->next)	/* P:0 */
+		if (!strnicmp(fe->path, p, n) &&
+		    (fe->path[n] == 0 || fe->path[n] == '.') &&
+		    fe->oshandle)	/* P:0 */
+		    if (fe != fe1)	/* P:0 */
+		    {
+			int h = fe->oshandle;	/* P:0 */
+			fe1 = fe;
+			fe->oshandle = 0;
+			DEBUGf("Closing %d\n", h);	/* P:0 */
+			_kernel_osfind(0, (char *) h);
+			goto lp;
+		    }
+	    DEBUGf("Dismount %s:\n", p);	/* P:0 */
+	    for (ce = theCacheEntrys; ce; ce = ce->next)	/* P:0 */
+		if (!ce->invalid && !strnicmp(ce->path, p, n) && (ce->path[n] == 0 || ce->path[n] == '.'))	/* P:0 */
+		    ce->invalid = 1;	/* P:0 */
+	    DEBUGf("Dismount %s:\n", p);	/* P:0 */
+	    return NULL;	/* P:0 */
+	}
+
+#ifdef ACCESSPLUS
+      case 3:	/* *ShareFSLogon */
+	owner_logon(argv[1], ((argc == 2) ? argv[2] : ""), 0);
+	return NULL;
+
+      case 4:	/* *ShareFSLogoff */
+	owner_logoff(argv[1]);
+	return NULL;
+#endif
+#endif
+
+#if 0
+      case 2:	/* *RemoteTimeOut */
+	if (argc)
+	{
+	    dirtime = atoi(argv[1]);
+	}
+	printf("TimeOut set to %d\n", dirtime);
+	return NULL;
+#endif
+
+#ifndef USEFREEWAY
+      case 3:	/* *Import */
+	err = connect(argv[2], &c);
+	if (err)
+	    return err;
+	return getvol(argv[1], c, &v, 0);
+
+      case 4:	/* *Imports */
+	for (v = thevolumes; v; v = v->next)
+	    printf("%-10s %s\n", v->name, v->connection->name);
+	return NULL;
+
+      case 5:	/* *UnImport */
+	if (argc > 1)
+	{
+	    err = connect(argv[2], &c);
+	    if (err)
+		return err;
+	}
+	else
+	    c = NULL;
+	err = getvol(argv[1], c, &v, 0);
+	if (err)
+	    return err;
+	for (vp = &thevolumes; NULL != *vp; vp = &(*vp)->next)
+	    if (*vp == v)
+	    {
+		*vp = v->next;
+		free(v->name);
+		free(v);
+		break;
+	    }
+	_swix(OS_ServiceCall, _IN(1), Service_RemoteFSVolume);
+	return NULL;
+	/* }}}  */
+#endif
+      default:			/* P:0 */
+	return ERR(BadParm);	/* P:0 */
+    }
+}
+
+#ifndef NOTMODULE
+char ModuleName[] = "RemoteFS";
+error *module_swi(int swi_number, regs * r, void *private_word)	/* dummy */
+{
+    r = r;
+    private_word = private_word;
+    switch (swi_number)
+    {
+      case RemoteFS_EnumerateVolumes & 63:
+	{
+	    int n = r->r[0];
+#ifdef USEFREEWAY
+	    char name[256];
+	    char descriptor;
+	    error *err;
+	    int pos = 0, addr;
+	    for (pos = 0; pos != -1;)
+	    {
+		err = _swix(Freeway_Enumerate, _INR(0, 7) | _OUTR(6, 7), 0, DOMAIN_DISCS, sizeof(name), &name, sizeof(descriptor), &descriptor, 0, pos, &addr, &pos);
+		if (err)
+		    return err;
+		if (pos != -1 && !n--)
+		    goto gotit;
+	    }
+	    return ERR(NotVol);
+
+      gotit:
+	    r->r[0] = (int) &name;
+	    r->r[1] = 0;
+	    return NULL;
+#else
+	    struct volume *v;
+	    for (v = thevolumes; v; v = v->next)
+	    {
+		if (!stricmp(v->name, "ALL"))
+		    continue;
+		if (!n--)
+		    break;
+	    }
+	    if (!v)
+		return ERR(NotVol);
+	    r->r[0] = (int) &v->name[0];
+	    r->r[1] = (int) &v->connection->name[0];
+	    return NULL;
+#endif
+	}
+
+      case RemoteFS_Receive & 63:
+	return fs_receive(r->r[3], (char *) r->r[0], r->r[1]);
+
+      default:
+	return lookuperr(ERRBadSWI, "BadSWI", ModuleName);
+	}
+}
+
+void module_service(int service_number, regs * r, void *private_word)	/**/
+{
+    extern void fs_service(regs * r);
+    service_number = service_number;
+    private_word = private_word;
+    fs_service(r);
+}
+
+void module_finalise(void)	/**/
+{
+    extern void fs_finalise(void);
+    fs_finalise();
+    lookup_clear();
+}
+
+error *module_initialise(char *cmd_tail, int podule_base, void *privw)	/**/
+{
+    extern error *fs_initialise(void);
+    cmd_tail = cmd_tail;
+    podule_base = podule_base;
+    private_word = privw;
+    atexit(module_finalise);
+    lookup_init("RemoteFS:Messages");
+    return fs_initialise();
+}
+
+#endif
+
+/* EOF remotefs.c */

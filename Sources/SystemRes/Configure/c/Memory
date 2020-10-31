@@ -1,0 +1,341 @@
+/*
+ * memory.c
+ *
+ * This is the module that handles the Memory window.
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+
+#include "configure.h"
+#include "configfile.h"
+#include "memory.h"
+#include "cmos.h"
+
+#define MemoryWindow_Screen   14
+#define MemoryWindow_Heap     15
+#define MemoryWindow_RMA      16
+#define MemoryWindow_FontSize 17
+#define MemoryWindow_FontMax  18
+#define MemoryWindow_Sprite   19
+#define MemoryWindow_RamFS    20
+
+
+#if 0  /* Left for documentation value */
+#define MemoryWindow_ScreenDown   7
+#define MemoryWindow_HeapDown     8
+#define MemoryWindow_RMADown      9
+#define MemoryWindow_FontSizeDown 10
+#define MemoryWindow_FontMaxDown  11
+#define MemoryWindow_SpriteDown   12
+#define MemoryWindow_RamFSDown    13
+
+#define MemoryWindow_ScreenUp   21
+#define MemoryWindow_HeapUp     22
+#define MemoryWindow_RMAUp      23
+#define MemoryWindow_FontSizeUp 24
+#define MemoryWindow_FontMaxUp  25
+#define MemoryWindow_SpriteUp   26
+#define MemoryWindow_RamFSUp    27
+#endif
+
+static int memory_window=0;
+static int pagesize=0;
+
+/* For internal purposes, we give the areas the following numbers */
+
+#define HeapArea 0
+#define RMAArea 1
+#define ScreenArea 2
+#define SpriteArea 3
+#define FontSizeArea 4
+#define FontMaxArea 5
+#define RamFSArea 6
+
+/* This table maps area number onto area characteristics.  The items MUST
+ * correspond to the numbers in the #defines above.
+ * Indexed by our area number (not the system dynamic area number)
+ */
+
+static const struct
+{
+    int dynarea;                              /* which system dynamic area it is in */
+    int unit;                                 /* in kilobytes.  0 means pagesize */
+    int max;                                  /* 0 <= value <= max (limit not applicable if is 0) */
+    int CMOSaddr;
+    char *configcommand;                      /* NULL or command to use */
+    int configcommandline;                    /* line in predesk file to use */
+    int icon;                                 /* value icon in memory window */
+} areas [] =
+{
+    0, 0, 1<<6, CMOS_HeapSize,   NULL,                            0,                    MemoryWindow_Heap,      /* 0: HeapArea */
+    1, 0, 1<<7, CMOS_RMASize,    NULL,                            0,                    MemoryWindow_RMA,       /* 1: RMAArea */
+    2, 0, 1<<7, CMOS_ScreenSize, NULL,                            0,                    MemoryWindow_Screen,    /* 2: ScreenArea */
+    3, 0, 1<<7, CMOS_SpriteSize, NULL,                            0,                    MemoryWindow_Sprite,    /* 3: SpriteArea */
+    4, 4, 1<<8, CMOS_FontSize,   NULL,                            0,                    MemoryWindow_FontSize,  /* 4: FontSizeArea */
+    4, 4, 1<<8, CMOS_FontMax,    NULL,                            0,                    MemoryWindow_FontMax,   /* 5: FontMaxArea */
+    5, 0, 0,    CMOS_RamFSSize,  "ChangeDynamicArea -RamFsSize ", PreDeskRAMFSSizeLine, MemoryWindow_RamFS,     /* 6: RamFSArea */
+};
+#define NAREAS (sizeof(areas) / sizeof(areas[0]))
+
+
+/* This table maps icon numbers onto area numbers and types.
+ * It MUST match the icon number assignments in the template file!
+ * It MUST also match the reverse mappings in the areas array.
+ */
+
+typedef enum { MapUp, MapDown, MapValue, MapUndef } MapType;
+
+static const struct
+{
+    int area;                                /* area number for areas[] */
+    MapType type;                            /* 1 for up, -1 for down, 0 for readout */
+} map [] =
+{
+    /*  0 */    0, MapUndef,
+    /*  1 */    0, MapUndef,
+    /*  2 */    0, MapUndef,
+    /*  3 */    0, MapUndef,
+    /*  4 */    0, MapUndef,
+    /*  5 */    0, MapUndef,
+    /*  6 */    0, MapUndef,
+
+    /*  7 */    ScreenArea, MapDown,          /* MemoryWindow_Screen   */
+    /*  8 */    HeapArea, MapDown,            /* MemoryWindow_Heap     */
+    /*  9 */    RMAArea, MapDown,             /* MemoryWindow_RMA      */
+    /* 10 */    FontSizeArea, MapDown,        /* MemoryWindow_FontSize */
+    /* 11 */    FontMaxArea, MapDown,         /* MemoryWindow_FontMax  */
+    /* 12 */    SpriteArea, MapDown,          /* MemoryWindow_Sprite   */
+    /* 13 */    RamFSArea, MapDown,           /* MemoryWindow_RamFS    */
+
+    /* 14 */    ScreenArea, MapValue,
+    /* 15 */    HeapArea, MapValue,
+    /* 16 */    RMAArea, MapValue,
+    /* 17 */    FontSizeArea, MapValue,
+    /* 18 */    FontMaxArea, MapValue,
+    /* 19 */    SpriteArea, MapValue,
+    /* 20 */    RamFSArea, MapValue,
+
+    /* 21 */    ScreenArea, MapUp,
+    /* 22 */    HeapArea, MapUp,
+    /* 23 */    RMAArea, MapUp,
+    /* 24 */    FontSizeArea, MapUp,
+    /* 25 */    FontMaxArea, MapUp,
+    /* 26 */    SpriteArea, MapUp,
+    /* 27 */    RamFSArea, MapUp,
+};
+#define NMAPS (sizeof(map) / sizeof(map[0]))
+
+
+/* Convert icon number to area and type */
+
+static MapType map_icon (int icon, int *area)
+{
+    if (icon < 0 || icon >= NMAPS)
+        return MapUndef;
+    *area = map[icon].area;
+    return map[icon].type;
+}
+
+static int get_area_unit( int n )
+{
+        return areas[n].unit ? areas[n].unit * 1024 : pagesize;
+}
+
+static int get_area_size( int n )
+{
+        int size;
+
+        if ( areas[n].configcommand )
+        {
+                char *tt = configfile_readline( PreDeskConfigFile, areas[n].configcommandline );
+
+                if ( tt && strncmp( tt, areas[n].configcommand, strlen( areas[n].configcommand )) == 0 )
+                {
+                        size = atoi( &tt[ strlen( areas[n].configcommand ) ] );
+                }
+                else
+                {
+                        size = 0;
+                }
+        }
+        else
+        {
+                size = cmos_get( areas[n].CMOSaddr ) * get_area_unit( n );
+        }
+
+        return size;
+}
+
+/* Update icon for area n to match the CMOS RAM value */
+
+static void update_area (int n)
+{
+        int size;
+        wimp_icon i;
+        wimp_caretstr c;
+
+        size = get_area_size( n );
+
+        wimp_get_icon_info( memory_window, areas[n].icon, &i );
+        wimp_get_caret_pos( &c );
+        sprintf( i.data.indirecttext.buffer, "%i", size / 1024 );
+        c.index = -1;
+        wimp_set_caret_pos( &c );
+        wimp_set_icon_state( memory_window, areas[n].icon, 0, 0 );
+}
+
+
+/* Set area to size bytes.  Force it within valid range */
+
+static void change_area( int n, int size )
+{
+        _kernel_swi_regs r;
+        int unit = get_area_unit( n );
+        int nunits;
+
+        /* Round up to next unit, in bytes: */
+        size = (size + unit - 1) / unit * unit;
+
+        r.r[0] = areas[n].dynarea | (1 << 7);
+        _kernel_swi( XOS_Bit | OS_ReadDynamicArea, &r, &r );
+#if 0
+        werr(0, "Area %d: Size %d Unit %d Curr is %d Max is %d\n", n, size, unit, r.r[1], r.r[2]);
+#endif
+
+        if ( size < 0 ) size = 0;
+        if ( size >= r.r[2] ) size = r.r[2]-1;
+
+        nunits = size / unit;
+        if ( areas[n].max && nunits >= areas[n].max ) nunits = areas[n].max - 1;    /* must fit! */
+#if 0
+        werr(0, "Setting to %d\n", nunits);
+#endif
+        if ( areas[n].configcommand )
+        {
+                char line[256];
+
+                sprintf( line, "%s%d", areas[n].configcommand, nunits * unit );
+                configfile_writeline( PreDeskConfigFile, areas[n].configcommandline, line );
+        }
+        else
+        {
+                cmos_set( areas[n].CMOSaddr, nunits );
+        }
+
+        update_area (n);
+}
+
+/* Change area n by delta units */
+
+static void change_area_by (int n, int delta)
+{
+        change_area( n, get_area_size( n ) + delta * get_area_unit( n ) );
+}
+
+
+#define block
+
+static void memory_event_handler(wimp_eventstr *e,void *handle)
+{
+    handle = handle;
+
+    switch (e->e)
+    {
+    case wimp_EOPEN:
+        wimp_open_wind(&e->data.o);
+        break;
+    case wimp_ECLOSE:
+        block
+        {
+            wimp_mousestr m;
+            wimp_get_point_info(&m);
+            if (m.bbits==wimp_BRIGHT)
+            {
+                wimp_wstate s;
+                wimp_get_wind_state(memory_window,&s);
+                reopen_main_window(s.o.box.x0,s.o.box.y1);
+            }
+            delete_window( &memory_window );
+        }
+        break;
+    case wimp_EBUT:
+        if ((e->data.but.m.bbits==wimp_BRIGHT) ||
+            (e->data.but.m.bbits==wimp_BLEFT)
+            )
+        {
+            int area, sign = (e->data.but.m.bbits == wimp_BRIGHT) ? -1 : 1;
+            MapType map = map_icon (e->data.but.m.i, &area);
+            if (map == MapUp)
+                change_area_by (area, sign);
+            else if (map == MapDown)
+                change_area_by (area, -sign);
+        }
+        break;
+    case wimp_EKEY:
+        if (unknown_configure_key(e->data.key.chcode)) wimp_processkey(e->data.key.chcode);
+        if ((e->data.key.chcode!=13) &&
+            (e->data.key.chcode!=0x18a)  &&
+            (e->data.key.chcode!=0x19a) &&
+            (e->data.key.chcode!=0x18e) &&
+            (e->data.key.chcode!=0x18f)) break;
+        else
+        {
+            int area;
+            MapType map = map_icon (e->data.key.c.i, &area);
+            wimp_icon i;
+            int val=-1;
+
+            if (map != MapValue) break;
+
+            wimp_get_icon_info (memory_window,e->data.key.c.i,&i);
+            if (strcmp (i.data.indirecttext.buffer, "") == 0) break;
+            if (sscanf (i.data.indirecttext.buffer, "%i", &val) != 1) val = 0;
+
+            change_area( area, val * 1024 );
+        }
+        break;
+    }
+}
+
+
+int memory_create_window(void)
+{
+        int i;
+
+        if (! memory_window)
+        {
+                _kernel_swi_regs r;
+                _kernel_swi(XOS_Bit | OS_ReadMemMapInfo,&r,&r);
+                pagesize=r.r[0];
+                memory_window=create_window("Memory",memory_event_handler,"ME");
+        }
+
+        for (i = 0; i < NAREAS; i++)
+                update_area (i);
+
+        return memory_window;
+}
+
+void memory_update_window(void)
+{
+        if (memory_window) memory_create_window();
+}

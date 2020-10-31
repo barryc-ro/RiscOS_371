@@ -1,0 +1,1681 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/* Title: > c.dbox3d
+ * Purpose: System-independent dialog boxes.
+ * History: IDJ: 05-Feb-92: prepared for source release
+ *          MK:  28-Oct-92: Fixed for 3d icons and genh2
+ *          MK:  02-Nov-92: Allowed dboxes to be dragged by any point
+ *          MK:  10-Nov-92: Fixed for sliders in dialogue boxes
+ *          MK:  11-Nov-92: Patched for up/down arrows on numerics (see below)
+ *          MK:  12-Nov-92: Patched to allow write/click/drag icons
+ *          MK:  12-Nov-92: Forced exclusivity in ESGs 2-11
+ *          MK:  27-Nov-92: Fixed to allow text icons to 'click' buttons
+ *          MK:  27-Nov-92: Fixed to prevent unnec. switching of action buttons
+ *          MK:  02-Dec-92: Fixed to detect dbox closes by menu system
+ *          MK:  03-Dec-92: Fixed to allow menu type icons (see below)
+ *          MK:  10-Dec-92: Fixed bug which caused keypresses to do odd things
+ *          MK:  12-Jan-93: Allowed menu clicks anywhere to get first menu icon
+ *          MK:  24-Feb-93: Massaged help messages for icons linked to others
+ *          MK:  05-Mar-93: Auto scroll bars on dboxes not fitting on screen
+ *          TCS: 23-Jun-94: Removed 3D stuff as Acorn now have official 3D look
+ *          TCS: 27-Jun-94: Added routines for single static dboxes, preventing multiple statics.
+ *          TCS: 28-Jun-94: Fixed to prevent menu click 'anywhere' activating first menu button when
+ *                          that button is faded out
+ *          TCS: 13-Jul-94: Added dbox_assert_decimal2() and dbox_get_decimal2() for
+ *                          decimal numbers to 2 D.P.
+ *
+ *
+ *   An up/down arrow is an icon whose validation string contains the
+ *   sequence ';^' followed by four colon separated parameters, eg:
+ *              $@down;^7:-5:20:50
+ *   This example modifies the value in icon#7 by adding -5 to it when the
+ *   button is clicked, ensuring it stays in the range 20 to 50.
+ *
+ *
+ *   A menu type icon is an icon whose validation string contains the
+ *   sequence ';m' followed by the number of the icon it is associated with.
+ *   Such an icon will be reported as the field returned from dbox_fillin()
+ *   whenever it is clicked on or whenever MENU is clicked on its associated
+ *   icon (or any icon linked to that, eg arrows or linked text).
+ *     Menu events are handled by passing back the address of the hit[] array
+ *   as the field number. This will always be >0x8000 and so can be seen to
+ *   be an invalid field number, by the client.
+ *
+ *
+ *   To open a static dbox, call dbox_new_static() with the dbox name.  This returns
+ *   a BOOLEAN (TRUE=success).  To show the dbox, call dbox_display_static(), and to
+ *   close it, call dbox_dispose_static().  The dbox handle should always be obtained
+ *   'on the fly' by calling dbox_static(), which returns the static local that the handle
+ *   is kept in.
+ *
+ *
+:MESSAGES
+dbox1:Not enough memory to create dialogue box -- increase wimpslot
+dbox2:Templates file is not loaded for use with dialog boxes
+:END
+ */
+
+#define dbox__MAX_EXCLUSIVE_ESG 11
+#define MAXBUTTONS 256
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <limits.h>
+
+#include "trace.h"
+#include "werr.h"
+#include "os.h"
+#include "akbd.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "win.h"
+#include "menu.h"
+#include "event.h"
+/*------------------------------------------------------------------------*/
+#include "dbox.h"
+#include "res.h"
+#include "sprite.h"
+#include "resspr.h"
+#include "template.h"
+#include "alarm.h"
+#include "msgs.h"
+#include "bbc.h"
+#include "visdelay.h"
+
+#include "Slide.h"
+#include "Graphics.h"
+#include "Browser.h"
+#include "Printing.h"
+
+static int dbox__hit[10]; /* menu hit list */
+static int dbox__lastmenuicon=-1; /* icon number the icon that caused this menu to pop up */
+static wimp_caretstr oldcaret={-1,-1,-1,-1,-1,-1}; /* store for caret before dbox opened */
+
+typedef struct dbox__str {
+  struct dbox__str *next;  /* if user wants to link dboxes into a list */
+  wimp_w w;                /* only used in live dialog boxes */
+  int posatcaret;          /* Every time it is shown, it appears "near" the
+                            * caret.
+                            */
+  int showing;
+  wimp_caretstr caretstr;   /* save between fillin's. */
+  dbox_handler_proc eventproc;
+  void *eventprochandle;
+  dbox_raw_handler_proc raweventproc;
+  void *raweventprochandle;
+
+  dbox_field field;     /* button last pressed */
+  int fieldwaiting;     /* a button waiting to be picked up */
+  int eventdepth;       /* for delaying disposal */
+  int disposepending;
+
+  char name[12];
+  char *workspace;
+  int workspacesize;
+  wimp_wind window;
+  /* any icons follow directly after this. */
+} dbox__str;
+/* Abstraction: a dbox is really a dbox__str*. */
+
+/* -------- Miscellaneous. -------- */
+
+static BOOL dbox_icon_is_button(wimp_icon *info)
+{
+if((info->flags&(wimp_INDIRECT))==(wimp_INDIRECT))
+  {
+  char *p;
+
+  p=info->data.indirecttext.validstring;
+  if((int)p>0x8000) return(TRUE);
+  }
+return(FALSE);
+}
+
+void dbox_button_icon_validate(wimp_w w,wimp_i i)
+{
+wimp_icon info;
+
+wimp_get_icon_info(w,i,&info);
+if(!dbox_icon_is_button(&info)) return;
+wimp_set_icon_state(w,i,wimp_ITEXT|wimp_ISPRITE,
+                     wimp_ITEXT|wimp_ISPRITE|wimp_IBORDER|wimp_IFILLED|
+                     wimp_IFONT);
+}
+
+void dbox_button_icons_validate(wimp_w w)
+{
+/*
+   Validates all the button icons in a window
+*/
+wimp_i           ilist[MAXBUTTONS];
+int              i;
+wimp_which_block block;
+
+block.window=w;
+block.bit_set=block.bit_mask=wimp_IREDRAW|wimp_INDIRECT;
+block.bit_mask|=wimp_IDELETED;
+wimp_which_icon(&block,ilist);
+i=0;
+while(ilist[i]>=0)
+  {
+  dbox_button_icon_validate(w,ilist[i]);
+  i++;
+  }
+}
+
+static void dbox__store_caret(void)
+{
+wimp_get_caret_pos(&oldcaret);
+}
+
+static void dbox__restore_caret(void)
+{
+if(oldcaret.w>=0) wimp_set_caret_pos(&oldcaret);
+oldcaret.w=-1;
+}
+
+static void dbox__check_esg(wimp_w w,int i)
+{
+wimp_icon info;
+int       esg;
+
+wimp_get_icon_info(w,i,&info);
+esg=(info.flags>>16)&31;
+if(esg>1 && esg<=dbox__MAX_EXCLUSIVE_ESG)
+  {
+  wimp_which_block wb;
+  int              icons[200];
+  int              *p;
+
+  wb.window=w;
+  wb.bit_mask=(31<<16)|wimp_ISELECTED;
+  wb.bit_set=(esg<<16)|wimp_ISELECTED;
+  wimp_which_icon(&wb,icons);
+  if(icons[0]<0)
+  {
+    wimp_set_icon_state(w,i,wimp_ISELECTED,wimp_ISELECTED);
+  }
+  else
+    if(icons[1]>=0)
+      {
+      p=icons;
+      while(*p>=0)
+        {
+        if(*p!=i)
+          {
+          wimp_get_icon_info(w,*p,&info);
+          if(info.flags&wimp_ISELECTED)
+            {
+            wimp_set_icon_state(w,*p,0,wimp_ISELECTED);
+            }
+          }
+        p++;
+        }
+      wimp_get_icon_info(w,i,&info);
+      if(!(info.flags&wimp_ISELECTED))
+        {
+        wimp_set_icon_state(w,i,wimp_ISELECTED,wimp_ISELECTED);
+        }
+      }
+  }
+}
+
+static void dbox__check_esgs(dbox d)
+{
+int       i,e;
+int       esg[dbox__MAX_EXCLUSIVE_ESG+1];
+wimp_icon info;
+
+for(i=2;i<=dbox__MAX_EXCLUSIVE_ESG;i++) esg[i]=0;
+for(i=0;i<d->window.nicons;i++)
+  {
+  wimp_get_icon_info(d->w,i,&info);
+  e=(info.flags>>16)&31;
+  if(e>1 && e<=dbox__MAX_EXCLUSIVE_ESG && !esg[e]) dbox__check_esg(d->w,i);
+  }
+}
+
+static dbox dbox__fromtemplate(template *from)
+{
+  dbox to;
+  int j;
+  int size = sizeof(dbox__str) + from->window.nicons * sizeof(wimp_icon);
+
+  to = malloc(size);
+  if (to == 0) return 0;
+
+  /* --- copy relevant stuff from template --- */
+  strncpy (to->name, from->name, 12);
+  to->workspacesize = from->workspacesize;
+  (void) memcpy(&to->window, &from->window, sizeof(wimp_wind) + from->window.nicons * sizeof(wimp_icon));
+
+  /* --- allocate and copy workspace --- */
+  if (to->workspacesize != 0)
+  {
+    to->workspace = malloc(to->workspacesize);
+    if (to->workspace == 0)
+    {
+      free(to);
+      return 0;
+    }
+    (void) memcpy(to->workspace, from->workspace, to->workspacesize);
+
+    /* -- fix up indirect icon pointers -- */
+    for (j=0; j<to->window.nicons; j++)
+    {
+      wimp_icon *i = ((wimp_icon *)(&to->window + 1)) + j;
+      if ((i->flags & wimp_INDIRECT) != 0)
+      {
+        i->data.indirecttext.buffer += to->workspace - from->workspace;
+        if ((i->flags & wimp_ITEXT) != 0 &&
+            (int) (i->data.indirecttext.validstring) > 0)
+          i->data.indirecttext.validstring += to->workspace - from->workspace;
+      }
+    }
+
+    /* -- fix up indirect title pointer -- */
+    if ((to->window.titleflags & wimp_INDIRECT) != 0)
+      to->window.title.indirecttext.buffer += to->workspace - from->workspace;
+
+  }
+  if(!(to->window.flags&(wimp_WVSCR|wimp_WHSCR|wimp_WTOGGLE)))
+    { /* if window cannot normally be resized or scrolled */
+    to->window.ex.x0=to->window.scx;
+    to->window.ex.y1=-to->window.scy;
+    to->window.ex.x1=to->window.ex.x0+to->window.box.x1-to->window.box.x0;
+    to->window.ex.y0=to->window.ex.y1-(to->window.box.y1-to->window.box.y0);
+    to->window.scx=to->window.scy=0;
+    }
+  j=(bbc_modevar(-1,12)+1)*(1<<bbc_modevar(-1,5)); /* screen height */
+  if(j<=to->window.box.y1-to->window.box.y0+44) to->window.flags|=wimp_WVSCR;
+  j=(bbc_modevar(-1,11)+1)*(1<<bbc_modevar(-1,4)); /* screen width */
+  if(j<=to->window.box.x1-to->window.box.x0) to->window.flags|=wimp_WHSCR;
+  return(to);
+
+}
+
+
+static void dbox__dispose(dbox d)
+{
+  if (d->workspacesize != 0) free(d->workspace);
+  free(d);
+}
+
+static void dbox__dodispose(dbox d)
+{
+  dbox__restore_caret();
+  win_register_event_handler(d->w, 0, 0);
+  event_attachmenu(d->w, 0, 0, 0);
+  if (d->showing) win_activedec();
+  wimpt_noerr(wimp_delete_wind(d->w));
+  dbox__dispose(d);
+}
+
+
+/* -------- Finding Icons. -------- */
+
+/* useful icon flag masks, for searching for specific icon types */
+#define BUTTON_IFLAGS (15 * wimp_IBTYPE)
+#define WRITABLE_IFLAGS (wimp_BWRITABLE * wimp_IBTYPE)
+#define WRITEDRAG_IFLAGS (14*wimp_IBTYPE)
+#define CLICK_IFLAGS (wimp_BCLICKDEBOUNCE * wimp_IBTYPE)
+#define AUTO_IFLAGS (wimp_BCLICKAUTO * wimp_IBTYPE)
+#define RELEASE_IFLAGS (wimp_BSELREL * wimp_IBTYPE)
+#define ONOFF_IFLAGS (wimp_BSELDOUBLE * wimp_IBTYPE)
+#define ONOFF2_IFLAGS (wimp_BCLICKSEL * wimp_IBTYPE)
+#define MENU_IFLAGS (wimp_BSELNOTIFY * wimp_IBTYPE)
+
+
+
+static int dbox__findselectableicon(dbox d, wimp_iconflags mask, wimp_iconflags settings, wimp_i *j)
+/* Rather like SWI WhichIcon, but only finds the first. Returns 0 if not
+found. */
+{
+  for (; (*j)<d->window.nicons; (*j)++)
+  {
+    wimp_icon *i = ((wimp_icon*) (&d->window + 1)) + *j;
+    wimp_icon ii;
+    wimp_get_icon_info(d->w, *j, &ii);
+    if ((i->flags & mask) == settings && !(ii.flags & wimp_INOSELECT))
+    {
+      return(1);
+    }
+    if(mask==settings && mask==WRITABLE_IFLAGS &&
+       (i->flags & WRITEDRAG_IFLAGS)==WRITEDRAG_IFLAGS &&
+       !(ii.flags & wimp_INOSELECT))
+      return(1);
+  }
+  return(0);
+}
+
+
+
+static int dbox__findselectableiconbefore(dbox d,
+  wimp_iconflags mask, wimp_iconflags settings, wimp_i *j)
+/* Does not look at the current icon. */
+{
+  while ((*j) != 0)
+  {
+    wimp_icon *i = ((wimp_icon*) (&d->window + 1)) + (--(*j));
+    wimp_icon ii;
+    wimp_get_icon_info(d->w, *j, &ii);
+    if ((i->flags & mask) == settings && !(ii.flags & wimp_INOSELECT)) {
+      return(1);
+    if(mask==settings && mask==WRITABLE_IFLAGS &&
+       (i->flags & WRITEDRAG_IFLAGS)==WRITEDRAG_IFLAGS &&
+       !(ii.flags & wimp_INOSELECT))
+      return(1);
+    }
+    if(mask==settings && mask==WRITABLE_IFLAGS &&
+       (i->flags & WRITEDRAG_IFLAGS)==WRITEDRAG_IFLAGS &&
+       !(ii.flags & wimp_INOSELECT))
+      return(1);
+  }
+  return(0);
+}
+
+/* -------- Icons and Fields. -------- */
+
+static wimp_i dbox__fieldtoicon(dbox_field f)
+{
+  return(f);
+}
+
+static wimp_icon *dbox__iconhandletoptr(dbox d, wimp_i i)
+{
+  return(((wimp_icon*) (&d->window + 1)) + i);
+}
+
+static wimp_icon *dbox__fieldtoiconptr(dbox d, dbox_field f)
+{
+  return(dbox__iconhandletoptr(d, dbox__fieldtoicon(f)));
+}
+
+static wimp_iconflags dbox__ibutflags(wimp_icon *i)
+{
+  return(i->flags & BUTTON_IFLAGS);
+}
+
+static dbox_fieldtype dbox__iconfieldtype(wimp_icon *i)
+{
+  switch (dbox__ibutflags(i))
+  {
+     case AUTO_IFLAGS:
+     case RELEASE_IFLAGS:
+     case CLICK_IFLAGS:
+     case MENU_IFLAGS:
+       return(dbox_FACTION);
+     case ONOFF_IFLAGS:
+     case ONOFF2_IFLAGS:
+       return(dbox_FONOFF);
+     case WRITEDRAG_IFLAGS:
+     case WRITABLE_IFLAGS:
+       return(dbox_FINPUT);
+     default:
+       return(dbox_FOUTPUT);
+  }
+}
+
+static int dbox__min(int a, int b) {if (a<b) return(a); else return(b);}
+
+
+/*------------------------------------------------------------------------*/
+void dbox_fadefield (dbox d, dbox_field f)
+{
+  wimp_icon info;
+  int       i;
+
+  i=dbox__fieldtoicon(f);
+  wimp_get_icon_info(d->w,i,&info);
+  if(!(info.flags&wimp_INOSELECT))
+  {
+    wimpt_noerr(wimp_set_icon_state (d->w, i, wimp_INOSELECT, wimp_INOSELECT));
+  }
+}
+
+/*------------------------------------------------------------------------*/
+void  dbox_unfadefield (dbox d, dbox_field f)
+{
+  wimp_icon info;
+  int       i;
+
+  i=dbox__fieldtoicon(f);
+  wimp_get_icon_info(d->w,i,&info);
+  if(info.flags&wimp_INOSELECT)
+  {
+    wimpt_noerr(wimp_set_icon_state(d->w, i, 0, wimp_INOSELECT));
+  }
+}
+
+/*------------------------------------------------------------------------*/
+void  dbox_setfadestate(dbox d,dbox_field f,BOOL faded)
+{
+  if (faded) dbox_fadefield(d,f);
+  else dbox_unfadefield(d,f);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_setfield(dbox d, dbox_field f, char *value)
+{
+  wimp_icon *i = dbox__fieldtoiconptr(d, f);
+  if ((i->flags & wimp_ITEXT) == 0)
+  {
+    /* Allowed, has no effect */
+  }
+  else
+  {
+    wimp_caretstr caret ;
+    if ((i->flags & wimp_INDIRECT) != 0)
+    {
+      (void) memcpy(i->data.indirecttext.buffer, value,
+        dbox__min(i->data.indirecttext.bufflen - 1,
+                  strlen(value) + 1));
+      i->data.indirecttext.buffer[i->data.indirecttext.bufflen-1] = 0;
+    }
+    else
+    {
+      (void) memcpy(&i->data.text[0], value, 12);
+      i->data.text[11] = 0;
+    }
+
+    /* ensure that the caret moves correctly if it's in this icon */
+
+    wimpt_noerr(wimp_get_caret_pos(&caret)) ;
+
+    if (caret.w == d->w && caret.i == dbox__fieldtoicon(f))
+    {
+     int l = strlen((i->flags & wimp_INDIRECT) != 0 ?
+                       i->data.indirecttext.buffer : i->data.text) ;
+
+     if (caret.index > l) caret.index = l ;
+     caret.height = caret.x = caret.y -1 ;   /* calc from index */
+     wimpt_noerr(wimp_set_caret_pos(&caret)) ;
+    }
+
+    /* prod it, to cause redraw */
+    wimpt_noerr(wimp_set_icon_state(d->w, dbox__fieldtoicon(f), 0, 0));
+  }
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_getfield(dbox d, dbox_field f, char *buffer, int size)
+{
+  wimp_icon *i = dbox__fieldtoiconptr(d, f);
+  int j = 0;
+  char *from;
+  if ((i->flags & wimp_ITEXT) == 0)
+  {
+    /* Allowed, returns "". */
+  }
+  else
+  {
+    if ((i->flags & wimp_INDIRECT) != 0)
+    {
+      while (i->data.indirecttext.buffer[j] >= 32) {j++;};
+      from = i->data.indirecttext.buffer;
+    }
+    else
+    {
+      while (i->data.text[j] >= 32 && j < 11) {j++;};
+      from = &i->data.text[0];
+    }
+    if (j > size) j = size;
+    (void) memcpy(buffer, from, j);
+  }
+  buffer[j] = 0;
+}
+
+static int dbox__fieldlength(dbox d, dbox_field f)
+{
+  char a[255];
+  dbox_getfield((dbox) d, f, a, 255);
+  return(strlen(a));
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_setnumeric(dbox d, dbox_field f, int n)
+{
+  char a[20];
+  wimp_icon *i = dbox__fieldtoiconptr(d, f);
+  dbox_fieldtype ftype = dbox__iconfieldtype(i);
+
+  switch (ftype)
+  {
+     case dbox_FONOFF:
+     case dbox_FACTION:
+         {
+         int       i,flag;
+         wimp_icon info;
+
+         i=dbox__fieldtoicon(f);
+         wimp_get_icon_info(d->w,i,&info);
+         flag=n?wimp_ISELECTED:0;
+         if((info.flags&wimp_ISELECTED)!=flag)
+         {
+           wimp_set_icon_state(d->w,i,flag,wimp_ISELECTED);
+         }
+         dbox__check_esg(d->w,i);
+         } break;
+     default:
+         sprintf(a, "%i", n);
+         dbox_setfield((dbox) d, f, a);
+  }
+}
+
+/*------------------------------------------------------------------------*/
+int dbox_getnumeric(dbox d, dbox_field f)
+{
+  char a[20];
+  int n;
+  int i;
+  int neg;
+  int fail;
+  wimp_icon *iptr = dbox__fieldtoiconptr(d, f);
+  wimp_icon icon;
+
+  if (dbox__iconfieldtype(iptr) == dbox_FONOFF)
+  {
+    wimpt_noerr(wimp_get_icon_info(d->w, dbox__fieldtoicon(f), &icon));
+    if ((icon.flags & wimp_ISELECTED) != 0)
+    {
+      n = 1;
+    }
+    else
+    {
+      n = 0;
+    }
+  }
+  else
+  {
+    dbox_getfield((dbox) d, f, a, 20);
+    n = 0;
+    i = 0;
+    neg = 0;
+    fail = 0;
+    while (1)
+    {
+      if (fail || a[i] == 0) {break;}
+      if (a[i] == '-')
+      {
+        if (neg || (n!=0)) {fail = 1;} else {neg = 1;}
+      }
+      else if ((a[i] >= '0') && (a[i] <= '9'))
+      {
+        n = n * 10 + a[i] - '0';
+      }
+      else {
+        fail = 1;
+      }
+      i++;
+    }
+    if (neg) n = -n;
+    if (fail) n = 0;
+  }
+  return(n);
+}
+
+/* -------- Arrival of events from DBoxes. -------- */
+
+/*------------------------------------------------------------------------*/
+dbox_field dbox_get(dbox d)
+{
+  d->fieldwaiting = 0;
+  return(d->field);
+}
+
+/*------------------------------------------------------------------------*/
+dbox_field dbox_read(dbox d)
+{
+  return(d->field);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_eventhandler(dbox d, dbox_handler_proc handler, void* handle)
+{
+  d->eventproc = handler;
+  d->eventprochandle = handle;
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_raw_eventhandler(dbox d, dbox_raw_handler_proc handler, void *handle)
+{
+  d->raweventproc = handler;
+  d->raweventprochandle = handle;
+}
+
+/* -------- Processing Wimp Events. -------- */
+
+static void dbox__buttonclick(dbox d, dbox_field f)
+{
+  d->field = f;
+  d->fieldwaiting = 1;
+  if (d->eventproc != 0)
+  {
+    d->eventdepth++;
+    d->eventproc((dbox) d, d->eventprochandle);
+    d->eventdepth--;
+    if (d->disposepending && d->eventdepth == 0)
+    {
+      dbox__dodispose(d);
+    }
+  }
+}
+
+static int dbox__arrow_link(wimp_icon *info)
+{
+char *p;
+
+if(!dbox_icon_is_button(info)) return(-1);
+p=info->data.indirecttext.validstring;
+while(*p && *p!='\r' && *p!=';') p++;
+if(*p!=';' || *++p!='^') return(-1);
+return(atoi(++p));
+}
+
+static BOOL dbox3d__process_arrow(wimp_w w,int i,int bbits)
+{
+wimp_icon     info;
+char          *p;
+int           icon,step,bottom,top,value;
+wimp_caretstr c;
+char          newvalue[40];
+
+if(i<0 || (bbits!=wimp_BLEFT && bbits!=wimp_BRIGHT)) return(FALSE);
+wimp_get_icon_info(w,i,&info);
+if(dbox__arrow_link(&info)<0) return(FALSE);
+p=info.data.indirecttext.validstring;
+while(*p && *p!='\r' && *p!=';') p++;
+if(!p || *++p!='^') return(FALSE);
+icon=atoi(++p); while(*p && *p!=':') p++; if(*p) p++;
+step=atoi(p); while(*p && *p!=':') p++; if(*p) p++;
+bottom=atoi(p); while(*p && *p!=':') p++; if(*p) p++;
+top=atoi(p);
+if(icon<1 || !step) return(FALSE);
+if(top<bottom) {int t; t=top; top=bottom; bottom=t;}
+if(bbits==wimp_BRIGHT) step=-step;
+wimp_get_icon_info(w,icon,&info);
+if((info.flags&(wimp_INDIRECT|wimp_ITEXT))!=(wimp_INDIRECT|wimp_ITEXT))
+  return(FALSE);
+value=atoi(info.data.indirecttext.buffer)+step;
+if(value<bottom) value=bottom;
+if(value>top) value=top;
+sprintf(newvalue,"%d",value);
+if(strcmp(newvalue,info.data.indirecttext.buffer))
+  {
+  sprintf(info.data.indirecttext.buffer,"%d",value);
+  wimp_get_caret_pos(&c);
+  if(c.i==icon && c.w==w)
+    {
+    c.index=strlen(info.data.indirecttext.buffer);
+    wimp_set_caret_pos(&c);
+    }
+  wimp_set_icon_state(w,icon,0,0);
+  }
+return(TRUE);
+}
+
+static BOOL dbox__hitbutton(dbox d, int button)
+/* A button is an action button or an on/off switch. "button" counts only
+such interesting buttons, button==0 -> the first one in the DBox. Find the
+right icon. If an action, do it. If on/off, flip it. If button is too big, do
+nothing. */
+{
+  wimp_icon *i;
+  int j = 0; /* counts icons */
+  dbox_fieldtype f;
+  wimp_icon icon;
+  BOOL icon_found = FALSE;
+
+  for (j=0; j<d->window.nicons; j++)
+  {
+    i = dbox__iconhandletoptr(d, j);
+    f = dbox__iconfieldtype(i);
+    if (f == dbox_FACTION || f == dbox_FONOFF)
+    {
+      if (button == 0)
+      {
+        /* this is the right one */
+        if (f == dbox_FACTION)
+        {
+          dbox__buttonclick(d, j);
+        }
+        else
+        {
+          /* on/off button */
+          (void) wimp_get_icon_info(d->w, j, &icon);
+          wimpt_noerr(wimp_set_icon_state(d->w, j, wimp_ISELECTED, 0));
+          dbox__check_esg(d->w,j);
+        }
+        icon_found = TRUE;
+        break;
+      }
+      else
+      {
+        /* right sort, but not this one. keep going. */
+        button--;
+      }
+    }
+    else
+    {
+      /* not the right sort of icon: keep going. */
+    }
+  }
+
+  return icon_found;
+}
+
+static int dbox__linkedicon(wimp_icon *i)
+{
+if((i->flags&(wimp_ITEXT|wimp_INDIRECT))!=(wimp_ITEXT|wimp_INDIRECT) ||
+   (int)i->data.indirecttext.validstring<0x8000 ||
+   *(i->data.indirecttext.validstring)!='=')
+  return(-1);
+return(atoi(i->data.indirecttext.validstring+1));
+}
+
+static void dbox__linkicon(dbox d,wimp_eventstr *e)
+{
+  if(e->e!=wimp_EBUT || e->data.but.m.i<0) return;
+  if(dbox__iconfieldtype(dbox__iconhandletoptr(d,e->data.but.m.i))==
+            dbox_FOUTPUT)
+  {
+    wimp_icon icon;
+
+    if(!wimp_get_icon_info(e->data.but.m.w,e->data.but.m.i,&icon))
+    {
+      int ic;
+
+      ic=dbox__linkedicon(&icon);
+      if(ic<d->window.nicons && ic>=0)
+      {
+        wimp_icon      *i,info;
+        dbox_fieldtype f;
+        int            j,b=0;
+
+        wimp_get_icon_info(d->w,ic,&info);
+        if(!(info.flags&wimp_INOSELECT))
+        {
+          for(j=0;j<ic;j++)
+          {
+            i=dbox__iconhandletoptr(d,j);
+            f=dbox__iconfieldtype(i);
+            if(f==dbox_FACTION || f==dbox_FONOFF) b++;
+          }
+          dbox__hitbutton(d,b);
+        }
+      }
+    }
+  }
+}
+
+
+static int dbox__menu_icon_number(wimp_icon *i)
+{
+char *p;
+
+if(!dbox_icon_is_button(i)) return(-1);
+p=i->data.indirecttext.validstring;
+while(*p && *p!='\r' && *p!=';') p++;
+if(!p || *++p!='m') return(-1);
+if (i->flags&wimp_INOSELECT) return(-1);  /* prevents menu activation when button is grayed */
+return(atoi(++p));
+}
+
+static int dbox__sub_menu_event_icon(dbox d,wimp_eventstr *e)
+{
+wimp_icon info;
+int       i,t;
+
+if(e->e!=wimp_EBUT || e->data.but.m.i<0) return(-1);
+i=e->data.but.m.i;
+if(wimp_get_icon_info(d->w,i,&info)) return(-1);
+t=dbox__menu_icon_number(&info);
+if(t>=0) return(i);
+if(e->data.but.m.bbits&wimp_BMID)
+  {
+  t=dbox__linkedicon(&info);
+  if(t>=0)
+   {
+   i=t;
+   if(wimp_get_icon_info(d->w,i,&info)) return(-1);
+   }
+  t=dbox__arrow_link(&info);
+  if(t>=0) i=t;
+  for(t=0;t<d->window.nicons;t++)
+    if(!wimp_get_icon_info(d->w,t,&info))
+      if(dbox__menu_icon_number(&info)==i) return(t);
+  }
+return(-1);
+}
+
+static int dbox__menu_event_icon(dbox d,wimp_eventstr *e)
+{
+wimp_icon info;
+int       icon;
+
+icon=dbox__sub_menu_event_icon(d,e);
+if(icon<0 && e->e==wimp_EBUT && (e->data.but.m.bbits&wimp_BMID))
+  {
+  int t,i;
+
+  t=-1;
+  i=0;
+  while(i<d->window.nicons && icon<0)
+    {
+    if(!wimp_get_icon_info(d->w,i,&info))
+      if(dbox__menu_icon_number(&info)>=0) icon=i;
+    i++;
+    }
+  if(icon>=0) e->data.but.m.i=icon;
+  }
+return(icon);
+}
+
+static void dbox__wimp_event_handler(wimp_eventstr *e, void *handle)
+{
+  dbox d = (dbox) handle;
+  wimp_caretstr c;
+  wimp_icon *i;
+  wimp_i j;
+  char target;
+  int  mi;
+
+  dbox__linkicon(d,e);
+  if (d->raweventproc != 0)
+  {
+    BOOL done;
+    d->eventdepth++;
+    done = (d->raweventproc)(d, (void*) e, d->raweventprochandle);
+    d->eventdepth--;
+    if (d->disposepending && d->eventdepth == 0)
+    {
+      dbox__dodispose(d);
+      return;
+    }
+    else if (done)
+    {
+      /* this event has been processed. */
+      return;
+    }
+  }
+
+  switch (e->e)
+  {
+     case  wimp_ECLOSE:
+         dbox__buttonclick(d, dbox_CLOSE); /* special button code */
+         break;
+     case wimp_EOPEN:
+         wimpt_noerr(wimp_open_wind(&e->data.o));
+         break;
+     case wimp_EBUT:
+         if(e->data.but.m.x==-2000000000)
+           {
+           wimp_get_point_info(&e->data.but.m);
+           dbox__buttonclick(d,(int)dbox__hit);
+           break;
+           }
+         mi=dbox__menu_event_icon(d,e);
+         if(mi>=0)
+         {
+           dbox__lastmenuicon=mi; /* remember this icon number as we may need it to
+                                     re-create the menu on an Adjust-Click */
+           if(e->data.but.m.bbits>wimp_BLEFT) break;
+           e->data.but.m.i=mi;
+           e->data.but.m.bbits=wimp_BLEFT;
+         }
+         if ((wimp_BMID & e->data.but.m.bbits) != 0)
+         {
+           /* ignore it. */
+           /* It will already have been intercepted (by Events) if there's
+           a menu, otherwise we're not interested anyway. */
+         }
+         else if (dbox3d__process_arrow(e->data.but.m.w,e->data.but.m.i,
+                                        e->data.but.m.bbits));
+         else if ((e->data.but.m.bbits==wimp_BLEFT ||
+                   e->data.but.m.bbits==wimp_BRIGHT ||
+                   e->data.but.m.bbits==wimp_BDRAGLEFT ||
+                   e->data.but.m.bbits==wimp_BDRAGRIGHT) &&
+                  slider_is_slider(e->data.but.m.w,e->data.but.m.i))
+                 wimpt_complain(slider_slide(0,(int)(&e->data.but.m)));
+         else if (e->data.but.m.bbits==wimp_BDRAGLEFT ||
+                  e->data.but.m.bbits==wimp_BDRAGRIGHT)
+         {
+           wimp_dragstr drag;
+
+           slider_slide(3,0);
+           drag.window=e->data.but.m.w;
+           drag.type=wimp_MOVE_WIND;
+           wimp_drag_box(&drag);
+         }
+         else if (e->data.but.m.i != (wimp_i) -1)
+         {
+           /* ignore clicks not on icons. */
+           i = dbox__iconhandletoptr(d, e->data.but.m.i);
+           dbox__check_esg(d->w,e->data.but.m.i);
+           if (dbox__iconfieldtype(i) == dbox_FACTION || mi>=0)
+           {
+             /* avoid spurious double-click from on/off button! */
+             dbox__buttonclick(d, e->data.but.m.i);
+           }
+         }
+         break;
+     case wimp_EREDRAW:
+         {
+         BOOL           more;
+         wimp_redrawstr r;
+         coords_cvtstr  c;
+
+         r.w=d->w;
+         wimp_redraw_wind(&r,&more);
+         graphics_checkmode(FALSE);
+         c.scy=r.scy;
+         c.scx=r.scx;
+         c.box=r.box;
+         while(more)
+           {
+           slider_draw_icons(r.w,&r.g,&c);
+           wimp_get_rectangle(&r,&more);
+           }
+         }
+         break;
+     case wimp_EKEY:
+         wimpt_noerr(wimp_get_caret_pos(&c));
+         switch (e->data.key.chcode)
+         {
+            case akbd_Fn+1:
+            case akbd_Fn+2:
+            case akbd_Fn+3:
+            case akbd_Fn+4:
+            case akbd_Fn+5:
+            case akbd_Fn+6:
+            case akbd_Fn+7:
+            case akbd_Fn+8:
+            case akbd_Fn+9:
+                /* if fnkey matches icon number, do action, else pass it on
+                 * as a hotkey stroke
+                 */
+                if (!dbox__hitbutton(d, e->data.key.chcode - (akbd_Fn+1)))
+                  wimp_processkey(e->data.key.chcode);
+                break;
+
+            case 13: /* return key */
+                c.i++;
+                if (c.i >= d->window.nicons ||
+                    c.i < 0 ||
+                    0==dbox__findselectableicon(d, WRITABLE_IFLAGS, WRITABLE_IFLAGS, &c.i)
+                     /* find a writable button */
+                   )
+                {
+                  dbox__buttonclick(d, 0); /* should be first action button! */
+                }
+                else
+                {
+                  c.height = -1;
+                  c.index = dbox__fieldlength(d, c.i);
+                  wimpt_noerr(wimp_set_caret_pos(&c));
+                }
+                break;
+            case 27: /* ESC key */
+                dbox__buttonclick(d, dbox_CLOSE);
+                break;
+            case  398: /* DOWN key */
+                if (c.i == (wimp_i) -1)
+                {
+                  /* do nothing */
+                }
+                else
+                {
+                  c.i++;
+                  if (c.i >= d->window.nicons ||
+                      ! dbox__findselectableicon(d, WRITABLE_IFLAGS, WRITABLE_IFLAGS, &c.i))
+                  {
+                    c.i = 0;
+                    if (dbox__findselectableicon(d, WRITABLE_IFLAGS, WRITABLE_IFLAGS, &c.i))
+                    {
+                      /* bound to find at least the one you started on. */
+                    }
+                  }
+                  c.height = -1;
+                  c.index = dbox__fieldlength(d, c.i);
+                  wimpt_noerr(wimp_set_caret_pos(&c));
+                }
+                break;
+            case  399: /* UP key */
+                if (c.i == (wimp_i) -1)
+                {
+                  /* do nothing */
+                }
+                else
+                {
+                  if (!dbox__findselectableiconbefore(d,
+                        WRITABLE_IFLAGS, WRITABLE_IFLAGS, &c.i))
+                  {
+                    c.i = d->window.nicons;
+                    if (dbox__findselectableiconbefore(d,
+                          WRITABLE_IFLAGS, WRITABLE_IFLAGS, &c.i))
+                    {
+                      /* bound to find at least the one you started on. */
+                    }
+                  }
+                  c.height = -1;
+                  c.index = dbox__fieldlength(d, c.i);
+                  wimpt_noerr(wimp_set_caret_pos(&c));
+                }
+                break;
+            default:
+                /* If not to a field and this is a letter, try matching it
+                with the first chars of action buttons in this DBox. */
+                if (e->data.key.chcode >= 'a' &&
+                    e->data.key.chcode <= 'z')
+                {
+                  e->data.key.chcode -= 'a'-'A';
+                }
+                if (e->data.key.chcode >= 'A' && e->data.key.chcode <= 'Z')
+                {
+                  for (j=0; j<d->window.nicons; j++)
+                  {
+                    i = dbox__iconhandletoptr(d, j);
+                    if ((i->flags & wimp_ITEXT) != 0
+                    && dbox__iconfieldtype(i) == dbox_FACTION)
+                    {
+                      char *targetptr;
+                      BOOL found = FALSE;
+
+                      if ((i->flags & wimp_INDIRECT) != 0)
+                      {
+                        targetptr = &i->data.indirecttext.buffer[0];
+                      }
+                      else
+                      {
+                        targetptr = &i->data.text[0];
+                      }
+
+                      while (1)
+                      {
+                        target = *targetptr++;
+                        if (target < ' ') break;
+                        if (target == e->data.key.chcode)
+                        {
+                          dbox__buttonclick(d, j);
+                          found = TRUE;
+                          break;
+                        }
+                        if (target >= 'A' && target <= 'Z') break;
+                      }
+                      if (found) break;
+                    }
+                  }
+                }
+                else
+                {
+                  wimp_processkey(e->data.key.chcode);
+                }
+            }
+            break;
+     default:
+         /* do nothing */
+         break;
+  }
+}
+
+/* -------- New and Dispose. -------- */
+
+/*------------------------------------------------------------------------*/
+dbox dbox_new(char *name)
+{
+  dbox d = dbox__fromtemplate(template_find(name));
+  wimp_i j;
+  if (d == 0)
+  {
+    werr(FALSE, msgs_lookup("dbox1:Not enough memory to create dialogue box -- increase wimpslot"));
+    return 0;
+  }
+  d->next = 0;
+  d->posatcaret = (wimp_WTRESPASS & d->window.flags) != 0;
+  d->window.flags &= ~wimp_WTRESPASS;
+  { os_error *er;
+    er = wimp_create_wind(&d->window, &d->w);
+    if (er != 0)
+    {
+      werr(FALSE, &er->errmess[0]);
+      dbox__dispose(d);
+      return 0;
+    }
+  }
+  dbox_button_icons_validate(d->w);
+  slider_validate_icons(d->w);
+  dbox__check_esgs(d);
+  d->eventproc = 0;
+  d->raweventproc = 0;
+  d->disposepending = 0;
+  d->eventdepth = 0;
+  d->fieldwaiting = 0;
+  d->field = 0;
+  d->showing = 0;
+  win_register_event_handler(d->w, dbox__wimp_event_handler, d);
+  j = 0;
+  if (dbox__findselectableicon(d, WRITABLE_IFLAGS, WRITABLE_IFLAGS, &j))
+  {
+    /* there is a writable icon to be found. */
+    /* Default setting, used in FillIn */
+    d->caretstr.w = d->w;
+    d->caretstr.i = j;
+    d->caretstr.x = 0;
+    d->caretstr.y = 0;
+    d->caretstr.height = -1;
+    d->caretstr.index = INT_MAX;
+  }
+  return d;
+}
+
+static wimp_w dbox__submenu = 0;
+
+static void dbox__doshow(dbox d, BOOL isstatic)
+/* This is complicated by the following case: if the show is as a result
+of a submenu message (e.g. that was the last message received) then we
+open the dbox as a submenu rather than as a standalone window. */
+{
+  wimp_mousestr m;
+  wimp_caretstr c;
+  wimp_openstr o;
+  wimp_wstate s;
+  wimp_eventstr *e;
+
+  if (d->showing) return;
+  d->showing = TRUE;
+  win_activeinc();
+
+  dbox__store_caret();
+  e = wimpt_last_event();
+  if (e->e == wimp_ESEND && e->data.msg.hdr.action == wimp_MMENUWARN)
+  {
+    /* this is a dbox that is actually part of the menu tree. */
+    dbox__submenu = d->w; /* there's only ever one. */
+    wimp_create_submenu(
+      (wimp_menustr*) d->w,
+      e->data.msg.data.words[1],
+      e->data.msg.data.words[2]);
+  }
+  else
+  {
+    o.w = d->w;
+    o.box = d->window.box;
+    if (d->posatcaret)
+    {
+      /* move to near the caret. */
+      if (wimpt_last_event_was_a_key())
+      {
+        wimpt_noerr(wimp_get_caret_pos(&c));
+        if (c.w != (wimp_w) -1)
+        {
+          wimpt_noerr(wimp_get_wind_state(c.w, &s));
+          c.x = c.x + (s.o.box.x0 - s.o.x);
+          c.y = c.y + (s.o.box.y1 - s.o.y);
+        }
+        m.x = c.x + 100; /* a little to the right */
+        m.y = c.y - 120; /* a little down */
+      }
+      else
+      {
+        wimpt_noerr(wimp_get_point_info(&m));
+        m.x -= 48; /* try to be a bit into it. */
+        m.y += 48;
+      }
+      o.box.y0 = m.y - (o.box.y1 - o.box.y0);
+      o.box.x1 = m.x + (o.box.x1 - o.box.x0);
+      o.box.y1 = m.y;
+      o.box.x0 = m.x;
+    }
+    o.x = d->window.scx;
+    o.y = d->window.scy;
+    o.behind = (wimp_w) -1;
+
+    if (isstatic)
+    {
+      wimpt_noerr(wimp_open_wind(&o));
+    }
+    else
+    {
+      dbox__submenu = d->w; /* there's only ever one. */
+      wimp_create_menu((wimp_menustr*) d->w, o.box.x0, o.box.y1);
+    }
+
+  }
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_show(dbox d)
+{
+  dbox__doshow(d, FALSE);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_showstatic(dbox d)
+{
+  dbox__doshow(d, TRUE);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_hide(dbox d)
+{
+  if (! d->showing)
+  {
+  }
+  else
+  {
+    dbox__restore_caret();
+    d->showing = FALSE;
+    win_activedec();
+    if (d->w == dbox__submenu)
+    {
+      wimp_wstate ws;
+      wimpt_noerr(wimp_get_wind_state(d->w, &ws));
+      dbox__submenu = 0;
+      if ((ws.flags & wimp_WOPEN) == 0)
+      {
+        /* The dbox has been closed: presumably by the wimp. */
+        /* Thus, there is nothing more to do. */
+      }
+      else
+      {
+        /* The dbox was closed without the menu tree knowing about it. */
+        event_clear_current_menu();
+        /* That will cause the menu system to close the dbox. */
+      }
+    }
+    else
+    {
+      wimpt_noerr(wimp_close_wind(d->w));
+    }
+  }
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_dispose(dbox *dd)
+{
+  dbox d = *dd;
+  if (d->eventdepth != 0)
+  {
+    d->disposepending = 1;
+  }
+  else
+  {
+    if (d->showing) dbox_hide(d);
+    dbox__dodispose(d);
+  }
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_scroll(dbox d,int x,int y,BOOL absolute)
+{
+  wimp_wstate state;
+
+  wimp_get_wind_state(d->w,&state);
+  if (absolute)
+  {
+    state.o.x=x;
+    state.o.y=y;
+  }
+  else
+  {
+    state.o.x+=x;
+    state.o.y+=y;
+  }
+  wimp_sendmessage(wimp_EOPEN,(wimp_msgstr*)&state.o,(wimp_t)d->w);
+}
+
+/* -------- Static Dboxes ------------ */
+
+static dbox dbox__static=NULL;
+
+/*------------------------------------------------------------------------*/
+dbox dbox_static(void)
+{
+  return(dbox__static);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_hide_static(void)
+{
+  dbox_hide(dbox__static);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_dispose_static(void)
+{
+  if (dbox__static) dbox_dispose(&dbox__static);
+  dbox__static=NULL;
+}
+
+/*------------------------------------------------------------------------*/
+dbox dbox_new_static(char *name)
+{
+  wimp_wstate state;
+
+  state.o.w=NULL;
+  if (dbox__static)
+  {
+    wimp_get_wind_state(dbox__static->w,&state);
+  }
+  dbox_dispose_static();
+  dbox__static=dbox_new(name);
+  if (dbox__static && state.o.w)
+  {
+    int width,height,center;
+
+    width=dbox__static->window.box.x1-dbox__static->window.box.x0;
+    height=dbox__static->window.box.y1-dbox__static->window.box.y0;
+    center=(state.o.box.x0+state.o.box.x1+1)/2;
+    dbox__static->window.box.y1=state.o.box.y1;
+    dbox__static->window.box.y0=state.o.box.y1-height;
+    dbox__static->window.box.x0=center-((width+1)/2);
+    dbox__static->window.box.x1=dbox__static->window.box.x0+width;
+    dbox__static->posatcaret=0;
+  }
+  return(dbox__static);
+}
+
+/* This routine opens a static dbox as dbox_new_static(), but ensures that it is in the center
+   of the screen */
+
+/*------------------------------------------------------------------------*/
+dbox dbox_new_c_static(char *name)
+{
+  dbox_dispose_static();
+  dbox__static=dbox_new(name);
+  if (dbox__static)
+  {
+    wimp_wstate state;
+    int         xlimit,ylimit,width,height;
+
+    wimp_get_wind_state(dbox__static->w,&state);
+    xlimit=bbc_modevar(-1,11)*Wimpt_dx;
+    ylimit=bbc_modevar(-1,12)*Wimpt_dy;
+    width=dbox__static->window.box.x1-dbox__static->window.box.x0;
+    height=dbox__static->window.box.y1-dbox__static->window.box.y0;
+    dbox__static->window.box.x0=(xlimit+1)/2-(width+1)/2;
+    dbox__static->window.box.x1=dbox__static->window.box.x0+width;
+    dbox__static->window.box.y0=(ylimit+1)/2-(height+1)/2;
+    dbox__static->window.box.y1=dbox__static->window.box.y0+height;
+    dbox__static->posatcaret=0;
+  }
+  return(dbox__static);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_display_static(void)
+{
+  if (dbox__static) dbox_showstatic(dbox__static);
+}
+
+/* -------- Event processing. -------- */
+
+/* We cheerfully allow the caret to go elsewhere, but we intercept any
+keystroke events and divert them to the dbox. This allows e.g. find commands
+to see where in the text they've got to so far. dboxes with no fill-in fields
+do not even try to get the caret. */
+
+dbox_field dbox_fillin_loop(dbox d)
+{
+  wimp_eventstr e;
+  int harmless;
+  dbox_field result;
+  wimp_wstate ws;
+
+  while (1)
+  {
+    if(!global_fixed_ptr()) visdelay_end();
+    wimpt_complain(wimp_poll(event_getmask() & ~wimp_EMNULL, &e));
+    if(!global_fixed_ptr()) visdelay_begin();
+    if (d->w == dbox__submenu)
+    {
+      wimpt_noerr(wimp_get_wind_state(d->w, &ws));
+      if ((ws.flags & wimp_WOPEN) == 0)
+      {
+        wimpt_fake_event(&e); /* stuff it back in the queue */
+        if (e.e == wimp_EREDRAW) event_process();
+        return dbox_CLOSE;
+      }
+    }
+
+    switch (e.e)
+    {
+       case wimp_ENULL:
+       case wimp_EREDRAW:
+       case wimp_EPTRENTER:
+       case wimp_EPTRLEAVE:
+       case wimp_ESCROLL:
+       case wimp_EOPEN:
+       case wimp_ELOSECARET:
+       case wimp_EGAINCARET:
+       case wimp_EUSERDRAG:
+           harmless = TRUE;
+           break;
+       case  wimp_EMENU:
+           memcpy(dbox__hit,e.data.menu,sizeof(dbox__hit));
+           e.e=wimp_EBUT;
+           wimp_get_point_info(&e.data.but.m);
+           if (e.data.but.m.bbits==wimp_BRIGHT)
+           {
+             /* ;{{ Should do something here to make the menu get re-created */
+           }
+           e.data.but.m.i=0;
+           e.data.but.m.w=d->w;
+           e.data.but.m.bbits=wimp_BLEFT;
+           e.data.but.m.x=-2000000000;
+           harmless=TRUE;
+           break;
+       case wimp_ECLOSE:
+           harmless = e.data.o.w == d->w;
+           break;
+       case wimp_EKEY:
+           /* Intercept all key events. */
+           if (e.data.key.c.w != d->w)
+           {
+             e.data.key.c.w = d->w;
+             e.data.key.c.i = (wimp_i) -1;
+           }
+           harmless = 1;
+           break;
+       case wimp_EBUT:
+           harmless = e.data.but.m.w == d->w;
+           break;
+       case wimp_ESEND:
+       case wimp_ESENDWANTACK:
+           harmless = TRUE;
+           if (e.data.msg.hdr.action == wimp_MPREQUIT) harmless = FALSE;
+           if (e.data.msg.hdr.action == wimp_MHELPREQUEST)
+           {
+             wimp_icon icon;
+             int       w,i;
+
+             w=e.data.msg.data.helprequest.m.w;
+             i=e.data.msg.data.helprequest.m.i;
+             if(!wimp_get_icon_info(w,i,&icon)) i=dbox__linkedicon(&icon);
+             if(i>=0)
+             {
+               wimp_get_icon_info(w,i,&icon);
+               if(!(icon.flags&wimp_INOSELECT))
+                 e.data.msg.data.helprequest.m.i=i;
+             }
+           }
+           break;
+       default:
+           harmless = 0;
+    }
+    wimpt_fake_event(&e); /* stuff it back in the queue */
+    if (harmless)
+      event_process();
+    else
+      {result = dbox_CLOSE; break;}
+    /* And keep going round until he presses a button. */
+    if (d -> fieldwaiting) {result = dbox_get((dbox) d); break;}
+  } /* loop */
+  return(result);
+}
+
+/*------------------------------------------------------------------------*/
+dbox_field dbox_fillin(dbox d)
+{
+  wimp_i j;
+
+  j = 0;
+  if (dbox__findselectableicon(d, WRITABLE_IFLAGS, WRITABLE_IFLAGS, &j))
+  {
+    d->caretstr.i = j;
+    d->caretstr.x = 0;
+    d->caretstr.y = 0;
+    d->caretstr.height = -1;
+    d->caretstr.index = dbox__min(d->caretstr.index, dbox__fieldlength(d, j));
+    /* w, i already set up. */
+    d->caretstr.index = dbox__fieldlength(d, j);
+    d->caretstr.w=d->w;
+    wimp_set_caret_pos(&d->caretstr);
+  }
+
+  return dbox_fillin_loop(d);
+}
+
+/*------------------------------------------------------------------------*/
+dbox_field dbox_fillin_fixedcaret(dbox d)
+{
+   wimp_i j;
+   wimp_caretstr caret;
+
+   j = 0;
+   wimpt_noerr(wimp_get_caret_pos(&caret));
+   if (dbox__findselectableicon(d, WRITABLE_IFLAGS, WRITABLE_IFLAGS, &j))
+   {
+      if (caret.w != dbox_syshandle(d))
+      {
+         d->caretstr.i = j;
+         d->caretstr.x = 0;
+         d->caretstr.y = 0;
+         d->caretstr.height = -1;
+         d->caretstr.index = dbox__fieldlength(d, j);
+         wimpt_noerr(wimp_set_caret_pos(&d->caretstr));
+      }
+   }
+   return dbox_fillin_loop(d);
+}
+
+
+
+/*------------------------------------------------------------------------*/
+dbox_field dbox_popup(char *name, char *message)
+{
+  dbox_field result;
+  dbox d = dbox_new(name);
+  dbox_setfield(d, 1, message);
+  dbox_show(d);
+  result = dbox_fillin(d);
+  dbox_dispose(&d);
+  return(result);
+}
+
+/*------------------------------------------------------------------------*/
+BOOL dbox_persist(void)
+{
+  wimp_mousestr m;
+  wimpt_noerr(wimp_get_point_info(&m));
+  return (m.bbits & wimp_BRIGHT) != 0;
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_assert_numeric(dbox d,int f,int state)
+{
+  if (dbox_getnumeric(d,f)!=state) dbox_setnumeric(d,f,state);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_assert_string(dbox d,int f,char *string)
+{
+  char mystring[256];
+
+  dbox_getfield(d,f,mystring,sizeof(mystring));
+  if (strcmp(string,mystring)) dbox_setfield(d,f,string);
+}
+
+/*------------------------------------------------------------------------*/
+int dbox_get_decimal2(dbox d,int f,int divisor,char sep)
+{
+  char mystring[256],dec[3],*buffer;
+  int  t1,t2;
+
+  dbox_getfield(d,f,mystring,sizeof(mystring));
+  buffer=mystring;
+  t1=t2=0;
+  t1=atoi(buffer);
+  buffer=strchr(buffer,sep);
+  if(buffer)
+  {
+    char *t=dec;
+
+    buffer++;
+    if(*buffer) *t++=*buffer++; else *t++='0';
+    if(*buffer) *t++=*buffer++; else *t++='0';
+    *t=0;
+    t2=atoi(dec);
+  }
+  return(t1*divisor+(t2*divisor+50)/100);
+}
+
+/*------------------------------------------------------------------------*/
+void dbox_assert_decimal2(dbox d,int f,int num,int divisor,char sep)
+{
+  char mystring[256];
+  int  whole,current;
+
+  current=dbox_get_decimal2(d,f,divisor,sep);
+  if (current!=num)
+  {
+    whole=num/divisor;
+    num=(100*(num%divisor)+(divisor>>1))/divisor;
+    if (num>99) num=99;
+    sprintf(mystring,"%d%c%02d",whole,sep,num);
+    dbox_setfield(d,f,mystring);
+  }
+}
+
+/* -------- System Hook. -------- */
+
+/*------------------------------------------------------------------------*/
+int dbox_syshandle(dbox d)
+{
+  return(d->w);
+}
+
+/* -------- Initialisation. -------- */
+
+/*------------------------------------------------------------------------*/
+void dbox_init(void)
+{
+
+  if (template_loaded() == FALSE)
+      werr(0, msgs_lookup("dbox2:Templates file is not loaded for use with dialog boxes"));
+}
+/* end */
+
+/*------------------------------------------------------------------------*/
+wimp_wind *dbox_template_pointer(dbox d)
+{
+  return(&(d->window));
+}

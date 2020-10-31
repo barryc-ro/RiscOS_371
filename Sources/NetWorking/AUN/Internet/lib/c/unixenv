@@ -1,0 +1,828 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Internet/lib/unixenv.c:networking  1.8  $
+ * $Source: /ax/networking:Internet/lib/unixenv.c: $
+ *
+ * Copyright(c) 1994 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	unixenv.c,v $
+ * Revision 1.9  96/03/06            kbracey
+ * Made sleep do an UpCall 6 if we're in a TaskWindow
+ * Turn all _kernel_swi into _swix
+ * Add taskwindow_sleep
+ * Add R3 to generate_event (local port number)
+ * Removed unnecessary splx() (interrupt state is restored on return from a
+ * function in SVC mode!)
+ *
+ * Revision 1.8  95/06/13  14:25:54  kwelton
+ * Undid the "optimisation" of tick_handler() which broke all timeout code.
+ *
+ * Revision 1.7  95/06/05  14:57:06  kwelton
+ * Added a debug line to generate_event().
+ *
+ * Revision 1.6  95/03/31  14:02:09  kwelton
+ * Improved string handling within panic().
+ *
+ * Revision 1.5  95/03/31  11:44:58  kwelton
+ * Callbacks are now handled slightly differently in a new scheme which allows
+ * pending callbacks to be cancelled during module finalisation.
+ *
+ * Revision 1.4  95/03/19  18:21:52  kwelton
+ * There is a problem somewhere in sleep() - it is running out of sleeptab
+ * entries.  The mechanism behind this is not understood yet, but the
+ * imminent freeze of the Black ROMs needs some sort of fix, so:
+ *
+ * 1)  Put spl protection around table manipulations - this is a bug fix,
+ *     but it is not certain that it is the cause of the sleep() panics.
+ *
+ * 2)  The size of the sleep table has been increased from 12 (a random
+ *     number?) to 96 (max. no. of sockets open at one time) in a rather
+ *     sad attempt to shove the problem under the carpet.
+ *
+ * Revision 1.3  95/01/24  15:30:12  kwelton
+ * Econet_InetRxDirect is declared in "swis.h", and does not need to be
+ * defined here.
+ *
+ * Revision 1.2  95/01/03  13:35:00  kwelton
+ * Tidied up declaration of panicbuf, fixed header inclusion.
+ *
+ * Revision 1.1  94/12/02  10:48:46  kwelton
+ * Initial revision
+ *
+ */
+#include <kernel.h>
+#include <swis.h>
+
+#include "sys/param.h"
+#include "sys/systm.h"
+#include "sys/queue.h"
+#include "sys/uio.h"
+#include "sys/time.h"
+#include "sys/kernel.h"
+#include "sys/callout.h"
+#include "sys/mbuf.h"
+#include "sys/proc.h"
+#include "sys/socket.h" //
+#include "sys/socketvar.h" //
+#include "sys/domain.h" //
+#include "sys/protosw.h" //
+
+#include "net/netisr.h"
+#include "net/route.h" //
+
+#include "netinet/in.h" //
+#include "netinet/in_systm.h"
+#include "netinet/ip.h"
+#include "netinet/in_pcb.h" //
+
+#include "debug.h"
+#include "module.h"
+#include "swiveneers.h"
+
+#define TickerV	 28
+
+#define NCALLOUT 20
+
+/*
+ * The callout structure is for
+ * a routine arranging
+ * to be called by the clock interrupt
+ * in a specified amount of time.
+ */
+
+struct	callout callout[NCALLOUT];
+
+struct	callout *callfree;
+struct	callout calltodo;
+
+int	ncallout = NCALLOUT;
+
+extern int user_mode_donothing();
+extern struct socket *getsock(int s);
+
+volatile int callo_pending;
+extern void *module_wsp;
+extern int paniced;
+
+#define INTERNET_EVENT	    19
+
+#define SOCKET_ASYNC_EVENT  1
+#define SOCKET_URGENT_EVENT 2
+#define SOCKET_BROKEN_EVENT 3
+
+long siglist[SOCKTABSIZE];
+
+/*
+ * Queue a signal for later processing - ie as we exit a SWI or our
+ * callback handler
+ */
+void
+psignal(p, signum)
+	struct proc *p;
+	register int signum;
+{
+	register int sockid = (int) p - 1;
+
+	if (sockid < 0)
+		return;
+
+	siglist[sockid] |= sigmask(signum);
+}
+
+void
+sendallsignals()
+{
+	register int sockid;
+
+	for (sockid = 0; sockid < SOCKTABSIZE; sockid++)
+		if (siglist[sockid])
+			sendsignals(sockid);
+}
+
+/*
+ * Send pending signals on a socket id. Be careful not to erase signals
+ * that are raised by routines responding to the signals - save them for
+ * later processing
+ */
+void
+sendsignals(sockid)
+	register int sockid;
+{
+	register int signum;
+	register long mask;
+
+	mask = siglist[sockid];
+
+	for (;;) {
+		if (mask == 0)
+			return;
+		signum = ffs(mask);
+#ifdef DIAGNOSTIC
+		if (signum != SIGIO && signum != SIGURG && signum != SIGPIPE)
+			Printf("Unknown signal pending for socket %d: %d\n",
+				sockid, signum);
+#endif
+		siglist[sockid] &= ~sigmask(signum);
+		mask &= ~sigmask(signum);
+		generate_event(sockid, signum);
+	}
+}
+
+int
+generate_event(sockid, sig)
+	int sockid, sig;
+{
+    int event = 0;
+    int port = 0;
+    struct socket *so;
+
+#ifdef DEBUG
+    if( DODEBUG(DBGEVENTS) )
+	Printf("\021\04generate_event: SIG%s on socket %d\021\07\n",
+	       (sig == SIGIO) ? "IO" : (sig == SIGURG) ? "URG" : "PIPE",
+	       sockid);
+#endif
+
+    switch (sig)
+    {
+      case SIGIO:
+	event = SOCKET_ASYNC_EVENT;
+	break;
+
+      case SIGURG:
+	event = SOCKET_URGENT_EVENT;
+	break;
+
+      case SIGPIPE:
+	event = SOCKET_BROKEN_EVENT;
+	break;
+
+      default:
+	return(NULL);
+    }
+
+#   ifdef NO_PORT_EVENT
+    return os_generate_event(INTERNET_EVENT, event, sockid, 0) ? -1 : 0;
+#   else
+    /* If it's an Inet socket, fill in R3 with the local port number */
+    so=getsock(sockid);
+    if (so && so->so_proto->pr_domain->dom_family == PF_INET)
+    {
+        struct inpcb *inp=(struct inpcb *) so->so_pcb;
+
+        if (inp)
+            port = inp->inp_lport;
+    }
+
+    return os_generate_event(INTERNET_EVENT, event, sockid, port) ? -1 : 0;
+#   endif
+}
+
+void rsignal(int s, int m, int sa, int esrc, int unit, int swinum, int n)
+{
+    int sockid;
+
+    sockid = s - 1;
+    if (sockid < 0)
+	return;
+
+    econet_inet_rx_direct(sockid, m, sa, esrc, unit, swinum, n);
+}
+
+_kernel_oserror *calleverytick(int (*fun)())
+{
+    return os_claim(TickerV, fun, module_wsp);
+}
+
+void removetickerevent(int (*fun)())
+{
+    os_release(TickerV, fun, module_wsp);
+}
+
+void init_callout(void)
+{
+    int i;
+
+    callo_pending = 0;
+    calltodo.c_next = 0;
+    callfree = &callout[0];
+    for (i = 1; i < ncallout; i++)
+	callout[i-1].c_next = &callout[i];
+}
+
+/*
+ * This routine, plus its veneer, have been recrafted in assembler, and can
+ * be found in s.tick_entry - KJB
+ */
+#ifdef NoAsm
+int tick_handler(int *r, void *pw)
+{
+    struct callout *p1;
+    int needtocall = 0;
+
+    /*
+     * Update time ticker
+     */
+    if ((time.tv_usec += 10000) >= 1000000) {
+        time.tv_usec = 0;
+        time.tv_sec++;
+    }
+
+    /*
+     * Update real-time timeout queue.
+     * At front of queue are some number of events which are ``due''.
+     * The time to these is <= 0 and if negative represents the
+     * number of ticks which have passed since it was supposed to happen.
+     * The rest of the q elements (times > 0) are events yet to happen,
+     * where the time for each is given as a delta from the previous.
+     * Decrementing just the first of these serves to decrement the time
+     * to all events.
+     */
+    p1 = calltodo.c_next;
+    while (p1)
+    {
+	if( --p1->c_time > 0 )
+	    break;
+
+	needtocall = 1;
+
+	if( p1->c_time == 0 )
+	    break;
+
+	p1 = p1->c_next;
+    }
+
+    if (needtocall)
+	schednetisr(NETISR_CALLO);
+
+    return (1);
+}
+#endif
+
+/*
+ * callout handler
+ */
+callo_handler(void)
+{
+    struct callout *p1;
+    void *arg;
+    timeout_func_t func;
+    int a;
+    int s;
+
+    for (;;)
+    {
+	if ((p1 = calltodo.c_next) == 0 || p1->c_time > 0)
+	    return;
+
+	arg = p1->c_arg; func = p1->c_func; a = p1->c_time;
+        s = splimp();
+	calltodo.c_next = p1->c_next;
+	p1->c_next = callfree;
+	callfree = p1;
+	splx(s);
+	(*func)(arg);
+    }
+}
+
+/*
+ * Arrange that (*fun)(arg) is called in t/hz seconds.
+ */
+void
+timeout(fun, arg, t)
+	timeout_func_t fun;
+	void *arg;
+	int t;
+{
+	struct callout *p1, *p2, *pnew;
+	func_splimp();
+
+#if 0
+        Printf("timeout(%x,%x,%d)\n", fun, arg, t);
+#endif
+
+	if (t <= 0)
+		t = 1;
+
+	pnew = callfree;
+	if (pnew == NULL) {
+		panic("timeout table overflow");
+		func_splx();
+		return;
+	}
+
+	callfree = pnew->c_next;
+	pnew->c_arg = arg;
+	pnew->c_func = fun;
+	for (p1 = &calltodo; (p2 = p1->c_next) && p2->c_time < t; p1 = p2)
+		if (p2->c_time > 0)
+			t -= p2->c_time;
+
+	p1->c_next = pnew;
+	pnew->c_next = p2;
+	pnew->c_time = t;
+
+	if (p2)
+		p2->c_time -= t;
+
+	func_splx();
+}
+
+/*
+ * untimeout is called to remove a function timeout call
+ * from the callout structure.
+ */
+void
+untimeout(fun, arg)
+	timeout_func_t fun;
+	void *arg;
+{
+    struct callout *p1, *p2;
+    func_splimp();
+
+    for (p1 = &calltodo; (p2 = p1->c_next) != 0; p1 = p2)
+    {
+	if (p2->c_func == fun && p2->c_arg == arg)
+	{
+	    if (p2->c_next && p2->c_time > 0)
+		p2->c_next->c_time += p2->c_time;
+
+	    p1->c_next = p2->c_next;
+	    p2->c_next = callfree;
+	    callfree = p2;
+
+	    break;
+	}
+    }
+
+    func_splx();
+}
+
+int
+hzto(tv)
+	struct timeval *tv;
+{
+	long n;
+	func_splhi();
+
+	n = (tv->tv_sec - time.tv_sec) * 100 + (tv->tv_usec - time.tv_usec) / 10000;
+	if (n < 0)
+	    n = 0;
+
+	func_splx();
+	return n;
+}
+
+/*
+uiomove(char *cp, int n, enum uio_rw rw, struct uio *uio)
+{
+    struct iovec *iov;
+    u_int cnt;
+
+    while (n > 0 && uio->uio_resid)
+    {
+	iov = uio->uio_iov;
+	cnt = iov->iov_len;
+
+	if (cnt == 0)
+	{
+	    uio->uio_iov++;
+	    uio->uio_iovcnt--;
+	    continue;
+	}
+
+	if (cnt > n)
+	    cnt = n;
+
+	if (rw == UIO_READ)
+	    memcpy (iov->iov_base, cp, cnt);
+	else
+	    memcpy (cp, iov->iov_base, cnt);
+
+	iov->iov_base += cnt;
+	iov->iov_len -= cnt;
+	uio->uio_resid -= cnt;
+	uio->uio_offset += cnt;
+	cp += cnt;
+	n -= cnt;
+    }
+
+    return (0);
+} */
+
+extern char panicbuf[];
+
+void
+panic(const char *str, ...)
+{
+    if (paniced)
+	return;
+
+    paniced = 1;
+
+    strncpy(panicbuf, str, PANICBUFLEN - 1);
+    panicbuf[PANICBUFLEN - 1] = '\0';
+}
+
+#if 0
+# define NSTAB	12
+#else
+# define NSTAB	96
+#endif
+
+struct stab_entry
+{
+    char	 *event;
+    volatile int  flag;
+} stable[NSTAB];
+
+int
+sleeptabinit()
+{
+    struct stab_entry *s;
+
+    for (s = &stable[0]; s < &stable[NSTAB]; s++)
+    {
+	s->event = (char *)NULL;
+	s->flag = 0;
+    }
+
+    return(0);
+}
+
+static void endtsleep(struct stab_entry *s);
+
+static void taskwindow_sleep(volatile int *pollword)
+{
+    int in_taskwindow;
+    _kernel_oserror *e;
+
+    e=taskwindow_task_info(0, &in_taskwindow);
+
+    if (!e && in_taskwindow)
+        os_upcall(6, pollword);
+}
+
+int
+tsleep(event, prio, wmesg, wait, sleep_task)
+	void *event;
+	char *wmesg;
+	int prio, sleep_task, wait;
+{
+	struct stab_entry *s;
+	int ms;
+	int error = 0;
+
+	ms = splimp();
+
+#ifdef DEBUG
+	Printf("tsleep(0x%x,0x%x,%s,%d,%d)\n", event, prio, wmesg, wait, sleep_task);
+#endif
+	for (s = &stable[0]; s < &stable[NSTAB]; s++) {
+		if (s->event == 0) {
+			s->event = event;
+			s->flag = 0;
+			splx(ms);
+
+			if (wait)
+				timeout(endtsleep, s, wait);
+			while (s->flag == 0) {
+
+				if (sleep_task)
+					taskwindow_sleep(&s->flag);
+
+				if ((prio & PCATCH) && escape_seen()) {
+#ifdef DEBUG
+					Printf("Escape seen\n");
+#endif
+					error = EINTR;
+					goto out;
+				}
+
+				user_mode_donothing();
+			}
+out:
+			if (wait)
+				untimeout(endtsleep, s);
+			ms = splimp();
+			s->event = 0;
+			s->flag = 0;
+			splx(ms);
+			return (error);
+		}
+	}
+
+	splx(ms);
+	panic("sleep");
+	return (EFAULT);
+}
+
+static void
+endtsleep(s)
+	struct stab_entry *s;
+{
+	s->flag = 1;
+}
+
+void
+wakeup(event)
+    void *event;
+{
+    struct stab_entry *s;
+    func_splimp();
+
+    for (s = &stable[0]; s < &stable[NSTAB]; s++)
+	if (s->event == event)
+	    s->flag = 1;
+
+    func_splx();
+}
+
+#define NBITS 32
+
+int
+ffs(mask)
+	long mask;
+{
+	int i;
+
+	for (i = 0; i < NBITS; i++) {
+		if (mask & 1)
+	    		return (i+1);
+		mask >>= 1;
+    	}
+
+    	return (0);
+}
+
+#ifdef NoAsm
+ntohl(u_long x)
+{
+    return( ((x & 0xff) << 24) | ((x & 0xff00) << 8) | \
+	   ((x & 0xff0000) >> 8) | ((x & 0xff000000) >> 24) );
+}
+#endif
+
+ntohs(int x)
+{
+    return ( (x & 0xff) << 8 | (x & 0xff00) >> 8 );
+}
+
+struct qelem
+{
+    struct qelem *q_forw;
+    struct qelem *q_back;
+    char *q_data;
+};
+
+void insque(struct qelem *elem, struct qelem *pred)
+{
+    func_splhi();
+
+    if (pred == 0 || elem == 0)
+    {
+	func_splrestore();
+	return;
+    }
+
+    if (pred->q_forw)
+	pred->q_forw->q_back = elem;
+
+    elem->q_forw = pred->q_forw;
+    pred->q_forw = elem;
+    elem->q_back = pred;
+
+    func_splrestore();
+}
+
+void remque(struct qelem *elem)
+{
+    func_splhi();
+
+    if (elem == 0)
+    {
+	func_splrestore();
+	return;
+    }
+
+    if (elem->q_back != 0)
+	elem->q_back->q_forw = elem->q_forw;
+
+    if (elem->q_forw)
+	elem->q_forw->q_back = elem->q_back;
+
+    func_splrestore();
+}
+
+void callback_init(void)
+{
+    struct callback_record *cbptr;
+    extern void callb_entry(void);
+    extern void startup_entry(void);
+
+    /*
+     * manually fill in the callback tables here
+     */
+    cbptr = callbacks + CALLB_CALLB;
+    cbptr->cb_entry = callb_entry;
+    cbptr->cb_outstanding = 0;
+
+    cbptr = callbacks + CALLB_STARTUP;
+    cbptr->cb_entry = startup_entry;
+    cbptr->cb_outstanding = 0;
+}
+
+void callback_finalise(void)
+{
+    int i;
+    func_splimp();
+
+    /*
+     * loop over all possible callbacks
+     */
+    for( i = 0; i < NCALLBACKS; ++i )
+    {
+	struct callback_record *cbptr = callbacks + i;
+
+	while( cbptr->cb_outstanding > 0 )
+	{
+	    os_remove_call_back(cbptr->cb_entry, module_wsp);
+	    cbptr->cb_outstanding--;
+	}
+    }
+
+    func_splx();
+}
+
+void callback_entered(int callbackno)
+{
+    func_splimp();
+
+    callbacks[callbackno].cb_outstanding--;
+    func_splx();
+}
+
+int callback(int callbackno)
+{
+    struct callback_record *cbptr = callbacks + callbackno;
+    int s = splimp();
+
+    cbptr->cb_outstanding++;
+    splx(s);
+
+    return os_add_call_back(cbptr->cb_entry, module_wsp) ? -1 : 0;
+}
+
+void
+microtime(tv)
+	struct timeval *tv;
+{
+	func_splhi();
+
+	*tv = time;
+
+	func_splx();
+}
+
+/*
+ * Check that a proposed value to load into the .it_value or
+ * .it_interval part of an interval timer is acceptable, and
+ * fix it to have at least minimal value (i.e. if it is less
+ * than the resolution of the clock, round it up.)
+ */
+int
+itimerfix(tv)
+	struct timeval *tv;
+{
+
+	if (tv->tv_sec < 0 || tv->tv_sec > 100000000 ||
+	    tv->tv_usec < 0 || tv->tv_usec >= 1000000)
+		return (EINVAL);
+	if (tv->tv_sec == 0 && tv->tv_usec != 0 && tv->tv_usec < tick)
+		tv->tv_usec = tick;
+	return (0);
+}
+
+/*
+ * Add and subtract routines for timevals.
+ * N.B.: subtract routine doesn't deal with
+ * results which are before the beginning,
+ * it just gets very confused in this case.
+ * Caveat emptor.
+ */
+void
+timevaladd(t1, t2)
+	struct timeval *t1, *t2;
+{
+
+	t1->tv_sec += t2->tv_sec;
+	t1->tv_usec += t2->tv_usec;
+	timevalfix(t1);
+}
+
+void
+timevalsub(t1, t2)
+	struct timeval *t1, *t2;
+{
+
+	t1->tv_sec -= t2->tv_sec;
+	t1->tv_usec -= t2->tv_usec;
+	timevalfix(t1);
+}
+
+void
+timevalfix(t1)
+	struct timeval *t1;
+{
+
+	if (t1->tv_usec < 0) {
+		t1->tv_sec--;
+		t1->tv_usec += 1000000;
+	}
+	if (t1->tv_usec >= 1000000) {
+		t1->tv_sec++;
+		t1->tv_usec -= 1000000;
+	}
+}
+
+#define secs0070 (((unsigned)86400) * (365 * 70 + 17))	/* less than 2^32 */
+
+typedef struct {unsigned int l,h;} machinetime;
+
+long realtime()
+{
+    /*
+     * this is time(), recoded here to avoid the absurd 6ms delay
+     * in the RISC OS 3 Shared C Library (penalty is timezone())
+     */
+    machinetime bt, w, w2;
+
+    /*
+     * read timer as 5 byte integer
+     * centiseconds since 1/1/1900
+     */
+    bt.l = 3;				/* presumably 'request time' arg */
+    _kernel_osword(14, (int *)&bt);
+
+    /* to two 3-byte things - for divide */
+    w.h = ((bt.h & 255) << 8) | (bt.l >> 24);
+    w.l = bt.l & 0xffffff;
+
+    /* turn csecs to secs */
+    w2.h = w.h / 100;
+    w2.l = ((w.h % 100 << 24) | w.l) / 100;
+
+    /* back to 8 byte binary */
+    bt.h = w2.h >> 8;
+    bt.l = (w2.h << 24) | w2.l;
+
+    /* normalise to Jan70 instead of Jan00... */
+    if (bt.l < secs0070) bt.h--;
+    bt.l -= secs0070;
+
+    /*
+     * if high word is non-zero then date
+     * is unset/out of unix range...
+     */
+    return bt.h ? -1 : bt.l;
+}

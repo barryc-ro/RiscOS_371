@@ -1,0 +1,1575 @@
+/*  Title: > c.editchar
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+#include "h.main"
+
+#include "h.drag"
+#include "h.editchar"
+#include "h.loadsave"
+#include "h.menu"
+#include "h.redraw"
+#include "h.scaffold"
+#include "h.sprites"
+#include "h.suspend"
+
+
+int matchscaffoldx(Char_Block *charptr, wimp_mousestr *mousep,
+                           seltype sel_type, int index, int *x1return, int *x2return);
+int matchscaffoldy(Char_Block *charptr, wimp_mousestr *mousep,
+                           seltype sel_type, int index, int *y1return, int *y2return);
+
+
+/* ---- scaling routines -------------------------------------------------- */
+
+int scalex(int x) { return(rscalex(x)+bx); }
+int scaley(int y) { return(rscaley(y)+by); }
+int rscalex(int x) { return(((((x-x0)*xscale)+(1<<15))>>16) + (dx>>1)); }
+int rscaley(int y) { return(((((y-y1)*yscale)+(1<<15))>>16) + (dy>>1)); }
+int scalex8(int x) { return(((x-x0)*xscale)>>8)+(bx<<8)+(dx<<7); }
+int scaley8(int y) { return(((y-y1)*yscale)>>8)+(by<<8)+(dy<<7); }
+int unscalex(int x) { return(((((x-bx-(dx>>1))<<16)+(1<<15))/xscale)+x0); }
+int unscaley(int y) { return(((((y-by-(dy>>1))<<16)-(1<<15))/yscale)+y1); }
+
+
+/* ---- skeleton window editing routines ---------------------------------------- */
+
+
+/* Return potential actions in a skeleton window,
+ * resulting from the current state / pointer position.
+ * Used for editskel() and helprequest().
+ */
+
+os_error * getskelaction(skel_action *result, Wind_Link *wlink, wimp_mousestr *mousep)
+{
+  Line_Block templine;
+
+  er(getwlinkstate(wlink));       /* sets up bx,by,x0,y0,x1,y1,xsize,ysize,xscale,yscale,thischar */
+
+  mousex = mousep->x;   /* for matchpoint() and matchhandle() */
+  mousey = mousep->y;
+
+  result->t = SPB_NONE;
+  result->sel_type = scafftype(thischar);
+  result->edline = NULL;
+  result->edpoint = NULL;
+
+  /* don't do anything special with MENU */
+
+  if (mousep->bbits & wimp_BMID) return(NULL);
+
+  /* check for dragging the background sprite */
+
+  if (showhandles && thischar->backsprite[0])
+  {
+    sprite_pgm b;
+    er(scalebox(&b,&thischar->backsprbox,0));
+    result->t = scanhandles(&b, matchhandle);
+    if (result->t == SPB_NONE) {
+      wimp_box box;
+      box.x0 = b.p0[0];
+      box.x1 = b.p1[0];
+      box.y0 = b.p1[1];
+      box.y1 = b.p2[1];
+      if (mousex >= box.x0 &&     /* this should really test for the pointer being inside a parallelogram */
+          mousey >= box.y0 &&
+          mousex <= box.x1 &&
+          mousey <= box.y1) {
+        handlebox.x0 = handlebox.x1 = handlex = mousex;   /* absolute coordinates */
+        handlebox.y0 = handlebox.y1 = handley = mousey;
+        result->t = SPB_MAIN;
+      }
+    }
+  }
+
+  /* if no scaffold line selected, check for control points / lines */
+
+  if (result->sel_type == SEL_NONE)
+  {
+    templine = thischar->sline;   /* allow result->edline to be set to this */
+
+    if (thischar->sline.p[1] != NULL)
+    {
+      result->edline = &templine;
+      if (matchpoint(result->edpoint=thischar->sline.p[1])==0)
+      if (matchpoint(result->edpoint=thischar->sline.p[2])==0)
+      if (matchpoint(result->edpoint=thischar->sline.p[0])==0)
+      if (matchpoint(result->edpoint=thischar->sline.p[3])==0) {
+        if (matchline(&thischar->sline)) {
+          result->edline = &templine;
+        } else {
+          result->edline = scanchar(thischar,matchline);
+        }
+        result->edpoint = scancharpt(thischar,matchendpoint);
+      }
+    } else {
+      result->edline = scanchar(thischar,matchline);                /* no previous matches */
+      result->edpoint = scancharpt(thischar,matchendpoint);
+    }
+  }
+
+  /* if no control point, check for scaffold control points */
+
+  if (result->edpoint == NULL)
+  {
+    result->scaffindex = matchscaffoldx(thischar,
+                                        mousep,
+                                        result->sel_type,
+                                        thischar->parent->scaffold.index,
+                                        &result->xx1,
+                                        &result->xx2);
+    if (result->scaffindex == 0) {
+      result->scaffindex = matchscaffoldy(thischar,
+                                          mousep,
+                                          result->sel_type,
+                                          thischar->parent->scaffold.index-8,
+                                          &result->xx1,
+                                          &result->xx2) + 8;
+    }
+  }
+
+  return(NULL);
+}
+
+
+/* Act on mouse click event in a skeleton window */
+
+os_error * editskel(Wind_Link *wlink, wimp_mousestr *mousep)
+{
+  skel_action action;
+  Pt_Block *pt;
+  int inkey1 = bbc_inkey(-1);    /* shift key */
+  int inkey2 = bbc_inkey(-2);    /* ctrl key */
+
+  /* grab input focus whenever there's a click in the skeleton window */
+  {
+    wimp_caretstr caret;
+    caret.w = mousep->w;
+    caret.i = -1;
+    caret.height = 1<<25; /* invisible */
+    er(wimp_set_caret_pos(&caret));
+  }
+
+  er(getskelaction(&action, wlink, mousep));     /* fills in action structure */
+
+  /* check for dragging sprite bbox handles */
+
+  if (action.t != SPB_NONE) {
+    if (mousep->bbits & wimp_BRIGHT) action.t |= SPB_ADJUST;   /* ADJUST button used */
+    return(draghandle(action.t,wlink));
+  }
+
+  /* if not on a control point, check for scaffold control points */
+
+  if (action.edpoint == NULL)
+  switch (mousep->bbits)
+  {
+    case wimp_BLEFT:
+    case wimp_BDRAGLEFT:
+    case wimp_BDRAGRIGHT:
+      { int i = action.scaffindex;
+        seltype sctype = (i < 8) ? SEL_SCAFFOLDX : SEL_SCAFFOLDY;
+        if (i & 7) {
+          switch(mousep->bbits) {
+            case wimp_BLEFT:
+              if (inkey1 || inkey2) {
+                if (action.sel_type == sctype) {
+                  int newlink = (thischar->parent->scaffold.index & 7) + (inkey2 ? 8 : 0); /* linear if ctrl */
+                  if (newlink == thischar->scaffold.xlink[i]) {   /* ylink[] is consecutive */
+                    return(linkscaffold(i, 0));
+                  } else {
+                    return(linkscaffold(i, newlink));   /* linear if ctrl */
+                  } /* if already linked */
+                } /* if sel_type == sctype */
+              } else {
+                return(selectscaffold(thischar, sctype, i & 7));
+              } /* if inkey1 or inkey2 */
+              break;
+            case wimp_BDRAGLEFT:
+            case wimp_BDRAGRIGHT:
+              if (i < 8) return(dragscaffold(DR_SCAFFOLDX,wlink,i & 7,action.xx2,by,action.xx1,0));
+              else return(dragscaffold(DR_SCAFFOLDY,wlink,i & 7,bx,action.xx2,0,action.xx1));
+          } /* switch(buttons) */
+        } /* if (i & 7) */
+      }
+  } /* switch(buttons) */
+
+  switch(mousep->bbits)
+  {
+    case wimp_BMID:
+         if (action.sel_type == SEL_NONE)
+         if (action.edline!=NULL) er(selectline(thischar, action.edline));
+
+         shadeitem(Menu_Skeleton,0,(thischar->sline.p[1]==NULL && action.sel_type == SEL_NONE));
+         shadeitem(Menu_Skeleton,1,(thischar->sline.p[1]==NULL));
+       
+         /* menu item not yet implemented so grey it out (see redraw.c) */
+         shadeitem(Menu_Skeleton_Display,8,TRUE);
+
+         tickitem(Menu_Skeleton_Display,0,showpointer);
+         tickitem(Menu_Skeleton_Display,1,showcoords);
+         tickitem(Menu_Skeleton_Display,2,showwidth);
+         tickitem(Menu_Skeleton_Display,3,showbbox);
+         tickitem(Menu_Skeleton_Display,4,showobox);
+         tickitem(Menu_Skeleton_Display,5,showfbox);
+         tickitem(Menu_Skeleton_Display,6,showsprites);
+         tickitem(Menu_Skeleton_Display,7,showhandles);
+         tickitem(Menu_Skeleton_Display,8,showendpoints);
+
+         sprintf(mb_skeleton_width, "%d", thischar->xwidth);
+         {
+           int flag[2];
+           int i;
+           shadeitem(Menu_Skeleton_Scaffold, 3, !canundelete(thischar));
+           shadeitem(Menu_Skeleton_Scaffold, 4, action.sel_type==SEL_NONE);
+           for(i=0;i<3;i++) shadeitem(Menu_Skeleton_Scaffold3, i, action.sel_type != SEL_SCAFFOLDY);
+           for(i=3;i<6;i++) shadeitem(Menu_Skeleton_Scaffold3, i, action.sel_type != SEL_SCAFFOLDX);
+           flag[0] = flag[1] = 1;
+           for (i=1;i<16;i++) if (i != 8) {
+             if (thischar->scaffold.xcoord[i] == NULL_SCAFFOLD) flag[i>>3] = 0;
+           }
+           for (i=0;i<3;i++) shadeitem(Menu_Skeleton_Scaffold1, i, flag[1]);
+           for (i=3;i<6;i++) shadeitem(Menu_Skeleton_Scaffold1, i, flag[0]);
+           flag[1] = checkglobal(thischar, 8, NULL) ? 0 : 1;
+           flag[0] = checkglobal(thischar, 0, NULL) ? 0 : 1;
+           for (i=0;i<3;i++) shadeitem(Menu_Skeleton_Scaffold2, i, flag[1]);
+           for (i=3;i<6;i++) shadeitem(Menu_Skeleton_Scaffold2, i, flag[0]);
+         }
+
+         er(wimp_set_icon_state(magnifier_window,7,
+                                                      thischar->variable?wimp_ISELECTED:0,
+                                                      wimp_ISELECTED));
+
+         sprintf(wricon_magnifierup,"%d",thischar->magnifierup);
+         sprintf(wricon_magnifierdown,"%d",thischar->magnifierdown);
+
+         erx(wimp_create_menu(Menu_Skeleton,mousep->x-80,mousep->y+16));
+         menuhandle = wlink;    /* all necessary info obtainable from link */
+         break;
+
+    case wimp_BRIGHT:
+         if (action.edline!=NULL) er(selectline(thischar, action.edline));
+         break;
+
+    case wimp_BDRAGRIGHT:
+         if (action.edpoint!=NULL) er(dragpoint(action.edpoint,wlink));
+         break;
+
+    case wimp_BLEFT:
+         switch(action.sel_type)
+         {
+           case SEL_NONE:
+                er(selectline(thischar, action.edline));
+                break;
+
+           case SEL_SCAFFOLDX:
+                { wimp_redrawstr rblk;
+                  BOOL more;
+                  if ((pt = scancharpt(thischar,matchendpoint)) != NULL) {
+                    scafflink(pt,
+                                 (pt->scaffoldx == thischar->parent->scaffold.index)
+                                 ? 0
+                                 : thischar->parent->scaffold.index);
+                    minx = maxx = pt->x;
+                    miny = maxy = pt->y;
+                    rblk.w=handle;
+                    for(more=updminmax(&rblk);more;more=nextrect(&rblk)) {
+                      drawpoint(pt,GCOL(0,pt->scaffoldx?11:13));
+                    }
+                  } else {
+                    if (inkey1) er(selectline(thischar, NULL));
+                  }
+                }
+                break;
+
+           case SEL_SCAFFOLDY:
+                { wimp_redrawstr rblk;
+                  BOOL more;
+                  if ((pt = scancharpt(thischar,matchendpoint)) != NULL) {
+                    scafflink(pt,
+                                 (pt->scaffoldy == thischar->parent->scaffold.index-8)
+                                 ? 8
+                                 : thischar->parent->scaffold.index);
+                    minx = maxx = pt->x;
+                    miny = maxy = pt->y;
+                    rblk.w=handle;
+                    for(more=updminmax(&rblk);more;more=nextrect(&rblk)) {
+                      drawpoint(pt,GCOL(0,pt->scaffoldy?11:13));
+                    }
+                  } else {
+                    if (inkey1) er(selectline(thischar, NULL));
+                  }
+                }
+         }
+         break;
+
+    case wimp_BDRAGLEFT:
+         switch(action.sel_type)
+         {
+           case SEL_NONE:
+                {
+                  static Line_Block newline;
+                  int mx,my;
+
+                  if (action.edpoint!=NULL)
+                    if (action.edpoint->type==PT_CONTROL || action.edpoint->type==PT_STRAIGHT)
+                      action.edpoint=NULL;
+
+                  if (action.edpoint==NULL)
+                  {
+                    Path_Block *newp;
+
+                    er(getheap(Path_Block,&newp));
+
+                    mx = unscalex(mousep->x);
+                    my = unscaley(mousep->y);
+
+                    newp->nextpath = thischar->nextpath;
+                    thischar->nextpath = newp;
+                    er(newpt(PT_HINGED,mx,my,newp,&newline.p[0]));
+                    newp->firstpoint = newline.p[0];
+
+                    er(newpt(PT_STRAIGHT,mx,my,newp,&newline.p[1]));
+                    er(newpt(PT_STRAIGHT,mx,my,newp,&newline.p[2]));
+                    er(newpt(PT_HINGED,  mx,my,newp,&newline.p[3]));
+
+                    join(newline.p[0],1,newline.p[1],1);
+                    join(newline.p[1],0,newline.p[2],0);
+                    join(newline.p[2],1,newline.p[3],0);
+                  }
+                  else
+                  {
+                    Pt_Block *pt;
+                    int link = -1;
+                    if (action.edpoint->nextpt[0]==NULL) link=0;
+                    if (action.edpoint->nextpt[1]==NULL) link=1;
+
+                    mx = action.edpoint->x;
+                    my = action.edpoint->y;
+
+                    newline.p[0] = action.edpoint;
+                    er(newpt(PT_STRAIGHT,mx,my,action.edpoint->path,&newline.p[1]));
+                    er(newpt(PT_STRAIGHT,mx,my,action.edpoint->path,&newline.p[2]));
+                    er(newpt(PT_HINGED  ,mx,my,action.edpoint->path,&newline.p[3]));
+                    {
+                      int i;
+                      for (i=1;i<=3;i++) {
+                        newline.p[i]->scaffoldx = action.edpoint->scaffoldx;   /* inherits parent's scaffolding */
+                        newline.p[i]->scaffoldy = action.edpoint->scaffoldy;
+                      }
+                    }
+                    join(newline.p[1],0,newline.p[2],0);
+                    join(newline.p[2],1,newline.p[3],0);
+
+                    if (link!=-1)
+                    {
+                      if (action.edpoint->path->firstpoint==action.edpoint)
+                          action.edpoint->path->firstpoint=newline.p[3];
+
+                      join(newline.p[1],1,(newline.p[0]=action.edpoint),link);
+                    }
+                    else
+                    {
+                      link=0; /* default */
+                      if (selected(thischar, action.edpoint->nextpt[0])) link=0;
+                      if (selected(thischar, action.edpoint->nextpt[1])) link=1;
+                      pt=action.edpoint->nextpt[link];
+
+                      join(pt,1,newline.p[3],1);
+                      join(action.edpoint,link,newline.p[1],1);
+                    }
+                  }
+                  er(selectline(thischar, &newline));
+                  er(dragpoint(newline.p[3],wlink));
+                }
+                break;
+
+           case SEL_SCAFFOLDX:
+           case SEL_SCAFFOLDY:
+                er(dragrectangle(DR_RECTSCAFFOLD,wlink));
+         }
+  }
+  return(NULL);
+}
+
+
+os_error *dragrectangle(dragtype type, Wind_Link *wlink)
+{
+  wimp_dragstr d;
+  wimp_wstate w;
+
+  handle = wlink->wind_handle;
+  erx(wimp_get_wind_state(handle,&w));                 /* global variable set up already */
+
+  d.window = handle;
+  d.type = wimp_USER_HIDDEN;
+  d.box.x0 = d.box.x1 = mousex;                    /* used to preserve offset from mouse position */
+  d.box.y0 = d.box.y1 = mousey;
+  d.parent.x0 = w.o.box.x0;
+  d.parent.y0 = w.o.box.y0;
+  d.parent.x1 = w.o.box.x1;
+  d.parent.y1 = w.o.box.y1;
+  erx(wimp_drag_box(&d));
+
+  dragbox.type = type;
+  dragbox.wlink = wlink;
+  dragbox.d.rectangle.x0 = dragbox.d.rectangle.x1 = mousex-bx;
+  dragbox.d.rectangle.y0 = dragbox.d.rectangle.y1 = mousey-by;
+
+  dragbox.limit.minx = w.o.box.x0 + 32;   /* for auto-scrolling the window */
+  dragbox.limit.miny = w.o.box.y0 + 32;
+  dragbox.limit.maxx = w.o.box.x1 - 32;
+  dragbox.limit.maxy = w.o.box.y1 - 32;
+
+  er(eo_rectangle());
+
+  if (!showpointer) pointer(0);
+  return(NULL);
+}
+
+
+os_error *eo_rectangle(void)
+{
+  wimp_redrawstr rblk;
+  BOOL more;
+  int x0 = dragbox.d.rectangle.x0;
+  int y0 = dragbox.d.rectangle.y0;
+  int x1 = dragbox.d.rectangle.x1;
+  int y1 = dragbox.d.rectangle.y1;
+  int temp;
+
+  if (x0 > x1) { temp=x0; x0=x1; x1=temp; }
+  if (y0 > y1) { temp=y0; y0=y1; y1=temp; }
+
+  erx(getwindowstate(dragbox.wlink->wind_handle));
+    
+  rblk.w = handle;
+  rblk.box.x0 = x0;
+  rblk.box.y0 = y0;
+  rblk.box.x1 = x1+dx;
+  rblk.box.y1 = y1+dy;
+  erx(wimp_update_wind(&rblk,&more));
+    
+  while (more) {
+    wimp_gcol(3,7);
+    bbc_move(bx+x0,by+y0);
+    bbc_plot(bbc_SolidExFinal+5,bx+x1,by+y0);
+    bbc_plot(bbc_SolidExFinal+5,bx+x1,by+y1);
+    bbc_plot(bbc_SolidExFinal+5,bx+x0,by+y1);
+    bbc_plot(bbc_SolidExFinal+5,bx+x0,by+y0);
+    erx(wimp_get_rectangle(&rblk,&more));
+  }
+  return(NULL);
+}
+
+
+/* ---- Updating routines -------------------------------------------------- */
+
+
+os_error * deleteline(lineptr)
+Line_Block *lineptr;
+{
+  Line_Block line = *lineptr;             /* make copy of line block! */
+  Path_Block *pathptr = line.p[0]->path;
+  int link1,link2;
+  int wascyclic = nullindex(pathptr->firstpoint);  /* do this now! */
+
+  if (selected(thischar, line.p[1])) er(selectline(thischar, NULL));
+
+  setminmax(&line);
+  link1 = findlink(line.p[0],line.p[1]);  /* must match */
+  link2 = findlink(line.p[3],line.p[2]);  /* must match */
+
+  if (line.p[0]==line.p[3])
+  {
+    heap_free(line.p[0]);     /* only one point exists! */
+    deletepathentry(pathptr);
+  }
+  else
+  switch( delpt(line.p[0],link1) +
+         (delpt(line.p[3],link2) << 1)
+        )
+  {
+    case 0:                  /* neither deleted - create new subpath? */
+         {
+           if (wascyclic<0)                        /* path was cyclic */
+           {
+             pathptr->firstpoint=line.p[0];        /* either will do */
+           }
+           else                                    /* divide into 2 */
+           {
+             Path_Block *newpath;
+
+             er(getheap(Path_Block,&newpath));
+
+             convertpath(pathptr,newpath);
+             newpath->nextpath = thischar->nextpath;
+             thischar->nextpath = newpath;
+
+             link1 = (line.p[0]->path==newpath)?0:3;
+             if (line.p[link1]->path!=newpath) finish("confused of Cambs!");
+
+             newpath->firstpoint=line.p[link1];
+             pathptr->firstpoint=line.p[3-link1];
+           }
+         }
+         break;
+
+    case 1:
+         pathptr->firstpoint = line.p[3];  /* p[0] deleted, p[3] not */
+         break;
+
+    case 2:
+         pathptr->firstpoint = line.p[0];  /* p[3] deleted, p[0] not */
+         break;
+
+    case 3:                   /* both deleted - remove parent subpath */
+         deletepathentry(pathptr);
+  }
+  heap_free(line.p[1]);
+  heap_free(line.p[2]);
+
+  invalidate(handle,rscalex(minx)-tt,
+                    rscaley(miny)-tt,
+                    rscalex(maxx)+tt,
+                    rscaley(maxy)+tt);
+
+  er(updatecopies(thischar,TRUE));
+  er(updatebbox(thischar,handle));
+  validate(thischar,"deleteline");
+  return(NULL);
+}
+
+
+int delpt(pt,link)       /* returns 1==>point was deleted */
+Pt_Block *pt;
+int link;
+{
+  pt->nextpt[link] = NULL;         /* was pointing to control point */
+  if (pt->nextpt[1-link]==NULL) { heap_free(pt); return(1); }
+  return(0);
+}
+
+
+os_error * straighten(line)
+Line_Block *line;
+{
+  Pt_Block *pt = line->p[1];
+
+  if (pt->type==PT_CONTROL)
+  {
+    er(eorbits(pt,EO_REMOVE));
+               pt->type = PT_STRAIGHT+PT_INVISIBLE;
+    pt->nextpt[0]->type = PT_STRAIGHT+PT_INVISIBLE;
+    er(eorbits(pt,EO_RESTORE));
+    er(updatecopies(thischar,TRUE));
+    er(updatebbox(thischar,handle));
+  }
+  return(NULL);
+}
+
+
+/* start dragging a control point
+ * mouse button inspected earlier - extra point created if left button used
+ */
+
+os_error * dragpoint(Pt_Block *pt, Wind_Link *wlink)
+{
+  wimp_dragstr d;
+  wimp_wstate w;
+
+  erx(wimp_get_wind_state(handle,&w));
+
+  d.window = handle;
+  d.type = wimp_USER_HIDDEN;
+  d.box.x0 = d.box.x1 = scalex(pt->x);
+  d.box.y0 = d.box.y1 = scaley(pt->y);
+  d.parent.x0 = w.o.box.x0;
+  d.parent.y0 = w.o.box.y0;
+  d.parent.x1 = w.o.box.x1;
+  d.parent.y1 = w.o.box.y1;
+  erx(wimp_drag_box(&d));
+
+  dragbox.type = DR_POINT;
+  dragbox.xoff = d.box.x1-mousex;
+  dragbox.yoff = d.box.y1-mousey;
+  dragbox.wlink = wlink;
+  dragbox.d.point.pt = pt;
+  dragbox.limit.minx = w.o.box.x0 + 32;
+  dragbox.limit.miny = w.o.box.y0 + 32;
+  dragbox.limit.maxx = w.o.box.x1 - 32;
+  dragbox.limit.maxy = w.o.box.y1 - 32;
+
+  er(eorbits(pt,EO_REMOVE));
+  if (pt->type==PT_STRAIGHT+PT_INVISIBLE)
+  {
+    pt->type = PT_CONTROL+PT_INVISIBLE;
+    (pt->nextpt[0])->type = PT_CONTROL+PT_INVISIBLE;
+  }
+  er(eorbits(pt,EO_DRAG));
+  if (!showpointer) pointer(0);
+  return(NULL);
+}
+
+
+/* start dragging one of the sprite handles
+ * action depends on mouse button - worked out earlier
+ */
+
+os_error * draghandle(spb_type subtype, Wind_Link *wlink)
+{
+  wimp_dragstr d;
+  wimp_wstate w;
+
+  er(wimp_get_wind_state(handle,&w));
+
+  d.window = handle;              /* (window) handle set up in editchar() */
+  d.type = wimp_USER_HIDDEN;
+  d.box = handlebox;              /* (bitmap) handlebox set up in scanhandles() */
+  d.parent.x0 = w.o.box.x0;
+  d.parent.y0 = w.o.box.y0;
+  d.parent.x1 = w.o.box.x1;
+  d.parent.y1 = w.o.box.y1;
+  er(wimp_drag_box(&d));
+
+  dragbox.type = DR_SPRITEBOX;
+  dragbox.d.spritebox.subtype = subtype;
+  dragbox.d.spritebox.oldhandlex = unscalex(handlex);
+  dragbox.d.spritebox.oldhandley = unscaley(handley);
+  dragbox.xoff = handlex - mousex;
+  dragbox.yoff = handley - mousey;
+  dragbox.wlink = wlink;
+  dragbox.limit.minx = w.o.box.x0 + 32;
+  dragbox.limit.miny = w.o.box.y0 + 32;
+  dragbox.limit.maxx = w.o.box.x1 - 32;
+  dragbox.limit.maxy = w.o.box.y1 - 32;
+
+  if (!showpointer) pointer(0);
+  return(NULL);
+}
+
+
+os_error *eo_spritebox(dragtype type, Wind_Link *wlink)
+{
+  Char_Block *charptr = wlink->info;
+  wimp_redrawstr rblk;
+  BOOL more;
+  sprite_pgm b;
+  int gcol1, gcol2;
+
+  switch(type) {
+    case EO_REMOVE: gcol1 = 0; gcol2 = 0; break;
+    case EO_RESTORE: gcol1 = 0; gcol2 = 11; break;
+    case EO_DRAG: gcol1 = 3; gcol2 = 11; break;
+    default: returnerr("Illegal drag type for eo_spritebox()");
+  }
+
+  er(getwindowstate(dragbox.wlink->wind_handle));
+  er(scalebox(&b,&charptr->backsprbox,0));          /* get absolute box coords */
+
+  rblk.w = handle;
+  rblk.box.x0 =
+  rblk.box.y0 = -big;
+  rblk.box.x1 =
+  rblk.box.y1 = big;
+
+  er(wimp_update_wind(&rblk,&more));
+    
+  while (more) {
+    er(drawspritebox(gcol1,gcol2,charptr));
+
+    er(wimp_get_rectangle(&rblk,&more));
+  }
+
+  return(NULL);
+}
+
+
+/* start dragging a scaffold line */
+
+os_error *dragscaffold(dragtype type, Wind_Link *wlink, int index, int x,int y,int cx, int cy)
+{
+  wimp_dragstr d;
+  wimp_wstate w;
+
+  erx(wimp_get_wind_state(handle=wlink->wind_handle,&w));
+
+  d.window = handle;
+  d.type = wimp_USER_HIDDEN;
+  d.box.x0 = d.box.x1 = x;                    /* used to preserve offset from mouse position */
+  d.box.y0 = d.box.y1 = y;
+  d.parent.x0 = w.o.box.x0;
+  d.parent.y0 = w.o.box.y0;
+  d.parent.x1 = w.o.box.x1;
+  d.parent.y1 = w.o.box.y1;
+  erx(wimp_drag_box(&d));
+
+  dragbox.type = type;
+  dragbox.xoff = x-mousex;
+  dragbox.yoff = y-mousey;
+  dragbox.wlink = wlink;               /* this window is used for coordinate scaling */
+  dragbox.d.scaffold.index = index;
+  dragbox.d.scaffold.x = cx;
+  dragbox.d.scaffold.y = cy;
+
+  dragbox.limit.minx = w.o.box.x0 + 32;   /* for auto-scrolling the window */
+  dragbox.limit.miny = w.o.box.y0 + 32;
+  dragbox.limit.maxx = w.o.box.x1 - 32;
+  dragbox.limit.maxy = w.o.box.y1 - 32;
+
+  if (type == DR_SCAFFOLDX) {
+    er(eo_scaffold(cx,EO_REMOVE));
+    er(eo_scaffold(cx,EO_DRAG));
+  } else {
+    er(eo_scaffold(cy,EO_REMOVE));
+    er(eo_scaffold(cy,EO_DRAG));
+  }
+
+  if (!showpointer) pointer(0);
+  return(NULL);
+}
+
+/*
+ * Uses dragbox struct to work out where the line's partner is
+ * (so it can draw the connecting line)
+ * reason codes:  EO_REMOVE, EO_RESTORE, EO_DRAG, EO_JUSTDRAG
+ */
+
+os_error * eo_scaffold(int coord, eo_reasoncode code)
+{
+  wimp_redrawstr rblk;
+  BOOL more, prindex;
+  int gcolaction, gcol1, gcol2;
+  int x,y,xx,x2;
+  Wind_Link *wlink;
+  int basechar;
+  Char_Block *chr, *dragchar = dragbox.wlink->info;
+  int index = dragbox.d.scaffold.index + ((dragbox.type == DR_SCAFFOLDY) ? 8 : 0);
+  int xco = dragchar->scaffold.xcoord[index];
+  int wid = dragchar->scaffold.xwidth[index];
+  char widbuff[4];
+  int widstr = 0;
+
+  if (wid < WID_LTANGENT &&
+      (code == EO_DRAG || code == EO_JUSTDRAG || code == EO_RESTORE)) {
+    sprintf(widbuff, "%d", wid);
+    widstr = (strlen(widbuff) << 4) + 3*tt;
+  }
+
+  if (code == EO_JUSTDRAG) {
+    wlink = findwindlink(handle);    /* handle set up in redraw_skel */
+  } else {
+    wlink = Wind_Head.next;
+  }
+  basechar = dragchar->scaffold.xchar[index];
+
+  while (wlink)
+  {
+    if (wlink->type == W_SKELETON)
+    if ((chr=wlink->info)->parent == dragchar->parent)
+    if (chr->scaffold.xchar[index] == basechar)
+    {
+      if (code != EO_JUSTDRAG) er(getwlinkstate(wlink));
+
+      /* calculate xx,xx2 = endpoints of line connecting blobs */
+
+      x2 = xco + ((wid < WID_LTANGENT) ? wid : 0);
+
+      if (dragbox.type==DR_SCAFFOLDX) {
+        x = scalex(coord);
+        y = by;
+        xx = scalex(xco)+tt+dx;
+        x2 = scalex(x2)-tt-dx;
+      } else {
+        x = bx;
+        y = scaley(coord);
+        xx = scaley(xco)+tt+dy;
+        x2 = scaley(x2)-tt-dy;
+      }
+    
+      /* work out appropriate colours (different if line selected) */
+    
+      gcolaction = 0;
+      gcol1 = scaffoldcolour(chr,index);
+      gcol2 = gcol1 >> 8;
+      gcol1 &= 0xFF;
+      prindex = (gcol1 == GCOL_SELECTED &&
+                     (code == EO_REMOVE || code == EO_RESTORE)) ? 1 : 0;
+      if (code == EO_REMOVE) { gcol1 = 0; gcol2 = 0; }
+      if (code == EO_JUSTDRAG || code == EO_DRAG) gcolaction = 3;
+    
+      /* call UpdateWindow unless this is part of a repaint */
+    
+      if (code != EO_JUSTDRAG) {
+        rblk.w = handle;
+        if (dragbox.type == DR_SCAFFOLDX) {
+          rblk.box.x0 = (xx<x-tt) ? xx-bx : x-tt - bx;
+          rblk.box.y0 = -big;
+          rblk.box.x1 = ((x2>x+tt) ? x2 : x+tt)+dx - bx + widstr;
+          rblk.box.y1 = big;
+          if (prindex) rblk.box.x1 += 3*tt+16;
+        } else {
+          rblk.box.x0 = -big;
+          rblk.box.y0 = (xx<y-tt) ? xx-by : y-tt - by;
+          rblk.box.x1 = big;
+          rblk.box.y1 = (x2>y+tt) ? x2+dy-by : y+tt+dy - by;
+          if (prindex) rblk.box.y1 += 2*tt + 32;
+          if (widstr) rblk.box.y1 += 2*tt + 32;
+        }
+        erx(wimp_update_wind(&rblk,&more));
+      } else {
+        more = 1;    /* gx0, gy0, gx1, gy1 already set up */
+      }
+    
+      /* draw it! */
+    
+      while (more) {
+        if (code != EO_JUSTDRAG) {     /* already set up if EO_JUSTDRAG */
+          gx0 = unscalex(rblk.g.x0);
+          gy0 = unscaley(rblk.g.y0);
+          gx1 = unscalex(rblk.g.x1);
+          gy1 = unscaley(rblk.g.y1);
+        }
+        if (code == EO_RESTORE) {
+          if (widstr) er(printscaffoldstring(dragbox.type, x2, widbuff, 0, 0));
+          er(eo_drawtemplate(chr->template));
+          er(eo_drawcomposites(chr));
+        }
+        if (dragbox.type == DR_SCAFFOLDX) {
+          wimp_gcol(gcolaction,gcol1); bbc_move(x,0); bbc_draw(x,5000);
+          wimp_gcol(gcolaction,gcol2);
+          switch(wid) {
+            case WID_LTANGENT:
+              bbc_move(x,by); bbc_move(x,by+tt); bbc_plot(bbc_Sector+5,x,by-tt);
+              break;
+            case WID_RTANGENT:
+              bbc_move(x,by); bbc_move(x,by-tt); bbc_plot(bbc_Sector+5,x,by+tt);
+              break;
+            default:
+              bbc_circlefill(x,by,tt);
+              if (xx<=x2) { bbc_move(xx,by); bbc_draw(x2,by); }
+              if (widstr && code != EO_RESTORE) {
+                er(printscaffoldstring(dragbox.type, x2, widbuff, 3, 7));
+              }
+          } /* switch */
+        } else {    /* dragbox.type == DR_SCAFFOLDY */
+          wimp_gcol(gcolaction,gcol1); bbc_move(0,y); bbc_draw(5000,y);
+          wimp_gcol(gcolaction,gcol2);
+          switch(wid) {
+            case WID_LTANGENT:
+              bbc_move(bx,y); bbc_move(bx-tt,y); bbc_plot(bbc_Sector+5,bx+tt,y);
+              break;
+            case WID_RTANGENT:
+              bbc_move(bx,y); bbc_move(bx+tt,y); bbc_plot(bbc_Sector+5,bx-tt,y);
+              break;
+            default:
+              bbc_circlefill(bx,y,tt);
+              if (xx<=x2) { bbc_move(bx,xx); bbc_draw(bx,x2); }
+              if (widstr && code != EO_RESTORE) {
+                er(printscaffoldstring(dragbox.type, x2, widbuff, 3, 7));
+              }
+          } /* switch */
+        } /* if (DR_SCAFFOLDX/Y) */
+        switch(code) {
+          case EO_REMOVE:
+            if (prindex) er(printscaffoldindex(dragbox.type, x2, index & 7, 0, 0));
+            er(drawbacksprite(chr,&rblk));
+            er(eo_drawtemplate(chr->template));
+            er(eo_drawcomposites(chr));
+            er(drawscaffold(chr,&rblk));    /* excluding the line being dragged */
+            scanchar(chr,drawline);
+            pointcol=GCOL(0,13); scanchar(chr,drawpoints);
+            break;
+          case EO_RESTORE:
+            er(drawscaffold(chr,&rblk));    /* excluding the line being dragged */
+            if (prindex) er(printscaffoldindex(dragbox.type, x2, index & 7, 0, 11));
+            scanchar(chr,drawline);
+            pointcol=GCOL(0,13); scanchar(chr,drawpoints);
+        }
+        if (code == EO_JUSTDRAG) more = 0; else more = nextrect(&rblk);
+      }
+    } /* endif */
+    if (code == EO_JUSTDRAG) wlink = NULL; else wlink = wlink->next;
+  } /* endwhile */
+  return(NULL);
+}
+    
+
+os_error * printscaffoldstring(dragtype type, int coord, char *string, int gcol1, int gcol2)
+{
+  wimp_gcol(gcol1, gcol2);
+  if (type==DR_SCAFFOLDX) {
+    bbc_move(coord+3*tt,by+28);
+  } else {
+    bbc_move(bx-(strlen(string)<<3), coord+2*tt+28);
+  }
+  puts(string);
+  return(NULL);
+}
+
+
+os_error * printscaffoldindex(dragtype type, int coord, int index, int gcol1, int gcol2)
+{
+  char buffer[4];
+
+  sprintf(buffer, "%d", index);
+  return(printscaffoldstring(type, coord, buffer, gcol1, gcol2));
+}
+
+
+/* Select pointer shape number n
+ * NB: Assumes that the hourglass is enabled when it is called
+ */
+
+void pointer(n)
+int n;
+{
+  wimp_pshapestr p;
+
+  hourglass_off();            /* NB: hourglass must have been turned on at the time */
+
+  p.shape_num = n;
+  p.shape_data = NULL;          /* use existing shape */
+  erx(wimp_set_point_shape(&p));
+
+  hourglass_on();
+}
+
+
+/*
+ * Select a line (or curve) in a given character's skeleton window
+ * Also deselects any selected scaffold line or composite character section
+ */
+
+os_error * selectline(Char_Block *charptr, Line_Block *line)
+{
+  Pt_Block *pt, *pt2;
+  wimp_redrawstr rblk;
+  BOOL more;
+  Wind_Link *wlink = findwindinfo(W_SKELETON, charptr);
+
+  if (scafftype(charptr) != SEL_NONE) {
+    er(selectscaffold(thischar, SEL_NONE,0));
+  }
+
+  /* cycle composite selection if no line is selected, otherwise set to 0 */
+  /* goes back to start of list if has reached end, or not selected previously */
+
+  if (line == NULL && charptr->sline.p[1] == NULL) {
+    Comp_Block *comp = charptr->composites;
+    while (comp) {
+      if (comp == charptr->selcomp) break;
+      comp = comp->next;
+    }
+    if (comp) comp = comp->next;
+    if (comp==NULL) comp = charptr->composites;
+    charptr->selcomp = comp;
+  } else {
+    charptr->selcomp = NULL;
+  }
+
+/*
+  printf("Old: &%5x = ",(int)&charptr->sline);
+  printf("%5x %5x %5x %5x\n",(int)charptr->sline.p[0],
+                             (int)charptr->sline.p[1],
+                             (int)charptr->sline.p[2],
+                             (int)charptr->sline.p[3]);
+  printf("New: &%5x = ",(int)line);
+  if (line!=NULL)
+  {
+    printf("%5x %5x %5x %5x\n",(int)line->p[0],
+                               (int)line->p[1],
+                               (int)line->p[2],
+                               (int)line->p[3]);
+  } else putchar('\n');
+*/
+
+  if (line!=NULL) if (selected(charptr, line->p[1])) return(NULL);
+
+  if ((pt=charptr->sline.p[1])==NULL)
+  {
+    if (line==NULL) return(NULL); else setminmax(line);
+  }
+  else
+  {
+    pt2 = charptr->sline.p[2];
+    setminmax(&charptr->sline);
+    if (line!=NULL) addminmax(line);
+  }
+
+  if (line==NULL)
+       charptr->sline.p[1] = NULL;
+  else charptr->sline = *line;
+
+  rblk.w = wlink->wind_handle;
+  for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+  {
+    if (pt!=NULL)
+    {
+      drawpoint(pt,GCOL(0,0));
+      drawpoint(pt2,GCOL(0,0));
+      er(drawbacksprite(charptr,&rblk));
+      er(eo_drawtemplate(charptr->template));
+      er(eo_drawcomposites(charptr));
+      er(drawscaffold(charptr,&rblk));
+    }
+    scanchar(charptr,drawline);
+    pointcol=GCOL(0,13); scanchar(charptr,drawpoints);
+  }
+  return(NULL);
+}
+
+
+
+void setminmax(Line_Block *line)
+{
+  Pt_Block endp1 = *(line->p[0]);
+  Pt_Block ctrl1 = *(line->p[1]);
+  Pt_Block ctrl2 = *(line->p[2]);
+  Pt_Block endp2 = *(line->p[3]);
+
+  endp1.x -= ctrl1.x - endp1.x;         /* allow for selected line tangents */
+  endp1.y -= ctrl1.y - endp1.y;
+  endp2.x -= ctrl2.x - endp2.x;
+  endp2.y -= ctrl2.y - endp2.y;
+
+  {
+    register int cc;
+
+    minx = maxx = cc = endp1.x;
+    if ((cc = ctrl1.x)<minx) minx = cc;
+    if  (cc           >maxx) maxx = cc;
+    if ((cc = ctrl2.x)<minx) minx = cc;
+    if  (cc           >maxx) maxx = cc;
+    if ((cc = endp2.x)<minx) minx = cc;
+    if  (cc           >maxx) maxx = cc;
+
+    miny = maxy = cc = endp1.y;
+    if ((cc = ctrl1.y)<miny) miny = cc;
+    if  (cc           >maxy) maxy = cc;
+    if ((cc = ctrl2.y)<miny) miny = cc;
+    if  (cc           >maxy) maxy = cc;
+    if ((cc = endp2.y)<miny) miny = cc;
+    if  (cc           >maxy) maxy = cc;
+  }
+}
+
+void addminmax(Line_Block *line)
+{
+  Pt_Block endp1 = *(line->p[0]);
+  Pt_Block ctrl1 = *(line->p[1]);
+  Pt_Block ctrl2 = *(line->p[2]);
+  Pt_Block endp2 = *(line->p[3]);
+
+  endp1.x -= ctrl1.x - endp1.x;         /* allow for selected line tangents */
+  endp1.y -= ctrl1.y - endp1.y;
+  endp2.x -= ctrl2.x - endp2.x;
+  endp2.y -= ctrl2.y - endp2.y;
+
+  {
+    register int cc;
+
+    if ((cc = endp1.x)<minx) minx = cc;
+    if  (cc           >maxx) maxx = cc;
+    if ((cc = ctrl1.x)<minx) minx = cc;
+    if  (cc           >maxx) maxx = cc;
+    if ((cc = ctrl2.x)<minx) minx = cc;
+    if  (cc           >maxx) maxx = cc;
+    if ((cc = endp2.x)<minx) minx = cc;
+    if  (cc           >maxx) maxx = cc;
+    if ((cc = endp1.y)<miny) miny = cc;
+    if  (cc           >maxy) maxy = cc;
+    if ((cc = ctrl1.y)<miny) miny = cc;
+    if  (cc           >maxy) maxy = cc;
+    if ((cc = ctrl2.y)<miny) miny = cc;
+    if  (cc           >maxy) maxy = cc;
+    if ((cc = endp2.y)<miny) miny = cc;
+    if  (cc           >maxy) maxy = cc;
+  }
+}
+
+
+BOOL updminmax(wimp_redrawstr *rptr)
+{
+  BOOL more;
+  rptr->box.x0 = rscalex(minx)-tt;
+  rptr->box.y0 = rscaley(miny)-tt;
+  rptr->box.x1 = rscalex(maxx)+tt;
+  rptr->box.y1 = rscaley(maxy)+tt;
+  erx(wimp_update_wind(rptr,&more));
+
+  bx = rptr->box.x0 - rptr->scx;
+  by = rptr->box.y1 - rptr->scy;
+  xsize = rptr->box.x1 - rptr->box.x0;
+  ysize = rptr->box.y1 - rptr->box.y0;
+
+  gx0 = unscalex(rptr->g.x0); 
+  gy0 = unscaley(rptr->g.y0);
+  gx1 = unscalex(rptr->g.x1);
+  gy1 = unscaley(rptr->g.y1);
+
+  return(more);
+}
+
+
+BOOL nextrect(wimp_redrawstr *rptr)
+{
+  BOOL more;
+
+  erx(wimp_get_rectangle(rptr,&more));
+
+  gx0 = unscalex(rptr->g.x0); 
+  gy0 = unscaley(rptr->g.y0);
+  gx1 = unscalex(rptr->g.x1);
+  gy1 = unscaley(rptr->g.y1);
+
+  return(more);
+}
+
+
+static Line_Block dragline1, dragline2;
+
+os_error * eorbits(Pt_Block *pt,eo_reasoncode flag)
+{
+  Pt_Block *pt2;
+
+  switch(pt->type)
+  {
+    case PT_CONTROL:
+    case PT_STRAIGHT:
+    case PT_CONTROL  + PT_INVISIBLE:
+    case PT_STRAIGHT + PT_INVISIBLE:
+         dragline1.p[0] = pt->nextpt[1];
+         dragline1.p[1] = pt;
+         dragline1.p[2] = pt2=pt->nextpt[0];
+         dragline1.p[3] = pt2->nextpt[1];
+
+         switch(flag)
+         {
+           case EO_DRAG:
+                minx = pt->x - (56<<16)/xscale;
+                miny = pt->y;
+                maxx = pt->x + (56<<16)/xscale;
+                maxy = pt->y + (40<<16)/yscale;
+                addminmax(&dragline1);
+                break;
+
+           default:
+                setminmax(&dragline1);
+
+           case EO_JUSTDRAG:
+                break;
+         }
+         er(eo_ctrlpoint(flag));
+         break;
+
+    case PT_HINGED:
+    case PT_PARALLEL:
+         dragline1.p[0] = pt;
+         dragline1.p[1] = pt2=pt->nextpt[0];
+         if (pt2!=NULL) { dragline1.p[2] = pt2=pt2->nextpt[0];
+                          dragline1.p[3] = pt2->nextpt[1];
+                        }
+         dragline2.p[0] = pt;
+         dragline2.p[1] = pt2=pt->nextpt[1];
+         if (pt2!=NULL) { dragline2.p[2] = pt2=pt2->nextpt[0];
+                          dragline2.p[3] = pt2->nextpt[1];
+                        }
+
+         switch(flag)
+         {
+           case EO_DRAG:
+                minx = pt->x - (56<<16)/xscale;
+                miny = pt->y;
+                maxx = pt->x + (56<<16)/xscale;
+                maxy = pt->y + (40<<16)/yscale;
+                if (dragline1.p[1]!=NULL) addminmax(&dragline1);
+                if (dragline2.p[1]!=NULL) addminmax(&dragline2);
+                break;
+
+           default:
+                setminmax(&dragline1);
+                if (dragline1.p[1]!=NULL)
+                { setminmax(&dragline1);
+                  if (dragline2.p[1]!=NULL) addminmax(&dragline2); }
+                else setminmax(&dragline2);
+
+           case EO_JUSTDRAG:
+                break;
+         }
+         er(eo_endpoint(flag));
+  }
+  return(NULL);
+}
+
+
+os_error * eo_ctrlpoint(eo_reasoncode flag)
+{
+  wimp_redrawstr rblk;
+  BOOL more;
+
+  rblk.w = handle;
+
+  switch(flag)
+  {
+    case EO_REMOVE:
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+           eo_removeline(&dragline1);
+         eo_markinvisible(&dragline1);
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+         {
+           er(drawbacksprite(thischar,&rblk));
+           er(eo_drawtemplate(thischar->template));
+           er(eo_drawcomposites(thischar));
+           er(drawscaffold(thischar,&rblk));
+           scanchar(thischar,drawline);
+           pointcol=GCOL(0,13); scanchar(thischar,drawpoints);
+         }
+         break;
+
+    case EO_RESTORE:
+         eo_markvisible(&dragline1);
+         eo_straighten(&dragline1);
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+         {
+           eo_restoreline(&dragline1);
+           eo_restorepoints(&dragline1);
+         }
+         break;
+
+    case EO_DRAG:
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+         {
+           eo_markvisible(&dragline1);
+           wimp_gcol(3,15); drawaline(&dragline1);
+           drawpoint(dragline1.p[1],GCOL(3,11));
+           eo_markinvisible(&dragline1);
+           eo_printcoords(dragline1.p[1]);
+         }
+         break;
+
+    case EO_JUSTDRAG:
+         eo_markvisible(&dragline1);
+         wimp_gcol(3,15); drawaline(&dragline1);
+         drawpoint(dragline1.p[1],GCOL(3,11));
+         eo_markinvisible(&dragline1);
+         eo_printcoords(dragline1.p[1]);
+  }
+  return(NULL);
+}
+
+
+os_error * eo_endpoint(eo_reasoncode flag)
+{
+  wimp_redrawstr rblk;
+  BOOL more;
+
+  rblk.w = handle;
+
+  switch(flag)
+  {
+    case EO_REMOVE:
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+         {
+           eo_removeline(&dragline1);
+           eo_removeline(&dragline2);
+         }
+         eo_markinvisible(&dragline1);
+         eo_markinvisible(&dragline2);
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+         {
+           er(drawbacksprite(thischar,&rblk));
+           er(eo_drawtemplate(thischar->template));
+           er(eo_drawcomposites(thischar));
+           er(drawscaffold(thischar,&rblk));
+           scanchar(thischar,drawline);
+           pointcol=GCOL(0,13); scanchar(thischar,drawpoints);
+         }
+         break;
+
+    case EO_RESTORE:
+         eo_markvisible(&dragline1);
+         eo_markvisible(&dragline2);
+         eo_straighten(&dragline1);
+         eo_straighten(&dragline2);
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+         {
+           eo_restoreline(&dragline1);
+           eo_restoreline(&dragline2);
+           eo_restorepoints(&dragline1);
+           eo_restorepoints(&dragline2);
+         }
+         break;
+
+    case EO_DRAG:
+         for(more=updminmax(&rblk);more;more=nextrect(&rblk))
+         {
+           eo_markvisible(&dragline1);
+           eo_markvisible(&dragline2);
+           wimp_gcol(3,15); drawaline(&dragline1);
+           wimp_gcol(3,15); drawaline(&dragline2);
+           drawpoint(dragline1.p[0],GCOL(3,7));
+           eo_markinvisible(&dragline1);
+           eo_markinvisible(&dragline2);
+           eo_printcoords(dragline1.p[0]);
+         }
+         break;
+
+    case EO_JUSTDRAG:
+         eo_markvisible(&dragline1);
+         eo_markvisible(&dragline2);
+         wimp_gcol(3,15); drawaline(&dragline1);
+         wimp_gcol(3,15); drawaline(&dragline2);
+         drawpoint(dragline1.p[0],GCOL(3,7));
+         eo_markinvisible(&dragline1);
+         eo_markinvisible(&dragline2);
+         eo_printcoords(dragline1.p[0]);
+  }
+  return(NULL);
+}
+
+
+void eo_printcoords(pt)
+Pt_Block *pt;
+{
+  if (showcoords)
+  {
+    wimp_gcol(3,7);
+    bbc_move(scalex(pt->x)-56,scaley(pt->y)+40);
+    printf("%3d,%3d",pt->x,pt->y);
+  }
+}
+
+
+/* #### Bug here: must scale template if different design size */
+
+os_error * eo_drawtemplate(charptr)
+Char_Block *charptr;
+{
+  int fillpath[MAXPATH];
+
+  if (charptr!=NULL)
+  {
+    wimp_gcol(0,3);
+    initsize(fillpath);
+    er(buildpath(charptr, fillpath, NULL, FALSE));
+    drawstroke(fillpath, NULL, 0);
+  }
+  return(NULL);
+}
+
+
+os_error * eo_drawcomposites(Char_Block *charptr)
+{
+  int fillpath[MAXPATH];
+  os_error *err;
+  Path_Block *charpath = charptr->nextpath;
+
+  charptr->nextpath = NULL;     /* forget about main body */
+  initsize(fillpath);
+  err=buildpath(charptr, fillpath, NULL, FALSE);
+  charptr->nextpath = charpath;
+  if (err) return(err);
+
+  wimp_gcol(0,7);
+  drawstroke(fillpath, NULL, 0);
+
+  return(NULL);
+}
+
+
+void eo_straighten(line)
+Line_Block *line;
+{
+  Pt_Block * pt;
+
+  if ((pt=line->p[1])!=NULL)
+  if (pt->type==PT_STRAIGHT)
+  {
+    pt->x = (line->p[0]->x*2 + line->p[3]->x)/3;
+    pt->y = (line->p[0]->y*2 + line->p[3]->y)/3;
+    line->p[2]->x = (line->p[0]->x + line->p[3]->x*2)/3;
+    line->p[2]->y = (line->p[0]->y + line->p[3]->y*2)/3;
+  }
+}
+
+
+void eo_removeline(line)
+Line_Block *line;
+{
+  if (line->p[1]!=NULL)
+  {
+    wimp_gcol(0,0); drawaline(line);
+    pointcol=GCOL(0,0);
+    drawpoints(line);
+  }
+}
+
+
+void eo_markinvisible(line)
+Line_Block *line;
+{
+  if (line->p[1]!=NULL)
+  {
+    line->p[1]->type += PT_INVISIBLE;
+    line->p[2]->type += PT_INVISIBLE;
+  }
+}
+
+
+void eo_markvisible(line)
+Line_Block *line;
+{
+  if (line->p[1]!=NULL)
+  {
+    line->p[1]->type -= PT_INVISIBLE;
+    line->p[2]->type -= PT_INVISIBLE;
+  }
+}
+
+
+void eo_restoreline(line)
+Line_Block *line;
+{
+  Pt_Block *pt;
+
+  if ((pt=line->p[1])!=NULL)
+  {
+    if (selected(thischar, pt)) wimp_gcol(0,15); else wimp_gcol(0,7);
+    drawaline(line);
+  }
+}
+
+
+void eo_restorepoints(line)
+Line_Block *line;
+{
+  if (line->p[1]!=NULL)
+  {
+    pointcol=GCOL(0,13);
+    drawpoints(line);
+  }
+}
+
+
+/*
+ * Matches the selected line by preference if dragging,
+ * else doesn't match the selected line for left-click
+ *
+ * Global parameters:
+ *      bx, by, x0,y0,x1,y1, xscale, yscale
+ */
+
+int matchscaffoldx(Char_Block *charptr,
+                           wimp_mousestr *mousep,
+                           seltype sel_type,
+                           int index,
+                           int *x1return, int *x2return)
+{
+  register int mousex = mousep->x;
+  register int mousey = mousep->y;
+
+  if (mousey > by-tt && mousey < by+tt) {
+    int *xcoord = charptr->scaffold.xcoord;
+    int *xwidth = charptr->scaffold.xwidth;
+    char flags[8];
+    int x1ret[8], x2ret[8];
+    int i,x,xx,x2;
+
+    for (i=0; i<=7; i++) {
+      flags[i] = 0;
+      x = xcoord[i];
+      if (x != NULL_SCAFFOLD) {
+        x2 = x + xwidth[i];
+        xx = scalex(x);
+        if (mousex > xx-tt && mousex < xx+tt) {           /* try left-hand line */
+          x2 = xx;   /* x, x2 = appropriate coords */
+        } else {
+          if (xwidth[i] < WID_LTANGENT) {
+            x = x2;                                                      /* try right-hand line */
+            x2 = scalex(x2);
+          } else x2=xx;
+        }
+        if (mousex > x2-tt && mousex < x2+tt) {           /* matches this scaffold line */
+          flags[i] = 1;
+          x1ret[i] = x;
+          x2ret[i] = x2;
+        }
+      } /* if */
+    } /* for */
+    i=0;
+    if (sel_type == SEL_SCAFFOLDX) {
+      if (mousep->bbits == wimp_BLEFT) flags[index] = 0;    /* can't select that again */
+      else if (flags[index]) i=index;     /* prefer selected line if dragging */
+    }
+    if (i==0) for (i=1; i<8; i++) if (flags[i]) break;
+    if (i<8) {
+      *x1return = x1ret[i];
+      *x2return = x2ret[i];
+      return(i);
+    }
+  }
+  return(0);
+}
+
+/*
+ * Matches the selected line by preference if dragging,
+ * else doesn't match the selected line for left-click
+ *
+ * Global parameters:
+ *      bx, by, x0,y0,x1,y1, xscale, yscale
+ */
+
+int matchscaffoldy(Char_Block *charptr,
+                           wimp_mousestr *mousep,
+                           seltype sel_type,
+                           int index,
+                           int *y1return, int *y2return)
+{
+  register int mousex = mousep->x;
+  register int mousey = mousep->y;
+
+  if (mousex>bx-tt && mousex<bx+tt) {
+    int *ycoord = charptr->scaffold.ycoord;
+    int *ywidth = charptr->scaffold.ywidth;
+    char flags[8];
+    int y1ret[8], y2ret[8];
+    int i,y,yy,y2;
+
+    for (i=0;i<8;i++) {
+      flags[i] = 0;
+      y = ycoord[i];
+      if (y != NULL_SCAFFOLD) {
+        y2 = y+ywidth[i];
+        yy = scaley(y);
+        if (mousey > yy-tt && mousey < yy+tt) {           /* try lower line */
+          y2 = yy;   /* y, y2 = appropriate coords */
+        } else {
+          if (ywidth[i] < WID_LTANGENT) {
+            y = y2;                                                       /* try upper line */
+            y2 = scaley(y2);
+          } else y2=yy;
+        }
+        if (mousey > y2-tt && mousey < y2+tt) {
+          flags[i] = 1;
+          y1ret[i] = y;
+          y2ret[i] = y2;
+        }
+      } /* if */
+    } /* for */
+    i=0;
+    if (sel_type == SEL_SCAFFOLDY) {
+      if (mousep->bbits == wimp_BLEFT) flags[index] = 0;    /* can't select that again */
+      else if (flags[index]) i=index;     /* prefer selected line if dragging */
+    }
+    if (i==0) for (i=1; i<8; i++) if (flags[i]) break;
+    if (i<8) {
+      *y1return = y1ret[i];
+      *y2return = y2ret[i];
+      return(i);
+    }
+  }
+  return(0);
+}

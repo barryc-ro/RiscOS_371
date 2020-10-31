@@ -1,0 +1,522 @@
+/* > tools.c
+
+ * © SJ Middleton, 1993
+
+ * This file controls the tools pane and timebar that hangs off the display window
+ * Pane code is in WimpLib.pane
+
+ */
+
+#include "akbd.h"
+#include "alarm.h"
+#include "bbc.h"
+#include "coords.h"
+#include "dboxes.h"
+#include "werr.h"
+#include "wimpx.h"
+#include "wimpt.h"
+
+#include <stdio.h>
+
+#include "macros.h"
+#include "pane.h"
+#include "redraw.h"
+#include "screenmode.h"
+#include "wmisc.h"
+
+#include "artools.h"
+#include "display.h"
+
+#define TOOLS_IDENT     "Tools"
+
+#define STOP_FIELD      1
+#define PLAY_FIELD      2
+#define PAUSE_FIELD     3
+#define STEP_FIELD      4
+#define MUTE_FIELD      5
+#define TIMEBAR_FIELD   6
+#define TIME_FIELD      8
+#define BIGPLAY_FIELD   9
+
+static wimp_icon    time_icon;
+static wimp_box     time_box;
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Redraw code, draw appropriate section of timebar in red and grey1
+ * according to the current time in dp->current_t
+ */
+
+static void tool_redraw_setup(void *handle, wimp_redrawstr *r, BOOL local)
+{
+    display_str *dp = handle;
+    time_box = time_icon.box;
+    coords_box_toscreen(&time_box, (coords_cvtstr *)&r->box);
+    UNUSED(dp);
+    UNUSED(local);
+}
+
+static void tool_redraw(void *handle, wimp_redrawstr *r, BOOL local)
+{
+    if (coords_boxesoverlap(&r->g, &time_box))
+    {
+        display_str *dp = handle;
+        int total_width = time_box.x1 - time_box.x0,
+            height = time_box.y1 - time_box.y0,
+            width = dp->hdr ? (total_width*dp->current_frame / dp->nframes) &~ (screen_Vars.dx - 1) : 0,
+            width_left = total_width - width;
+        
+        if (width > 0)
+        {
+            os_err(screen_SetFGCol(TIMEBAR_COLOUR));
+            bbc_rectanglefill(time_box.x0, time_box.y0, width-1, height-1);
+        }
+        
+        if (width_left > 0)
+        {
+            os_err(screen_SetFGCol(TIMEBAR_BG_COLOUR));
+            bbc_rectanglefill(time_box.x0 + width, time_box.y0, width_left-1, height-1);
+        }
+    }
+    UNUSED(local);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Handle the user events, makes calls to play.c
+ */
+
+static void tool_events(dbox d, void *handle)
+{
+    display_str *dp = handle;
+    dbox_field  action = dbox_get(d);
+
+    switch (action)
+    {
+        case STOP_FIELD:
+            dbox_setnumeric(d, STOP_FIELD, TRUE);
+            play_stop(dp);
+            dbox_setnumeric(d, STOP_FIELD, FALSE);
+            break;
+
+        case PLAY_FIELD:
+            play_start(dp, FALSE);
+            break;
+
+        case BIGPLAY_FIELD:
+            play_start(dp, TRUE);
+            break;
+
+        case PAUSE_FIELD:
+            play_pause(dp);
+            break;
+
+        case STEP_FIELD:
+            dbox_setnumeric(d, STEP_FIELD, TRUE);
+            play_step(dp, dbox_persist() ? -1 : +1);
+            dbox_setnumeric(d, STEP_FIELD, FALSE);
+            break;
+
+        case MUTE_FIELD:
+            play_togglemute(dp);
+            break;
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+
+/*
+ * Given a click on the timebar, work out the time in centiseconds that
+ * is actually meant and return that time.
+ */
+
+static int read_mouse_frame(display_str *dp, wimp_mousestr *mp)
+{
+    coords_pointstr p = *(coords_pointstr *)&mp->x;
+    wimp_openstr    o = window_state(mp->w);
+    int             val;
+    coords_point_toworkarea(&p, (coords_cvtstr *)&o.box);
+    val = (p.x - time_icon.box.x0)*dp->nframes / (time_icon.box.x1 - time_icon.box.x0);
+    return val < 0 ? 0 : val > dp->nframes ? dp->nframes : val;
+}
+
+/*
+ * Alarm function, called whilst dragging the timebar.
+ * Caluculate new current time and update the timebar accordingly
+ */
+
+static void timebar_alarm(int called_at, void *handle)
+{
+    display_str     *dp = handle;
+    wimp_mousestr   m;
+    int             new_frame;
+
+    no_err(wimp_get_point_info(&m));
+    new_frame = read_mouse_frame(dp, &m);
+    if (dp->current_frame != new_frame)
+    {
+        dp->current_frame = new_frame;
+        tools_refreshtime(dp);
+    }
+
+    alarm_set(alarm_timenow() + 4, timebar_alarm, dp);
+    UNUSED(called_at);
+}
+
+/*
+ * Called when the drag has finished, remove processors
+ */
+
+static BOOL timebar_unknown_events(wimp_eventstr *e, void *handle)
+{
+    display_str *dp = handle;
+    if (e->e == wimp_EUSERDRAG)
+    {
+        timebar_alarm(0, dp);
+        alarm_removeallproc(timebar_alarm, dp);
+        win_remove_unknown_event_processor(timebar_unknown_events, dp);
+
+        if (!akbd_pollctl())
+            play_seek(dp);
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * Handle clicks on the timebar.
+ * Either update the timebar to the point clicked or start a drag
+ */
+
+static void timebar_pressed(display_str *dp, wimp_mousestr *mp)
+{
+    if (mp->i == TIMEBAR_FIELD)
+    {
+        if (dp->state == play_Stopped) switch (mp->bbits)
+        {
+            case wimp_BLEFT:
+            {
+                wimp_dragstr drag;
+                wimp_openstr o = window_state(mp->w);
+
+                drag.window = mp->w;
+                drag.type = wimp_USER_HIDDEN;
+                drag.parent = time_icon.box;
+                coords_box_toscreen(&drag.parent, (coords_cvtstr *)&o.box);
+                drag.box.x0 = drag.box.x1 = mp->x;
+                drag.box.y0 = drag.box.y1 = mp->y;
+                no_err(wimp_drag_box(&drag));
+
+                win_add_unknown_event_processor(timebar_unknown_events, dp);
+                timebar_alarm(0, dp);
+                break;
+            }
+        }
+    }
+}
+
+/*
+ * Handle system events on timebar wndow.
+ * Either redraw or mouse cick events.
+ */
+
+static BOOL tool_rawevents(dbox d, void *event, void *handle)
+{
+    display_str     *dp = handle;
+    wimp_eventstr   *e = event;
+    switch (e->e)
+    {
+        case wimp_EOPEN:
+            return TRUE;
+
+        case wimp_EREDRAW:
+            redraw_window(e->data.o.w, tool_redraw_setup, tool_redraw, dp);
+            break;
+
+        case wimp_EBUT:
+            timebar_pressed(dp, &e->data.but.m);
+            break;
+    }
+    return FALSE;
+    UNUSED(d);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Close the toolbar and reopen according to the state of the flags in dp.
+ * This could mean none, one or both of the timebar and the VCR controls
+ * being shown.
+ */
+
+void tools_toggle(display_str *dp)
+{
+    wimp_openstr o;
+
+    tools_dispose(dp);
+    tools_create(dp, dp->timebar_open, dp->tools_open);
+
+    o = window_state(dp->window);
+    pane_check_open(&o);
+}
+
+/*
+ * Detach the tools pane from the main window and dispose of it.
+ */
+
+void tools_dispose(display_str *dp)
+{
+    if (dp->tools)
+    {
+        pane_remove(dbox_syshandle(dp->tools), FALSE);
+        dbox_dispose(&dp->tools);
+        dp->tools = NULL;
+    }
+}
+
+/*
+ * Create a new tools window (if at least one of timebar and tools pabe is wanted).
+ * Display it, and attach it to the bottom of the display window
+ */
+
+void tools_create(display_str *dp, BOOL time, BOOL tools)
+{
+    if (dp->tools == NULL && (time || tools))
+    {
+        dbox d;
+        if ((d = dp->tools = dbox_new(TOOLS_IDENT)) != NULL)
+        {
+            dbox_eventhandler(d, tool_events, dp);
+            dbox_raw_eventhandler(d, tool_rawevents, dp);
+
+            dbox_showstatic(d);
+
+            tools_refreshsound(dp);
+            dp->displayed_frame = -1;
+            tools_refreshtime(dp);
+
+            no_err(wimp_get_icon_info(dbox_syshandle(dp->tools), TIMEBAR_FIELD, &time_icon));
+            time_icon.box.x0 += 12;
+            time_icon.box.x1 -= 12;
+            time_icon.box.y0 += 12;
+            time_icon.box.y1 -= 12;
+
+            {
+                wimp_openstr    o = window_state(dbox_syshandle(dp->tools));
+                wimp_icon       icon;
+                no_err(wimp_get_icon_info(o.w, 0, &icon));
+                coords_box_toscreen(&icon.box, (coords_cvtstr *)&o.box);
+                if (!time)
+                {
+                    o.y += (icon.box.y1 - 8) - o.box.y1;
+                    o.box.y1 = icon.box.y1 - 8;
+                }
+                else if (!tools)
+                    o.box.y0 = icon.box.y1;
+                no_err(wimp_open_wind(&o));
+
+                pane_setpane(dp->window, o.w, 0, -4,
+                    pane_AttachLeft | pane_AttachBottom, 0, 0, dp);
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+static void set_time(display_str *dp, BOOL force)
+{
+    int nsecs, nframes;
+
+    if (dp->hdr)
+    {
+        nsecs = (int)(dp->current_frame / dp->hdr->fps);
+        nframes = (int)(dp->current_frame - nsecs*dp->hdr->fps);
+    }
+    else
+        nsecs = nframes = 0;
+
+    if (dp->time_mode == time_Decimal)
+    {
+        if (force || dp->displayed_frame != dp->current_frame)
+        {
+            dboxes_setfieldf(dp->tools, TIME_FIELD, "%02d:%02d.%02d", nsecs / 60, nsecs % 60, nframes);
+            dp->displayed_frame = dp->current_frame;
+        }
+    }
+    else
+    {
+        if (force || dp->displayed_frame != nsecs)
+        {
+            dboxes_setfieldf(dp->tools, TIME_FIELD, "%02d:%02d", nsecs / 60, nsecs % 60);
+            dp->displayed_frame = nsecs;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Refresh various buttons of the tools pane.
+ * Called from other parts of the application when the state changes
+ */
+
+void tools_refreshsound(display_str *dp)
+{
+    if (dp->tools)
+        dbox_setnumeric(dp->tools, MUTE_FIELD, dp->sound_on);
+}
+
+void tools_refreshpause(display_str *dp)
+{
+    if (dp->tools)
+        dbox_setnumeric(dp->tools, PAUSE_FIELD, dp->state == play_Paused);
+}
+
+void tools_clearstop(display_str *dp)
+{
+    if (dp->tools)
+    {
+        dbox_setnumeric(dp->tools, STOP_FIELD, FALSE);
+        dbox_setnumeric(dp->tools, STEP_FIELD, FALSE);
+    }
+}
+
+void tools_refreshplay(display_str *dp)
+{
+    if (dp->tools)
+    {
+        dbox_setnumeric(dp->tools, PLAY_FIELD, dp->state != play_Stopped);
+        dbox_fadestate(dp->tools, BIGPLAY_FIELD, dp->state != play_Stopped);
+    }
+}
+
+void tools_timemode(display_str *dp, int mode)
+{
+    if (dp->tools)
+    {
+        dp->time_mode = mode;
+
+        switch (mode)
+        {
+            case time_Decimal:
+            case time_Seconds:
+                dbox_unfadefield(dp->tools, TIME_FIELD);
+                set_time(dp, TRUE);
+                break;
+
+            case time_Faded:
+                dbox_fadefield(dp->tools, TIME_FIELD);
+                break;
+        }
+    }
+}
+
+/*
+ * Assuming dp->current_t has been updated, redraw the timebar and
+ * update the seconds counter.
+ */
+
+void tools_refreshtime(display_str *dp)
+{
+    if (dp->tools && dp->time_mode != time_Faded)
+    {
+        wimp_redrawstr  r;
+
+        r.w = dbox_syshandle(dp->tools);
+        r.box = time_icon.box;
+        redraw_local(&r, tool_redraw_setup, tool_redraw, dp);
+
+        set_time(dp, FALSE);
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Construct a list of button positions as a string to pass in the
+ * command-line to player.
+ * Also writes out the x position in scren OS coords of the left
+ * hand size of the button.
+ */
+
+static int add_button(char *buffer, wimp_w w, dbox_field f, int code, coords_pointstr *offset, int *xpos, int *ypos)
+{
+    wimp_icon icon;
+    no_err(wimp_get_icon_info(w, f, &icon));
+    coords_offsetbox(&icon.box, offset->x, offset->y, &icon.box);
+
+    if (icon.box.x0 >= 0 && icon.box.y0 >= 0 &&
+        icon.box.x1 <= screen_Vars.oswidth &&
+        icon.box.y1 <= screen_Vars.osheight)
+    {
+        *ypos = icon.box.y1;
+    }
+    else
+    {
+        *ypos = -1;
+    }
+
+    *xpos = icon.box.x0;
+    return sprintf(buffer, " %c%d,%d,%d,%d", code,
+            icon.box.x0, icon.box.y0,
+            icon.box.x1 - icon.box.x0, icon.box.y1 - icon.box.y0);
+}
+
+int tool_buttonpositions(display_str *dp, char *buffer, int *xpos, int *ypos)
+{
+    int             n = 0;
+    wimp_w          w = dbox_syshandle(dp->tools);
+    wimp_openstr    o = window_state(w);
+    coords_pointstr offset;
+    offset.x = offset.y = 0;
+    coords_point_toscreen(&offset, (coords_cvtstr *) &o.box);
+    n += add_button(buffer + n, w, PAUSE_FIELD, 'P', &offset, &xpos[0], &ypos[0]);
+    n += add_button(buffer + n, w, STOP_FIELD, 'E', &offset, &xpos[1], &ypos[1]);
+    n += add_button(buffer + n, w, STEP_FIELD, 'S', &offset, &xpos[2], &ypos[2]);
+    n += add_button(buffer + n, w, MUTE_FIELD, 'M', &offset, &xpos[3], &ypos[3]);
+    return n;
+}
+
+/*
+ * If the tool bar is open and the buttons are showing then
+ * write out their pixel offsets from the movie base
+ * else return FALSE.
+ */
+
+BOOL tool_barposition(display_str *dp, wimp_box *out_box)
+{
+    if (dp->timebar_open)
+    {
+        wimp_openstr    display_o = window_state(dp->window),
+                        tool_o = window_state(dbox_syshandle(dp->tools));
+        wimp_box        box;
+    
+        box = time_icon.box;
+        coords_box_toscreen(&box, (coords_cvtstr *)&tool_o.box);
+
+        if (box.y0 >= 0 &&                  /* timebar goes off screen bottom */
+            box.y1 < display_o.box.y0 &&    /* timebar overlaps frame */
+            box.x1 < screen_Vars.oswidth)   /* timebar goes off screen right */
+        {
+/* get position of timebar on screen in OS coords */
+            out_box->x0 = box.x0;
+            out_box->y0 = box.y1;
+
+/* get width in pixels of timebar */
+            out_box->x1 = (time_icon.box.x1 - time_icon.box.x0) >> screen_Vars.xeig;
+            out_box->y1 = (time_icon.box.y1 - time_icon.box.y0) >> screen_Vars.yeig;
+
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/* eof tools.c */

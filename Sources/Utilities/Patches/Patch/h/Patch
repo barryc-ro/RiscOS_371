@@ -1,0 +1,572 @@
+#include <stddef.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <locale.h>
+
+#include "swis.h"
+#include "kernel.h"
+#include "os.h"
+#include "wimpt.h"
+#include "wimp.h"
+#include "win.h"
+#include "event.h"
+#include "template.h"
+#include "baricon.h"
+#include "menu.h"
+#include "dbox.h"
+#include "res.h"
+
+
+#define HOST_DEBUG
+
+
+
+/* Error numbers. */
+
+#define ErrorNumber_TokenNotFound       0xAC2
+
+
+
+/* File types. */
+
+#define FileType_DontCare               0
+#define FileType_Patch                  0xFC3
+#define FileType_Directory              0x1000
+#define FileType_Application            0x2000
+
+
+/* SWI numbers with the X bit set. */
+
+#define XHourglass_On                   (Hourglass_On | XOS_Bit)
+#define XHourglass_Off                  (Hourglass_Off | XOS_Bit)
+#define XOS_ConvertSpacedCardinal4      (OS_ConvertSpacedCardinal4 | XOS_Bit)
+#define XOS_GSTrans                     (OS_GSTrans | XOS_Bit)
+#define XOS_Args                        (OS_Args | XOS_Bit)
+#define XOS_GBPB                        (OS_GBPB | XOS_Bit)
+#define XOS_File                        (OS_File | XOS_Bit)
+#define XOS_Find                        (OS_Find | XOS_Bit)
+#define XOS_FSControl                   (OS_FSControl | XOS_Bit)
+#define XOS_ReadUnsigned                (OS_ReadUnsigned | XOS_Bit)
+#define XWimp_ReportError               (Wimp_ReportError | XOS_Bit)
+#define XWimp_SlotSize                  (Wimp_SlotSize | XOS_Bit)
+#define XWimp_StartTask                 (Wimp_StartTask | XOS_Bit)
+
+
+
+/* Defines for OS_File object type bits. */
+
+#define object_nothing                  0
+#define object_file                     1
+#define object_directory                2
+
+
+
+/* Defines for OS_Find calls. Error if doesn't exist, NO error
+   if it is a directory (so we can patch images). */
+
+#define OS_FIND_OPEN_UPDATE_NOPATH      0xCB
+#define OS_FIND_OPEN_READ_NOPATH        0x4B
+#define OS_FIND_CLOSE                   0
+
+
+/* Defines for OS_GBPB calls. */
+
+#define OSGBPB_WriteAtGiven             1
+#define OSGBPB_ReadFromGiven            3
+#define OSGBPB_ReadDirEntriesFileType   12
+
+
+/* Defines for OS_FSControl calls. */
+
+#define FSControl_CanonicalisePath      37
+
+
+/* Defines for OS_File calls. */
+
+#define OSFile_Delete                   6
+#define OSFile_MakeError                19
+#define OSFile_ReadWithTypeNoPath       23
+
+
+/* Defines for OS_Args calls. */
+
+#define OSArgs_ReadEXT                  2
+
+
+/* Make sure that HOST_DEBUG is only defined if DEBUG is. */
+
+#if (defined(HOST_DEBUG) && !defined(DEBUG))
+#undef HOST_DEBUG
+#endif
+
+
+
+#ifdef DEBUG
+
+/* Debugging printf - goes to tube podule if HOST_DEBUG defined, otherwise
+   it shits all over the screen. The pragma gets the compiler to do
+   printf() format string checking on the parameters. */
+
+#pragma -v1
+
+extern void debug_printf
+(
+    char const * const                  format_string,
+    ...
+);
+
+#pragma -v0
+
+
+/* Macro which prints debug when debugging is turned on. */
+
+#define DEBUG_PRINTF(parameters)        debug_printf parameters
+
+
+#else /* DEBUG */
+
+
+/* No debugging, so macro does nothing. */ 
+
+#define DEBUG_PRINTF(parameters)
+
+
+#endif /* DEBUG */
+
+
+
+/* Tube podule SWI numbers. */
+
+#ifdef HOST_DEBUG
+#define XHostFS_HostVdu                 (0x40100 | XOS_Bit)
+#define XHostFS_TubeVdu                 (0x40101 | XOS_Bit)
+#endif
+
+
+
+/* Global variable for restoring the wimp next slot size on exit(). */
+
+extern int                              orig_next_slot;
+
+/* Global variable of channel to close on exit(). */
+
+extern int                              glob_channel;
+
+/* Global variable of file to delete on exit(). */
+
+extern char const *                     glob_delete;
+
+
+
+/* Macro to wrap up calls to functions that we wish to fatal if they fail.
+   There is no extra function call unless there actually was an error.
+   wimpt_noerr() on the other hand imposes an extra nested function call
+   whether or not there was an error. Thus NOERR gains speed at the expense
+   of a very small increase in code size (3 extra instructions per use).
+   It also means we avoid have all the standard crappy text that
+   wimpt_noerr() puts around the error. */
+
+#define NOERR(_function_call) \
+{ \
+    _kernel_oserror *                   _error; \
+ \
+    _error = (_kernel_oserror *) (_function_call); \
+ \
+    if (_error != NULL) \
+    { \
+        report_error(_error, wimp_ECANCEL); \
+    } \
+}
+
+
+
+/* Malloc functions which never fail (fatal the program instead). These
+   would be macros, except that you just can't do it as you need a new
+   scope to get a variable to hold the returned pointer in to check it,
+   and you can't return a value from inside a scope (no RESULTIS). */
+
+extern void * malloc_noerr(size_t);
+extern void * calloc_noerr(size_t, size_t);
+
+
+
+/* Function to open a MessageTrans file and put it on the list. Returns
+   the handle for the file, which can be used later to do lookups in
+   just that one file. */
+
+extern char * open_msgtrans_file
+(
+    char const * const                  filename
+);
+
+
+/* Function to close all MessageTrans files on the list. This function is
+   designed to get called after exit(0) is called, so it ignores all errors
+   and doesn't free() any application space up. */
+
+extern void close_all_mgstrans_files
+(
+    void
+);
+
+
+/* Function to do a MessageTrans_GSLookup in the file specfied.
+
+   The lookup is performed into the buffer passed, which must be big
+   enough. 256 bytes is the usual number. The buffer is the return value. */
+
+extern char * msgtrans_lookup
+(
+    char const * const                  msg_file_desc,
+    char * const                        buffer,
+    int                                 buffer_size,
+    char const * const                  token,
+    char const * const                  parm1,
+    char const * const                  parm2,
+    char const * const                  parm3,
+    char const * const                  parm4
+);
+
+
+/* Global variable for the main Messages file handle. */
+
+extern char *                           msgs_file_desc;
+
+
+/* Global variables for the default message lookup buffer. */
+
+extern char                             msg_lookup_buff[256];
+#define msg_lookup_buff_size            sizeof(msg_lookup_buff)
+
+/* Global variable for the secondary message lookup buffer. */
+
+extern char                             msg_lookup_aux_buff[256];
+#define msg_lookup_aux_buff_size        sizeof(msg_lookup_aux_buff)
+
+
+/* Macros to bundle up the single file lookups for the main Messages
+   file, for between 0 and 4 parameters. */
+
+#define MSG_LOOKUP0(_token) \
+    msgtrans_lookup(msgs_file_desc, msg_lookup_buff, msg_lookup_buff_size, \
+                    (_token), NULL, NULL, NULL, NULL)
+
+#define MSG_LOOKUP1(_token, _arg1) \
+    msgtrans_lookup(msgs_file_desc, msg_lookup_buff, msg_lookup_buff_size, \
+                    (_token), (_arg1), NULL, NULL, NULL)
+
+#define MSG_LOOKUP2(_token, _arg1, _arg2) \
+    msgtrans_lookup(msgs_file_desc, msg_lookup_buff, msg_lookup_buff_size, \
+                    (_token), (_arg1), (_arg2), NULL, NULL)
+
+#define MSG_LOOKUP3(_token, _arg1, _arg2, _arg3) \
+    msgtrans_lookup(msgs_file_desc, msg_lookup_buff, msg_lookup_buff_size, \
+                    (_token), (_arg1), (_arg2), (_arg3), NULL)
+
+#define MSG_LOOKUP4(_token, _arg1, _arg2, _arg3) \
+    msgtrans_lookup(msgs_file_desc, msg_lookup_buff, msg_lookup_buff_size, \
+                    (_token), _arg1), (_arg2), (_arg3), (_arg4))
+
+
+/* Function to do a MessageTrans_GSLookup in all of the files, until
+   we don't get a Token Not Found error.
+
+   The lookup is performed into the buffer passed, which must be big
+   enough. 256 bytes is the usual number. The buffer is the return value. */
+
+extern char * msgtrans_lookup_all
+(
+    char * const                        buffer,
+    int                                 buffer_size,
+    char const * const                  token,
+    char const * const                  parm1,
+    char const * const                  parm2,
+    char const * const                  parm3,
+    char const * const                  parm4
+);
+
+
+/* Macro to define an error block with an error number of zero. Note the
+   use of C token concatenation to get the error label, and
+   stringisation and string concatenation to build the error string.
+
+   I can't use the _kernel_oserror structure, as that defines the string
+   as char [256] which means all 256 bytes (mostly zero) will end up in
+   the executable. */
+
+#define ERROR_BLOCK(_error) \
+    char const ErrorBlock_ ## _error[] = "\0\0\0\0" #_error
+
+
+/* Macro to declare an error block. */
+
+#define EXTERN_ERROR_BLOCK(_error) \
+    extern char const ErrorBlock_ ## _error[]
+
+
+/* Function to do a MessagTrans_ErrorLookup in the main Messages file.
+   Returns the error buffer return by MessageTrans ie. in the RMA. */
+
+extern _kernel_oserror * msgtrans_error_lookup
+(
+    char const * const                  error_token,
+    char const * const                  parm1,
+    char const * const                  parm2,
+    char const * const                  parm3,
+    char const * const                  parm4
+);
+
+
+/* Error blocks used in multiple files. */
+
+EXTERN_ERROR_BLOCK(NoTemplate);
+
+
+
+/* Function to report the error passed to the wimp. If Cancel is pressed,
+   aborts the program. If OK is pressed, continues. The buttons allowed
+   are passed in errflags. */
+
+extern void report_error
+(
+    _kernel_oserror const * const       error,
+    wimp_errflags                       errflags
+);
+
+
+
+/* Useful function to create a window from a template. */
+
+extern void create_window
+(
+    char *                              name,
+    wimp_w *                            handle
+);
+
+
+
+/* Enumerate all the objects in the file or directory passed, and on each
+   one call the function passed (if of the object type asked for - file or
+   directory or both) giving it the directory containing the object, the
+   object itself and the file type. The object passed in should NOT have
+   a dot on the end of it. */
+
+extern void enumerate_files_in_object
+(
+    char const * const                  object,
+    int                                 present_type,
+    void                                (*entry_fn) (char const * const,
+                                                     char const * const,
+                                                     int const)
+);
+
+
+/* Structures for holding the patches we know about from the patch
+   definition files. */
+
+#define CHUNK_SIZE 256
+
+typedef struct modify_chunk 
+{
+    struct modify_chunk *               next;
+    int                                 location;
+    int                                 length;
+    char *                              old;
+    char *                              new;
+} MODIFY_CHUNK;
+
+typedef struct verify_chunk
+{
+    struct verify_chunk *               next;
+    int                                 location;
+    int                                 length;
+    char *                              data;
+} VERIFY_CHUNK;
+
+typedef enum
+{
+    FLAVOUR_MODIFY = 0,
+    FLAVOUR_REPLACE,
+    FLAVOUR_CREATE,
+    FLAVOUR_DELETE
+} PATCH_FLAVOUR;
+
+typedef struct file_data
+{
+    struct file_data *                  next;
+    char *                              name;
+    int                                 name_len;
+    PATCH_FLAVOUR                       flavour;
+    union
+    {
+        /* This member if FLAVOUR_MODIFY */
+
+        struct
+        {
+            int                         file_type;
+            char *                      transform;
+            MODIFY_CHUNK *              changes;
+            VERIFY_CHUNK *              verifies;
+        } modify_data;
+
+        /* This member if FLAVOUR_REPLACE, FLAVOUR_CREATE or
+           FLAVOUR_DELETE */
+
+        struct
+        {
+            char *                      old_contents;
+            int                         old_file_type;
+            char *                      new_contents;
+            int                         new_file_type;
+        } replace_data;
+
+    } file_un1;
+} FILE_DATA;
+
+#define u_file_type                     file_un1.modify_data.file_type
+#define u_transform                     file_un1.modify_data.transform
+#define u_changes                       file_un1.modify_data.changes
+#define u_verifies                      file_un1.modify_data.verifies
+
+#define u_old_contents                  file_un1.replace_data.old_contents
+#define u_old_file_type                 file_un1.replace_data.old_file_type
+#define u_new_contents                  file_un1.replace_data.new_contents
+#define u_new_file_type                 file_un1.replace_data.new_file_type
+
+typedef struct patch_data
+{
+    struct patch_data *                 next;
+    char *                              desc;
+    int                                 desc_len;
+    FILE_DATA *                         files;
+} PATCH_DATA;
+
+/* This is for all the actual instances on disk of the application
+   we have found. eg. if there are three directories called !PCEm,
+   then there will be three elements on the list hanging off the
+   !PCEm application struct.
+
+   outer_dir includes a trailing '.' */
+
+typedef struct target_app
+{
+    struct target_app *                 next;
+    char *                              outer_dir;
+    int                                 outer_dir_len;
+    char *                              display_path;
+    int                                 num_patches;
+} TARGET_APP;
+
+/* In memory directly after the TARGET_APP structure, is an array of
+   TARGET_PATCH structures, the whole lot being allocated as one chunk
+   of memory. Each PATCH_ACTION in the array corresponds (and points) to
+   one of the patches for the application. We can use an array, because
+   by the time we need to allocate it we know how many patches there
+   are for the application. Once the array has been allocated, there is
+   no problem with new patch description files being loaded in as each
+   member of the array points to the appropriate patch and the size of
+   the array is held in the TARGET_APP. Of course, the new patch file
+   information won't be of any use until a new set of files are dragged
+   onto !Patch, but it is very hard indeed (and a complete waste of
+   time) to get round that. */
+
+/* ACTION_NONE must be 0, and the others must be powers of two so that
+   there is one bit for each of them. */
+
+typedef enum
+{
+    ACTION_NONE = 0,                    /* Implies no select_icon. */
+    ACTION_APPLY = 1,
+    ACTION_REMOVE = 2,
+
+    /* Flag value used while working out if patches can be applied or not. */
+
+    ACTION_UNKNOWN = -1
+} PATCH_ACTION;
+
+typedef struct
+{
+    PATCH_DATA *                        patch;
+    wimp_i                              select_icon;
+    int                                 select_icon_y1;
+    PATCH_ACTION                        select_action;
+} TARGET_PATCH;
+
+/* Back to the stuff for the patch files - the top level list of all
+   the applications we know how to patch. The list of all the actual
+   real matches we have found for the application hangs off it. */
+
+typedef struct application
+{
+    struct application *                next;
+    char *                              name;
+    int                                 name_len;
+    int                                 file_type;
+    char *                              desc;
+    int                                 desc_len;
+    PATCH_DATA *                        patches;
+    int                                 num_patches;
+    TARGET_APP *                        targets;
+} APPLICATION;
+
+
+/* Global data - root of the memory tree of all the patch files. */
+
+extern APPLICATION *                    apps_root;
+
+
+/* This function reads a patch file, and adds it to the memory structure. */
+
+void read_patch_file
+(
+    char const * const                  the_dir,
+    char const * const                  the_file,
+    int                                 file_type
+);
+
+
+
+/* Function to simplify calling SWI OS_ReadUsigned to read numbers,
+   including signed ones (eg. filetype -1 for untyped). */
+
+extern int read_number
+(
+    char const *                        string
+);
+
+
+
+/* Function to check whether a patch can be applied, removed, or neither
+   to the target specified. */
+
+extern PATCH_ACTION check_patch
+(
+    TARGET_APP const * const            targ_app,
+    TARGET_PATCH const * const          targ_patch
+);
+
+
+
+/* Function to apply (or remove as appropriate) the patch specified. */
+
+extern void perform_patch
+(
+    TARGET_APP const * const            targ_app,
+    TARGET_PATCH const * const          targ_patch
+);
+
+
+
+/* Performs an OS_GSTrans on the string passed, returning a new string
+   on the heap that the caller is responsible for freeing. Returns
+   NULL if there was an error and the user clicked OK in the error box. */
+
+extern char * gstrans
+(
+    char const * const                  source,
+    int const                           source_len,
+    int * const                         result_len
+);

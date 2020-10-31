@@ -1,0 +1,426 @@
+/*  Title: > c.thicken
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.drag"
+#include "h.isqrt"
+#include "h.loadsave"
+#include "h.redraw"
+#include "h.scaffold"
+#include "h.sprites"
+#include "h.suspend"
+#include "h.thicken"
+
+
+typedef struct Line_Eqn { int x0,y0, x1,y1; } Line_Eqn;
+
+static os_error *alter_charthickness(Char_Block *charptr, int thickenby);
+static int thickenline(Line_Block *line);
+static void setlastline(Line_Block *line, int new_x1, int new_y1, int new_x2, int new_y2, int new_x3, int new_y3);
+static void move_parallel(Line_Eqn *line, int thickenby);
+static void intersect(Line_Eqn *line1, Line_Eqn *line2, int *resultx, int *resulty);
+static int global_thickenby;            /* amount to thicken by */
+static Line_Block *lastline;            /* pointer to previous line (NULL if this is the first) */
+static int old_x1,old_y1, old_x2,old_y2, old_x3,old_y3;
+
+
+typedef struct pixeladdr {
+  struct pixeladdr *next;               /* next in chain */
+  Path_Block *path;                     /* path which this relates to */
+  int *address;                         /* address of word containing set pixel */
+  int mask;                             /* mask of set pixel */
+  BOOL blackorwhite;                    /* whether this is set or unset when the whole char is eo-filled */
+} pixeladdr;
+
+static os_error * normalise_path(Char_Block *charptr, Path_Block *pathptr);
+static os_error * plotpath(Char_Block *charptr, Path_Block *path, BOOL withborder);
+static os_error * findpixel(sprite_header *spr, pixeladdr *pixaddr);
+static os_error * reversepath(Path_Block *path);
+
+
+/* Increase or decrease the thickness of all characters in the font by a given number of design units.
+ * Subpath directions are first normalised so that black is on the left.
+ * Each subpath is then scanned, and the endpoints moved by the correct distance at right-angles to the tangent.
+ * The control point distances are scaled to match the new endpoint-endpoint distance.
+ */
+
+os_error *alter_thickness(Font_Block *font, int thickenby)
+{
+  int i;
+  Char_Block *charptr;
+
+  for (i=0; i<font->nchars; i++) {
+    charptr = font->chars[i];
+    if (charptr) er(alter_charthickness(charptr, thickenby));
+  }
+
+  return(NULL);
+}
+
+
+/* Do the above for a single character */
+
+os_error *alter_charthickness(Char_Block *charptr, int thickenby)
+{
+  Wind_Link *wlink = findwindinfo(W_SKELETON, charptr);
+  wimp_w handle = wlink ? wlink->wind_handle : NULL;
+
+  mytracef("Character '%s'\n", charname(charptr->charno));
+
+  er(unsuspendpathdata(charptr));
+
+  er(normalise_path(charptr, NULL));   /* may not be necessary */
+
+  global_thickenby = thickenby;                 /* global parameter */
+  lastline = NULL;
+  scancharpaths(charptr, thickenline, SCAN_OUTLINES);    /* thicken each line in turn */
+
+  er(updatecopies(charptr, TRUE));
+/*  er(updatebbox(charptr, handle)); */
+
+  return(suspendpathdata(charptr));
+}
+
+
+/* Subroutine called for each line in the character in turn.
+ * Only does one of the endpoints, since otherwise all endpoints get done twice!
+ * Amount to thicken by is in global_thickenby.
+ */
+
+int thickenline(Line_Block *line)
+{
+  static Pt_Block *firstpoint;
+  static int firstpoint_x0, firstpoint_y0;
+
+  Pt_Block *prev_p = line->p[0]->nextpt[0]==line->p[1] ? line->p[0]->nextpt[1] : line->p[0]->nextpt[0];
+  Pt_Block *next_p = line->p[3]->nextpt[0]==line->p[2] ? line->p[3]->nextpt[1] : line->p[3]->nextpt[0];
+  Line_Eqn tangent1, tangent2;
+  int new_x0,new_y0, new_x1,new_y1, new_x2,new_y2, new_x3,new_y3;
+  int dx, dy, new_d, old_d;
+
+  if (lastline) {
+    new_x0 = old_x3;
+    new_y0 = old_y3;
+  } else {
+    firstpoint = line->p[0];
+
+    tangent1.x0 = line->p[0]->x; tangent1.y0 = line->p[0]->y;
+    tangent1.x1 = line->p[1]->x; tangent1.y1 = line->p[1]->y;
+    move_parallel(&tangent1, global_thickenby);
+
+    tangent2.x0 = prev_p->x; tangent2.y0 = prev_p->y;
+    tangent2.x1 = line->p[0]->x; tangent2.y1 = line->p[0]->y;
+    move_parallel(&tangent2, global_thickenby);
+
+    intersect(&tangent1, &tangent2, &new_x0, &new_y0);
+
+    firstpoint_x0 = new_x0;
+    firstpoint_y0 = new_y0;
+  }
+
+  if (line->p[3] == firstpoint) {
+    new_x3 = firstpoint_x0;
+    new_y3 = firstpoint_y0;
+  } else {
+    tangent1.x0 = line->p[2]->x; tangent1.y0 = line->p[2]->y;
+    tangent1.x1 = line->p[3]->x; tangent1.y1 = line->p[3]->y;
+    move_parallel(&tangent1, global_thickenby);
+
+    tangent2.x0 = line->p[3]->x; tangent2.y0 = line->p[3]->y;
+    tangent2.x1 = next_p->x; tangent2.y1 = next_p->y;
+    move_parallel(&tangent2, global_thickenby);
+
+    intersect(&tangent1, &tangent2, &new_x3, &new_y3);
+  }
+
+  dx = line->p[3]->x - line->p[0]->x;
+  dy = line->p[3]->y - line->p[0]->y;
+  old_d = isqrt( (dx*dx) + (dy*dy) );
+
+  dx = new_x3 - new_x0;
+  dy = new_y3 - new_y0;
+  new_d = isqrt( (dx*dx) + (dy*dy) );
+
+  old_d = old_d ? old_d : new_d ? new_d : 1;
+
+  new_x1 = new_x0 + (((line->p[1]->x - line->p[0]->x) * new_d) / old_d);
+  new_y1 = new_y0 + (((line->p[1]->y - line->p[0]->y) * new_d) / old_d);
+
+  new_x2 = new_x3 + (((line->p[2]->x - line->p[3]->x) * new_d) / old_d);
+  new_y2 = new_y3 + (((line->p[2]->y - line->p[3]->y) * new_d) / old_d);
+
+  setlastline(line,new_x1,new_y1,new_x2,new_y2,new_x3,new_y3);
+
+  if (line->p[3]==firstpoint) {
+    setlastline(line,0,0,0,0,0,0);   /* do the last line in the path */
+    lastline = NULL;                 /* set up ready for next path */
+  }
+
+  return(0);
+}
+
+
+/* Write previously-computed data to the previous line, and remember this data for next time */
+
+void setlastline(Line_Block *line, int new_x1, int new_y1, int new_x2, int new_y2, int new_x3, int new_y3)
+{
+  static Line_Block lastlinestr;
+
+  if (lastline) {
+    lastline->p[1]->x = old_x1; lastline->p[1]->y = old_y1;
+    lastline->p[2]->x = old_x2; lastline->p[2]->y = old_y2;
+    lastline->p[3]->x = old_x3; lastline->p[3]->y = old_y3;
+  }
+
+  lastlinestr = *line;
+  lastline = &lastlinestr;
+
+  old_x1 = new_x1; old_y1 = new_y1;
+  old_x2 = new_x2; old_y2 = new_y2;
+  old_x3 = new_x3; old_y3 = new_y3;
+}
+
+
+/* Move the given line 'thickenby' units to the right.
+ */
+
+void move_parallel(Line_Eqn *line, int thickenby)
+{
+  int dx = line->x1 - line->x0;
+  int dy = line->y1 - line->y0;
+  int d0 = isqrt( (dx*dx)+(dy*dy) );
+  int ddx, ddy;
+
+  if (d0 != 0) {
+    ddx = + (global_thickenby * dy) / d0;
+    ddy = - (global_thickenby * dx) / d0;
+    line->x0 += ddx; line->y0 += ddy;
+    line->x1 += ddx; line->y1 += ddy;
+  }
+}
+
+
+/* Calculate the intersection of two lines.
+ * If the lines are parallel, take the midpoint of the two nearest endpoints.
+ */
+
+void intersect(Line_Eqn *line1, Line_Eqn *line2, int *resultx, int *resulty)
+{
+  int dx1 = line1->x1 - line1->x0;
+  int dy1 = line1->y1 - line1->y0;
+  int dx2 = line2->x1 - line2->x0;
+  int dy2 = line2->y1 - line2->y0;
+  int multiplier = (line1->x0-line2->x0)*dy1 + (line2->y0-line1->y0)*dx1;
+  int divisor = dx2*dy1 - dy2*dx1;
+
+  if (abs(divisor) < 3) {
+    *resultx = (line1->x1 + line2->x0) / 2;          /* lines are parallel - take midpoint of 2 endpoints */
+    *resulty = (line1->y1 + line2->y0) / 2;
+  } else {
+    *resultx = line2->x0 + ((multiplier * dx2) / divisor);      /* lines not parallel - take intersection */
+    *resulty = line2->y0 + ((multiplier * dy2) / divisor);
+  }
+}
+
+
+/* Normalise the direction of the given path so that it works when filled with non-zero winding number rule.
+ * (ie. outer paths go anti-clockwise, inner ones go clockwise).
+ * If the path ptr is null, all subpaths of the character are normalised.
+ * NB: char's path data must already have been expanded.
+ */
+
+os_error * normalise_path(Char_Block *charptr, Path_Block *pathptr)
+{
+  Font_Block *font = charptr->parent;
+  BOOL isfilled;
+  pixeladdr *headpixaddr, *pixaddr, *nextpixaddr;
+  Path_Block *path;
+  Pt_Block *firstpt;
+
+  xsize = SUPERX;              /* used by the drawing code later */
+  ysize = SUPERY;
+
+  x0 = -120;                    /* bodge to move char to approx. right place */
+  y0 = -20;
+  x1 = 300;
+  y1 = y0 + font->filedata->designsize;
+
+  xscale = yscale = ((SUPERY-32)<<16)/(y1-y0);
+
+  bx = 8-(dx>>1);             /* bx,by = top-left coordinate of box */
+  by = ysize-(dy>>1);         /* correct for half-pixel adjustment of scalex8() and scaley8() */
+
+  /* ---- go through each subpath in turn, finding a point inside the path ---- */
+
+  headpixaddr = NULL;
+
+  for (path = pathptr ? pathptr : charptr->nextpath; path; path = pathptr ? NULL : path->nextpath) {
+    firstpt = path->firstpoint;
+    if (firstpt->nextpt[0] != NULL && firstpt->nextpt[1] != NULL) {
+      er(getheap(pixeladdr,&pixaddr));
+      pixaddr->next = headpixaddr;
+      pixaddr->path = path;
+      headpixaddr = pixaddr;
+      er(plotpath(charptr, path, FALSE));        /* plot path on its own */
+      er(findpixel(sprbpp1, pixaddr));
+    }
+  }
+
+  /* ---- now plot the whole character using even-odd filling ------------ */
+  /* ---- and look at each path in turn to see if it's black or white ---- */
+
+  er(plotpath(charptr, NULL, FALSE));
+
+  for (pixaddr=headpixaddr; pixaddr; pixaddr = pixaddr->next) {
+    if (pixaddr->address) {
+      pixaddr->blackorwhite = (*(pixaddr->address) & pixaddr->mask) ? TRUE : FALSE;
+      mytracef("Checking pixel address &%p: value is %d\n", pixaddr->address, pixaddr->blackorwhite);
+    }
+  }
+
+  /* ---- finally plot each subpath with a border going clockwise -------- */
+  /* ---- if the pixel is now the same as the blackorwhite one, reverse the path */
+
+  for (pixaddr=headpixaddr; pixaddr; pixaddr = pixaddr->next) {
+    if (pixaddr->address) {
+      er(plotpath(charptr, pixaddr->path, TRUE));        /* plot path with a clockwise border */
+      isfilled = (*(pixaddr->address) & pixaddr->mask) ? TRUE : FALSE;
+      mytracef("Pixeladdress &%p: blackorwhite=%d, isfilled=%d\n", pixaddr->address,
+                                                                   pixaddr->blackorwhite, isfilled);
+      if (isfilled == pixaddr->blackorwhite) er(reversepath(pixaddr->path));
+    }
+  }
+
+  /* ---- now, don't forget to tidy up all those messy heap blocks! ----- */
+
+  for (pixaddr = headpixaddr; pixaddr; pixaddr = nextpixaddr) {
+    nextpixaddr = pixaddr->next;
+    heap_free(pixaddr);
+  }
+
+  return(NULL);
+}
+
+
+/* Plot a given subpath of a character into 'sprbpp1'.
+ */
+
+#define MINCOORD -2048
+#define MAXCOORD +2047
+
+os_error * plotpath(Char_Block *charptr, Path_Block *path, BOOL withborder)
+{
+  int fillpath[MAXPATH], strokepath[MAXPATH];
+  os_error * err;
+  sprite_state oldstate;
+  Path_Block *headptr, *tailptr;
+  static sprite_id spriteid = { NULL, sprite_id_name };
+
+  mytracef("plotpath(&%p, &%p, %d) ...", charptr, path, withborder);
+
+  spriteid.s.name = "bpp1";
+  er(sprite_outputtosprite(sprstatic, &spriteid, NULL, &oldstate));
+
+  bbc_clg();
+  initsize(fillpath);
+  initsize(strokepath);
+
+  buildoutptr = fillpath;
+
+  if (withborder) {
+    Pt_Block pt;
+    pt.x = MINCOORD; pt.y = MINCOORD; er(moveto(&pt, NULL));
+                   ; pt.y = MAXCOORD; er(lineto(&pt, NULL));
+    pt.x = MAXCOORD;                ; er(lineto(&pt, NULL));
+                   ; pt.y = MINCOORD; er(lineto(&pt, NULL));
+                                    ; er(closepath());
+  }
+
+  if (path) {
+    headptr = charptr->nextpath;
+    tailptr = path->nextpath;
+    charptr->nextpath = path;
+    path->nextpath = NULL;
+  }
+  {
+    int *fillp = buildoutptr;        /* use fillpath, including the border if present */
+    int *strokep = (int *)-1;        /* ignore skeleton entirely */
+    err = buildp(charptr, &fillp, &strokep, NULL, 0,0);
+  }
+  if (path) {
+    charptr->nextpath = headptr;
+    path->nextpath = tailptr;
+  }
+
+  if (!err) {
+    if (withborder) {
+      err = drawfill_winding(fillpath, NULL, charptr->flatness);
+    } else {
+      err = drawfill(fillpath, NULL, charptr->flatness);
+    }
+  }
+
+  erx(sprite_restorestate(oldstate));        /* restore state before returning error! */
+
+  mytracef("... done.\n");
+
+  return(err);
+}
+
+
+/* Given a sprite header pointer and a pixeladdr, find the address and mask of the first set pixel in the sprite.
+ * Actually it returns a mask of all the pixels set in the first word, but this doesn't matter.
+ * The address returned is null if no pixels were set.
+ */
+
+os_error * findpixel(sprite_header *spr, pixeladdr *pixaddr)
+{
+  int *firstword = (int *) ((char *)spr + spr->image);
+  int *lastword = (int *) ((char *)spr + spr->next);
+  int *word;
+
+  pixaddr->address = NULL;
+
+  for (word = firstword; word < lastword; word++) {
+    if (*word) {
+      pixaddr->address = word;
+      pixaddr->mask = *word;
+      break;
+    }
+  }
+
+  mytracef("Found pixel at &%p\n", pixaddr->address);
+
+  return(NULL);
+}
+
+
+/* Reverse the direction of the given path.
+ */
+
+os_error * reversepath(Path_Block *path)
+{
+  Pt_Block *pt = path->firstpoint;
+  Pt_Block *nextpt = pt->nextpt[0];
+  Pt_Block *prevpt = pt->nextpt[1];
+
+  mytracef("Reverse path: &%p\n", path);
+
+  if (nextpt==NULL || prevpt==NULL) {
+    prevpt = NULL;
+    do { nextpt = pt;
+         pt = pt->nextpt[0]==prevpt ? pt->nextpt[1] : pt->nextpt[0];
+         prevpt = nextpt;
+       } while (pt);
+    path->firstpoint = prevpt;       /* reverse open subpaths by moving to the other end */
+  } else {
+    pt->nextpt[0] = prevpt;          /* we only need to reverse the first point */
+    pt->nextpt[1] = nextpt;          /* as all the others follow from this */
+  }
+
+  return(NULL);
+}
+

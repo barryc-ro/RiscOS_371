@@ -1,0 +1,269 @@
+; > Sources.ModHead
+        LEADR   Module_LoadAddr
+
+        ASSERT  (.=Module_BaseAddr)
+
+        DCD     0
+        DCD     Initialise     - Module_BaseAddr
+        DCD     0
+        DCD     Service        - Module_BaseAddr        ; Service
+        DCD     Title          - Module_BaseAddr
+        DCD     Helpstr        - Module_BaseAddr
+        DCD     0                                       ; Helptable
+        DCD     0                                       ; SWIbase
+        DCD     0
+        DCD     0
+        DCD     0                                       ; SWIdecode
+        DCD     0
+        DCD     0
+
+; ---------------------------------------------------------------------------------------------------
+Title   DCB     "UnSqueezeAIF",0
+Helpstr DCB     "UnSqueezeAIF",9,"$VString ($Date)",0
+                ALIGN
+
+; ---------------------------------------------------------------------------------------------------
+
+        GBLL    AllowNonAIF               ;if true, attempt to patch even without AIF header
+AllowNonAIF SETL {TRUE}
+
+
+        GBLL    ForROM                    ;if true, refuse to initialise (go dormant) if not needed
+ForROM      SETL {TRUE}
+
+Service_UKCompression * &B7
+
+
+Initialise
+        Push    "R0,R1,LR"
+        MOV     R0,#0
+        SWI     XOS_PlatformFeatures
+        MOVVS   R0,#0
+        ANDS    R0,R0,#1                  ;bit 0 set if SynchroniseCodeAreas required
+  [ ForROM
+        ORRNE   R0,R0,#&100               ;bit 8 set to show we have initialised
+        STRNE   R0,[R12]                  ;store flags word as workspace word
+        ADREQ   R0,notneedederror
+        STREQ   R0,[SP]
+        SETV EQ
+  |
+        ORR     R0,R0,#&100               ;bit 8 set to show we have initialised
+        STR     R0,[R12]                  ;store flags word as workspace word
+  ]
+        Pull    "R0,R1,PC"
+
+;sod internationalisation - this message is hidden if in ROM
+notneedederror
+        DCD     0
+        DCB     "UnSqueezeAIF not needed on this platform",0
+        ALIGN
+
+
+Service
+        ROUT
+        TEQ     r1, #Service_UKCompression
+        MOVNES  pc, lr                  ;Not our service.
+
+        CMP     r0, #0                  ;Is it the pre-decompression call?
+        MOVNES  pc, lr                  ;No, so we're not interested.
+
+        Push    "r0,r2-r6,lr"
+
+        LDR     r0,[r12]
+        ANDS    r0,r0,#1
+        Pull    "r0,r2-r6,pc",EQ,^      ; forget it if not needed
+
+        ;Check whether the file is an AIF-headered file.
+        LDR     lr, [r2, #&10]          ; We know R2 is &8000, 'cos it's an app
+        MOV     r0, #&EF000000          ; 'SWI'
+        ORR     r0, r0, #&0011          ; 'OS_Exit'
+
+        CMP     r0, lr                  ; Is the 5th word a 'SWI OS_Exit'?
+        MOVEQ   r6,#1
+        MOVNE   r6,#0                   ;flag AIF/non-AIF
+  [ :LNOT: AllowNonAIF
+        BNE     %FT01                   ; Nope, so not an AIF file
+  ]
+
+        LDR     lr, [r2]                ; Read the first word of the AIF header
+        AND     lr, lr, #&FF000000      ; Clear the offset
+        CMP     lr, #&EB000000          ; BL? If so, we're compressed
+  [ AllowNonAIF
+        CMPNE   lr, #&EA000000          ; allow B as well
+  ]
+        BEQ     %FT02
+
+        ;there's nothing to do, so quit, unclaimed.
+01      MOV     r1, #Service_UKCompression
+        Debug   wt,"give up 1"
+        Pull    "r0,r2-r6,pc",,^
+
+02
+        LDR     lr,[r2]
+        BIC     lr,lr,#&FF000000
+        ADD     r0,r2,lr,LSL #2         ;add offset of branch in bytes (should be +ve)
+        ADD     r0,r0,#8                ;and account for PC+8
+
+        ADR     r4,UnsqSignature
+        LDR     r5,[r4],#4
+
+        ADD     r3,r3,r2
+        ADD     r3,r3,#3
+        BIC     r3,r3,#3
+        SUB     r3,r3,#UnsqSigSize      ;last address to look at for start of signature
+
+  Debug wt,"check between ",r0,r3,r5
+
+03
+        LDR     r1,[r0],#4
+        CMP     r1,r5
+        BEQ     %FT05
+        CMP     r0,r3
+        BLO     %BT03
+;give up
+04      MOV     r1, #Service_UKCompression
+        Debug   wt,"give up 2"
+        Pull    "r0,r2-r6,pc",,^
+
+05      ;found 1st word of signature
+        MOV     r3,#UnsqSigSize-4
+06
+        LDR     r5,[r4],#4
+        LDR     r1,[r0],#4
+        CMP     r1,r5
+        BNE     %BT04
+        SUBS    r3,r3,#4
+        BNE     %BT06
+
+;matched whole signature - apply patch
+   Debug wt,"matched"
+        ADR     r3,ComeToMeLittleChild
+        SUB     r4,r0,#UnsqSigSize
+        LDR     r1,[r3],#4
+        STR     r1,[r4],#4
+        LDR     r1,[r3],#4
+        STR     r1,[r4],#4
+        LDR     r1,[r3],#4
+        STR     r1,[r4],#4
+        ADR     r5,CopySyncAndGoR4
+        STR     r5,[r4],#4
+
+        ;if non-AIF, can't fix-up header to unsqueeze first, so cliam and return now
+        ;this means code can't really be patched after unsqueeze, but at least the
+        ;unsqueeze is fixed
+        ;
+        ;Note that we don't OS_SynchroniseCodeAreas here for code we've just poked,
+        ;because we know FileSwitch does a sychronise, after this service call (after
+        ;the next service call, for patching, in fact)
+
+        CMP     r6,#0                   
+        MOVEQ   r1, #0                  ; Mark it as claimed.
+        Pull    "r0,r2-r6,pc",EQ,^      ; That's all folks!
+
+        ;Now calculate the B needed to get back here once it's unsqueezed
+        Debug   wt,"It's a squeezed AIF file which we can handle!"
+        ADR     r0, retfrmunsq
+        MOV     r2, #&8000
+        ADD     r2, r2, #&14
+        SUB     r0, r0, r2              ; R0 is the offset, accounting for PC+8
+        MOV     r2, #&EA000000          ; Create the BAL bit of the instruction
+        ORR     r0, r2, r0, LSR #2      ; OR in the offset
+
+        MOV     r1, #&8000
+        ADD     r1, r1, #&0C
+        LDR     lr, [r1]                ; Grab what was at the ImageEntryPoint
+        STR     r0, [r1]                ; Replace it with the branch
+        Push    "lr"                    ; Stuff it safe on the stack, along with the cache status
+  Debug wt,"synchronise"
+        MOV     r0,#0
+        SWI     XOS_SynchroniseCodeAreas ; we've been poking code
+        LDR     lr,[sp]
+        ;Now go do the unsqueeze
+        TEQP    pc, #0                  ; USR mode, all ints on
+        MOV     r12, #&80000000         ; Cause address extinction if used
+        MOV     r13, #&80000000         ; (keep 1.20 compat capable)
+        MOV     pc, #&8000              ; Away the noo!
+
+retfrmunsq
+        ;Tada! Unsqueeze done
+        SWI     XOS_EnterOS             ; Back into SVC mode
+        Pull    "r1"
+  Debug wt,"back from unsqueeze",r1
+        MOV     r0, #&8000
+        ADD     r0, r0, #&0C
+        STR     r1, [r0]                ; Put the ImageEntryPoint instruction back!
+        MOV     r4, r0                  ; This is the new execution point
+        MOV     r0,#1
+        MOV     r1,r4
+        MOV     r2,r4
+        SWI     XOS_SynchroniseCodeAreas ;we've been poking again
+        STR     r4,[sp,#12]             ; update the stacked r4
+        MOV     r1, #0                  ; Mark it as claimed.
+        Pull    "r0,r2-r6,pc",,^        ;That's all folks!
+
+
+;code to look for
+UnsqSignature
+        LDMIA   R5!,{R0-R3}
+        STMIA   R7!,{R0-R3}
+        CMP     R5,R6
+        BLT     UnsqSignature
+        MOV     PC,R4
+UnsqSigSize * 5*4
+
+
+;code to poke in
+ComeToMeLittleChild
+        ADR     R0,mememe
+        LDR     R0,[R0]
+        MOV     PC,R0
+mememe  DCD     0
+
+
+;code to be jumped to, instead of the signature code
+CopySyncAndGoR4
+        LDMIA   R5!,{R0-R3}
+        STMIA   R7!,{R0-R3}
+        CMP     R5,R6
+        BLT     CopySyncAndGoR4
+
+;word copied near end should be MOV PC,R8, which should itself be patched
+        SUB     R0,R7,#4
+        SUB     R1,R0,#16*4
+        ADR     R3,TheMOVPCR8
+        LDR     R3,[R3]
+08
+        LDR     R2,[R0],#-4
+        CMP     R2,R3
+        BEQ     %FT09
+        CMP     R0,R1
+        BGT     %BT08
+        B       %FT10
+09
+        ADD     r0,r0,#4        ;back to the instruction to patch
+        ADD     r2,r0,#8        ;account for PC+8
+        ADR     r1,SyncAndGoR8
+        SUB     r1,r1,r2
+        MOV     r2,#&EA000000   ; Branch to SynAndGoR8
+        ORR     r1,r2,r1,LSR #2
+        STR     r1,[r0],#4
+
+10
+        MOV     R0,#0
+        SWI     XOS_SynchroniseCodeAreas ;you've guessed it
+        MOV     PC,R4
+
+
+SyncAndGoR8
+        MOV     R0,#0
+        SWI     XOS_SynchroniseCodeAreas
+TheMOVPCR8
+        MOV     PC,R8
+
+;----------------------------------------------------------------------------------------------------
+; Neil's debugging routines
+      [ debug
+        InsertNDRDebugRoutines
+      ]
+
+        END

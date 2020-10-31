@@ -1,0 +1,730 @@
+/*
+  Merlyn Kline, 1995
+
+  Hot list manager for Browser (and history list manager)
+
+  The hot list is stored in a flex block as a series of zero
+  terminated strings, two per entry. These are URL followed
+  by title. The title is a repeat of the URL if necessary.
+
+  There are several hotlists with their anchors stored in an array.
+  These are:
+    0 - the user hotlist
+    1 - the resources hotlist
+
+:NOTES
+:END
+
+:MESSAGES
+HdHOTL:This is the hot list of favourite pages.|MDouble-click SELECT to view one of the pages.
+HdHOTLD:This is the hot list of favourite pages.|MDouble-click SELECT to delete one of the pages.
+HdRESL:This is the list of system resources.|MDouble-click SELECT to view one of the pages.
+HdHIST:This is the list of recently visited pages.|MDouble-click SELECT to view one of the pages.
+HTITLE:Browser hot list for %s
+HTDEL:Hotlist: Delete page
+HTSEL:Hotlist: Go to page
+HTRES:System resources
+HotFile:HotList
+HTHIST:History list
+:END
+
+:HISTORY
+:END
+
+*/
+
+#include "stdlib.h"
+#include "stddef.h"
+#include "string.h"
+#include "stdio.h"
+
+#include "kernel.h"
+#include "wimp.h"
+#include "coords.h"
+/*----------------------------------------------------------------------*/
+#include "flex.h"
+#include "help.h"
+#include "wimpt.h"
+#include "msgs.h"
+#include "bbc.h"
+#include "win.h" /* fixes problem caused by incorrect header for iconbar.c since Acorn had a go at it */
+
+/*----------------------------------------------------------------------*/
+#include "Browser.h"
+#include "Redraw1.h"
+#include "FontManage.h"
+#include "ErrorGen.h"
+#include "Button.h"
+#include "Save.h"
+#include "Iconbar.h"
+#include "dboxfix.h"
+#include "Hotlist.h"
+#include "mflex.h"
+
+
+#define HOTLIST_LINEHEIGHT 44
+#define HOTLIST_FONTSIZE FM_STANDARD_SIZE
+#define HOTLIST_DELOFFSET (HOTLIST_FONTSIZE/8)
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static void *hotlist[2]={NULL,NULL}; /* flex anchor for hot lists, 0=user, 1=resource */
+
+extern void *global_history;
+
+/*----------------------------------------------------------------------*/
+int  hotlist_size[2]={0,0};
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+typedef struct hotlist_info
+{
+  int     selection; /* user's selection */
+  int     deleting; /* this is a deletion list */
+  int     hnum; /* htlist number */
+  browser *b; /* for history lists */
+} hotlist_info;
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static BOOL hotlist_handler(dbox d,void *event,void *handle)
+{
+  wimp_eventstr *e=(wimp_eventstr*)event;
+  hotlist_info  *hi=(hotlist_info*)handle;
+
+  switch(e->e)
+  {
+    case wimp_EBUT:
+    {
+      int         y;
+      wimp_wstate state;
+
+      if(e->data.but.b==0)
+      {
+        wimp_get_wind_state(dbox_syshandle(d),&state);
+        y=coords_y_toworkarea(e->data.but.m.y,(coords_cvtstr*)&state.o.box);
+        y=(-1-y)/HOTLIST_LINEHEIGHT;
+        if(y<hotlist_size[hi->hnum])
+        {
+          hi->selection=y;
+          e->data.but.m.i=0; /* fake a click on icon 0 */
+        }
+      }
+    }
+    break;
+    case wimp_EREDRAW:
+    {
+      int            more;
+      fm_face        handle;
+      wimp_redrawstr r;
+
+      r.w=dbox_syshandle(d);;
+      wimp_redraw_wind(&r,&more);
+      if(more)
+      {
+        handle=fm_find_font("dialogue",HOTLIST_FONTSIZE,HOTLIST_FONTSIZE,FALSE,FALSE);
+        while(more)
+        {
+          int  i,x,y;
+          char *p;
+
+          fm_set_font_colour(handle,0,0xd0d0d000);
+          p=(char*)hotlist[hi->hnum];
+          if(p) p+=strlen(p)+1; /* skip the first URL */
+          y=coords_y_toscreen(-1,CVTSTR(&r));
+          x=coords_x_toscreen(8,CVTSTR(&r));
+          if(hi->deleting) x+=HOTLIST_DELOFFSET;
+          for(i=0;i<hotlist_size[hi->hnum];i++)
+          {
+            y-=HOTLIST_LINEHEIGHT;
+            if(y>=r.g.y0-HOTLIST_LINEHEIGHT && y<=r.g.y1)
+            {
+              fm_puts(handle,x,y+HOTLIST_LINEHEIGHT/4,p,TRUE,FALSE);
+              if(hi->deleting)
+              {
+                fm_set_font_colour(handle,0x0000ff00,0xd0d0d000);
+                fm_puts(handle,x-HOTLIST_DELOFFSET,y+HOTLIST_LINEHEIGHT/4,"×",TRUE,FALSE);
+                fm_set_font_colour(handle,0,0xd0d0d000);
+              }
+            }
+            p+=strlen(p)+1;
+            if(i<hotlist_size[hi->hnum]-1) p+=strlen(p)+1; /* skip the following URL */
+          }
+          wimp_get_rectangle(&r,&more);
+        }
+        fm_lose_font(handle);
+      }
+      return(TRUE);
+    }
+    break;
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+    {
+      if(e->data.msg.hdr.action==wimp_MHELPREQUEST)
+      {
+        if(hi->hnum==0)
+        {
+          if(hi->deleting)
+            help_genmessage("HdHOTLD","");
+          else
+            help_genmessage("HdHOTL","");
+        }
+        else help_genmessage("HdRESL","");
+      }
+    }
+    break;
+  }
+return(FALSE);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *hotlist_set_extent(wimp_w w,int hnum)
+{
+  wimp_redrawstr r;
+
+  r.w=w;
+  r.box.x0=0;
+  r.box.x1=1500;
+  r.box.y1=-1;
+  r.box.y0=HOTLIST_LINEHEIGHT*hotlist_size[hnum];
+  if(r.box.y0<780) r.box.y0=780;
+  r.box.y0=r.box.y1-r.box.y0;
+  return(wimp_set_extent(&r));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *hotlist_delete(int n,wimp_w w,int hnum)
+{
+  char          *t,*f;
+  int            oldsize,i;
+  wimp_box       box;
+
+  oldsize=mflex_size(&hotlist[hnum]);
+  t=(char*)hotlist[hnum];
+  i=n;
+  while(i--) {t+=strlen(t)+1; t+=strlen(t)+1;}
+  f=t+strlen(t)+1;
+  f+=strlen(f)+1;
+  memmove(t,f,oldsize-(f-(char*)hotlist[hnum]));
+  hotlist_size[hnum]--;
+  if(w)
+  {
+    box.x0=0;
+    box.x1=30000;
+    box.y1=-1-(n+1)*HOTLIST_LINEHEIGHT;
+    box.y0=-30000;
+    wimp_blockcopy(w,&box,box.x0,box.y0+HOTLIST_LINEHEIGHT);
+    hotlist_set_extent(w,hnum);
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *hotlist_display(browser *b,BOOL del,int hnum)
+{
+  dbox           d;
+  int            f,button;
+  hotlist_info   hi;
+  char           *p;
+
+  if(!hotlist_size[hnum]) return(NULL);
+  hi.selection=-1;
+  hi.deleting=del;
+  hi.hnum=hnum;
+  d=dbox_new("hotlist");
+  if(!d) return(errorgen(2));
+  hotlist_set_extent(dbox_syshandle(d),hnum);
+  dbox_raw_eventhandler(d,hotlist_handler,&hi);
+  if(hnum==0) button=del?B_SUBHOT:B_HOTLIST;
+  else button=B_RESOURCE;
+  button_set_flags(b,button,TRUE,FALSE);
+  if(hnum==0)
+  {
+    if(del) p=msgs_lookup("HTDEL:Hotlist: Delete page");
+    else p=msgs_lookup("HTSEL:Hotlist: Go to page");
+  }
+  else p=msgs_lookup("HTRES:System resources");
+  strcpy(dbox_template_pointer(d)->title.indirecttext.buffer,p);
+  dbox_show(d);
+  do
+  {
+    f=dbox_fillin(d);
+    if(f==0 && hi.selection>=0 && hi.selection<hotlist_size[hnum])
+    {
+      if(del)
+        wimpt_complain(hotlist_delete(hi.selection,dbox_syshandle(d),hnum));
+      else
+      {
+        char *p;
+
+        p=(char*)hotlist[hnum];
+        while(hi.selection--) {p+=strlen(p)+1; p+=strlen(p)+1;}
+        wimpt_complain(browser_show_url_f(b,p,TRUE));
+      }
+    }
+  } while(f!=dbox_CLOSE && dbox_persist());
+  dbox_raw_eventhandler(d,0,0);
+  dbox_dispose(&d);
+  browser_set_all_button_states();
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *hotlist_add_page(browser *b,int hnum)
+{
+  int  l,o;
+  char *c,*h;
+
+  c=browser_current_url(b);
+  if(!c || !*c) return(NULL);
+  if(hotlist[hnum])
+  {
+    l=0; /* temp: l=found flag */
+    o=0; /* temp: o=counter */
+    h=(char*)hotlist[hnum];
+    while(o++<=hotlist_size[hnum] && !l)
+      if(!strcmp(c,h)) l=o-1; else {h+=strlen(h)+1; h+=strlen(h)+1;}
+    if(l) hotlist_delete(l,0,hnum);
+  }
+  if(hotlist_size[hnum]>=params.maxhot) return(errorgen(3));
+  l=strlen(browser_current_url(b))+strlen(b->title);
+  if(l)
+  {
+    if(hotlist[hnum])
+    {
+      o=mflex_size(&hotlist[hnum]);
+      if(!mflex_extend(&hotlist[hnum],o+l+2)) return(errorgen(2));
+      memmove(((char*)hotlist[hnum])+l+2,hotlist[hnum],o);
+    }
+    else
+    {
+      if(!mflex_alloc(&hotlist[hnum],l+2)) return(errorgen(2));
+    }
+    strcpy((char*)hotlist[hnum],browser_current_url(b));
+    strcpy(((char*)hotlist[hnum])+strlen((char*)hotlist[hnum])+1,b->title);
+    hotlist_size[hnum]++;
+  }
+  browser_set_all_button_states();
+  return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static void hotlist_output(char *s,BOOL count,int *length,FILE *f)
+{
+  if(f)
+  {
+    if(!*length && fwrite(s,1,strlen(s),f)!=strlen(s))
+    {
+      wimpt_complain((os_error*)_kernel_last_oserror());
+      *length=TRUE;
+    }
+  }
+  else
+  {
+    if(count)
+      *length+=strlen(s);
+    else
+      if(!*length && !save_write_bytes(s,strlen(s))) *length=TRUE;
+  }
+}
+
+/*----------------------------------------------------------------------*/
+int hotlist_make_file(BOOL count,int hnum,char *filename,char *prefix)
+{ /* make the hotlist file or, if count is TRUE, just get its length.
+     If filename is set, write to it, otherwise use the save library. */
+  int  length,i;
+  char title[100];
+  char buffer[200];
+  char *p;
+  FILE *f=NULL;
+
+  length=0;
+  if(filename)
+  {
+    f=fopen(filename,"w");
+    if(!f)
+    {
+      wimpt_complain((os_error*)_kernel_last_oserror());
+      return(FALSE);
+    }
+  }
+  if(prefix) hotlist_output(prefix,count,&length,f);
+  #ifndef SINGLE_USER
+  sprintf(title,msgs_lookup("HTITLE:Browser hot list for %s"),user.name);
+  #else
+  sprintf(title,msgs_lookup("STITLE:Browser Hot List"),user.name);
+  #endif
+  sprintf(buffer,"<html>\n<head>\n<title>%s</title>\n</head>\n<body>\n",title);
+  hotlist_output(buffer,count,&length,f);
+  sprintf(buffer,"<h1>%s</h1>\n<ul>\n",title);
+  hotlist_output(buffer,count,&length,f);
+  p=(char*)hotlist[hnum];
+  for(i=0;i<hotlist_size[hnum];i++)
+  {
+    hotlist_output("    <li><a href=\"",count,&length,f);
+    hotlist_output(p,count,&length,f);
+    p+=strlen(p)+1;
+    hotlist_output("\">",count,&length,f);
+    hotlist_output(p,count,&length,f);
+    p+=strlen(p)+1;
+    hotlist_output("</a>\n",count,&length,f);
+  }
+  hotlist_output("</ul><p>\n</body>\n</html>\n",count,&length,f);
+  if(!count) length=!length;
+  if(f) fclose(f);
+  return(length);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int hotlist_make_history_file(BOOL count,browser *b,char *filename)
+{ /* make the history export file or, if count is TRUE, just get its length.
+     If filename is set, write to it, otherwise use the save library. */
+  int  length,i;
+  char title[100];
+  char buffer[200];
+  char *p,*e;
+  FILE *f=NULL;
+
+  length=0;
+  if(filename)
+  {
+    f=fopen(filename,"w");
+    if(!f)
+    {
+      wimpt_complain((os_error*)_kernel_last_oserror());
+      return(FALSE);
+    }
+  }
+  sprintf(title,msgs_lookup("HTITLEH:Browser history list for %s"),user.name);
+  sprintf(buffer,"<html>\n<head>\n<title>%s</title>\n</head>\n<body>\n",title);
+  hotlist_output(buffer,count,&length,f);
+  sprintf(buffer,"<h1>%s</h1>\n<p><dl>\n",title);
+  hotlist_output(buffer,count,&length,f);
+  p=(char*)global_history;
+  e=p+mflex_size(&global_history)-1;
+  while(p && p<e)
+  {
+    p+=sizeof(int);
+    hotlist_output("    <dt><a href=\"",count,&length,f);
+    hotlist_output(p,count,&length,f);
+    hotlist_output("\">",count,&length,f);
+    hotlist_output(p,count,&length,f);
+    p+=strlen(p)+1;
+    while((int)p&3) p++; /* word aligned */
+    hotlist_output("</a>\n",count,&length,f);
+  }
+  hotlist_output("</dl><p>\n</body>\n</html>\n",count,&length,f);
+  if(!count) length=!length;
+  if(f) fclose(f);
+  return(length);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static BOOL hotlist_saver(void *handle,char *pathname)
+{
+  pathname=pathname;
+  return(hotlist_make_file(FALSE,(int)handle,NULL,NULL));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int hotlist_file_size(int hnum)
+{
+  return(hotlist_make_file(TRUE,hnum,NULL,NULL));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static BOOL hotlist_history_saver(void *handle,char *pathname)
+{
+  pathname=pathname;
+  return(hotlist_make_history_file(FALSE,(browser*)handle,NULL));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int hotlist_file_history_size(browser *b)
+{
+  return(hotlist_make_history_file(TRUE,b,NULL));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *hotlist_save(browser *b,int hnum)
+{
+  char pathname[256];
+
+  strcpy(pathname,msgs_lookup("HotFile:HotList"));
+  if(hnum==0) button_set_flags(b,B_SAVEHOT,TRUE,FALSE);
+  if(hnum==0 && bbc_inkey(-1) && bbc_inkey(-3)) save_saveas(FILETYPE_HTML,pathname,hotlist_file_history_size(b),hotlist_history_saver,NULL,(void*)b);
+  else save_saveas(FILETYPE_HTML,pathname,hotlist_file_size(hnum),hotlist_saver,NULL,(void*)hnum);
+  if(hnum==0) button_set_flags(b,B_SAVEHOT,FALSE,FALSE);
+  return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *get_file_size(char *filename,int *size)
+{
+os_filestr f;
+
+f.action=17;
+f.name=filename;
+ERROUT(os_file(&f));
+*size=f.start;
+return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *load_file_at(char *filename,void *address)
+{
+os_filestr f;
+
+f.action=16;
+f.name=filename;
+f.loadaddr=(int)address;
+f.execaddr=0;
+return(os_file(&f));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *load_file_into_flex(char *filename,flex_ptr anchor)
+{
+int        size;
+os_error   *e;
+
+ERROUT(get_file_size(filename,&size))
+if(!mflex_alloc(anchor,size))
+  {
+  *anchor=NULL;
+  return(errorgen(2));
+  }
+e=load_file_at(filename,*anchor);
+if(e)
+  {
+  e=errorgen((int)e);
+  mflex_free(anchor);
+  return(e);
+  }
+return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static void hotlist_find(char **start,char *s)
+{
+  char *p=*start;
+  int  len=strlen(s);
+
+  while(*p && ml_strncmpi(p,s,len)) p++;
+  *start=p;
+}
+
+/*----------------------------------------------------------------------*/
+os_error *hotlist_load(char *filename,int hnum)
+{
+  os_error *e=NULL;
+  char     *infile,*p;
+  int      o1,o2,o3,o4,size;
+
+  ERROUT(load_file_into_flex(filename,(void**)&infile));
+  size=mflex_size((void**)&infile);
+  if(!mflex_extend((void**)&infile,size+1)) e=errorgen(2);
+  if(!e)
+  {
+    infile[size]=0;
+    if(hotlist[hnum])
+    {
+      mflex_free(&hotlist[hnum]);
+      hotlist_size[hnum]=0;
+    }
+    p=infile;
+    o1=o2=o3=o4=0;
+    while(*p && !e && hotlist_size[hnum]<params.maxhot)
+    {
+      hotlist_find(&p,"<a ");
+      if(*p)
+      {
+        p+=2;
+        hotlist_find(&p," href");
+        p+=5;
+        if(*p) while(*p==' ' || *p=='=') p++;
+        if(*p=='\"')
+        {
+          p++;
+          o1=p-infile;
+          p=strchr(p,'\"');
+          if(p)
+          {
+            o2=p-infile;
+            p=strchr(p,'>');
+            if(p)
+            {
+              p++;
+              o3=p-infile;
+              hotlist_find(&p,"</a>");
+              if(*p)
+              {
+                BOOL ok;
+                int  oldsize;
+
+                o4=p-infile;
+                p=strchr(infile+o3,'\n');
+                if(p-infile-1<o4) o4=p-infile;
+                if(hotlist[hnum])
+                {
+                  oldsize=mflex_size(&hotlist[hnum]);
+                  ok=mflex_extend(&hotlist[hnum],oldsize+o2-o1+1+o4-o3+1);
+                }
+                else
+                {
+                  oldsize=0;
+                  ok=mflex_alloc(&hotlist[hnum],o2-o1+1+o4-o3+1);
+                }
+                if(ok)
+                {
+                  char *t;
+
+                  t=((char*)hotlist[hnum])+oldsize;
+                  strncpy(t,infile+o1,o2-o1);
+                  t+=(o2-o1);
+                  *t++=0;
+                  strncpy(t,infile+o3,o4-o3);
+                  t+=(o4-o3);
+                  *t=0;
+                  p=infile+o4;
+                  hotlist_size[hnum]++;
+                }
+                else e=errorgen(2);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  mflex_free((void**)&infile);
+  browser_set_all_button_states();
+  return(e);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static BOOL history_handler(dbox d,void *event,void *handle)
+{
+  browser       *b;
+  wimp_eventstr *e=(wimp_eventstr*)event;
+  hotlist_info  *hi=(hotlist_info*)handle;
+
+  b=hi->b;
+  switch(e->e)
+  {
+    case wimp_EBUT:
+    {
+      int         y;
+      wimp_wstate state;
+
+      if(e->data.but.b==0)
+      {
+        wimp_get_wind_state(dbox_syshandle(d),&state);
+        y=coords_y_toworkarea(e->data.but.m.y,(coords_cvtstr*)&state.o.box);
+        y=(-1-y)/HOTLIST_LINEHEIGHT;
+        if(y<b->hnum)
+        {
+          hi->selection=y;
+          e->data.but.m.i=0; /* fake a click on icon 0 */
+        }
+      }
+    }
+    break;
+    case wimp_EREDRAW:
+    {
+      int            more;
+      fm_face        handle;
+      wimp_redrawstr r;
+
+      r.w=dbox_syshandle(d);;
+      wimp_redraw_wind(&r,&more);
+      if(more)
+      {
+        handle=fm_find_font("dialogue",HOTLIST_FONTSIZE,HOTLIST_FONTSIZE,FALSE,FALSE);
+        while(more)
+        {
+          int  i,x,y;
+          char *p;
+
+          fm_set_font_colour(handle,0,0xd0d0d000);
+          y=coords_y_toscreen(-1,CVTSTR(&r));
+          x=coords_x_toscreen(8,CVTSTR(&r));
+          for(i=0;i<b->hnum;i++)
+          {
+            y-=HOTLIST_LINEHEIGHT;
+            if(y>=r.g.y0-HOTLIST_LINEHEIGHT && y<=r.g.y1)
+            {
+              int j;
+
+              j=b->hnum-i-1;
+              p=browser_history(b);
+              while(j>0) {p+=strlen(p)+1; j--;}
+              fm_puts(handle,x,y+HOTLIST_LINEHEIGHT/4,p,TRUE,FALSE);
+            }
+          }
+          wimp_get_rectangle(&r,&more);
+        }
+        fm_lose_font(handle);
+      }
+      return(TRUE);
+    }
+    break;
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+    {
+      if(e->data.msg.hdr.action==wimp_MHELPREQUEST) help_genmessage("HdHIST","");
+    }
+    break;
+  }
+return(FALSE);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *history_set_extent(wimp_w w,int l)
+{
+  wimp_redrawstr r;
+
+  r.w=w;
+  r.box.x0=0;
+  r.box.x1=1500;
+  r.box.y1=-1;
+  r.box.y0=HOTLIST_LINEHEIGHT*l;
+  if(r.box.y0<780) r.box.y0=780;
+  r.box.y0=r.box.y1-r.box.y0;
+  return(wimp_set_extent(&r));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *history_display(browser *b)
+{
+  dbox           d;
+  int            f;
+  hotlist_info   hi;
+
+  hi.selection=-1;
+  hi.deleting=0;
+  hi.hnum=0;
+  hi.b=b;
+  d=dbox_new("hotlist");
+  if(!d) return(errorgen(2));
+  history_set_extent(dbox_syshandle(d),b->hnum);
+  dbox_raw_eventhandler(d,history_handler,&hi);
+  strcpy(dbox_template_pointer(d)->title.indirecttext.buffer,msgs_lookup("HTHIST:History list"));
+  dbox_show(d);
+  do
+  {
+    f=dbox_fillin(d);
+    if(f==0 && hi.selection>=0 && hi.selection<b->hnum)
+    {
+      char *p;
+      int  j;
+
+      p=browser_history(b);
+      j=b->hnum-hi.selection-1;
+      while(j--) p+=strlen(p)+1;
+      wimpt_complain(browser_show_url_f(b,p,TRUE));
+    }
+  } while(f!=dbox_CLOSE && dbox_persist());
+  dbox_raw_eventhandler(d,0,0);
+  dbox_dispose(&d);
+  browser_set_all_button_states();
+  return(NULL);
+}
+

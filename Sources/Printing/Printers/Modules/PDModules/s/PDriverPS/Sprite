@@ -1,0 +1,2942 @@
+; > Sources.PDriverPS.Sprite
+
+; Sprite handling routines for the PostScript printer driver
+
+; This routine is used by the sprite plotting routines in this file and
+; TransSprite.  It checks to see if bit 4 of R5 is set, and if so
+; it arranges to use the sprite's palette in preference to the
+; translation table, unless the palette is nonexistent or the wrong size.
+; It does this by modifying R7 to point at the palette, setting bit 31
+; so that the later code notices.
+; On entry, R0-R2 are sprite identifiers, R7 is the translation table.
+; On exit registers are preserved except R7 may have been updated.
+
+sprite_checkR5bit4
+        Push    "R0-R5,LR"
+
+        Debug   Sprite, "sprite_checkR5bit4 in: Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+        TST     R5, #1 :SHL: 4
+        Pull    "R0-R5,PC", EQ
+
+        ; Read palette size into R3, sprite mode to R5
+        BIC     R0,R0,#&FF
+        ORR     R0,R0,#SpriteReason_CreateRemovePalette
+        MOV     R3,#-1                          
+        SWI     XOS_SpriteOp
+
+        Debug   Sprite, "after createremovepalette Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+        MOVVC   R0,R5
+        MOVVC   R1,#VduExt_Log2BPP
+        SWIVC   XOS_ReadModeVariable
+
+        Debug   Sprite, "after ReadModeVariable Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+        Pull    "R0-R5,PC", VS
+        Pull    "R0-R5,PC", CS
+
+        TEQ     R3, #0                  ; If the sprite has no palette
+        TEQNE   R2, #4                  ; or if it's 16 or 32bpp, then this is all
+        TEQNE   R2, #5                  ; irrelevant - we use a different strategy
+        Pull    "R0-R5,PC", EQ          ; so return
+
+        MOV     R0, #1
+        MOV     R1, R0, LSL R2          ; R1 is number of bits per pixel in the mode
+        MOV     R1, R0, LSL R1          ; now R1 is the max number of colours in the mode
+
+        Debug   Sprite, "Finally ncol,npal == ", R1,R3
+
+        TEQ     R3, R1                  ; Number of colours == number of palette entries?
+        ORREQ   R7, R4, #1 :SHL: 31     ; If so, point to palette instead of translation table
+        Debug   Sprite, "On exit R7 is",R7
+
+        Pull    "R0-R5,PC"
+
+
+; Sprite outputting routine
+; =========================
+;
+; Entry: R0 is SpriteOp reason code and controls how R1 and R2 should be
+;          interpreted.
+;        R1 -> sprite area if R0 >= &100; otherwise the sprite area concerned
+;          is the system area.
+;        R2 -> sprite name if R0 < &200.
+;        R2 -> sprite if R0 >= &200.
+;        R3 is the X co-ordinate relative to the bottom left of the current
+;          rectangle (in OS units).
+;        R4 is the Y co-ordinate relative to the bottom left of the current
+;          rectangle (in OS units).
+;        R5 is the GCOL action.  Bit 4 may be set, meaning "use sprite's
+;          palette in preference to the trans table".  The rest of the bits
+;          in this register are guaranteed to be 0 or 8 meaning
+;          "don't use mask" and "use mask" respectively
+;        R6 <= 0 for no scaling, or points to 4 scaling factors (x-mag,
+;          y-mag, x-div, y-div).
+;        R7 <= 0 for no translation, or points to a translation table.
+; Exit:  All registers preserved
+
+        [ Medusa
+; For TrueColour sprites on B/W printers, we create the temporary
+; sprite in a suitable 8bpp mode, and we create our own translation
+; table to render the source down to 256 grey-levels.
+
+; For TrueColour sprites on colour printers, we call new code that
+; uses colorimage to image the sprite.  This code is incapable of
+; handling the MASK properly; PostScript simply does not cope with
+; the idea of a bitmap mask for the colorimage operator.  In desparation,
+; we simply map masked pixels to white; this is horribly bogus but
+; will at least cover one common case.
+
+        GBLA    FakeMaskColour
+FakeMaskColour  SETA    &00FFFFFF       ; RGB white
+
+        ]
+
+
+
+
+sprite_greyscaled                       ;No sensible difference exists
+sprite_put                              ;  between these two in PostScript
+        Push    "R0-R9,LR"
+        PrError sprite_put_no_grestore_return
+
+        Debug   Sprite, "Sprite_Put in: Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+        Debug   Medusa, "Sprite_Put starts"
+        Debug   Medusa, "Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+        CMP     R7, #0                  ;If user wants no translation table, then
+        MOVLT   R7, #0                  ;force R7 to zero (we use top bit of R7
+                                        ;  to distinguish a translation table from a
+                                        ;  sprite palette)
+
+        [ Medusa
+        BL      sprite_clear32Ktable
+        ]
+
+; Not doing source clipping
+        MOV     lr, #0
+        STR     lr, sourceclip_x
+        STR     lr, sourceclip_y
+
+; Sprite and VDU calls issued from in here should go to the real code.
+
+        LDRB    LR,passthrough
+        STRB    LR,sprpassthrough
+        ORR     LR,LR,#passthrough_spr
+        STRB    LR,passthrough
+
+; Save current graphics state, then translate to sprite origin.
+
+        [       PSCoordSpeedUps
+        BL      ensure_OScoords
+        BLVC    output_gsave
+        |
+        BL      output_gsave
+        ]
+        BLVC    sprite_translatebyR3R4
+
+; Get sprite information, first putting GCOL action and the scaling
+; information in safe registers.
+
+        ANDVC   R8,R5,#15
+        MOVVC   R9,R6
+
+; Check whether the user has asked to use the sprite's palette, rather
+; than the translation table.  Adjust if so.
+        BL      sprite_checkR5bit4
+        
+        BICVC   R0,R0,#&FF
+        ORRVC   R0,R0,#SpriteReason_ReadSpriteSize
+        SWIVC   XOS_SpriteOp
+        PrPassError
+        TEQ     R3,#0
+        TEQNE   R4,#0
+        BEQ     sprite_put_return               ;Note V is clear
+
+; Make GCOL actions 8-15 identical to actions 0-7 if the sprite has no mask.
+; Then ignore GCOL actions other than 0 and 8 (overwriting).
+
+        TEQ     R5,#0
+        ANDEQ   R8,R8,#7
+        TST     R8,#7
+        BNE     sprite_put_return               ;Note V is clear
+
+        [ Medusa
+
+; If the sprite is 16 or 32bpp, we want to process it specially.
+; XXX check the TransSprite code keeps in step with this
+
+        MOV     LR, R6, LSR #27
+        AND     LR, LR, #31
+        Debug   Medusa, "Sprite T=",LR
+        TEQ     LR, #5
+        BEQ     %FT02
+        TEQ     LR, #6
+        BNE     %FT00
+
+; It's a 32bpp sprite.
+
+        LDR     LR,info_features        ;If output is destined for a monochrome
+        TST     LR,#1                   ;  printer, fudge the sprite mode
+        BEQ     %FT01
+
+        BL      sprite_scaling
+        BLVC    sprite_output32bpp
+        PrPassError
+        B       sprite_put_return
+
+; It's a 16bpp sprite
+02
+        LDR     LR,info_features        ;If output is destined for a monochrome
+        TST     LR,#1                   ;  printer, fudge the sprite mode
+        BEQ     %FT01
+
+        BL      sprite_scaling
+        BLVC    sprite_output16bpp
+        PrPassError
+        B       sprite_put_return
+
+; Truecolour sprite->mono printer, so modify the mode number to make a
+; similar 8bpp mode and arrange for the real sprite to be plotted into
+; that as greyscale
+01
+        Debuga  Medusa, "Changing sprite type from ", R6
+        BIC     R6, R6, #2_11111 :SHL: 27
+        ORR     R6, R6, #2_00100 :SHL: 27
+        Debug   Medusa, " to ", R6
+; And create a suitable translation table, putting the address of the anchor block into R7
+        BL      sprite_make32Ktable
+
+00
+        ]
+
+; Use scaling factors to get the co-ordinate system units right.
+
+        BL      sprite_scaling
+        PrPassError
+
+; Clear out the printer driver's temporary sprite area and create a 256 bits
+; by 64 lines sprite for this sprite's mode in it. Give the new sprite a
+; mask, then get its address for future reference.
+;
+; R0-R2:   the info about the sprite (as usual)
+; R3,R4:   sprite width & height in pixels, as returned from ReadSpriteSize
+; R6:      the sprite's mode
+; R7:      translation table pointer.
+; R8:      0 for unmasked plotting, 8 for masked plotting (& mask exists).
+; R10-R12: file handle and workspace pointers.
+
+sprite_commonoutput
+
+        BL    sprite_createtempsprite
+        PrPassError
+
+        Debug   Medusa, "Start of plot loop"
+        Debug   Medusa, "Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+; We're now ready to start plotting 256 bits by 64 rows chunks of the
+; sprite. First split it into 256 bit wide strips.
+;   Currently, important register contents are:
+; R0-R2:   sprite identifiers.
+; R3,R4:   sprite width & height in pixels.
+; R5:      number of pixels that make up 256 bits.
+; R6:      sprite mode.
+; R7:      translation table pointer.
+; R8:      0 for unmasked plotting, 8 for masked plotting (& mask exists).
+; R10-R12: file handle and workspace pointers.
+
+sprite_put_xloop
+        CMP     R5,R3
+        MOVGT   R5,R3
+
+;   Currently, important register contents are:
+; R0-R2:   sprite identifiers.
+; R3:      width of the part of the sprite we still have to do.
+; R4:      sprite height in pixels.
+; R5:      width of the strip we're taking off the right hand side of the
+;            sprite.
+; R6:      sprite mode.
+; R7:      translation table pointer.
+; R8:      0 for unmasked plotting, 8 for masked plotting (& mask exists).
+; R10-R12: file handle and workspace pointers.
+
+        Push    "R4"
+        MOV     R9,#64
+sprite_put_yloop
+        CMP     R9,R4
+        MOVGT   R9,R4
+
+;   Currently, important register contents are:
+; R0-R2:   sprite identifiers.
+; R3:      width of the part of the sprite we still have to do.
+; R4:      height of the part of the current strip we still have to do.
+; R5:      width of the strip we're taking off the right hand side of the
+;            sprite.
+; R6:      sprite mode.
+; R7:      translation table pointer.
+; R8:      0 for unmasked plotting, 8 for masked plotting (& mask exists).
+; R9:      height of the chunk we're taking off the top of the current strip.
+; R10-R12: file handle and workspace pointers.
+
+        BL      sprite_putchunk
+        Pull    "R4",VS
+        PrPassError
+
+        SUBS    R4,R4,R9
+        BNE     sprite_put_yloop
+        Pull    "R4"
+
+        SUBS    R3,R3,R5
+        BNE     sprite_put_xloop
+
+; Restore original graphics state.
+
+sprite_put_return
+        BL      output_grestore
+
+sprite_put_no_grestore_return
+
+        [ Medusa
+        BL      sprite_free32Ktable             ; free it if allocated
+        ]
+
+; Revert to normal handling of sprite calls and return
+        LDRB    LR,sprpassthrough
+        STRB    LR,passthrough
+        STRVS   R0,[R13]
+        Pull    "R0-R9,PC"
+
+; Sprite mask outputting routine
+; ==============================
+;
+; Entry: R0 is SpriteOp reason code and controls how R1 and R2 should be
+;          interpreted.
+;        R1 -> sprite area if R0 >= &100; otherwise the sprite area concerned
+;          is the system area.
+;        R2 -> sprite name if R0 < &200.
+;        R2 -> sprite if R0 >= &200.
+;        R3 is the X co-ordinate relative to the bottom left of the current
+;          rectangle (in OS units).
+;        R4 is the Y co-ordinate relative to the bottom left of the current
+;          rectangle (in OS units).
+;        R6 <= 0 for no scaling, or points to 4 scaling factors (x-mag,
+;          y-mag, x-div, y-div).
+;        Correct colour has already been set up.
+; Exit:  All registers preserved
+
+sprite_mask
+        Push    "R0-R9,LR"
+        PrError sprite_mask_no_grestore_return
+
+; Not doing source clipping
+        MOV     lr, #0
+        STR     lr, sourceclip_x
+        STR     lr, sourceclip_y
+
+; Sprite and VDU calls issued from in here should go to the real code.
+
+        LDRB    LR,passthrough
+        STRB    LR,sprpassthrough
+        ORR     LR,LR,#passthrough_spr
+        STRB    LR,passthrough
+
+; Save current graphics state, then translate to sprite origin.
+
+        [       PSCoordSpeedUps
+        BL      ensure_OScoords
+        BLVC    colour_ensure
+        BLVC    output_gsave
+        |
+        BL      output_gsave
+        ]
+        BLVC    sprite_translatebyR3R4
+
+; Get sprite information, first putting the scaling information in a safe
+; register.
+
+        MOVVC   R9,R6
+        BICVC   R0,R0,#&FF
+        ORRVC   R0,R0,#SpriteReason_ReadSpriteSize
+        SWIVC   XOS_SpriteOp
+        PrPassError
+        TEQ     R3,#0
+        TEQNE   R4,#0
+        BEQ     sprite_mask_return              ;Note V is clear
+
+        MOV     R8,R5                           ;Preserve mask information
+
+; Use scaling factors to get the co-ordinate system units right.
+
+        BL      sprite_scaling
+
+; Note: don't try to deal with unmasked sprites here, before breaking them
+; down into pieces. Problem with attempting to do so is that the 'FFs' string
+; may be too small to do so with 'imagemask's, but we must use 'imagemask' if
+; we don't want to get rounding errors on the edges of the result.
+
+; Clear out the printer driver's temporary sprite area and create a 256 bits
+; by 64 lines sprite for this sprite's mode in it. Give the new sprite a
+; mask, then get its address for future reference.
+
+sprite_mask_commonoutput
+
+        BLVC    sprite_createtempsprite
+        PrPassError
+
+; We're now ready to start plotting 256 bits by 64 rows chunks of the
+; mask. First split it into 256 bit wide strips.
+;   Currently, important register contents are:
+; R0-R2:   sprite identifiers.
+; R3,R4:   sprite width & height in pixels.
+; R5:      number of pixels that make up 256 bits.
+; R6:      sprite mode.
+; R8:      0 if no mask exists, 1 if mask exists.
+; R10-R12: file handle and workspace pointers.
+
+sprite_mask_xloop
+        CMP     R5,R3
+        MOVGT   R5,R3
+
+;   Currently, important register contents are:
+; R0-R2:   sprite identifiers.
+; R3:      width of the part of the sprite we still have to do.
+; R4:      sprite height in pixels.
+; R5:      width of the strip we're taking off the right hand side of the
+;            sprite.
+; R6:      sprite mode.
+; R8:      0 if no mask exists, 1 if mask exists.
+; R10-R12: file handle and workspace pointers.
+
+        Push    "R4"
+        MOV     R9,#64
+sprite_mask_yloop
+        CMP     R9,R4
+        MOVGT   R9,R4
+
+;   Currently, important register contents are:
+; R0-R2:   sprite identifiers.
+; R3:      width of the part of the sprite we still have to do.
+; R4:      height of the part of the current strip we still have to do.
+; R5:      width of the strip we're taking off the right hand side of the
+;            sprite.
+; R6:      sprite mode.
+; R8:      0 if no mask exists, 1 if mask exists.
+; R9:      height of the chunk we're taking off the top of the current strip.
+; R10-R12: file handle and workspace pointers.
+
+        BL      sprite_maskchunk
+        Pull    "R4",VS
+        PrPassError
+
+        SUBS    R4,R4,R9
+        BNE     sprite_mask_yloop
+        Pull    "R4"
+
+        SUBS    R3,R3,R5
+        BNE     sprite_mask_xloop
+
+; Restore original graphics state.
+; Revert to normal handling of sprite calls and return
+
+sprite_mask_return
+        BL      output_grestore
+sprite_mask_no_grestore_return
+        LDRB    LR,sprpassthrough
+        STRB    LR,passthrough
+        STRVS   R0,[R13]
+        Pull    "R0-R9,PC"
+
+; Subroutine to get the co-ordinate system units right for sprite plotting.
+;
+; The co-ordinate system has been translated to the correct origin, but we
+; still have to get the units right. They are currently OS units by OS units.
+; They need to be sprite bits by sprite pixels. So the X scaling involves:
+;   (a) Dividing by the sprite's bits/pixel (sprite bits -> sprite pixels);
+;   (b) Multiplying by the current screen mode's X pixel size (sprite pixels
+;       -> sprite OS units);
+;   (c) Multiplying by the X multiplier and dividing by the X divisor (sprite
+;       OS units -> real OS units).
+; The Y scaling involves:
+;   (a) Multiplying by the current screen mode's Y pixel size (sprite pixels
+;       -> sprite OS units);
+;   (b) Multiplying by the Y multiplier and dividing by the Y divisor (sprite
+;       OS units -> real OS units).
+; To do these, we need to look up the appropriate mode variables.
+;   At this stage, we also generate the scaling matrix used by 'imagemask' or
+; 'image' in the sprite output routine. This is based on the number of bits/
+; pixel in the sprite, but note that it should use Log2BPP, not Log2BPC...
+; Entry: R0-R2:   sprite identifiers.
+;        R3,R4:   sprite width & height in pixels.
+;        R6:      sprite mode.
+;        R9:      scale factors pointer.
+;        R10-R12: file handle and workspace pointers.
+; Exit:  R0-R8, R10-R12 preserved (except R0 on an error).
+;        R9 = Log(bytes/character) for sprite's screen mode.
+
+sprite_scaling
+        Push    "R0-R6,LR"
+        PrError sprite_scaling_return
+        MOV     R0,R6
+
+        CMP     R9,#0                           ;Pick up scaling factors
+        LDMGTIA R9,{R3-R6}
+        MOVLE   R3,#1
+        MOVLE   R4,#1
+        MOVLE   R5,#1
+        MOVLE   R6,#1
+
+        MOV     R1,#VduExt_Log2BPC              ;Adjust X divisor for
+        SWI     XOS_ReadModeVariable            ;  (software) bits/pixel
+        MOVVC   R5,R5,LSL R2
+        MOVVC   R9,R2
+
+        LDRVC   R2,currxeig                     ;Adjust X multiplier for
+        MOVVC   R3,R3,LSL R2                    ;  pixel size
+
+        LDRVC   R2,curryeig                     ;Adjust Y multiplier for
+        MOVVC   R4,R4,LSL R2                    ;  pixel size
+
+        MOVVC   R1,#VduExt_Log2BPP              ;Get (hardware) bits/pixel
+        SWIVC   XOS_ReadModeVariable            ;  for scaling matrix
+
+        PrPassError
+
+        PrPair  R3,R5
+        PrPair  R4,R6
+        PrLnIm  "SS"
+
+        MOV     LR,#1
+        MOV     R2,LR,LSL R2
+        PrNumSp R2
+        PrLnIm  "SM",FallThroughOnError
+
+        PrError
+sprite_scaling_return
+        STRVS   R0,[R13]
+        Pull    "R0-R6,PC"
+
+; Subroutine to put an appropriate (256 bit by 64 lines) sprite into the
+; printer driver's temporary sprite area.
+; Entry: R6 = mode number / sprite type
+;        R9 = LOG(bytes/character) for the sprite's mode.
+; Exit:  R0-R4,R6-R12 preserved (except R0 on an error).
+;        R5 = number of pixels that make up 256 bits.
+
+sprite_createtempsprite
+        MOV     R5,#&100                        ;Calculate width of a 256 bit
+        MOV     R5,R5,LSR R9                    ;  chunk in pixels
+
+        Push    "R0-R5,LR"
+
+        LDR     R0,=&100+SpriteReason_ClearSprites
+        ADRL    R1,sprarea
+        SWI     XOS_SpriteOp
+
+        LDRVC   R0,=&100+SpriteReason_CreateSprite
+        ADRVC   R2,sprite_name
+        MOVVC   R3,#0
+        MOVVC   R4,R5
+        MOVVC   R5,#64
+
+        DebugIf VC,Medusa,"Create temp. sprite ",R0,R1,R2,R3,R4,R5,R6
+        SWIVC   XOS_SpriteOp
+
+        [ Medusa
+; Create a second identical sprite to hold the mask data
+        ADRVC   R2,spritemsk_name
+        DebugIf VC,Medusa,"Create temp. mask ",R0,R1,R2,R3,R4,R5,R6
+        SWIVC   XOS_SpriteOp
+        |
+; Give the sprite a mask
+        LDRVC   R0,=&100+SpriteReason_CreateMask
+        SWIVC   XOS_SpriteOp
+        ]
+
+        LDRVC   R0,=&100+SpriteReason_SelectSprite
+        [ Medusa
+        ADRVC   R2,spritemsk_name
+        SWIVC   XOS_SpriteOp
+        STRVC   R2,spritemskaddress
+        ]
+        ADRVC   R2,sprite_name
+        SWIVC   XOS_SpriteOp
+        STRVC   R2,spriteaddress
+
+        STRVS   R0,[R13]
+        Pull    "R0-R5,PC"
+
+sprite_name
+        DCB     "tmp",0
+spritemsk_name
+        DCB     "msk",0
+        ALIGN
+
+        LTORG
+
+
+; Subroutine to output a specified rectangular chunk of a sprite. The chunk
+; to be printed has its top right hand corner at (R3,R4) and is of size
+; (R5,R9).
+; Entry: R0-R2 identify the sprite in the usual way.
+;        R3 contains the right edge of the chunk to be plotted.
+;        R4 contains the top edge of the chunk to be plotted.
+;        R5 contains the width of the chunk to be plotted.
+;        R6 contains the mode of the sprite.
+;        R7 contains a translation table pointer.
+;        R8 contains 0 for unmasked plotting, 8 for masked plotting. In the
+;           latter case, the sprite definitely has a mask.
+;        R9 contains the height of the chunk to be plotted.
+;        R10-R12 contain the file handle and workspace pointers as usual.
+;        sourceclip_x,_y: source x and y offsets in pixels.  Normally 0.
+;        The sprite pointed to by 'spritehandle' is suitable as a place into
+;        which to copy the chunk to be plotted.
+; Exit:  All registers preserved.
+
+sprite_putchunk
+        Push    "R0-R9,LR"
+
+        Debug   Medusa, "sprite_putchunk; Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+; Convert R3,R4 to bottom left corner of chunk.
+
+        SUB     R3,R3,R5
+        SUB     R4,R4,R9
+
+; The next major step is to transfer a copy of the chunk concerned to the
+; sprite pointed to by 'spriteaddress'
+
+        Push    "R3-R5"
+
+; Negate the bottom left corner and convert it to OS co-ordinates (this is
+; the position at which we want to plot the given sprite in the one pointed
+; at by 'spritehandle').
+
+        RSB     R3,R3,#0
+        RSB     R4,R4,#0
+
+; Here we must allow for the altered source origin brought about by
+; source clipping.  Simply subtract this offset from the bottom-left
+; position in R3,R4.  Note that this is only used for obtaining the source data -
+; the real values of R3,R4 have been pushed.
+
+        Push    "R0-R2"
+
+        LDR     r0, sourceclip_x
+        LDR     r1, sourceclip_y
+        SUB     R3, R3, R0
+        SUB     R4, R4, R1
+
+        Debuga  Medusa, "Pixel offsets are ", R3, R4
+
+        MOV     R0,R6
+        MOV     R1,#VduExt_XEigFactor
+        SWI     XOS_ReadModeVariable
+        MOVVC   R3,R3,LSL R2
+
+        MOVVC   R1,#VduExt_YEigFactor
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   R4,R4,LSL R2
+
+        Debug   Medusa, " & OSunit offsets are ", R3, R4
+
+        STRVS   R0,[R13]
+        Pull    "R0-R2"
+
+; Switch output to the sprite pointed to by 'spritehandle'
+
+        Push    "R0-R3"
+        LDRVC   R0,=&200+SpriteReason_SwitchOutputToSprite
+        ADRVCL  R1,sprarea
+        LDRVC   R2,spriteaddress
+        MOVVC   R3,#0
+        SWIVC   XOS_SpriteOp
+        ADRVC   LR,oldspritestate
+        STMVCIA LR,{R0-R3}
+        STRVS   R0,[R13]
+        Pull    "R0-R3"
+        BVS     sprite_putchunk_chunktransferred
+
+; Plot the given chunk's data.
+
+        BIC     R0,R0,#&FF
+        MOV     R5,#0                           ; Plot action
+
+        [ Medusa
+        ORR     R0,R0,#SpriteReason_PutSpriteScaled
+        Push    "R6,R7"
+        MOV     R6, #0                          ; No scaling
+        ADRL    LR, colourtrans32K              ; We only want to pass a translation
+        TEQ     LR, R7                          ; table through if it is our own
+        MOVNE   R7, #0                          ; 32K greyscale one.  Zero it if not.
+        SWI     XOS_SpriteOp
+        Pull    "R6,R7"
+        |
+        ORR     R0,R0,#SpriteReason_PutSpriteUserCoords
+        SWI     XOS_SpriteOp
+        ]
+        BVS     sprite_putchunk_switchoutputback
+
+; We're done if no mask is wanted.
+
+        TEQ     R8,#0
+        BEQ     sprite_putchunk_switchoutputback        ;Note V is clear
+
+; Aaargh! We must transfer the mask data. Technique: switch output to the
+; mask of the sprite pointed to by 'spriteaddress'. Clear it to zeroes, then
+; plot the mask of the given sprite, using the inverting action.
+
+        Push    "R0-R3"
+        ADRL    R1,sprarea
+
+        [ Medusa
+        Debug   Medusa, "Switching output to sprite instead of mask"
+        LDR     R0,=&200+SpriteReason_SwitchOutputToSprite
+        LDR     R2,spritemskaddress
+        |
+        LDR     R0,=&200+SpriteReason_SwitchOutputToMask
+        LDR     R2,spriteaddress
+        ]
+        MOV     R3,#0
+        SWI     XOS_SpriteOp
+        STRVS   R0,[R13]
+        Pull    "R0-R3"
+
+        SWIVC   XOS_WriteI+16           ;Current background must be zeroes
+                                        ;  after the output switch, so we can
+                                        ;  do a CLG immediately.
+
+        SWIVC   XOS_WriteI+18           ;Set inverting background
+        SWIVC   XOS_WriteI+4
+        SWIVC   XOS_WriteI+128
+
+        Push    "R6"
+        BICVC   R0,R0,#&FF              ;Plot this sprite's mask
+        ORRVC   R0,R0,#SpriteReason_PlotMaskScaled
+        MOV     R6, #0                  ; No scaling
+        SWIVC   XOS_SpriteOp
+        Pull    "R6"
+
+sprite_putchunk_switchoutputback
+        Push    "R0-R3,PC"
+        ADR     LR,oldspritestate
+        LDMIA   LR,{R0-R3}
+        SWI     XOS_SpriteOp
+        STRVS   R0,[R13]
+        Pull    "R0-R3,LR"
+        TST     LR,#V_bit
+        SETV    NE
+
+sprite_putchunk_chunktransferred
+        DebugE  Medusa, "chunktransferred error: "
+        Pull    "R3-R5"
+
+; The chunk we want to plot is now safely in the sprite pointed to by
+; 'spriteaddress'.
+;   Currently, important register contents are:
+; R3,R4:   pixel co-ordinates of where we want to plot the current chunk.
+; R5:      width of the chunk in pixels.
+; R6:      sprite mode.
+; R7:      translation table pointer.
+; R8:      0 for unmasked plotting, 8 for masked plotting (& mask exists).
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+
+; Now we change the X co-ordinates to bits, then translate the co-ordinate
+; system to the chunk origin.
+
+        Debug   Medusa, "chunk xferred; Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+        PrError sprite_putchunk_return
+
+        MOVVC   R0,R6
+        MOVVC   R1,#VduExt_Log2BPC
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   R3,R3,LSL R2
+        MOVVC   R5,R5,LSL R2
+
+        MOVVC   R1,#VduExt_Log2BPP              ;To interpret colours in the
+        SWIVC   XOS_ReadModeVariable            ;  data, we need this form
+        MOVVC   R6,R2                           ;  of Log2(bits/pixel)
+        STRVC   R6,spritelog2bpp
+        BLVC    output_gsave
+        BLVC    sprite_translatebyR3R4
+        PrPassError
+
+        Debug   Medusa, "translated; Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+; The next step is to scan the chunk we are to plot, to find out which
+; pixel values exist and what their bounding boxes are. First prepare for
+; the main analysis.
+;   Currently, important register contents are:
+; R5:      width of the chunk in bits.
+; R6:      Log2(bits/pixel)
+; R7:      translation table pointer.
+; R8:      0 for unmasked plotting, 8 for masked plotting (& mask exists).
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+
+        ADRL    R4,colourbounds                 ;Start by clearing the
+        ADD     R3,R4,#4*&100                   ;  'colourbounds' table
+        [       PSSprUseBBoxes
+        LDR     R2,=&FFFF0000
+        |
+        MOV     R2,#&00FF0000           ;If not using bounding boxes, all
+                                        ;  we need to do is distinguish
+                                        ;  colours found from ones not found
+        ]
+sprite_putchunk_clearcolourbounds
+        STR     R2,[R3],#-4
+        CMP     R3,R4
+        BHS     sprite_putchunk_clearcolourbounds
+
+        LDR     LR,spriteaddress                ;Get address of the temp. sprite
+        LDR     R0,[LR,#spImage]                ;Get offset of image data
+        ADD     R0,LR,R0                        ;Convert to address
+        [ Medusa
+        LDR     LR,spritemskaddress             ;Get address of 'mask' sprite
+        LDR     R1,[LR,#spImage]                ;Get offset of image data
+        ADD     R1,LR,R1                        ;Convert to address
+        |
+        LDR     R1,[LR,#spTrans]                ;Get offset of mask data
+        ADD     R1,LR,R1                        ;Convert to address
+        ]
+        ADD     R0,R0,#63*32                    ;Shift origins to bottom left
+        ADD     R1,R1,#63*32                    ;  of sprite
+
+        MOV     LR,#1                           ;Calculate bits/pixel
+        MOV     R6,LR,LSL R6
+        RSB     LR,LR,LR,LSL R6                 ;And pixel mask
+
+        EOR     R8,R8,#8                        ;Invert masking flag
+        MOV     R8,R8,LSL #13                   ;Move it up to bit 16
+        ORR     R8,R8,LR,LSL #24                ;And merge in the pixel mask
+
+; Now do the analysis.
+;   Currently, important register contents are:
+; R0:      address of sprite data.
+; R1:      address of sprite mask.
+; R4:      address of 'colourbounds' table.
+; R5:      width of the chunk in bits.
+; R6:      bits/pixel.
+; R7:      translation table pointer.
+; R8:      Bit 16 set for unmasked plotting, clear for masked plotting.
+;          Bits 31 to 24 are the pixel mask.
+;          All other bits clear.
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+
+        Debug   Medusa, "start analysis; Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+        [       :LNOT:PSSprUseBBoxes
+
+        SUB     LR,R9,#1                ;If not using real bounding boxes,
+        ADD     LR,LR,R5,LSL #8         ;  generate a "colourbounds" entry
+        SUBS    LR,LR,R6,LSL #8         ;  that describes the boundary of
+                                        ;  the chunk.
+
+        ]
+
+        Push    "R0,R1,R7,R9,R10"
+        SUB     R9,R9,#1
+        SUB     R0,R0,R9,LSL #5                 ;Shift origins to top left
+        SUB     R1,R1,R9,LSL #5                 ;  of chunk
+sprite_putchunk_analyseyloop
+
+        Push    "R0,R1"
+        MOV     R10,#0
+sprite_putchunk_analysexloop
+        TST     R10,#31                 ;Get another word if we need to
+        LDREQ   R2,[R0],#4
+        LDREQ   R3,[R1],#4
+
+        TST     R8,#&10000              ;Use mask?
+        TSTEQ   R3,R8,LSR #24           ;If so, test for transparency
+        MOVEQ   R7,#&100                ;Either set "transparent" colour
+        ANDNE   R7,R2,R8,LSR #24        ;  or read pixel, as appropriate
+
+        [       PSSprUseBBoxes
+
+        MOV     R7,R7,LSL #2            ;Update high Y for this colour
+        LDRB    LR,[R4,R7]
+        CMP     R9,LR
+        STRGTB  R9,[R4,R7]
+
+        ADD     R7,R7,#1                ;Update high X for this colour
+        LDRB    LR,[R4,R7]
+        CMP     R10,LR
+        STRGTB  R10,[R4,R7]
+
+        ADD     R7,R7,#1                ;Update low Y for this colour
+        LDRB    LR,[R4,R7]
+        CMP     R9,LR
+        STRLTB  R9,[R4,R7]
+
+        ADD     R7,R7,#1                ;Update low X for this colour
+        LDRB    LR,[R4,R7]
+        CMP     R10,LR
+        STRLTB  R10,[R4,R7]
+
+        |
+
+        STR     LR,[R4,R7,LSL #2]       ;Store boundary of chunk (so all used
+                                        ;  colours have this bounding box)
+
+        ]
+
+        MOV     R2,R2,ROR R6            ;Advance to next pixel
+        MOV     R3,R3,ROR R6
+        ADD     R10,R10,R6
+        CMP     R10,R5
+        BLT     sprite_putchunk_analysexloop
+        Pull    "R0,R1"
+
+        ADD     R0,R0,#32               ;Advance to next row
+        ADD     R1,R1,#32
+        SUBS    R9,R9,#1                ;Note V is clear on exit from loop
+        BGE     sprite_putchunk_analyseyloop
+        Pull    "R0,R1,R7,R9,R10"
+
+; The 'colourbounds' table now contains all the information we want. At this
+; point, we want to select between printing strategies. This selection is
+; done by the following algorithm:
+;
+;   IF transparent pixels exist THEN
+;     print colour by colour, using 'imagemask'
+;   ELSIF exactly one colour THEN
+;     fill the chunk with this colour, using 'imagemask'
+;   ELSIF monochrome output AND enough colours exist THEN
+;     print all at once using an 8 bit/pixel 'image' operator
+;   ELSIF "fill with largest colour" optimisation allowed THEN
+;     fill the chunk with the colour with the largest extent, then
+;       print the remaining colours one by one, using 'imagemask'
+;   ELSE
+;     print colour by colour, using 'imagemask'
+;   ENDIF
+
+        LDR     LR,[R4,#4*&100]
+        TST     LR,#&800000                     ;Y values only go up to 63,
+                                                ;  so any transparent pixel
+                                                ;  will have cleared this
+        DebugIf EQ, Medusa, "Colour by colour"
+        BEQ     sprite_putchunk_colourbycolour  ;Note V is clear here
+
+        ADD     R3,R4,#4*&FF
+        MOV     R2,#0                           ;Initialise colour count
+sprite_putchunk_countcolours
+        LDR     LR,[R3],#-4
+        TST     LR,#&800000
+        ADDEQ   R2,R2,#1                        ;Count an existing colour
+        CMP     R3,R4
+        BGE     sprite_putchunk_countcolours
+
+        Debug   Medusa, "Colour count was ", R2
+
+        [       PSSprColLimit >= 256
+
+        [       :LNOT:PSSprFillChunk
+        CMP     R2,#1
+        BNE     sprite_putchunk_colourbycolour
+        ]
+; Fall through to sprite_putchunk_fillandcols
+
+        |
+
+        CMP     R2,#1
+        BEQ     sprite_putchunk_fillandcols
+
+        LDR     LR,info_features
+        TST     LR,#1
+       [       PSSprFillChunk
+        BNE     sprite_putchunk_fillandcols
+        |
+        BNE     sprite_putchunk_colourbycolour
+        ]
+
+        CMP     R2,#PSSprColLimit
+        [       PSSprFillChunk
+        BLT     sprite_putchunk_fillandcols
+        |
+        BLT     sprite_putchunk_colourbycolour
+        ]
+
+; We should output this sprite all at once, via an 'image' operator.
+;   Currently, important register contents are:
+; R0:      address of sprite data.
+; R5:      width of the chunk in bits.
+; R6:      bits/pixel.
+; R7:      translation table pointer.
+; R8:      Bit 16 set for unmasked plotting, clear for masked plotting.
+;          Bits 31 to 24 are the pixel mask.
+;          All other bits clear.
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+; 'spritelog2bpp' holds Log2(R6).
+
+sprite_putchunk_allatonce
+        Push    "R0-R4,R9"
+        PrError sprite_putchunk_allatonce_return
+
+        Debug   Medusa, "All at once; Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+; Get height and width of bounding box and start printing the plane.
+
+        LDR     LR,spritelog2bpp
+        MOV     R4,R5,LSR LR
+
+        PrPair  R4,R9
+        PrLnIm  "SN"
+
+; Now we just have to output the hex data.
+
+        [       PSSprRLEncode
+        LDRB    LR,joblevel2
+        CMP     LR,#0
+        BLNE    ascii85_begin
+        MOV     LR,#0                           ;We're run-length encoding,
+        STRB    LR,sprstringlen                 ;  so initialise byte counts.
+        STR     LR,sprrepeatcount               ;NB 'sprlastbyte' irrelevant.
+        ]
+
+sprite_putchunk_allatonce_yloop
+        MOV     R2,#0
+        [       :LNOT:PSSprRLEncode
+        MOV     R4,#33
+        ]
+sprite_putchunk_allatonce_xloop
+        TST     R2,#31                          ;Get another word if it's
+        LDREQ   R3,[R0,R2,LSR #3]               ;  needed
+
+        AND     R1,R3,R8,LSR #24                ;Isolate pixel value
+
+        CMP     R7,#0                           ;R7 could be a translation table, a palette or neither
+        BEQ     sprite_putchunk_allatonce_pixval_lookup
+        [ Medusa
+        ADRL    LR, colourtrans32K              ;Is it our truecolour trans table?
+        TEQ     R7, LR                          ;If so, pixel value is a valid grey level
+        BEQ     sprite_putchunk_allatonce_gotgrey
+        ]
+        TST     R7, #1 :SHL: 31                 ;If bit 31 is clear, it's a translation table;
+        LDREQB  R1, [R7, R1]                    ;  get a byte representing a grey level
+        BEQ     sprite_putchunk_allatonce_gotgrey
+        BIC     LR, R7, #1 :SHL: 31             ;If bit 31 is set, it's a 256-entry sprite palette
+        LDR     R1, [LR, R1, LSL #3]            ; take the first 4 of the 8-byte entry
+        B       sprite_putchunk_allatonce_rgbtogrey
+
+sprite_putchunk_allatonce_pixval_lookup
+        BL      pixval_lookup                   ;Otherwise, look up screen
+sprite_putchunk_allatonce_rgbtogrey
+        BL      colour_rgbtogrey                ;  RGB, then convert to grey
+sprite_putchunk_allatonce_gotgrey
+
+        [       PSSprRLEncode
+
+        BL      sprite_outputbyte
+
+        |
+
+        SUBS    R4,R4,#1                        ;Print a newline at 32 byte
+        BNE     sprite_putchunk_allatonce_cont  ;  boundaries
+        PrNewLn FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate                 ;Check for escape, returning
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+        PrPassError                             ;  will set R0 for us if so.
+        ADD     R4,R4,#32
+sprite_putchunk_allatonce_cont
+
+        PrHex   R1                              ;Print the byte we just got
+
+        ]
+
+        ADD     R2,R2,R6                        ;Advance to next pixel and
+        MOV     R3,R3,LSR R6                    ;  loop if necessary
+        CMP     R2,R5
+        BLT     sprite_putchunk_allatonce_xloop
+
+        [       :LNOT:PSSprRLEncode
+        PrNewLn FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+        PrPassError                             ;  will set R0 for us if so.
+        ]
+
+        SUB     R0,R0,#32                       ;Advance to next line
+        SUB     R1,R1,#32
+        SUBS    R9,R9,#1
+        BGT     sprite_putchunk_allatonce_yloop
+
+        [       PSSprRLEncode
+        BL      sprite_endoutput
+        ]
+
+sprite_putchunk_allatonce_return
+        STRVS   R0,[R13]
+        Pull    "R0-R4,R9"
+
+        PrError sprite_putchunk_return
+        PrPassError
+
+        B       sprite_putchunk_grestoreandreturn
+
+        ]
+
+sprite_putchunk_fillandcols
+
+        [       PSSprFillChunk:LAND:PSSprUseBBoxes
+
+; We want to find the colour with the largest extent in the sprite, fill
+; the area with that colour, then print the remaining colours one by one.
+;   Currently, important register contents are:
+; R0:      address of sprite data.
+; R1:      address of sprite mask.
+; R4:      address of 'colourbounds' table.
+; R6:      bits/pixel.
+; R7:      translation table pointer.
+; R8:      Bit 16 set for unmasked plotting, clear for masked plotting.
+;          Bits 31 to 24 are the pixel mask.
+;          All other bits clear.
+; R10-R12: file handle and workspace pointers.
+
+        Debug   Medusa, "fillandcols; Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+        Push    "R7"
+        ADD     R3,R4,#4*&100
+        MOV     R7,#-1                          ;Init. largest area found
+sprite_putchunk_findlargestcolour
+        LDR     LR,[R3,#-4]!
+        AND     R2,LR,#&FF0000                  ;Isolate low Y
+        AND     R9,LR,#&FF                      ;Isolate high Y
+        SUBS    R9,R9,R2,LSR #16                ;Get difference & check if
+                                                ;  colour exists. If so:
+        ADDGE   R9,R9,#1                        ;Get height
+        MOVGE   R2,LR,LSR #24                   ;Isolate low X
+        ANDGE   LR,LR,#&FF00                    ;Isolate high X
+        RSBGE   R2,R2,LR,LSR #8                 ;Get difference
+        MOVGE   R2,R2,LSR #3                    ;Calculate width, rounded up
+        ADDGE   R2,R2,#1                        ;  to a number of bytes
+        MULGE   LR,R2,R9                        ;Calculate bpp * (number of
+                                                ;  bytes to output colour)
+        CMPGE   LR,R7                           ;Larger than largest so far?
+        MOVGE   R7,LR                           ;If so, update largest so far
+        MOVGE   R5,R3                           ;  and remember which colour
+
+        CMP     R3,R4
+        BHI     sprite_putchunk_findlargestcolour
+
+        Pull    "R7"
+
+        LDR     R3,[R5]                         ;Get the bounding box of the
+                                                ;  colour concerned
+        |
+
+; Either we are not using colour bounding boxes, in which case all colours
+; have the same size, or there is only one colour. In either case, we want
+; to find a colour that exists, fill the entire chunk with that colour, then
+; print the remaining colours one by one.
+;   Currently, important register contents are:
+; R0:      address of sprite data.
+; R1:      address of sprite mask.
+; R4:      address of 'colourbounds' table.
+; R6:      bits/pixel.
+; R7:      translation table pointer.
+; R8:      Bit 16 set for unmasked plotting, clear for masked plotting.
+;          Bits 31 to 24 are the pixel mask.
+;          All other bits clear.
+; R10-R12: file handle and workspace pointers.
+
+        ADD     R5,R4,#4*&100
+sprite_putchunk_findacolour
+        LDR     R3,[R5,#-4]!                    ;Does this colour exist?
+        TST     R3,#&800000
+        BNE     sprite_putchunk_findacolour
+
+        ]
+
+        BL      sprite_fillboundingbox          ;Fill the bounding box of the
+        PrPassError                             ;  colour concerned
+
+        MOV     R2,R5
+        B       sprite_putchunk_remainingcols
+
+sprite_putchunk_colourbycolour
+        MOV     R2,#-1                  ;Don't use "fill with largest colour"
+                                        ;  optimisation
+
+sprite_putchunk_remainingcols
+
+; We want to output all or all but one of the colours, one at a time, via
+; the 'imagemask' operator.
+;   Currently, important register contents are:
+; R0:      address of sprite data.
+; R1:      address of sprite mask.
+; R2:      address of 'colourbounds' entry for colour to avoid plotting,
+;          or -1 to plot all colours.
+; R4:      address of 'colourbounds' table.
+; R6:      bits/pixel.
+; R7:      translation table pointer.
+; R8:      Bit 16 set for unmasked plotting, clear for masked plotting.
+;          Bits 31 to 24 are the pixel mask.
+;          All other bits clear.
+; R10-R12: file handle and workspace pointers.
+
+        Debug   Medusa, "remainingcols; Regs: ", R0,R1,R2,R3,R4,R5,R6,R7,R8,R9
+
+        ADD     R5,R4,#4*&FF                    ;Initialise loop counter,
+        TEQ     R5,R2                           ;  avoiding the undesirable
+        SUBEQ   R5,R5,#4                        ;  colour
+sprite_putchunk_colourloop
+
+        CLRV
+        LDR     R3,[R5]                         ;Get bounding box, then
+        TST     R3,#&800000                     ;  output colour if it exists
+
+        BLEQ    sprite_putplane
+        PrPassError
+
+        SUB     R5,R5,#4                        ;Advance to next colour,
+        TEQ     R5,R2                           ;  avoiding the undesirable
+        SUBEQ   R5,R5,#4                        ;  colour
+        CMP     R5,R4
+        BHS     sprite_putchunk_colourloop
+
+sprite_putchunk_grestoreandreturn
+        BL      output_grestore
+
+        PrError
+sprite_putchunk_return
+        STRVS   R0,[R13]
+        Pull    "R0-R9,PC"
+
+; Subroutine to output a specified rectangular chunk of a sprite's mask. The
+; chunk to be printed has its top right hand corner at (R3,R4) and is of size
+; (R5,R9).
+; Entry: R0-R2 identify the sprite in the usual way.
+;        R3 contains the right edge of the chunk to be plotted.
+;        R4 contains the top edge of the chunk to be plotted.
+;        R5 contains the width of the chunk to be plotted.
+;        R6 contains the mode of the sprite.
+;        R8 contains 0 if the sprite has no mask, 1 if is does have one.
+;        R9 contains the height of the chunk to be plotted.
+;        R10-R12 contain the file handle and workspace pointers as usual.
+;        sourceclip_x,_y: source x and y offsets in pixels.  Normally 0.
+;        The sprite pointed to by 'spritehandle' is suitable as a place into
+;        which to copy the chunk to be plotted.
+; Exit:  All registers preserved.
+
+        [ Medusa
+; For the time being, we take the simplest possible approach to changing
+; this code to work with Medusa sprites.  Instead of switching output to the
+; temporary sprite's mask (1bpp) we switch it to the temporary sprite's image (Nbpp).
+; (The image part of the temporary sprites is otherwise unused in this code).
+; The SpriteReason_PlotMaskScaled then scales the mask from 1bpp to Nbpp
+; where N is the bpp of the source sprite.  The rest of the code then continues
+; to work for old-format sprites, and also for new 1bpp mask sprites.
+; The code will work correctly with all sprites with 1bpp masks, including
+; 16 and 32bpp sprites.
+;
+; XXXX However, this strategy is not very efficient for sprites with large
+; numbers of bits per pixel.  The code renders the mask in strips 256/N pixels
+; wide, which means that there will be an excessive number of strips in the
+; output.  As an optimisation, the code should be rejigged to take advantage
+; of the fact that 256 pixel-wide strips can be output for sprites of all
+; modes, providing they have 1bpp masks.  This is fairly low priority, though,
+; as plotting the mask of a sprite to the printer is not a particularly common
+; thing to do.
+        ]
+
+sprite_maskchunk
+        Push    "R0-R9,LR"
+
+; Convert R3,R4 to bottom left corner of chunk.
+
+        SUB     R3,R3,R5
+        SUB     R4,R4,R9
+
+; This is pretty easy if there's no mask...
+
+        TEQ     R8,#0
+        BEQ     sprite_maskchunk_nomask
+
+; There is a mask. The next major step is to transfer a copy of the chunk
+; concerned to the sprite pointed to by 'spriteaddress'.
+
+        Push    "R3-R5"
+
+; Negate the bottom left corner and convert it to OS co-ordinates (this is
+; the position at which we want to plot the given sprite in the one pointed
+; at by 'spritehandle').
+
+        RSB     R3,R3,#0
+        RSB     R4,R4,#0
+
+; Here we must allow for the altered source origin brought about by
+; source clipping.  Simply subtract this offset from the bottom-left
+; position in R3,R4.  Note that this is only used for obtaining the source data -
+; the real values of R3,R4 have been pushed.
+
+        Push    "R0-R2"
+
+        LDR     r0, sourceclip_x
+        LDR     r1, sourceclip_y
+        SUB     R3, R3, R0
+        SUB     R4, R4, R1
+
+        MOV     R0,R6
+        MOV     R1,#VduExt_XEigFactor
+        SWI     XOS_ReadModeVariable
+        MOVVC   R3,R3,LSL R2
+
+        MOVVC   R1,#VduExt_YEigFactor
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   R4,R4,LSL R2
+
+        STRVS   R0,[R13]
+        Pull    "R0-R2"
+
+; Transfer the mask data. Technique: switch output to the mask of the sprite
+; pointed to by 'spriteaddress'. Clear it to zeroes, then plot the mask of
+; the given sprite, using the inverting action.
+
+        Push    "R0-R3"
+        [ Medusa
+        Debug   Medusa, "Switching output to sprite instead of mask"
+        LDRVC   R0,=&200+SpriteReason_SwitchOutputToSprite
+        LDRVC   R2,spritemskaddress
+        |
+        LDRVC   R0,=&200+SpriteReason_SwitchOutputToMask
+        LDRVC   R2,spriteaddress
+        ]
+        ADRVCL  R1,sprarea
+        MOVVC   R3,#0
+        SWIVC   XOS_SpriteOp
+        ADRVC   LR,oldspritestate
+        STMVCIA LR,{R0-R3}
+        STRVS   R0,[R13]
+        Pull    "R0-R3"
+        BVS     sprite_maskchunk_chunktransferred
+
+        SWI     XOS_WriteI+16           ;Current background must be zeroes
+                                        ;  after the output switch, so we can
+                                        ;  do a CLG immediately.
+
+        SWIVC   XOS_WriteI+18           ;Set inverting background
+        SWIVC   XOS_WriteI+4
+        SWIVC   XOS_WriteI+128
+
+        Push    "R6"
+        BICVC   R0,R0,#&FF              ;Plot this sprite's mask
+        ORRVC   R0,R0,#SpriteReason_PlotMaskScaled
+        MOV     R6, #0                  ; No scaling
+        SWIVC   XOS_SpriteOp
+        Pull    "R6"
+
+        Push    "R0-R3,PC"
+        ADR     LR,oldspritestate
+        LDMIA   LR,{R0-R3}
+        SWI     XOS_SpriteOp
+        STRVS   R0,[R13]
+        Pull    "R0-R3,LR"
+        TST     LR,#V_bit
+        SETV    NE
+
+sprite_maskchunk_chunktransferred
+        Pull    "R3-R5"
+
+; The chunk we want to plot is now safely in the mask of the sprite pointed
+; to by 'spriteaddress'.
+;   Currently, important register contents are:
+; R3,R4:   pixel co-ordinates of where we want to plot the current chunk.
+; R5:      width of the chunk in pixels.
+; R6:      sprite mode.
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+
+; Now we change the X co-ordinates to bits, then translate the co-ordinate
+; system to the chunk origin.
+
+        PrError sprite_maskchunk_return
+
+        MOVVC   R0,R6
+        MOVVC   R1,#VduExt_Log2BPC
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   R3,R3,LSL R2
+        MOVVC   R5,R5,LSL R2
+
+        MOVVC   R1,#VduExt_Log2BPP              ;To interpret colours in the
+        SWIVC   XOS_ReadModeVariable            ;  data, we need this form
+        MOVVC   R6,R2                           ;  of Log2(bits/pixel)
+        STRVC   R6,spritelog2bpp
+        BLVC    output_gsave
+        BLVC    sprite_translatebyR3R4
+        PrPassError
+
+; The next step is to scan the chunk we are to plot, to find interesting
+; information about the non-zero mask pixels.
+
+        [ Medusa
+        LDR     LR,spritemskaddress
+        LDR     R0,[LR,#spImage]                ;The mask data is actually in the image
+        |
+        LDR     LR,spriteaddress
+        LDR     R0,[LR,#spTrans]                ;Get transparency mask offset
+        ]
+        ADD     R0,LR,R0                        ;Convert to address, with
+        ADD     R0,R0,#63*32                    ;  origin at bottom left
+
+        MOV     LR,#1                           ;Calculate bits/pixel
+        MOV     R6,LR,LSL R6
+        RSB     R8,LR,LR,LSL R6                 ;And pixel mask
+
+        [       PSSprUseBBoxes
+
+; Now do the analysis: we want the bounding box and information about
+; whether transparent pixels exist.
+;   Important register contents are:
+; R0:      address of sprite mask.
+; R1:      (will be used for high X).
+; R2:      (will be used for high Y).
+; R3:      (will be used for low X).
+; R4:      (will be used for low Y).
+; R5:      width of the chunk in bits.
+; R6:      bits/pixel.
+; R7:      (will be used to indicate existence of a transparent pixel).
+; R8:      pixel mask.
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+
+        MOV     R1,#0
+        MOV     R2,#0
+        MOV     R3,#&FF
+        MOV     R4,#&FF
+        MOV     R7,#0
+
+        Push    "R0,R9,R10"
+        SUB     R9,R9,#1
+        SUB     R0,R0,R9,LSL #5                 ;Shift origin to top left
+sprite_maskchunk_analyseyloop
+
+        Push    "R0"
+        MOV     R10,#0
+sprite_maskchunk_analysexloop
+        TST     R10,#31                 ;Get another word if we need to
+        LDREQ   LR,[R0],#4
+
+        TST     LR,R8                   ;Check for transparency
+        MOVEQ   R7,#1                   ;Record its existence if found
+        BEQ     sprite_maskchunk_analysexloop_end
+
+        CMP     R2,R9                   ;Update high Y
+        MOVLT   R2,R9
+        CMP     R1,R10                  ;Update high X
+        MOVLT   R1,R10
+        CMP     R4,R9                   ;Update low Y
+        MOVGT   R4,R9
+        CMP     R3,R10                  ;Update low X
+        MOVGT   R3,R10
+
+sprite_maskchunk_analysexloop_end
+        MOV     LR,LR,ROR R6            ;Advance to next pixel
+        ADD     R10,R10,R6
+        CMP     R10,R5
+        BLT     sprite_maskchunk_analysexloop
+        Pull    "R0"
+
+        ADD     R0,R0,#32               ;Advance to next row
+        SUBS    R9,R9,#1                ;Note V is clear on exit from loop
+        BGE     sprite_maskchunk_analyseyloop
+        Pull    "R0,R9,R10"
+
+        CMP     R1,R3                   ;Any pixels? Return if not. NB V:=0
+        BLT     sprite_maskchunk_grestoreandreturn
+
+        |
+
+; Now do the analysis: we want information about whether tranparent and
+; non-transparent pixels exist. This code also sets up a fake bounding box in
+; R1-R4 to fit in with the optimised case above.
+;   Important register contents are:
+; R0:      address of sprite mask.
+; R1:      (will be used to indicate existence of a non-transparent pixel).
+; R5:      width of the chunk in bits.
+; R6:      bits/pixel.
+; R7:      (will be used to indicate existence of a transparent pixel).
+; R8:      pixel mask.
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+
+        MOV     R1,#0
+        MOV     R7,#0
+
+        SUB     R2,R9,#1
+        SUB     R4,R0,R2,LSL #5         ;Shift origin to top left
+sprite_maskchunk_analyseyloop
+
+        Push    "R4"
+        MOV     R3,#0
+sprite_maskchunk_analysexloop
+        TST     R3,#31                  ;Get another word if we need to
+        LDREQ   LR,[R4],#4
+
+        TST     LR,R8                   ;Check for transparency
+        MOVEQ   R7,#1                   ;Record transparency or
+        MOVNE   R1,#1                   ;  non-transparency as found
+
+        TST     R1,R7                   ;Finished if both have been found
+        Pull    "R4",NE
+        BNE     sprite_maskchunk_analysisdone
+
+        MOV     LR,LR,ROR R6            ;Advance to next pixel
+        ADD     R3,R3,R6
+        CMP     R3,R5
+        BLT     sprite_maskchunk_analysexloop
+        Pull    "R4"
+
+        ADD     R4,R4,#32               ;Advance to next row
+        SUBS    R2,R2,#1                ;Note V is clear on exit from loop
+        BGE     sprite_maskchunk_analyseyloop
+
+sprite_maskchunk_analysisdone
+        CMP     R1,#0                   ;Any pixels? Return if not. NB V:=0
+        BEQ     sprite_maskchunk_grestoreandreturn
+
+        SUB     R1,R5,R6                ;Generate fake bounding box
+        SUB     R2,R9,#1
+        MOV     R3,#0
+        MOV     R4,#0
+
+        ]
+
+; We've now got the bounding box and simply want to output the mask by
+; using an appropriately sized 'imagemask' operation. Translate to the
+; bottom left corner of the bounding box.
+
+        BL      sprite_translatebyR3R4
+        PrPassError
+
+        SUB     R0,R0,R4,LSL #5                 ;Address bottom of box
+
+; Get height and width of bounding box and start printing the plane.
+
+        SUB     R4,R2,R4                        ;Get height of bounding box
+        ADD     R4,R4,#1
+
+        SUB     R9,R1,R3                        ;Get width in pixels
+        LDR     LR,spritelog2bpp
+        MOV     R9,R9,LSR LR
+        ADD     R9,R9,#1
+
+        PrPair  R9,R4
+
+; If no transparent pixels exist, we can avoid outputting the main load of
+; data. Otherwise start outputting.
+
+        TEQ     R7,#0
+        BEQ     sprite_maskchunk_fillchunk
+        PrLnIm  "S1"
+
+; Now we just have to output the hex data.
+
+        [       PSSprRLEncode
+        LDRB    LR,joblevel2
+        CMP     LR,#0
+        BLNE    ascii85_begin
+        MOV     LR,#0                           ;We're run-length encoding,
+        STRB    LR,sprstringlen                 ;  so initialise byte counts.
+        STR     LR,sprrepeatcount               ;NB 'sprlastbyte' irrelevant.
+        ]
+
+sprite_maskchunk_yloop
+        Push    "R3"
+
+        BIC     LR,R3,#31                       ;Get first mask word, then
+        LDR     R2,[R0,LR,LSR #3]               ;  shift it into the correct
+        AND     LR,R3,#31                       ;  position for the first
+        MOV     R2,R2,LSR LR                    ;  pixel
+        MOV     R9,#&800000                     ;Put a sentinel bit in R9, to
+                                                ;  output after 9 data bits
+sprite_maskchunk_xloop
+        TST     R3,#31                          ;Get another word if it's
+        LDREQ   R2,[R0,R3,LSR #3]               ;  needed
+
+        TST     R2,R8                           ;Test for transparency and
+        ORRNE   R9,R9,#&400000                  ;  set output bit if not.
+
+        CLRV
+        MOVS    R9,R9,LSL #1                    ;Shift output data up, then
+        BLCS    sprite_putmaskbyte              ;  output and clear a byte if
+        BVS     sprite_maskchunk_yloopexit      ;  the sentinel bit appeared
+
+        ADD     R3,R3,R6                        ;Advance to next pixel and
+        MOV     R2,R2,LSR R6                    ;  loop if necessary
+        CMP     R3,R1
+        BLE     sprite_maskchunk_xloop
+
+sprite_maskchunk_padloop
+        MOVS    R9,R9,LSL #1                    ;Output whatever data remains
+        BCC     sprite_maskchunk_padloop        ;  in R7, first padding with
+        BL      sprite_putmaskbyte              ;  zeroes to a byte boundary
+                                                ;  (Note there is at least 1
+                                                ;  bit waiting for output.)
+
+        [       :LNOT:PSSprRLEncode
+        BVS     sprite_maskchunk_yloopexit
+        PrNewLn FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate                 ;Check for escape, return
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, return
+        ]
+        SETV    CS                              ;  error if so. NB top level
+                                                ;  will set R0 for us if so
+        ]
+
+sprite_maskchunk_yloopexit
+        Pull    "R3"
+        PrPassError
+
+        SUB     R0,R0,#32                       ;Advance to next line
+        SUBS    R4,R4,#1                        ;NB clears V on last
+        BGT     sprite_maskchunk_yloop          ;  iteration
+
+        [       PSSprRLEncode
+        BL      sprite_endoutput
+        ]
+
+        B       sprite_maskchunk_grestoreandreturn
+
+; The sprite has no mask - this is pretty easy!
+;   Currently, important register contents are:
+; R3,R4:   pixel co-ordinates of where we want to plot the current chunk.
+; R5:      width of the chunk in pixels.
+; R6:      sprite mode.
+; R9:      height of the chunk in pixels.
+; R10-R12: file handle and workspace pointers.
+
+sprite_maskchunk_nomask
+
+; Now we change the X co-ordinates to bits, then translate the co-ordinate
+; system to the chunk origin.
+
+        MOV     R0,R6
+        MOV     R1,#VduExt_Log2BPC
+        SWI     XOS_ReadModeVariable
+        MOVVC   R3,R3,LSL R2
+        MOVVC   R5,R5,LSL R2
+
+        MOVVC   R1,#VduExt_Log2BPP              ;To interpret colours in the
+        SWIVC   XOS_ReadModeVariable            ;  data, we need this form
+        MOVVC   R6,R2                           ;  of Log2(bits/pixel)
+        STRVC   R6,spritelog2bpp
+        BLVC    output_gsave
+        BLVC    sprite_translatebyR3R4
+        PrPassError
+
+; Output height and width of bounding box and print the plane.
+
+        LDR     LR,spritelog2bpp                ;Get width in pixels
+        MOV     R5,R5,LSR LR
+
+        PrPair  R5,R9
+
+sprite_maskchunk_fillchunk
+        PrStrIm "SF ",FallThroughOnError
+
+sprite_maskchunk_grestoreandreturn
+        BLVC    output_grestore
+
+        PrError
+sprite_maskchunk_return
+        STRVS   R0,[R13]
+        Pull    "R0-R9,PC"
+
+        LTORG
+
+; Subroutine to fill the bounding box of a given colour with that colour.
+; Entry: R3 = bounding box of colour concerned, in 'colourbounds' format.
+;        R4 points to 'colourbounds' table.
+;        R5 points to 'colourbounds' entry for this colour.
+;        R7 = translation table pointer.
+;        R10-R12: file handle and workspace pointers.
+; Exit:  All registers preserved.
+
+sprite_fillboundingbox
+        Push    "R2,R3,R4,R7,R9,LR"
+        PrError sprite_fillboundingbox_return
+
+        BL      sprite_setcolour
+        BLVC    output_gsave
+
+        MOVVC   LR,#&FF                         ;Isolate left, bottom, right
+        ANDVC   R2,LR,R3,LSR #8                 ;  and top co-ordinates of
+        ANDVC   R4,LR,R3,LSR #16                ;  bounding box
+        ANDVC   R7,LR,R3
+        MOVVC   R3,R3,LSR #24
+
+        BLVC    sprite_translatebyR3R4
+        PrPassError
+
+; Get height and width of bounding box and start printing the plane.
+
+        SUB     R4,R7,R4                        ;Get height of bounding box
+        ADD     R4,R4,#1
+
+        SUB     R9,R2,R3                        ;Get width in pixels
+        LDR     LR,spritelog2bpp
+        MOV     R9,R9,LSR LR
+        ADD     R9,R9,#1
+
+        PrPair  R9,R4
+        PrStrIm "SF ",FallThroughOnError
+        BLVC    output_grestore
+
+        PrError
+sprite_fillboundingbox_return
+        Pull    "R2,R3,R4,R7,R9,PC"
+
+; Subroutine to output the pixels of a given colour via an 'imagemask'
+; operator.
+; Entry: R0 = address of sprite data.
+;        R1 = address of sprite mask.
+;        R3 = bounding box of colour concerned, in 'colourbounds' format.
+;        R4 points to 'colourbounds' table.
+;        R5 points to 'colourbounds' entry for this colour.
+;        R6 = bits/pixel.
+;        R7 = translation table pointer.
+;        R8: bit 16 set for unmasked plotting, clear for masked plotting;
+;            bits 31 to 24 are the pixel mask;
+;            all other bits clear.
+;        R10-R12: file handle and workspace pointers.
+;        'spritelog2bpp' holds Log2(R6).
+; Exit:  All registers preserved.
+
+sprite_putplane
+        Push    "R0-R5,R7,R9,LR"
+        PrError sprite_putplane_return
+
+; Set up correct colour
+
+        BL      sprite_setcolour
+        BLVC    output_gsave
+
+        SUBVC   R5,R5,R4                        ;Get correct pixel value
+        MOVVC   R5,R5,LSR #2
+
+; Get bounding box co-ordinates and translate co-ordinate system to its
+; bottom left corner.
+
+        MOVVC   LR,#&FF                         ;Isolate left, bottom, right
+        ANDVC   R2,LR,R3,LSR #8                 ;  and top co-ordinates of
+        ANDVC   R4,LR,R3,LSR #16                ;  bounding box
+        ANDVC   R7,LR,R3
+        MOVVC   R3,R3,LSR #24
+
+        BLVC    sprite_translatebyR3R4
+        PrPassError
+
+        SUB     R0,R0,R4,LSL #5                 ;Address bottom of bounding
+        SUB     R1,R1,R4,LSL #5                 ;  box in sprite data & mask
+
+; Get height and width of bounding box and start printing the plane.
+
+        SUB     R4,R7,R4                        ;Get height of bounding box
+        ADD     R4,R4,#1
+
+        SUB     R9,R2,R3                        ;Get width in pixels
+        LDR     LR,spritelog2bpp
+        MOV     R9,R9,LSR LR
+        ADD     R9,R9,#1
+
+        PrPair  R9,R4
+        PrLnIm  "S1"
+
+; Now we just have to output the hex data.
+
+        [       PSSprRLEncode
+        LDRB    LR,joblevel2
+        CMP     LR,#0
+        BLNE    ascii85_begin
+        MOV     LR,#0                           ;We're run-length encoding,
+        STRB    LR,sprstringlen                 ;  so initialise byte counts.
+        STR     LR,sprrepeatcount               ;NB 'sprlastbyte' irrelevant.
+        ]
+
+sprite_putplane_yloop
+        Push    "R3,R4"
+
+        BIC     LR,R3,#31                       ;Get first data and mask
+        LDR     R4,[R0,LR,LSR #3]               ;  words, then shift them
+        LDR     R7,[R1,LR,LSR #3]               ;  into the correct position
+        AND     LR,R3,#31                       ;  for the first pixel
+        MOV     R4,R4,LSR LR
+        MOV     R7,R7,LSR LR
+        MOV     R9,#&800000                     ;Put a sentinel bit in R9, to
+                                                ;  output after 9 data bits
+sprite_putplane_xloop
+        TST     R3,#31                          ;Get another word if it's
+        LDREQ   R4,[R0,R3,LSR #3]               ;  needed
+        LDREQ   R7,[R1,R3,LSR #3]
+
+        TST     R8,#&10000                      ;Use mask?
+        TSTEQ   R7,R8,LSR #24                   ;If so, test for transparency
+        MOVEQ   LR,#&100                        ;Set "transparent" colour or
+        ANDNE   LR,R4,R8,LSR #24                ;  read pixel, as appropriate
+
+        CMP     LR,R5                           ;Check for correct colour and
+        ORREQ   R9,R9,#&400000                  ;  set output bit if found.
+                                                ;  Clear V into the bargain.
+
+        MOVS    R9,R9,LSL #1                    ;Shift output data up, then
+        BLCS    sprite_putmaskbyte              ;  output and clear a byte if
+        BVS     sprite_putplane_yloopexit       ;  the sentinel bit appeared
+
+        ADD     R3,R3,R6                        ;Advance to next pixel and
+        MOV     R4,R4,LSR R6                    ;  loop if necessary
+        MOV     R7,R7,LSR R6
+        CMP     R3,R2
+        BLE     sprite_putplane_xloop
+
+sprite_putplane_padloop
+        MOVS    R9,R9,LSL #1                    ;Output whatever data remains
+        BCC     sprite_putplane_padloop         ;  in R7, first padding with
+        BL      sprite_putmaskbyte              ;  zeroes to a byte boundary
+                                                ;  (Note there is at least 1
+                                                ;  bit waiting for output.)
+        [       :LNOT:PSSprRLEncode
+        BVS     sprite_putplane_yloopexit
+        PrNewLn FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate                 ;Check for escape, return
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, return
+        ]
+        SETV    CS                              ;  error if so. NB top level
+                                                ;  will set R0 for us if so
+        ]
+
+sprite_putplane_yloopexit
+        Pull    "R3,R4"
+        PrPassError
+
+        SUB     R0,R0,#32                       ;Advance to next line
+        SUB     R1,R1,#32
+        SUBS    R4,R4,#1
+        BGT     sprite_putplane_yloop
+
+        [       PSSprRLEncode
+        BL      sprite_endoutput
+        BLVC    output_grestore
+        |
+        BL      output_grestore
+        ]
+
+        PrError
+sprite_putplane_return
+        STRVS   R0,[R13]
+        Pull    "R0-R5,R7,R9,PC"
+
+        [       PSSprRLEncode
+
+; Subroutine to output the high byte of R9, then clear this byte and set a
+; new sentinel bit, preserving the extra output data bit held in bit 23.
+
+sprite_putmaskbyte
+        Push    "R1,LR"
+
+        [       PSSprInverted
+        MVN     R1,R9,LSR #24
+        |
+        MOV     R1,R9,LSR #24
+        ]
+        BIC     R9,R9,#&FF000000
+        ORR     R9,R9,#&01000000                ;Set sentinel bit to output
+                                                ;  after 8 more data bits
+        BL      sprite_outputbyte
+        Pull    "R1,PC"
+
+; Subroutine to terminate the run-length encoding of data, purging all
+; data in buffers to the file. Preserves all registers.
+
+sprite_endoutput
+        Push    "R1,R4,R7,LR"
+        LDRB    LR,joblevel2
+        CMP     LR,#0
+        BEQ     sprite_endoutput_notL2
+        MOV     R1,#&100                ;Start a fake new run of a non-byte
+        BL      sprite_outputbyte       ;  value
+        LDRVCB  R4,sprstringlen         ;Then output any remaining string
+        BLVC    sprite_outputstring_L2
+        MOVVC   R7,#128                 ;Level2 RLE end-of-data
+        BLVC    ascii85_byteR7
+        BLVC    ascii85_end
+        Pull    "R1,R4,R7,PC"
+sprite_endoutput_notL2
+        MOV     R1,#&100                ;Start a fake new run of a non-byte
+        BL      sprite_outputbyte       ;  value
+        LDRVCB  R4,sprstringlen         ;Then output any remaining string
+        BLVC    sprite_outputstring
+        Pull    "R1,R4,R7,PC"
+
+; Subroutine to output the byte in R1 through the run-length encoding
+; mechanism. The value in R1 is assumed to be a byte value and is never
+; actually output by the current call to this routine (the worst that happens
+; is that we end with an empty string and a run of length 1 of this byte).
+;   This allows us to clear up at the end of our data by first calling
+; this routine with R1 not a byte value (which will definitely result in
+; a string - possibly empty - followed by a run of length one), then calling
+; 'sprite_outputstring' below to output any remaining string.
+
+sprite_outputbyte
+        Push    "R1-R4,LR"
+        PrError sprite_outputbyte_return
+
+       LDRB    R2,joblevel2
+       CMP     R2,#0
+       BNE     sprite_outputbyte_L2_pushdone
+
+; Get current state of run-length encoding algorithm.
+
+        LDRB    R2,sprlastbyte                  ;Last byte encountered
+        LDRB    R4,sprstringlen                 ;Current length of string
+        LDR     R3,sprrepeatcount               ;Repeat count for this byte
+
+; Is this byte the same as the last one? If so, we just increment the repeat
+; count and return.
+
+        CMP     R1,R2
+        ADDEQ   R3,R3,#1
+        BEQ     sprite_outputbyte_storeandreturn        ;NB V=0 if taken
+
+; This byte is distinct from the last one. We have a choice of three
+; strategies:
+;   (1) We can append the last run of identical bytes to the end of the
+;       string and start a new run of identical bytes.
+;   (2) We can output the string, then restart with a string equal to the
+;       last run of identical bytes and a new run of identical bytes.
+;   (3) We can output the string followed by the last run of identical bytes,
+;       then restart with an empty string and a new run of identical bytes.
+; We choose the first strategy if (a) it will not increase the length of the
+; string above 'PSSprRLMaxStr' bytes, and (b) the last sequence of
+; identical bytes is less than 'PSSprRLMinRun' + 2 bytes long - i.e. we
+; probably won't waste output volume by appending the sequence of identical
+; bytes.
+;   Otherwise, we choose the second strategy if it probably won't waste
+; output volume - i.e. if the last run of identical bytes is not more than
+; 'PSSprRLMinRun' bytes long.
+
+        ADD     LR,R3,R4
+        CMP     LR,#PSSprRLMaxStr       ;First condition
+        CMPLS   R3,#PSSprRLMinRun+1     ;Second condition
+        BLS     sprite_outputbyte_extendandstartrun
+
+; We are going to adopt the second or third strategy, so output the string.
+; Note we have an empty string (i.e. R4=0) after this call.
+
+        BL      sprite_outputstring
+        PrPassError
+
+; Now adopt the second strategy if 'sprrepeatcount' <= 'PSSprRLMinRun', the
+; third otherwise.
+
+        CMP     R3,#PSSprRLMinRun
+        BLO     sprite_outputbyte_extendandstartrun
+        BL      sprite_outputrun
+        B       sprite_outputbyte_startrun
+
+; Extend the string we've got by R3 bytes equal to R2, then start a new
+; run of identical bytes.
+
+sprite_outputbyte_extendandstartrun
+        ADR     LR,sprstring
+        CMP     R3,#0
+sprite_outputbyte_extendloop
+        STRNEB  R2,[LR,R4]
+        ADDNE   R4,R4,#1
+        SUBNES  R3,R3,#1
+        BNE     sprite_outputbyte_extendloop    ;NB V=0 if not taken
+
+; Start a new run of identical bytes.
+
+sprite_outputbyte_startrun
+        MOVVC   R2,R1
+        MOVVC   R3,#1
+
+; Store new state of run-length encoding algorithm and return.
+
+        STRVCB  R2,sprlastbyte                  ;Last byte encountered
+        STRVCB  R4,sprstringlen                 ;Current length of string
+sprite_outputbyte_storeandreturn
+        STRVC   R3,sprrepeatcount               ;Repeat count for this byte
+
+        PrError
+sprite_outputbyte_return
+        Pull    "R1-R4,PC"
+
+; Subroutine to output the byte count held in R4 as a decimal integer, then a
+; space, then the R4 bytes starting at 'sprstring' as hex data, then a new
+; line. Does nothing if R4=0. Returns with R4=0, all other registers
+; unchanged.
+
+sprite_outputstring
+        [       PSSprRLMaxStr > 32
+        Push    "R0,R1,R2,LR"
+        |
+        Push    "R0,R1,LR"
+        ]
+        PrError sprite_outputstring_return
+
+        CMP     R4,#0                           ;NB clears V
+        BEQ     sprite_outputstring_return
+
+        PrNumSp R4
+
+        ADR     R1,sprstring
+        [       PSSprRLMaxStr > 32
+        MOV     R2,#33
+        ]
+sprite_outputstring_loop
+        [       PSSprRLMaxStr > 32
+        SUBS    R2,R2,#1
+        BNE     sprite_outputstring_continue
+        PrNewLn
+        MOV     R2,#32
+sprite_outputstring_continue
+        ]
+        LDRB    R0,[R1],#1
+        PrHex   R0,CorruptR0
+        SUBS    R4,R4,#1
+        BNE     sprite_outputstring_loop
+
+        PrNewLn FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate                 ;Check for ESCAPE, return
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for ESCAPE, return
+        ]
+        SETV    CS                              ;  error if so. NB top level
+                                                ;  will set R0 for us if so
+sprite_outputstring_return
+        STRVS   R0,[R13]
+        [       PSSprRLMaxStr > 32
+        Pull    "R0,R1,R2,PC"
+        |
+        Pull    "R0,R1,PC"
+        ]
+
+; Subroutine to output the repeat count held in R3, negated, then a space,
+; then the byte value held in R2, then a new line. Preserves all registers.
+
+sprite_outputrun
+        Push    "R0,LR"
+        PrError sprite_outputrun_return
+
+        RSB     R0,R3,#0
+        PrNumSp R0,CorruptR0
+        PrNum   R2,CorruptR0
+
+        PrNewLn FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate                 ;Check for ESCAPE, return
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for ESCAPE, return
+        ]
+        SETV    CS                              ;  error if so. NB top level
+                                                ;  will set R0 for us if so
+        PrError
+sprite_outputrun_return
+        STRVS   R0,[R13]
+        Pull    "R0,PC"
+
+
+;following RLE routines very similar to above, but use Level2 RLE style
+;and ASCII85 encoding, instead of hex
+
+
+sprite_outputbyte_L2
+        Push    "R1-R4,LR"        ;MUST match push in sprite_outputbyte
+        PrError sprite_outputbyte_L2_return
+
+sprite_outputbyte_L2_pushdone
+; Get current state of run-length encoding algorithm.
+
+        LDRB    R2,sprlastbyte                  ;Last byte encountered
+        LDRB    R4,sprstringlen                 ;Current length of string
+        LDR     R3,sprrepeatcount               ;Repeat count for this byte
+
+; Is this byte the same as the last one? If so, we just increment the repeat
+; count and return.
+
+        CMP     R1,R2
+        ADDEQ   R3,R3,#1
+        BEQ     sprite_outputbyte_L2_storeandreturn        ;NB V=0 if taken
+
+;distinct
+        ADD     LR,R3,R4
+        CMP     LR,#PSSprRLMaxStrL2     ;First condition
+        CMPLS   R3,#PSSprRLMinRunL2+1   ;Second condition
+        BLS     sprite_outputbyte_L2_extendandstartrun
+
+        BL      sprite_outputstring_L2
+        PrPassError
+
+        CMP     R3,#PSSprRLMinRunL2
+        BLO     sprite_outputbyte_L2_extendandstartrun
+        BL      sprite_outputrun_L2
+        B       sprite_outputbyte_L2_startrun
+
+sprite_outputbyte_L2_extendandstartrun
+        ADR     LR,sprstring
+        CMP     R3,#0
+sprite_outputbyte_L2_extendloop
+        STRNEB  R2,[LR,R4]
+        ADDNE   R4,R4,#1
+        SUBNES  R3,R3,#1
+        BNE     sprite_outputbyte_L2_extendloop    ;NB V=0 if not taken
+
+sprite_outputbyte_L2_startrun
+        MOVVC   R2,R1
+        MOVVC   R3,#1
+
+        STRVCB  R2,sprlastbyte                  ;Last byte encountered
+        STRVCB  R4,sprstringlen                 ;Current length of string
+sprite_outputbyte_L2_storeandreturn
+        STRVC   R3,sprrepeatcount               ;Repeat count for this byte
+
+        PrError
+sprite_outputbyte_L2_return
+        Pull    "R1-R4,PC"
+
+sprite_outputstring_L2
+        Push    "R0,R1,LR"
+        PrError sprite_outputstring_L2_return
+        CMP     R4,#0                           ;NB clears V
+        BEQ     sprite_outputstring_L2_return
+        SUB     R0,R4,#1    ;length byte = n-1
+        BL      ascii85_byte
+        BVS     sprite_outputstring_L2_return
+        ADR     R0,sprstring
+        MOV     R1,R4
+        BL      ascii85_block
+sprite_outputstring_L2_return
+        STRVS   R0,[R13]
+        MOV     R4,#0       ;required to mirror sprite_outputstring
+        Pull    "R0,R1,PC"
+
+sprite_outputrun_L2
+        Push    "R0,R1,R3,LR"
+        PrError sprite_outputrun_L2_return
+sprite_outputrun_L2_loop
+        MOV     R1,R3
+        CMP     R1,#128
+        MOVGT   R1,#128       ;max run 128
+        RSB     R0,R1,#256
+        ADD     R0,R0,#1      ;length byte for run = 257-n
+        BL      ascii85_byte
+        BVS     sprite_outputrun_L2_return
+        MOV     R0,R2
+        BL      ascii85_byte   ;value byte for run
+        BVS     sprite_outputrun_L2_return
+        SUBS    R3,R3,R1
+        BNE     sprite_outputrun_L2_loop
+        [       PSDebugEscapes
+        BLVC    readescapestate                 ;Check for ESCAPE, return
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for ESCAPE, return
+        ]
+        SETV    CS
+sprite_outputrun_L2_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,R3,PC"
+
+
+;end of RLE conditional stuff
+        |
+
+; Subroutine to output the high byte of R9, then clear this byte and set a
+; new sentinel bit, preserving the extra output data bit held in bit 23.
+
+sprite_putmaskbyte
+        Push    "R0,LR"
+
+        [       PSSprInverted
+        MVN     R0,R9,LSR #24
+        |
+        MOV     R0,R9,LSR #24
+        ]
+
+        BIC     R9,R9,#&FF000000
+        ORR     R9,R9,#&01000000                ;Set sentinel bit to output
+                                                ;  after 8 more data bits
+        PrHex   R0,CorruptR0,FallThroughOnError
+
+        STRVS   R0,[R13]
+        Pull    "R0,PC"
+
+        ]
+
+; Subroutine to set a given colour for a sprite.
+; Entry: R4 points to 'colourbounds' table.
+;        R5 points to 'colourbounds' entry for this colour.
+;        R7 = translation table pointer.
+;        R10-R12: file handle and workspace pointers.
+; Exit:  All registers preserved.
+
+sprite_setcolour
+        Push    "R1,LR"
+
+; R5-R4 is four times a sprite pixel value. We need to find the corresponding
+; RGB combination.
+;   This is rather tricky. The solution used depends on whether a translation
+; table is specified in the call. If it isn't, the value is looked up as a
+; pixel value for the current screen mode (this is just about the only thing
+; we CAN do).
+;   If it is, we assume that the values in the translation table have been
+; produced by the intercepted ColourTrans calls. If this is a monochrome
+; version of the printer driver, this value is simply a grey scale value. If
+; this is a colour version, we have to look up the value in the 'pixelvalues'
+; table.
+
+        SUB     R1,R5,R4
+        CMP     R7,#0                   ;Translation table/palette available?
+        BNE     sprite_setcolour_translate
+        MOV     R1,R1,LSR #2            ;If neither, go and look
+        BL      pixval_lookup           ;  up screen RGB combination.
+        B       sprite_setcolour_gotrgb
+sprite_setcolour_translate
+        TST     R7, #1 :SHL: 31         ;Is it a translation table or a palette?
+        BICNE   LR, R7, #1 :SHL: 31     ;If palette, look up the RGB value from the
+        LDRNE   R1,[LR,R1,LSL #1]       ;  palette entry (first 4 of the 8 bytes)
+        BNE     sprite_setcolour_gotrgb
+        [ Medusa
+        ADRL    LR, colourtrans32K      ;Is it our truecolour translation table?
+        TEQ     LR, R7                  ;  If so, the translation has already been done
+        MOVEQ   R1, R1, LSR #2          ;  when we plotted the chunk into the temporary
+        BEQ     sprite_setcolour_grey   ;  sprite, so just expand this grey level to RGB
+        ]
+        LDRB    R1,[R7,R1,LSR #2]       ;If translating, look the pixel value
+                                        ;  up in the translation table.
+        LDR     LR,info_features        ;If output is destined for a colour
+        TST     LR,#1                   ;  printer, look the result up in the
+        ADRNEL  LR,pixelvalues          ;  'pixelvalues' table.
+        LDRNE   R1,[LR,R1,LSL #2]
+sprite_setcolour_grey
+        ORREQ   R1,R1,R1,LSL #8         ;If for a monochrome printer, expand
+        ORREQ   R1,R1,R1,LSL #16        ;  grey level to rgb. No need to
+                                        ;  clear the bottom byte.
+sprite_setcolour_gotrgb
+
+        BL      colour_setrealrgb
+        [       PSCoordSpeedUps
+        BLVC    colour_ensure
+        ]
+        Pull    "R1,PC"
+
+; Subroutine to translate the co-ordinate system by the vector held in
+; R3,R4. Optimises out translations by 0,0. Preserves all registers.
+
+sprite_translatebyR3R4
+        Push    "R0,R1,LR"
+        PrError sprite_translatebyR3R4_return
+
+        CLRV
+        ORRS    LR,R3,R4
+        BEQ     sprite_translatebyR3R4_return
+
+        PrPair  R3,R4,CorruptR0andR1
+        PrLnIm  "T",FallThroughOnError
+
+sprite_translatebyR3R4_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,PC"
+
+
+        [ Medusa
+
+; Subroutine to generate a ColourTrans translation table suitable for
+; mapping from a 16/32bpp truecolour sprite onto 256 grey levels.
+; The table is generated in the RMA, and its address is stored in
+; the three-word anchor block 'colourtrans32K'
+;
+; Returns the address of the anchor block in R7
+
+sprite_make32Ktable
+        Push    "R0-R5,LR"
+
+        [ debugMedusa
+        SWI     XOS_ReadMonotonicTime
+        Debug   Medusa, "** Start time ", R0
+        ]
+        MOV     R0, #ModHandReason_Claim
+        MOV     R3, #32 * 1024
+        SWI     XOS_Module
+        MOVVC   R4, R2                          ; get ptr into R4
+        STRVS   R0, [SP]
+        Pull    "R0-R5,PC",VS
+
+        MOV     R0, #1 :SHL: 15
+        SUB     R0, R0, #1                      ; 2_11111 11111 11111
+        MOV     R5, #2_11111000
+00
+        AND     R3, R5, R0, LSL #3
+        ORR     R3, R3, R3, LSR #5
+        AND     R2, R5, R0, LSR #2
+        ORR     R2, R2, R2, LSR #5
+        AND     R1, R5, R0, LSR #7
+        ORR     R1, R1, R1, LSR #5
+        BL      colour_rgbcomponentstogray      ; R1 gets gray level (0-255)
+        STRB    R1, [R4, R0]                    ; put it in the table
+        SUBS    R0, R0, #1
+        BPL     %BT00
+        
+        ADRL    R7, colourtrans32K
+        MOV     R1, R7
+        ADR     R2, thirtytwok
+        LDR     R2, [R2]
+        STR     R2, [R1], #4
+        STR     R4, [R1], #4
+        STR     R2, [R1]
+
+        [ debugMedusa
+        SWI     XOS_ReadMonotonicTime
+        Debuga  Medusa, "** End time ", R0
+        Debug   Medusa, " addresses: anchor, table = ", R7, R4
+        ]
+        Pull    "R0-R5,PC"
+
+; Subroutine to clear the ColourTrans translation table anchor block
+
+sprite_clear32Ktable
+        Push    "R1,R4,LR"
+        ADRL    R1, colourtrans32K
+        MOV     R4, #0
+        STR     R4, [R1, #4]
+        Pull    "R1,R4,PC"
+
+; Subroutine to free the ColourTrans translation table if allocated
+; This gets used in cleaning up errors, so we ignore errors in this
+; routine and ensure that the flags are preserved.
+
+sprite_free32Ktable
+        Push    "R0-R2,LR"
+        ADRL    R1, colourtrans32K
+        LDR     R2, [R1, #4]
+        TEQ     R2, #0
+        Pull    "R0-R2,PC", EQ, ^
+        MOV     R0, #ModHandReason_Free
+        SWI     XOS_Module
+        MOV     R2, #0
+        STR     R2, [R1, #4]
+        Pull    "R0-R2,PC",,^
+
+thirtytwok
+        = "32K."
+
+        ]
+
+        
+        [ Medusa
+
+; Routine to output the data for a 32bpp sprite.
+; In:
+;       R0-R2:  info about the sprite
+;       R3,R4:  width & height in pixels, after any source clipping
+;       R8:     0 for unmasked plotting, 8 for masked plotting (& mask exists).
+;       R10-R12:file handle and workspace pointers.
+;       sourceclip_x,y: start position in image
+;
+; The PostScript coordinate system has been set up to sprite bits by sprite pixels
+; (by sprite_scaling).  Also the matrix for imagemask has been constructed by the same call.
+;
+; Caller has saved R0-R9 if required.
+
+
+sprite_output32bpp
+
+        Push    "LR"                            ; R0-R9 have been saved by caller
+        PrError sprite_output32bpp_error_return
+
+        Debug   Medusa, "sprite_output32bpp entered"
+        Debug   Medusa, "Regs ", r0, r1, r2, r3, r4, r5, r6, r7, r8, r9
+
+        BL      sprite_getspriteaddress         ; normalise R1 and R2
+        PrPassError
+
+;we'll use ASCII85 encoding for Level 2, hex coding otherwise
+        LDRB    R5,joblevel2
+        CMP     R5,#0
+        BLNE    ascii85_begin
+
+; Now get some essential info about the sprite
+
+        LDR     R5, [R2, #32]                   ; get address of the image
+        ADD     R5, R2, R5
+        TEQ     R8, #8                          ; is this 'masked plotting'?
+        MOVNE   R6, #0                          ; if not, then no mask data
+        LDREQ   R6, [R2, #36]                   ; get address of the mask
+        ADDEQ   R6, R2, R6
+        TEQEQ   R5, R6                          ; if the addresses are the same
+        MOVEQ   R6, #0                          ; then no mask data
+
+; Now R5->image data, R6->mask data (if mask is to be used, else 0)
+
+        Debug   Medusa, "Addresses: Image, Mask = ", R5, R6
+
+        LDR     R7, [R2, #16]                   ; get sprite width-1 (in words)
+        ADD     R7, R7, #1
+        MOV     R7, R7, LSL #2                  ; R7 is image row offset in bytes
+
+; Determine the bytes per row in the mask.  This is a simple function of
+; the total width in pixels, because there is one mask bit per pixel and up to
+; 31 bits of wastage.  We need the sprite's total width for this:-
+
+        TEQ     R6, #0                          ; no mask?
+        BEQ     %FT01
+
+        Push    "R3-R6"
+
+        BIC     R0, R0, #255
+        ORR     R0, R0, #SpriteReason_ReadSpriteSize
+        SWI     XOS_SpriteOp
+        
+        ADDVC   R8, R3, #31
+        MOVVC   R8, R8, LSR #5                  ; R8 = mask row offset in words
+        MOVVC   R8, R8, LSL #2                  ; R8 = mask row offset in bytes
+
+        Pull    "R3-R6"
+        PrPassError
+01
+
+; Now adjust R5 and R6 to point to the start of the lowest row we intend to plot
+
+        LDR     LR, [R2, #20]                   ; height in scanlines - 1
+        LDR     R0, sourceclip_y                ; this is in pixels from the bottom
+        SUB     LR, LR, R0                      ; height - 1 - sourceclip_y
+        MLA     R5, LR, R7, R5                  ; start of first desired line in image
+
+        TEQ     R6, #0                          ; If there is a mask
+        MLANE   R6, LR, R8, R6                  ; start of first desired line in mask
+
+;  R0-R2, the sprite identifiers, are no longer needed.
+
+; Now the registers look like this:-
+;  R0-R2,R9: scratch
+;  R3, R4: width and height of portion to plot, in pixels
+;  R5: address of bottom row of the image to plot
+;  R6: address of bottom row of the mask to plot, or 0 for no mask
+;  R7: number of bytes to subtract from R5 to get to previous row in image
+;  R8: number of bytes to subtract from R6 to get to previous row in mask
+;  R10-R12: file handle and workspace pointers
+
+
+; Output the colorimage command
+
+        PrPair  R3, R4                          ; width & height in pixels
+        PrLnIm  "S32"
+
+        Debug   Medusa, "Outputting data"
+        Debug   Medusa, "Regs ", r0, r1, r2, r3, r4, r5, r6, r7, r8, r9
+
+; Now loop over all the rows from the bottommost up.  We know that R4 is at least 1
+
+sprite_output32bpp_yloop
+
+; Check for the ESCAPE key at the start of each scanline.
+
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+        PrPassError                             ;  will set R0 for us if so.
+
+        Push    "R3,R4"                         ; stack width & height to free some registers
+
+        LDR     R9, sourceclip_x                ; Advance to the first pixel of the
+        ADD     R1, R5, R9, LSL #2              ; image data to be plotted
+
+        TEQ     R6, #0                          ; Masked?
+        MOVNE   LR, R9, LSR #5                  ; If mask, determine number of words into the mask row to start
+        ADDNE   R2, R6, LR, LSL #2              ;   and make R2 point there
+        LDRNE   R4, [R2], #4                    ;   Pick up first mask word
+        ANDNE   LR, R9, #31                     ;   LR = sourceclip_x MOD 32
+        MOVNE   R4, R4, LSR LR                  ;   Shift mask word so that first wanted bit is in lsbit
+
+; Now the registers look like this:-
+;  R1 -> next word to lift out of the image
+;  R2 -> next word to lift out of the mask, or undefined if no mask
+;  R3: width of portion to plot, in pixels
+;  R4: first mask word, with first wanted bit at bit 0, or undefined if no mask
+;  R5: address of bottom row of the image to plot
+;  R6: address of bottom row of the mask to plot, or undefined if no mask
+;  R7: number of bytes to subtract from R5 to get to previous row in image
+;  R8: number of bytes to subtract from R6 to get to previous row in mask
+;  R9: sourceclip_x
+;  R10-R12: file handle and workspace pointers
+
+        Debug   Medusa, "S.of.ROW: Regs ", r0, r1, r2, r3, r4, r5, r6, r7, r8, r9
+
+; Now loop across all the pixels in the row.  We know that R3 is at least 1
+; Use a different loop for the unmasked case to reduce the number of
+; comparisons
+
+        BNE     sprite_output32bpp_masked_xloop
+
+        LDRB    R0,joblevel2
+        CMP     R0,#0
+        BEQ     sprite_output32bpp_xloop_L1
+
+sprite_output32bpp_xloop_L2
+        LDR     R0, [R1], #4                    ; Get the next pixel
+        BL      ascii85_byte
+        Pull    "R3,R4,PC",VS
+        MOV     R0, R0, LSR #8
+        BL      ascii85_byte
+        Pull    "R3,R4,PC",VS
+        MOV     R0, R0, LSR #8
+        BL      ascii85_byte
+        Pull    "R3,R4,PC",VS
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output32bpp_xloop_L2
+        B       sprite_output32bpp_next_y
+
+sprite_output32bpp_xloop_L1
+        LDR     R0, [R1], #4                    ; Get the next pixel
+        PrHex   R0,ThisDoesNotCorruptR0,FallThroughOnError              ; Output R
+        MOV     R0, R0, LSR #8
+        PrHex   R0,ThisDoesNotCorruptR0,FallThroughOnError              ; Output G
+        MOV     R0, R0, LSR #8
+        PrHex   R0,ThisDoesNotCorruptR0,FallThroughOnError              ; Output B
+        ADD     R9, R9, #1                      ; Newline wanted?
+        TST     R9, #2_11111                    ; do one every 32 pixels or so
+        BNE     %FT02
+        PrNewLn FallThroughOnError
+02
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output32bpp_xloop_L1
+        B       sprite_output32bpp_next_y
+
+sprite_output32bpp_masked_xloop
+
+        LDRB    R0,joblevel2
+        CMP     R0,#0
+        BEQ     sprite_output32bpp_masked_xloop_L1
+
+sprite_output32bpp_masked_xloop_L2
+        MOVS    R4, R4, LSR #1                  ; Shift the mask bit into the C flag
+        LDRCS   R0, [R1], #4                    ; If mask set, get the next pixel
+        ADDCC   R1, R1, #4                      ; If mask clear, skip the next pixel and use
+        MOVCC   R0, #FakeMaskColour             ;   the "background" colour (white)
+        BL      ascii85_byte
+        Pull    "R3,R4,PC",VS
+        MOV     R0, R0, LSR #8
+        BL      ascii85_byte
+        Pull    "R3,R4,PC",VS
+        MOV     R0, R0, LSR #8
+        BL      ascii85_byte
+        Pull    "R3,R4,PC",VS
+        ADD     R9, R9, #1                      ; move to the next mask bit
+        TST     R9, #2_11111                    ; new mask word needed?
+        LDREQ   R4, [R2], #4                    ; get next mask word if so
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output32bpp_masked_xloop_L2
+        B       sprite_output32bpp_next_y
+
+sprite_output32bpp_masked_xloop_L1
+        MOVS    R4, R4, LSR #1                  ; Shift the mask bit into the C flag
+        LDRCS   R0, [R1], #4                    ; If mask set, get the next pixel
+        ADDCC   R1, R1, #4                      ; If mask clear, skip the next pixel and use
+        MOVCC   R0, #FakeMaskColour             ;   the "background" colour (white)
+        PrHex   R0,ThisDoesNotCorruptR0,FallThroughOnError              ; Output R
+        MOV     R0, R0, LSR #8
+        PrHex   R0,ThisDoesNotCorruptR0,FallThroughOnError              ; Output G
+        MOV     R0, R0, LSR #8
+        PrHex   R0,ThisDoesNotCorruptR0,FallThroughOnError              ; Output B
+        ADD     R9, R9, #1                      ; move to the next mask bit
+        TST     R9, #2_11111                    ; new mask word needed?
+        LDREQ   R4, [R2], #4                    ; get next mask word if so
+        BNE     %FT03
+        PrNewLn FallThroughOnError              ; and do a newline too
+03
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output32bpp_masked_xloop_L1
+
+; FALLTHRU
+
+sprite_output32bpp_next_y
+
+; Move on to the next (previous in fact) row
+
+        Pull    "R3,R4"                         ; Get width & height back
+
+        SUB     R5, R5, R7                      ; Address previous row of image
+        TEQ     R6, #0
+        SUBNE   R6, R6, R8                      ; and mask
+        SUBS    R4, R4, #1                      ; more rows?
+        BNE     sprite_output32bpp_yloop
+
+; All the data that colorimage is expecting has been output.  Terminate tidily.
+
+        LDRB    R0,joblevel2
+        CMP     R0,#0
+        BEQ     sprite_output32bpp_end_L1
+        BL      ascii85_end
+        Pull    "PC"
+
+sprite_output32bpp_end_L1
+        PrNewLn FallThroughOnError
+
+        Debug   Medusa, "Leaving sprite_output32bpp"
+
+sprite_output32bpp_error_return
+        Pull    "PC"                            ; caller outputs grestore, etc
+
+
+; Routine to output the data for a 16bpp sprite.
+;
+; PostScript does not understand 5 bits per colour component!  We therefore
+; have the awkward choice between losing a bit, and generating 4 bits per component,
+; or inventing three bits to generate 8 bits per component.  It is expected that
+; the former method would produce unacceptable degradation when printing a
+; dithered image; therefore we choose the latter method.
+
+; In:
+;       R0-R2:  info about the sprite
+;       R3,R4:  width & height in pixels, after any source clipping
+;       R8:     0 for unmasked plotting, 8 for masked plotting (& mask exists).
+;       R10-R12:file handle and workspace pointers.
+;       sourceclip_x,y: start position in image
+;
+; The PostScript coordinate system has been set up to sprite bits by sprite pixels
+; (by sprite_scaling).  Also the matrix for imagemask has been constructed by the same call.
+;
+; Caller has saved R0-R9 if required.
+
+
+sprite_output16bpp
+
+        Push    "LR"                            ; R0-R9 have been saved by caller
+        PrError sprite_output16bpp_error_return
+
+        Debug   Medusa, "sprite_output16bpp entered"
+        Debug   Medusa, "Regs ", r0, r1, r2, r3, r4, r5, r6, r7, r8, r9
+
+        BL      sprite_getspriteaddress         ; normalise R1 and R2
+        PrPassError
+
+;we'll use ASCII85 encoding for Level 2, hex coding otherwise
+        LDRB    R5,joblevel2
+        CMP     R5,#0
+        BLNE    ascii85_begin
+
+; Now get some essential info about the sprite
+
+        LDR     R5, [R2, #32]                   ; get address of the image
+        ADD     R5, R2, R5
+        TEQ     R8, #8                          ; is this 'masked plotting'?
+        MOVNE   R6, #0                          ; if not, then no mask data
+        LDREQ   R6, [R2, #36]                   ; get address of the mask
+        ADDEQ   R6, R2, R6
+        TEQEQ   R5, R6                          ; if the addresses are the same
+        MOVEQ   R6, #0                          ; then no mask data
+
+; Now R5->image data, R6->mask data (if mask is to be used, else 0)
+
+        Debug   Medusa, "Addresses: Image, Mask = ", R5, R6
+
+        LDR     R7, [R2, #16]                   ; get sprite width-1 (in words)
+        ADD     R7, R7, #1
+        MOV     R7, R7, LSL #2                  ; R7 is image row offset in bytes
+
+; Determine the bytes per row in the mask.  This is a simple function of
+; the total width in pixels, because there is one mask bit per pixel and up to
+; 31 bits of wastage.  We need the sprite's total width for this:-
+
+        TEQ     R6, #0                          ; no mask?
+        BEQ     %FT01
+
+        Push    "R3-R6"
+
+        BIC     R0, R0, #255
+        ORR     R0, R0, #SpriteReason_ReadSpriteSize
+        SWI     XOS_SpriteOp
+        
+        ADDVC   R8, R3, #31
+        MOVVC   R8, R8, LSR #5                  ; R8 = mask row offset in words
+        MOVVC   R8, R8, LSL #2                  ; R8 = mask row offset in bytes
+
+        Pull    "R3-R6"
+        PrPassError
+01
+
+; Now adjust R5 and R6 to point to the start of the lowest row we intend to plot
+
+        LDR     LR, [R2, #20]                   ; height in scanlines - 1
+        LDR     R0, sourceclip_y                ; this is in pixels from the bottom
+        SUB     LR, LR, R0                      ; height - 1 - sourceclip_y
+        MLA     R5, LR, R7, R5                  ; start of first desired line in image
+
+        TEQ     R6, #0                          ; If there is a mask
+        MLANE   R6, LR, R8, R6                  ; start of first desired line in mask
+
+;  R0-R2, the sprite identifiers, are no longer needed.
+
+; Now the registers look like this:-
+;  R0-R2,R9: scratch
+;  R3, R4: width and height of portion to plot, in pixels
+;  R5: address of bottom row of the image to plot
+;  R6: address of bottom row of the mask to plot, or 0 for no mask
+;  R7: number of bytes to subtract from R5 to get to previous row in image
+;  R8: number of bytes to subtract from R6 to get to previous row in mask
+;  R10-R12: file handle and workspace pointers
+
+
+; Output the colorimage command
+
+        PrPair  R3, R4                          ; width & height in pixels
+        PrLnIm  "S32"
+
+        Debug   Medusa, "Outputting data"
+        Debug   Medusa, "Regs ", r0, r1, r2, r3, r4, r5, r6, r7, r8, r9
+
+; Now loop over all the rows from the bottommost up.  We know that R4 is at least 1
+
+sprite_output16bpp_yloop
+
+; Check for the ESCAPE key at the start of each scanline.
+
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+        PrPassError                             ;  will set R0 for us if so.
+
+        LDR     R9, sourceclip_x                ; Advance to the first pixel of the
+        ADD     R1, R5, R9, LSL #1              ; image data to be plotted
+        BIC     R1, R1, #2_11                   ; two pixels per word
+        LDR     R0, [R1], #4                    ; get the first word
+        TST     R9, #1                          ; Is sourceclip_x odd?
+        MOVNE   R0, R0, LSR #16                 ; Shift the second pixel down if so
+
+        Push    "R3,R4,R5,R7,R8"                ; stack width, height, image row address and row offsets
+        MOV     R8, #2_11111000                 ; useful for extracting the pixels
+
+        TEQ     R6, #0                          ; Masked?
+        MOVNE   LR, R9, LSR #5                  ; If mask, determine number of words into the mask row to start
+        ADDNE   R2, R6, LR, LSL #2              ;   and make R2 point there
+        LDRNE   R4, [R2], #4                    ;   Pick up first mask word
+        ANDNE   LR, R9, #31                     ;   LR = sourceclip_x MOD 32
+        MOVNE   R4, R4, LSR LR                  ;   Shift mask word so that first wanted bit is in lsbit
+
+; Now the registers look like this:-
+;  R0: first word of image, shifted so that the first pixel is in bits 0..15
+;  R1 -> next word to lift out of the image
+;  R2 -> next word to lift out of the mask, or undefined if no mask
+;  R3: width of portion to plot, in pixels
+;  R4: first mask word, with first wanted bit at bit 0, or undefined if no mask
+;  R5: scratch
+;  R6: address of bottom row of the mask to plot, or undefined if no mask
+;  R7: scratch
+;  R8: 2_11111000
+;  R9: sourceclip_x
+;  R10-R12: file handle and workspace pointers
+
+        Debug   Medusa, "S.of.ROW: Regs ", r0, r1, r2, r3, r4, r5, r6, r7, r8, r9
+
+; Now loop across all the pixels in the row.  We know that R3 is at least 1
+; Use a different loop for the unmasked case to reduce the number of
+; comparisons
+
+
+        BNE     sprite_output16bpp_masked_xloop
+
+        LDRB    R7,joblevel2
+        CMP     R7,#0
+        BEQ     sprite_output16bpp_xloop_L1
+
+sprite_output16bpp_xloop_L2
+        AND     R7, R8, R0, LSL #3
+        ORR     R7, R7, R7, LSR #5
+        BL      ascii85_byteR7
+        Pull    "R3,R4,R5,R7,R8,PC",VS
+        AND     R7, R8, R0, LSR #2
+        ORR     R7, R7, R7, LSR #5
+        BL      ascii85_byteR7
+        Pull    "R3,R4,R5,R7,R8,PC",VS
+        AND     R7, R8, R0, LSR #7
+        ORR     R7, R7, R7, LSR #5
+        BL      ascii85_byteR7
+        Pull    "R3,R4,R5,R7,R8,PC",VS
+        TST     R9, #1                          ; Prepare next pixel
+        MOVEQ   R0, R0, LSR #16                 ; by shifting down
+        LDRNE   R0, [R1], #4                    ; or by loading
+        ADD     R9, R9, #1
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output16bpp_xloop_L2
+        B       sprite_output16bpp_next_y
+
+sprite_output16bpp_xloop_L1
+        AND     R7, R8, R0, LSL #3
+        ORR     R7, R7, R7, LSR #5
+        PrHex   R7,,FallThroughOnError          ; Output R
+        AND     R7, R8, R0, LSR #2
+        ORR     R7, R7, R7, LSR #5
+        PrHex   R7,,FallThroughOnError          ; Output G
+        AND     R7, R8, R0, LSR #7
+        ORR     R7, R7, R7, LSR #5
+        PrHex   R7,,FallThroughOnError          ; Output B
+        TST     R9, #1                          ; Prepare next pixel
+        MOVEQ   R0, R0, LSR #16                 ; by shifting down
+        LDRNE   R0, [R1], #4                    ; or by loading
+        ADD     R9, R9, #1                      ; Newline wanted?
+        TST     R9, #2_11111                    ; do one every 32 pixels or so
+        BNE     %FT02
+        PrNewLn FallThroughOnError
+02
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output16bpp_xloop_L1
+        B       sprite_output16bpp_next_y
+
+sprite_output16bpp_masked_xloop
+
+        LDRB    R7,joblevel2
+        CMP     R7,#0
+        BEQ     sprite_output16bpp_masked_xloop_L1
+
+sprite_output16bpp_masked_xloop_L2
+        MOVS    R4, R4, LSR #1                  ; Shift the mask bit into the C flag
+        MOVCS   R5, R0                          ; Use the pixel value if mask set
+        MOVCC   R5, #FakeMaskColour             ; or white otherwise
+        AND     R7, R8, R5, LSL #3
+        ORR     R7, R7, R7, LSR #5
+        BL      ascii85_byteR7
+        Pull    "R3,R4,R5,R7,R8,PC",VS
+        AND     R7, R8, R5, LSR #2
+        ORR     R7, R7, R7, LSR #5
+        BL      ascii85_byteR7
+        Pull    "R3,R4,R5,R7,R8,PC",VS
+        AND     R7, R8, R5, LSR #7
+        ORR     R7, R7, R7, LSR #5
+        BL      ascii85_byteR7
+        Pull    "R3,R4,R5,R7,R8,PC",VS
+        TST     R9, #1                          ; Prepare next pixel
+        MOVEQ   R0, R0, LSR #16                 ; by shifting down
+        LDRNE   R0, [R1], #4                    ; or by loading
+        ADD     R9, R9, #1                      ; move to the next mask bit
+        TST     R9, #2_11111                    ; new mask word needed?
+        LDREQ   R4, [R2], #4                    ; get next mask word if so
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output16bpp_masked_xloop_L2
+        B       sprite_output16bpp_next_y
+
+sprite_output16bpp_masked_xloop_L1
+        MOVS    R4, R4, LSR #1                  ; Shift the mask bit into the C flag
+        MOVCS   R5, R0                          ; Use the pixel value if mask set
+        MOVCC   R5, #FakeMaskColour             ; or white otherwise
+        AND     R7, R8, R5, LSL #3
+        ORR     R7, R7, R7, LSR #5
+        PrHex   R7,,FallThroughOnError          ; Output R
+        AND     R7, R8, R5, LSR #2
+        ORR     R7, R7, R7, LSR #5
+        PrHex   R7,,FallThroughOnError          ; Output G
+        AND     R7, R8, R5, LSR #7
+        ORR     R7, R7, R7, LSR #5
+        PrHex   R7,,FallThroughOnError          ; Output B
+        TST     R9, #1                          ; Prepare next pixel
+        MOVEQ   R0, R0, LSR #16                 ; by shifting down
+        LDRNE   R0, [R1], #4                    ; or by loading
+        ADD     R9, R9, #1                      ; move to the next mask bit
+        TST     R9, #2_11111                    ; new mask word needed?
+        LDREQ   R4, [R2], #4                    ; get next mask word if so
+        BNE     %FT03
+        PrNewLn FallThroughOnError              ; and do a newline too
+03
+        SUBS    R3, R3, #1                      ; Any more pixels to do?
+        BNE     sprite_output16bpp_masked_xloop_L1
+; FALLTHRU
+
+sprite_output16bpp_next_y
+
+; Move on to the next (previous in fact) row
+
+        Pull    "R3,R4,R5,R7,R8"                ; Get width, height, image row address and offsets back
+
+        SUB     R5, R5, R7                      ; Address previous row of image
+        TEQ     R6, #0
+        SUBNE   R6, R6, R8                      ; and mask
+        SUBS    R4, R4, #1                      ; more rows?
+        BNE     sprite_output16bpp_yloop
+
+; All the data that colorimage is expecting has been output.  Terminate tidily.
+
+        LDRB    R0,joblevel2
+        CMP     R0,#0
+        BEQ     sprite_output16bpp_end_L1
+        BL      ascii85_end
+        Pull    "PC"
+
+sprite_output16bpp_end_L1
+        PrNewLn FallThroughOnError
+
+        Debug   Medusa, "Leaving sprite_output16bpp"
+
+sprite_output16bpp_error_return
+        Pull    "PC"                            ; caller outputs grestore, etc
+
+
+
+; Given a standard set of R0-R2 SpriteOp entry values, obtain the sprite's
+; control block address.
+;
+; System sprite pool needs special attention due to the fact the
+; SpriteReason_SelectSprite refuses to return the sprite address for
+; sprites in the system pool.
+;
+; In: R0: SpriteOp reason code (bits 8 and 9 used)
+;     R1: may be a pointer to a sprite pool depending on bits 8 and 9 of R0
+;     R2: pointer to a sprite or sprite name depending on bits 8 and 9 of R0
+; Out:R0: a different SpriteOp reason code but with the same values in bits 8 and 9
+;     R1: pointer to the sprite pool
+;     R2: pointer to the sprite control block
+
+
+sprite_getspriteaddress
+        Push    "LR"
+
+        TST     R0, #256 + 512                  ; Is it "system sprite pool"
+        BNE     %FT00
+
+        DebugS  Medusa, "Performing system sprite pool lookup of ", R2
+
+        Push    "R0,R2"
+        MOV     R0, #3                          ; dynamic area 3 = system sprite pool
+        SWI     XOS_ReadDynamicArea
+        STRVS   R0, [SP]
+        MOVVC   R1, R0                          ; R1 <- system sprite pool address
+        Pull    "R0,R2"
+        Pull    "PC", VS
+
+        ORR     R0, R0, #256                    ; Now R1->sprite area, R2->name
+
+; Now obtain the address of the sprite if R2 is a name
+
+00      BIC     R0, R0, #255
+        ORR     R0, R0, #SpriteReason_SelectSprite
+        SWI     XOS_SpriteOp                    ; Now R2->sprite control block regardless
+                                                ; of the contents of R0-R2 on entry
+
+        DebugIf VC, Medusa, "Sprite address is ", R2
+
+        Pull    "PC"
+
+        ]
+
+
+        END

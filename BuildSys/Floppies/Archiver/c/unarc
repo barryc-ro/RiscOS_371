@@ -1,0 +1,255 @@
+
+/* unarc.c */
+
+/* 23 Aug 96 MJS originated */
+
+/* unarc is included for completeness; Installer actually used
+   to do unarchiving/installing, with gui interface */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "swis.h"
+
+
+#define ObjType_Dir 2
+
+#define FlagsField     0x7f000000
+#define LengthField    0x00ffffff
+#define IsSquashed     0x01000000
+#define IsDirectory    0x02000000
+#define IsTruncated    0x04000000
+#define IsNotTruncated 0x7bffffff
+#define IsContinuation 0x08000000
+
+typedef struct
+{
+  unsigned int load;
+  unsigned int exec;
+  unsigned int length;
+  unsigned int attribs;
+  unsigned int otype;
+  char         name[256];
+} drec_t;
+
+
+static unsigned char *buff, *sqbuff, *sqwork;
+static drec_t drec;
+
+static FILE *fi;
+static int  Narcs;
+static char arcname[256];
+ 
+static int  maxobjsize, verbose;
+static char destdir[256], arcname[256];
+
+static _kernel_oserror sqerror = { 0, "Squash decompress failure" };
+
+
+/* read next tag (flags and length), handling join across split arcs */
+static int read_tag(void)
+{
+  int  flags;
+  char digits[4];
+
+  fread(&flags,4,1,fi);
+  if (flags == -1)
+  {
+    if (verbose) printf("  brk\n");
+    fclose(fi);
+    Narcs++;
+    arcname[strlen(arcname)-2] = '\0';
+    sprintf(digits,"%02d",Narcs+1);
+    strcat(arcname,digits);
+    if (verbose)  printf("new arc: %s\n",arcname);
+    if (!verbose) printf("%s\n",arcname);
+    fi = fopen(arcname,"rb");
+    if (fi == NULL)
+    {
+      fprintf(stderr,"failed to open '%s'\n",arcname);
+      exit(1);
+    }
+    fread(&flags,4,1,fi);
+  }
+
+  return flags;
+}
+
+/* join object transparently */
+static void read_object(int *flags, int *length, unsigned char *buff)
+{
+  int flg, len, tflg, tlen;
+
+  flg = read_tag();
+
+  len = flg & LengthField;
+  flg = flg & FlagsField;
+
+  if (len)
+  {
+    fread(buff,len,1,fi);
+    tflg = flg;
+    while (tflg & IsTruncated)
+    {
+      read_object(&tflg,&tlen,buff+len);
+      len += tlen;
+    }
+  }
+
+  *length = len;
+  *flags  = flg & IsNotTruncated;
+}
+
+static _kernel_oserror *arc_extract(char *rootdir)
+{
+  int   blen, nest, flags, sqlen, sqstatus;
+  char  todir[256], fname[256];
+  _kernel_oserror *e = (_kernel_oserror *)NULL;
+
+  nest = 1;
+  strcpy(todir,rootdir);
+
+//  e = _swix(OS_File,_IN(0)|_IN(1)|_IN(4),8,rootdir,0); /* create dir */
+//  if (e) return e;
+
+  read_object(&flags,&blen,buff);
+  if (blen == 0) nest--;
+  while (nest)
+  {
+
+    if (flags & IsDirectory)
+    {
+      memcpy(&drec.attribs,buff,4);
+      strcpy(drec.name,(char *)(buff+4));
+      nest++;
+      strcat(todir,".");
+      strcat(todir,drec.name);
+      if (verbose) printf("  dir %s\n",drec.name);
+      e = _swix(OS_File,_IN(0)|_IN(1)|_IN(4),8,todir,0); /* create dir */
+      if (e) return e;
+      e = _swix(OS_File,_IN(0)|_IN(1)|_IN(5),4,todir,drec.attribs); /*set attributes */
+      if (e) return e;
+    }
+    else
+    {
+      if (flags & IsSquashed)
+      {
+        e = _swix(Squash_Decompress,_INR(0,5)|_OUT(0)|_OUT(5),
+                  4,sqwork,buff,blen,sqbuff,maxobjsize,&sqstatus,&sqlen);
+        if (e) return e;
+        if (sqstatus != 0) return &sqerror;
+
+        sqlen = maxobjsize - sqlen;
+        memcpy(&drec,sqbuff,5*4);
+        strcpy(drec.name,(char *)(sqbuff+5*4));
+        strcpy(fname,todir);
+        strcat(fname,".");
+        strcat(fname,drec.name);
+        if (verbose) printf("  sqf %s\n",drec.name);
+        e = _swix(OS_File,_INR(0,5),0,fname,drec.load,drec.exec,
+                  sqbuff+sqlen-drec.length,sqbuff+sqlen);
+        if (e) return e;
+      }
+      else
+      {
+        memcpy(&drec,buff,5*4);
+        strcpy(drec.name,(char *)(buff+5*4));
+        strcpy(fname,todir);
+        strcat(fname,".");
+        strcat(fname,drec.name);
+        if (verbose) printf("  uqf %s\n",drec.name);
+        e = _swix(OS_File,_INR(0,5),0,fname,drec.load,drec.exec,
+                  buff+blen-drec.length,buff+blen);
+        if (e) return e;
+      }
+      e = _swix(OS_File,_IN(0)|_IN(1)|_IN(5),4,fname,drec.attribs); /*set attributes */
+      if (e) return e;
+    }
+
+    read_object(&flags,&blen,buff);
+    while (nest && (blen == 0))
+    {
+      if (verbose) printf("  <--\n");
+      nest--;
+      if (nest > 0)
+      {
+        *(strrchr(todir,'.')) = '\0';
+        read_object(&flags,&blen,buff);
+      }
+    }
+
+  } /* while (nest) */
+
+  return e;
+}
+
+
+static int read_specfile(char *fname)
+{
+  int  i;
+  FILE *fp;
+
+  fp = fopen(fname,"r");
+  if (fp == NULL) return 0;
+
+  i =  fscanf(fp,"%d",&verbose);
+  i += fscanf(fp,"%d",&maxobjsize);
+  i += fscanf(fp,"%s",arcname);
+  i += fscanf(fp,"%s",destdir);
+  fclose(fp);
+printf("%1d %1dk %s %s\n",verbose,maxobjsize,arcname,destdir);
+  maxobjsize *= 1024;
+  return (i == 4);
+}
+
+
+int main(int argc, char *argv[])
+{
+  int  sqworksize;
+  _kernel_oserror *e;
+
+  if (argc != 2)
+  {
+    fprintf(stderr,"usage: unarc <spec file>\n");
+    exit(1);
+  }
+
+  if (!read_specfile(argv[1]))
+  {
+    fprintf(stderr,"bad spec file\n");
+    exit(1);
+  }
+
+  e = _swix(Squash_Decompress,_INR(0,1)|_OUT(0),8,256,&sqworksize);
+  if (!e)
+  {
+    buff   = malloc(maxobjsize);
+    sqbuff = malloc(maxobjsize);
+    sqwork = malloc(sqworksize);
+    if ((buff == NULL) || (sqbuff == NULL) || (sqwork == NULL))
+    {
+      fprintf(stderr,"failed to allocate memory\n");
+      exit(1);
+    }
+
+    Narcs = 0;
+    strcat(arcname,"01");
+
+    if (verbose)  printf("new arc: %s\n",arcname);
+    if (!verbose) printf("%s\n",arcname);
+    fi = fopen(arcname,"rb");
+    if (fi == NULL)
+    {
+      fprintf(stderr,"failed to open '%s'\n",arcname);
+      exit(1);
+    }
+    e = arc_extract(destdir);
+
+    fclose(fi);
+  }
+
+  if (e) fprintf(stderr,"%s\n",e->errmess);
+
+  return 0;
+}

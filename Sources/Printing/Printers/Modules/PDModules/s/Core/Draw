@@ -1,0 +1,247 @@
+; > Core.Draw
+
+;----------------------------------------------------------------------------
+;
+; The DrawV interception routine
+;
+;----------------------------------------------------------------------------
+
+interceptdraw
+        Push    "LR"
+
+; Is this Draw output we're not interested in?
+        LDRB    LR,passthrough
+        TST     LR,#passthrough_draw
+        Pull    "PC",NE
+
+; intercept but do precisely nothing if it is a counting pass
+        LDR     LR, counting_pass
+; Debug   PageBox, "draw counting_pass = ",LR
+        CMP     LR, #0
+        Pull    "LR,PC",NE
+
+; Intercept Draw_Fill, Draw_Stroke and Draw_ProcessPath calls.
+
+        TEQ     R8,#DrawReas_Fill
+        BEQ     intdraw_fill
+        TEQ     R8,#DrawReas_Stroke
+        BEQ     intdraw_stroke
+        TEQ     R8,#DrawReas_ProcessPath
+        Pull    "PC",NE
+
+; This is a Draw_ProcessPath call. We can hand it on to the Draw module if
+; it isn't meant to produce screen output. Otherwise, we produce an error.
+
+        SUB     LR,R7,#1
+        CMP     LR,#2-1
+        Pull    "PC",HI
+
+        Push    "R10,R11"
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+        BL      checkpersistenterror
+        BVS     intdraw_process_persistentreturn
+        ADR     r0, ErrorBlock_PrintCantDrawPlot
+        BL      LookupSingle            ; Always sets the V flag
+        BL      makepersistenterror
+intdraw_process_persistentreturn
+        Pull    "R10,R11,PC"
+
+        MakeInternatErrorBlock PrintCantDrawPlot,,NoDPlot
+
+
+; This is a Draw_Fill call. Main problem is whether printer drivers can
+; manage the fill style requested. At present, we only allow fill styles
+; 2_0000X0, 2_0110X0, 2_1000X0, 2_1100X0, 2_1110X0 and 2_1111X0.
+
+intdraw_fill
+        Push    "R1,R9-R11"
+        MOV     R9,R1                   ;Put fill style somewhere safe
+
+; Pick up current job's workspace, check for persistent errors, enable
+; ESCAPEs and pass through recursive OS_WriteC's
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+
+        BL      checkpersistenterror
+        BVS     intdraw_fill_persistentreturn
+
+        BL      enableescapes
+
+; Flush any buffered VDU 5 characters
+
+        BLVC    vdu5_flush
+        BVS     intdraw_fill_return
+
+; Get foreground colour. Return if no plotting wanted; otherwise set the
+; colour.
+
+      [ PrinterDrawBit
+        TST     R9, #1:SHL:16
+        BIC     R9, R9, #1:SHL:16
+        BNE     intdraw_fill_colour_setup
+      ]
+        MOV     R1,#disabled_vdu
+        BL      gcol_lookupfg
+        BNE     intdraw_fill_return
+        BL      colour_setrealrgb
+        BVS     intdraw_fill_return
+
+; Then test fill style to call the right routine.
+intdraw_fill_colour_setup
+        MOV     R1,R9                   ;Recover fill style
+        BICS    R9,R1,#&3E              ;Disallow out of range fill styles,
+        MOVNE   R9,#2_1000000           ;  and negative & positive rules,
+                                        ;  by addressing a fake table entry
+        ANDEQ   R9,R1,#2_111100         ;Otherwise address the correct entry
+        MOV     LR,PC                   ;Table-driven subroutine call
+        ADD     PC,PC,R9
+        B       intdraw_fill_return
+
+        B       intdraw_maybenothing    ;2_0000X0
+        B       intdraw_badfillstyle    ;2_0001X0
+        B       intdraw_badfillstyle    ;2_0010X0
+        B       intdraw_badfillstyle    ;2_0011X0
+        B       intdraw_badfillstyle    ;2_0100X0
+        B       intdraw_badfillstyle    ;2_0101X0
+        B       draw_boundaryonly       ;2_0110X0
+        B       intdraw_badfillstyle    ;2_0111X0
+        B       draw_interiornobdry     ;2_1000X0
+        B       intdraw_badfillstyle    ;2_1001X0
+        B       intdraw_badfillstyle    ;2_1010X0
+        B       intdraw_badfillstyle    ;2_1011X0
+        B       draw_interior           ;2_1100X0
+        B       intdraw_badfillstyle    ;2_1101X0
+        B       draw_interiorwithbdry   ;2_1110X0
+        B       plot_fillclipbox        ;2_1111X0
+intdraw_badfillstyle                    ;2_1000000 - a fake entry
+        ADR     r0, ErrorBlock_PrintCantThisFill
+        B       LookupSingle            ; Will set V and return to LR
+
+        MakeInternatErrorBlock PrintCantThisFill,,NoFill
+
+intdraw_fill_return
+        BL      disableandcheckescapes
+        BLVS    makepersistenterror
+intdraw_fill_persistentreturn
+        Pull    "R1,R9-R11,LR,PC"       ;Return from this routine
+
+; 2_0000X0 - this asks us to plot nothing at all or to plot according to the
+; default rule. In the first case, the details of the path, transformation,
+; etc., do not affect what happens!
+
+intdraw_maybenothing
+        TEQ     R1,#0
+        Return  NE
+        Push    "R1,LR"
+        MOV     R1,#&30
+        BL      draw_interior
+        Pull    "R1,PC"
+
+; This is a Draw_Stroke call. A number of parameters need vetting:
+; (a) if the thickness is zero, the fill style should be 2_XX00XX, 2_XX10XX
+;     or 2_XX11XX, possibly with the top bit set.
+; (b) if the thickness is non-zero, the fill style should be 2_000000,
+;     2_100000, 2_110000, 2_111000 or 2_111100, possibly with the top bit
+;     set.
+
+intdraw_stroke
+        Push    "R1,R9-R11"
+        MOV     R9,R1                   ;Put fill style somewhere safe
+
+; Pick up current job's workspace, check for persistent errors, enable
+; ESCAPEs and pass through recursive OS_WriteC's
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+
+        BL      checkpersistenterror
+        BVS     intdraw_stroke_persistentreturn
+
+        BL      enableescapes
+
+; Flush any buffered VDU 5 characters
+
+        BLVC    vdu5_flush
+        BVS     intdraw_stroke_return
+
+; Set up colour
+      [ PrinterDrawBit
+        TST     R9, #1:SHL:16
+        BIC     R9, R9, #1:SHL:16
+        BNE     intdraw_stroke_colour_setup
+      ]
+
+        MOV     R1,#disabled_vdu
+        BL      gcol_lookupfg
+        BNE     intdraw_stroke_return
+        BL      colour_setrealrgb
+        BVS     intdraw_stroke_return
+
+intdraw_stroke_colour_setup
+        MOV     R1,R9                           ;Recover fill style
+
+; Split according to whether this is zero or non-zero thickness
+
+        TEQ     R4,#0
+        BEQ     intdraw_stroke_thin
+
+; Check the fill style
+
+        BICS    R9,R1,#&8000003C        ;Disallow out of range fill styles,
+        MOVNE   R9,#2_1000000           ;  or other than non-zero rules,
+                                        ;  by addressing a fake table entry
+        ANDEQ   R9,R1,#2_111100         ;Otherwise address correct entry
+        MOV     LR,PC                   ;Table-driven subroutine call
+        ADD     PC,PC,R9
+        B       intdraw_stroke_return
+
+        B       draw_stroke             ;2_000000
+        B       intdraw_badfillstyle    ;2_000100
+        B       intdraw_badfillstyle    ;2_001000
+        B       intdraw_badfillstyle    ;2_001100
+        B       intdraw_badfillstyle    ;2_010000
+        B       intdraw_badfillstyle    ;2_010100
+        B       intdraw_badfillstyle    ;2_011000
+        B       intdraw_badfillstyle    ;2_011100
+        B       draw_strokenobdry       ;2_100000
+        B       intdraw_badfillstyle    ;2_100100
+        B       intdraw_badfillstyle    ;2_101000
+        B       intdraw_badfillstyle    ;2_101100
+        B       draw_stroke             ;2_110000
+        B       intdraw_badfillstyle    ;2_110100
+        B       draw_strokewithbdry     ;2_111000
+        B       plot_fillclipbox        ;2_111100
+        B       intdraw_badfillstyle    ;2_1000000 - a fake entry
+
+; Zero thickness. Switch according to the fill style
+
+intdraw_stroke_thin
+        BICS    R9,R1,#&8000003F        ;Change out of range fill style
+        MOVNE   R9,#2_000100            ;  to one we cannot handle
+        ANDEQS  R9,R9,#&3F              ;Otherwise apply default
+        MOVEQ   R9,#2_011000
+        AND     R9,R9,#2_001100
+        MOV     LR,PC                   ;Table-driven subroutine call
+        ADD     PC,PC,R9
+        B       intdraw_stroke_return
+
+        Return                          ;2_XX00XX
+        B       intdraw_badfillstyle    ;2_XX01XX
+        B       draw_thinstroke         ;2_XX10XX
+        B       plot_fillclipbox        ;2_XX11XX
+
+intdraw_stroke_return
+        BL      disableandcheckescapes
+        BLVS    makepersistenterror
+intdraw_stroke_persistentreturn
+        Pull    "R1,R9-R11,LR,PC"       ;Return from this routine
+
+        END

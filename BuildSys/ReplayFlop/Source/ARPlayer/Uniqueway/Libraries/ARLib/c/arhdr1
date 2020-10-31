@@ -1,0 +1,243 @@
+/* > arhdr1.c
+
+ * © SJ Middleton, 1992
+
+ * CHANGE LOG:
+ *  04/11/93:   changed reading of catalogue to allow no ; if no soundtracks (fixes problem with Rephorm movies). 
+ *  09/11/93:   check for track < 0 in validate_soundtrack
+ *  21/12/93:   long standing bug that made sound chunk sizes the same as in track 1.
+ *  08/02/94:   added memory allocator fns so that h_alloc or f_alloc can be used for catalogues.
+ *              fixed Rephorm problem again.
+ */
+
+#include "msgs.h"
+#include "werr.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "armovie.h"
+#include "utils.h"
+
+#define NO_SOUND                msgs_lookup("arhdr1:Movie soundtrack %i does not exist.")
+#define UNKNOWN_SOUND_FORMAT    msgs_lookup("arhdr2:Unknown sound format (%i) for track %i.")
+#define BAD_NCHANNELS           msgs_lookup("arhdr3:Cannot play soundtrack with %i channel(s) of sound.")
+#define LOADING_HDR             msgs_lookup("arhdr4:loading movie header")
+#define LOADING_CAT             msgs_lookup("arhdr6:loading chunk catalogue")
+#define BAD_SOUND_TRACK         msgs_lookup("arhdr10:Data exists for soundtrack %i but there is no definition in movie header.")
+#define NO_VIDEO_CHUNKSIZE      msgs_lookup("arhdr11:Corrupt catalogue. No size for video chunk %d.")
+#define NO_SOUND_CHUNKSIZE      msgs_lookup("arhdr12:Corrupt catalogue. No size for sound chunk %d.")
+#define UNSPECIFIED_RATE        msgs_lookup("arhdr13:No sample rate given for track %i.")
+#define UNSPECIFIED_PRECISION   msgs_lookup("arhdr14:No sample precision given for track %i.")
+
+static mem_allocfn  cat__alloc = c_alloc;
+static mem_freefn   cat__free = c_free;
+
+static BOOL allocate_catalogue_memory(armovie_hdr *hdr)
+{
+    armovie_soundstr *sp;
+    int i, size = sizeof(armovie_catentry)*hdr->nchunks;
+
+    if (hdr->video_format && !cat__alloc((mem_ptr)&hdr->video_chunks, size))
+        return oom_err(LOADING_CAT, size);
+
+    for (i = 0, sp = hdr->sound; i < hdr->nsoundtracks; i++, sp++)
+        if (!cat__alloc((mem_ptr)&sp->chunks, size))
+            return oom_err(LOADING_CAT, hdr->nsoundtracks*size);
+
+    return TRUE;
+}
+
+static BOOL armovie_readcatalogue(filehandle f, armovie_hdr *hdr)
+{
+    int chunk;
+
+    if (!allocate_catalogue_memory(hdr))
+        return FALSE;
+
+    if (os_err(file_setpos(f, hdr->catalogue_offset)) != NULL)
+        return FALSE;
+
+    for (chunk = 0; chunk < hdr->nchunks; chunk++)
+    {
+        char                buffer[256], *s = buffer;
+        armovie_catentry    *cp;
+        int                 offset, size;
+
+        if (os_err(file_readlinebuffer(f, buffer, sizeof(buffer))) != NULL)
+            return FALSE;
+
+/* decode video offset and size */
+        offset = (int) strtoul(s, &s, 10);
+        if ((s = strchr(s, ',')) == NULL)
+        {
+            werr(0, NO_VIDEO_CHUNKSIZE, chunk);
+            return FALSE;
+        }
+        size = (int) strtoul(s+1, &s, 10);
+        if ((s = strchr(s, ';')) == NULL && hdr->nsoundtracks != 0)
+        {
+            werr(0, NO_SOUND_CHUNKSIZE, chunk);
+            return FALSE;
+        }
+
+/* write into video chunk list (if exists) */
+        if (hdr->video_chunks)
+        {
+            cp = &hdr->video_chunks[chunk];
+            cp->offset = offset;
+            cp->size = size;
+        }
+
+/* update offset to be start of sound data */
+        offset += size;
+
+        if (s != NULL && strtoul(++s, NULL, 10) != 0)
+        {
+            char *s1 = strtok(s, "|");
+            do
+            {
+                int                 track = s1 == s ? 1 : (int) strtoul(s1, &s1, 10);
+                armovie_soundstr    *sp;
+                armovie_catentry    *scp;
+
+                if (track <= 0 || track > hdr->nsoundtracks)
+                {
+                    werr(0, BAD_SOUND_TRACK, track);
+                    return FALSE;
+                }
+
+                sp = &hdr->sound[track-1];
+                if (sp->format == 0)
+                {
+                    werr(0, BAD_SOUND_TRACK, track);
+                    return FALSE;
+                }
+
+                scp = &sp->chunks[chunk];
+                scp->offset = offset;
+                scp->size = (int) strtoul(s1, NULL, 10);
+
+                offset += scp->size;
+                if (sp->max_soundsize < scp->size)
+                    sp->max_soundsize = scp->size;
+            }
+            while ((s1 = strtok(NULL, "|")) != NULL);
+        }
+    }
+
+    return TRUE;
+}
+
+static void armovie_readpalette(filehandle f, armovie_hdr *hdr)
+{
+    if (hdr->palette_offset > 0)
+    {
+        int size = 3 << hdr->bpp;
+        if ((hdr->palette_data = malloc(size)) != NULL)
+            os_err(file_readfrom(f, hdr->palette_data, size, hdr->palette_offset));
+    }
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+/* Functions that work on the header information */
+
+static BOOL armovie__identify(filehandle f, armovie_hdr **hdrp)
+{
+    if ((*hdrp = armovie_scanhdr(f)) == NULL)
+        return FALSE;
+
+    if (!armovie_readcatalogue(f, *hdrp))
+    {
+        armovie_freehdr(*hdrp);
+        *hdrp = NULL;
+        return FALSE;
+    }
+
+    armovie_readpalette(f, *hdrp);
+
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+BOOL armovie_identify(const char *filename, armovie_hdr **hdrp)
+{
+    BOOL        success = FALSE;
+    filehandle  f;
+
+    if (os_err(file_open(fopt_Read, filename, &f)) == NULL)
+    {
+        armovie_hdr *hdr = NULL;
+        success = armovie__identify(f, &hdr);
+        if (success)
+        {
+            int val = (int) strtoul(&filename[strlen(filename) - 1], NULL, 10);
+            hdr->fsr = val == 0 ? 1 : val;
+
+            if (hdrp)
+                *hdrp = hdr;
+            else
+                armovie_freehdr(hdr);
+        }
+        file_close(f);
+    }
+
+    return success;
+}
+
+/*
+ * track number from 0
+ */
+
+BOOL armovie_validate_soundtrack(const armovie_hdr *hdr, int track)
+{
+    if (track < 0 || track >= hdr->nsoundtracks)
+        werr(0, NO_SOUND, track+1);
+    else
+    {
+        armovie_soundstr *sp = &hdr->sound[track];
+        if (sp->format == 0)
+            werr(0, NO_SOUND, track+1);
+        else if (sp->format > 2)
+            werr(0, UNKNOWN_SOUND_FORMAT, sp->format, track+1);
+        else if (sp->channels == 0)
+            werr(0, BAD_NCHANNELS, sp->channels);
+        else if (sp->rate == 0)
+            werr(0, UNSPECIFIED_RATE, track+1);
+        else if (sp->precision == 0)
+            werr(0, UNSPECIFIED_PRECISION, track+1);
+        else
+            return TRUE;
+    }
+    return FALSE;
+}
+
+void armovie_disposecataloguememory(armovie_hdr *hdr)
+{
+    int i;
+    for (i = 0; i < hdr->nsoundtracks; i++)
+        cat__free((mem_ptr) &hdr->sound[i].chunks);
+
+    cat__free((mem_ptr)&hdr->video_chunks);
+}
+
+void armovie_registercataloguememfns(mem_allocfn allocfn, mem_freefn freefn)
+{
+    cat__alloc = allocfn;
+    cat__free = freefn;
+}
+
+BOOL armovie_alloccatalogue(armovie_catentry **anchor, int nentries)
+{
+    return cat__alloc((mem_ptr)anchor, nentries*sizeof(armovie_catentry));
+}
+
+void armovie_freecatalogue(armovie_catentry **anchor)
+{
+    cat__free((mem_ptr)anchor);
+}
+
+/* eof arhdr1.c */

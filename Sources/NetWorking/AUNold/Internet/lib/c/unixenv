@@ -1,0 +1,670 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Internet/lib/unixenv.c:networking  1.6  $
+ * $Source: /ax/networking:Internet/lib/unixenv.c: $
+ *
+ * Copyright(c) 1994 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	unixenv.c,v $
+ * Revision 1.6  95/03/31  14:02:09  kwelton
+ * Improved string handling within panic().
+ * 
+ * Revision 1.5  95/03/31  11:44:58  kwelton
+ * Callbacks are now handled slightly differently in a new scheme which allows
+ * pending callbacks to be cancelled during module finalisation.
+ * 
+ * Revision 1.4  95/03/19  18:21:52  kwelton
+ * There is a problem somewhere in sleep() - it is running out of sleeptab
+ * entries.  The mechanism behind this is not understood yet, but the
+ * imminent freeze of the Black ROMs needs some sort of fix, so:
+ * 
+ * 1)  Put spl protection around table manipulations - this is a bug fix,
+ *     but it is not certain that it is the cause of the sleep() panics.
+ * 
+ * 2)  The size of the sleep table has been increased from 12 (a random
+ *     number?) to 96 (max. no. of sockets open at one time) in a rather
+ *     sad attempt to shove the problem under the carpet.
+ * 
+ * Revision 1.3  95/01/24  15:30:12  kwelton
+ * Econet_InetRxDirect is declared in "swis.h", and does not need to be
+ * defined here.
+ * 
+ * Revision 1.2  95/01/03  13:35:00  kwelton
+ * Tidied up declaration of panicbuf, fixed header inclusion.
+ * 
+ * Revision 1.1  94/12/02  10:48:46  kwelton
+ * Initial revision
+ * 
+ */
+#include <kernel.h>
+#include <swis.h>
+
+#include "sys/param.h"
+#include "sys/uio.h"
+#include "sys/time.h"
+#include "sys/mbuf.h"
+#include "sys/user.h"
+#include "sys/proc.h"
+
+#include "net/netisr.h"
+
+#include "module.h"
+
+#define TickerV	 28
+
+/*
+ * The callout structure is for
+ * a routine arranging
+ * to be called by the clock interrupt
+ * in a specified amount of time.
+ */
+
+struct user u = { 0 };
+struct proc proc = { 0 };
+
+struct	callout
+{
+    int		    c_time;		/* incremental time */
+    caddr_t	    c_arg;		/* argument to routine */
+    int		  (*c_func)();		/* routine */
+    struct callout *c_next;
+} callout[NCALLOUT] = { 0 };
+
+struct	callout *callfree = 0;
+struct	callout calltodo = { 0 };
+
+int	ncallout = NCALLOUT;
+
+extern void bcopy();
+extern int user_mode_donothing();
+volatile int callo_pending = 0;
+extern void *module_wsp;
+extern int paniced;
+
+u_init(void)
+{
+    u.u_procp = &proc;
+    proc.p_wchan = 0;
+}
+
+struct proc *pfind(short p)
+{
+    return ((struct proc *)p);
+}
+
+gsignal(int p, int sig)
+{
+    generate_event(p, sig);
+}
+
+psignal(int p, int sig)
+{
+    generate_event(p, sig);
+}
+
+#define INTERNET_EVENT	    19
+
+#define SOCKET_ASYNC_EVENT  1
+#define SOCKET_URGENT_EVENT 2
+#define SOCKET_BROKEN_EVENT 3
+
+int generate_event(int s, int sig)
+{
+    _kernel_swi_regs r;
+    int sockid;
+    int event = 0;
+
+    sockid = s - 1;
+    if (sockid < 0)
+	return(NULL);
+
+    switch (sig)
+    {
+      case SIGIO:
+	event = SOCKET_ASYNC_EVENT;
+	break;
+
+      case SIGURG:
+	event = SOCKET_URGENT_EVENT;
+	break;
+
+      case SIGPIPE:
+	event = SOCKET_BROKEN_EVENT;
+	break;
+
+      default:
+	return(NULL);
+    }
+
+    r.r[0] = INTERNET_EVENT;
+    r.r[1] = event;
+    r.r[2] = sockid;
+    return(_kernel_swi(XOS_Bit | OS_GenerateEvent, &r, &r) != 0 ? -1 : 0);
+}
+
+rsignal(int s, int m, int sa, int esrc, int unit, int swinum, int n)
+{
+    _kernel_swi_regs r;
+    int sockid;
+
+    sockid = s - 1;
+    if (sockid < 0)
+	return (0);
+
+    r.r[0] = sockid;
+    r.r[1] = m;
+    r.r[2] = sa;
+    r.r[3] = esrc;
+    r.r[4] = unit;
+    r.r[5] = swinum;
+    r.r[6] = n;
+    return(_kernel_swi(XOS_Bit | Econet_InetRxDirect, &r, &r) != 0 ? -1 : 0);
+}
+
+_kernel_oserror *calleverytick(int (*fun)())
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = TickerV;
+    r.r[1] = (int)fun;
+    r.r[2] = (int)module_wsp;
+    return(_kernel_swi(XOS_Bit | OS_Claim, &r, &r));
+}
+
+removetickerevent(int (*fun)())
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = TickerV;
+    r.r[1] = (int)fun;
+    r.r[2] = (int)module_wsp;
+    (void)_kernel_swi(XOS_Bit | OS_Release, &r, &r);
+}
+
+init_callout(void)
+{
+    int i;
+
+    callo_pending = 0;
+    calltodo.c_next = 0;
+    callfree = &callout[0];
+    for (i = 1; i < ncallout; i++)
+	callout[i-1].c_next = &callout[i];
+}
+
+tick_handler(int *r, void *pw)
+{
+    struct callout *p1;
+    int needtocall = 0;
+
+    /*
+     * Update real-time timeout queue.
+     * At front of queue are some number of events which are ``due''.
+     * The time to these is <= 0 and if negative represents the
+     * number of ticks which have passed since it was supposed to happen.
+     * The rest of the q elements (times > 0) are events yet to happen,
+     * where the time for each is given as a delta from the previous.
+     * Decrementing just the first of these serves to decrement the time
+     * to all events.
+     */
+    p1 = calltodo.c_next;
+    while (p1)
+    {
+	if (p1->c_time > 0 && --p1->c_time == 0)
+	{
+	    needtocall = 1;
+	    break;
+	}
+
+	p1 = p1->c_next;
+    }
+
+    if (needtocall)
+	schednetisr(NETISR_CALLO);
+
+    return (1);
+}
+
+/*
+ * callout handler
+ */
+callo_handler(void)
+{
+    struct callout *p1;
+    caddr_t arg;
+    int (*func)();
+    int a;
+
+    for (;;)
+    {
+	if ((p1 = calltodo.c_next) == 0 || p1->c_time > 0)
+	    return;
+
+	arg = p1->c_arg; func = p1->c_func; a = p1->c_time;
+	calltodo.c_next = p1->c_next;
+	p1->c_next = callfree;
+	callfree = p1;
+	(*func)(arg);
+    }
+}
+
+/*
+ * Arrange that (*fun)(arg) is called in t/hz seconds.
+ */
+timeout(int (*fun)(), caddr_t arg, int t)
+{
+    struct callout *p1, *p2, *pnew;
+    int s = splimp();
+
+    if (t <= 0)
+	t = 1;
+
+    pnew = callfree;
+    if (pnew == NULL)
+    {
+	panic("timeout table overflow");
+	splx(s);
+	return;
+    }
+
+    callfree = pnew->c_next;
+    pnew->c_arg = arg;
+    pnew->c_func = fun;
+    for (p1 = &calltodo; (p2 = p1->c_next) && p2->c_time < t; p1 = p2)
+	if (p2->c_time > 0)
+	    t -= p2->c_time;
+
+    p1->c_next = pnew;
+    pnew->c_next = p2;
+    pnew->c_time = t;
+
+    if (p2)
+	p2->c_time -= t;
+
+    splx(s);
+}
+
+/*
+ * untimeout is called to remove a function timeout call
+ * from the callout structure.
+ */
+untimeout(int (*fun)(), caddr_t arg)
+{
+    struct callout *p1, *p2;
+    int s = splimp();
+
+    for (p1 = &calltodo; (p2 = p1->c_next) != 0; p1 = p2)
+    {
+	if (p2->c_func == fun && p2->c_arg == arg)
+	{
+	    if (p2->c_next && p2->c_time > 0)
+		p2->c_next->c_time += p2->c_time;
+
+	    p1->c_next = p2->c_next;
+	    p2->c_next = callfree;
+	    callfree = p2;
+
+	    break;
+	}
+    }
+
+    splx(s);
+}
+
+hzto(struct timeval *tv)
+{
+    long ticks = 0;
+
+    if (tv->tv_sec > 0)
+	ticks += (tv->tv_sec * 100);
+
+    if (tv->tv_usec > 0)
+	ticks += (tv->tv_usec / 10000);
+
+    return (ticks);
+}
+
+uiomove(char *cp, int n, enum uio_rw rw, struct uio *uio)
+{
+    struct iovec *iov;
+    u_int cnt;
+
+    while (n > 0 && uio->uio_resid)
+    {
+	iov = uio->uio_iov;
+	cnt = iov->iov_len;
+
+	if (cnt == 0)
+	{
+	    uio->uio_iov++;
+	    uio->uio_iovcnt--;
+	    continue;
+	}
+
+	if (cnt > n)
+	    cnt = n;
+
+	if (rw == UIO_READ)
+	    memcpy (iov->iov_base, cp, cnt);
+	else
+	    memcpy (cp, iov->iov_base, cnt);
+
+	iov->iov_base += cnt;
+	iov->iov_len -= cnt;
+	uio->uio_resid -= cnt;
+	uio->uio_offset += cnt;
+	cp += cnt;
+	n -= cnt;
+    }
+
+    return (0);
+}
+
+copyout(caddr_t from, caddr_t to, int cnt)
+{
+    memcpy(to, from, cnt);
+    return (0);
+}
+
+copyin(caddr_t from, caddr_t to, int cnt)
+{
+    memcpy(to, from, cnt);
+    return (0);
+}
+
+void ovbcopy(caddr_t f, caddr_t t, int count)
+{
+    u_char *from = (u_char *)f, *to = (u_char *)t;
+    if (from < to)
+    {
+	from += count;
+	to += count;
+	while (count-- > 0)
+	    *--to = *--from;
+    }
+    else
+	while (count-- > 0)
+	    *to++ = *from++;
+}
+
+extern char panicbuf[];
+
+panic(char *str)
+{
+    int i;
+
+    if (paniced)
+	return;
+
+    paniced = 1;
+
+    strncpy(panicbuf, str, PANICBUFLEN - 1);
+    panicbuf[PANICBUFLEN - 1] = '\0';
+}
+
+#if 0
+# define NSTAB	12
+#else
+# define NSTAB	96
+#endif
+
+struct stab_entry
+{
+    char	 *event;
+    volatile int  flag;
+} stable[NSTAB] = { 0 };
+
+sleeptabinit(void)
+{
+    struct stab_entry *s;
+
+    for (s = &stable[0]; s < &stable[NSTAB]; s++)
+    {
+	s->event = (char *)NULL;
+	s->flag = 0;
+    }
+
+    return(0);
+}
+
+sleep(caddr_t event, int prio)
+{
+    struct stab_entry *s;
+    int ms = splimp();
+
+    for (s = &stable[0]; s < &stable[NSTAB]; s++)
+    {
+	if (s->event == (char *)NULL)
+	{
+	    s->event = event;
+	    s->flag = 0;
+	    splx(ms);
+
+	    while (s->flag == 0)
+	    {
+		if (escape_seen())
+		{
+		    ms = splimp();
+		    s->event = (char *)NULL;
+		    s->flag = 0;
+		    splx(ms);
+		    return (1);
+		}
+
+		user_mode_donothing();
+	    }
+
+	    ms = splimp();
+	    s->event = (char *)NULL;
+	    s->flag = 0;
+	    splx(ms);
+	    return (0);
+	}
+    }
+
+    splx(ms);
+    panic("sleep");
+    return (-1);
+}
+
+wakeup(caddr_t event)
+{
+    struct stab_entry *s;
+    int ms = splimp();
+
+    for (s = &stable[0]; s < &stable[NSTAB]; s++)
+	if (s->event == event)
+	    s->flag = 1;
+
+    splx(ms);
+}
+
+imin(int a, int b)
+{
+    return (a < b ? a : b);
+}
+
+imax(int a, int b)
+{
+    return (a > b ? a : b);
+}
+
+unsigned min(u_int a, u_int b)
+{
+    return (a < b ? a : b);
+}
+
+unsigned max(u_int a, u_int b)
+{
+    return (a > b ? a : b);
+}
+
+#define NBITS 32
+
+ffs(long mask)
+{
+    int i;
+
+    for (i = 0; i < NBITS; i++)
+    {
+	if (mask & 1)
+	    return (i+1);
+	mask >>= 1;
+    }
+
+    return (0);
+}
+
+void bcopy(char *src, char *dst, int length)
+{
+    memcpy(dst, src, length);
+}
+
+int bcmp(char *b1, char *b2, int length)
+{
+    return (memcmp(b1, b2, length));
+}
+
+void bzero(char *b, int length)
+{
+    memset(b, 0, length);
+}
+
+htonl(u_long x)
+{
+    return ( ntohl(x) );
+}
+
+htons(int x)
+{
+    return ( ntohs(x) );
+}
+
+ntohl(u_long x)
+{
+    return( ((x & 0xff) << 24) | ((x & 0xff00) << 8) | \
+	   ((x & 0xff0000) >> 8) | ((x & 0xff000000) >> 24) );
+}
+
+ntohs(int x)
+{
+    return ( (x & 0xff) << 8 | (x & 0xff00) >> 8 );
+}
+
+struct qelem
+{
+    struct qelem *q_forw;
+    struct qelem *q_back;
+    char *q_data;
+};
+
+void _insque(struct qelem *elem, struct qelem *pred)
+{
+    int s = splhi();
+
+    if (pred == 0 || elem == 0)
+    {
+	splrestore(s);
+	return;
+    }
+
+    if (pred->q_forw)
+	pred->q_forw->q_back = elem;
+
+    elem->q_forw = pred->q_forw;
+    pred->q_forw = elem;
+    elem->q_back = pred;
+
+    splrestore(s);
+}
+
+void _remque(struct qelem *elem)
+{
+    int s = splhi();
+
+    if (elem == 0)
+    {
+	splrestore(s);
+	return;
+    }
+
+    if (elem->q_back != 0)
+	elem->q_back->q_forw = elem->q_forw;
+
+    if (elem->q_forw)
+	elem->q_forw->q_back = elem->q_back;
+
+    splrestore(s);
+}
+
+void callback_init(void)
+{
+    struct callback_record *cbptr;
+    extern void callb_entry(void);
+    extern void startup_entry(void);
+
+    /*
+     * manually fill in the callback tables here
+     */
+    cbptr = callbacks + CALLB_CALLB;
+    cbptr->cb_entry = callb_entry;
+    cbptr->cb_outstanding = 0;
+
+    cbptr = callbacks + CALLB_STARTUP;
+    cbptr->cb_entry = startup_entry;
+    cbptr->cb_outstanding = 0;
+}
+
+void callback_finalise(void)
+{
+    int i;
+    _kernel_swi_regs r;
+    int s = splimp();
+
+    /*
+     * fill in module address
+     */
+    r.r[1] = (int)module_wsp;
+
+    /*
+     * loop over all possible callbacks
+     */
+    for( i = 0; i < NCALLBACKS; ++i )
+    {
+	struct callback_record *cbptr = callbacks + i;
+
+	r.r[0] = (int)(cbptr->cb_entry);
+
+	while( cbptr->cb_outstanding > 0 )
+	{
+	    (void)_kernel_swi(XOS_Bit | OS_RemoveCallBack, &r, &r);
+	    cbptr->cb_outstanding--;
+	}
+    }
+
+    splx(s);
+}
+
+void callback_entered(int callbackno)
+{
+    int s = splimp();
+
+    callbacks[callbackno].cb_outstanding--;
+    splx(s);
+}
+
+int callback(int callbackno)
+{
+    _kernel_swi_regs r;
+    struct callback_record *cbptr = callbacks + callbackno;
+    int s = splimp();
+
+    cbptr->cb_outstanding++;
+    splx(s);
+
+    r.r[0] = (int)cbptr->cb_entry;
+    r.r[1] = (int)module_wsp;
+    return((_kernel_swi(XOS_Bit | OS_AddCallBack, &r, &r) != NULL) ? -1 : 0);
+}
+
+/* EOF unixenv.c */

@@ -1,0 +1,652 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/ShareFS/sharep.c:networking  1.5  $
+ * $Source: /ax/networking:Starling/ShareFS/ShareFS/sharep.c: $
+ *
+ * $Log:	sharep.c,v $
+ * Revision 1.5  95/03/20  15:00:43  kwelton
+ * Improved the formatting of the error message printed by module_command()
+ * when startup is false.
+ * 
+ * Revision 1.4  95/03/15  11:46:40  pwain
+ * Fixed the share::.boot.!shareboot not working for AccessPlus.
+ * Upped WINDOWSIZE to 4 for all versions. Added *sharefswindow
+ * command to view WINDOWSIZE and set WINDOWSIZE (in internet.c)
+ * Version number changed to x.33
+ * 
+ * Revision 1.3  95/02/13  15:35:44  pwain
+ * Minor alteration to debugging routines
+ * 
+ * 
+ * Revision 1.2  95/02/01  10:16:38  pwain
+ * Lots of changes! Main ones include:
+ * + Lots of debug messages
+ * + Some change of structure to allow ROM based loading
+ *   of ShareFS
+ * + Comments added
+ * 
+ * Revision 1.1  95/01/09  13:53:24  kwelton
+ * Initial revision
+ * 
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "ker.h"
+#include "ModuleWrap.h"
+#include "lookup.h"
+#include "util.h"
+#include "remswis.h"
+#include "debug.h"
+#include "swis.h"
+#include "how.h"
+#include "msgproc.h"
+#include "ticker.h"
+#include "modface.h"
+#include "swis.h"
+#include "freeway.h"
+
+#define __system_io
+typedef int FILEHANDLE;
+#include "ralloc.h"
+
+/* #define FIXINETBUG */
+
+char ModuleName[] = "ShareFS";
+
+static struct
+{
+    int e_nbr;
+    char e_string[36];
+} ebuf =
+{
+     0
+};
+
+struct dib {
+    unsigned int   dib_swibase;
+    char          *dib_name;
+    unsigned int   dib_unit;
+    unsigned char *dib_address;
+    char 	  *dib_module;
+    char	  *dib_location;
+    char	  *dib_slot;
+    };
+struct chaindib {
+    struct chaindib *chd_next;
+    struct dib	    *chd_dib;
+    };
+
+#define READCMOS         161
+#define AccessBoot       0xc3
+#define AccessNoBootBit  0x2
+/*
+#define Service_FreewayStarting           0x95
+*/
+
+/*
+ * These are a few flags. They should probably NOT be globals....
+ */ 
+static int no_templates=1;	/* we havent read the templates file */
+static int freeway_running=0;	/* freeway isnt running */
+/* static int missed_fwstarting=0; A freeway starting call has to be */
+				/* processed still. */
+static int startup=0;		/* Startup isnt finished. */
+
+/*
+ * A few functions to enable ROM based startup.
+ */
+/* static error *module_finish_init(void); Calls dependant on other modules */
+static error *module_find_freeway(int *found_freeway); /* Is Freeway there */
+static void check_templates(void); /* Check and/or load templates */
+
+/*
+ * Look to see if the right environment variables are set.
+ */
+static error *is_access_configured(void)
+{
+    _kernel_swi_regs r;
+    char buf[32];
+
+    r.r[0] = (int) "Access$SoftBoot";
+    r.r[1] = (int) buf;
+    r.r[2] = 32;
+    r.r[3] = 0;
+    r.r[4] = 0;
+    if (_kernel_swi(XOS_Bit | OS_ReadVarVal, &r, &r) == 0)
+	return ((_kernel_oserror *) 0);
+
+    r.r[0] = READCMOS;
+    r.r[1] = AccessBoot;
+    if (_kernel_swi(XOS_Bit | OS_Byte, &r, &r) == 0 &&
+	(r.r[2] & AccessNoBootBit) == 0)
+	return ((_kernel_oserror *) 0);
+
+    strcpy(ebuf.e_string, "Acorn Access not configured");
+    ebuf.e_nbr = 0;
+    return ((error *) & ebuf);
+}
+
+/*
+ * Graceful shutdown.
+ */
+void module_finalise(void)
+{
+    filer_clear();		/* P:0 */
+    fs_finalise();
+    remoted_clear();
+    turnoff();
+    lookup_clear();
+#ifdef DEBUG2
+    ticker_clear();
+    rfreeall();
+#endif
+}
+
+
+/*
+ * From a module, these extra data structures get allocated in rma by
+ * a clib routine called sys_alloc, which seems to mean that they
+ * get freed when the user mode code exits. This causes subsequent
+ * use of printf etc. to corrupt whatever allocates the rma afterward.
+ * This routine moves the pointers into the data area of the module,
+ * so we can safely exit the user mode part over and over.
+ * This should be called before any use of stdio, ie as the first
+ * thing in the module_initialise routine.
+ */
+static struct __extradata
+{
+    int kkk[6];
+} __iob_extra[_SYS_OPEN] =
+{
+     0
+};
+
+static void fixstdio(void)
+{
+    int i;
+    for (i = 0; i < _SYS_OPEN; i++)
+	__iob[i].__extrap = &__iob_extra[i];
+}
+
+/*
+ * This is the main initialise routine.
+ */
+error *module_initialise(char *cmd_tail, int podule_base, void *privw)
+{
+    error *err;			/* P:3 */
+
+    cmd_tail = cmd_tail;
+    podule_base = podule_base;
+
+    private_word = privw;
+
+    fixstdio();
+
+    /*
+     * Are we configured environment wise?
+     */
+    err = is_access_configured();
+    if (err)
+	return err;
+
+    /*
+     * Setup some globals in the file handler code.
+     */
+    err = fs_initialise();
+    if (err)
+	return err;		/* P:0 */
+
+#ifdef FIXINETBUG
+    {
+	/*
+	 * Fix up bug in gethostent routine, using zapped version
+	 * with global labels 
+	 */
+	extern char hostaddr[];
+	extern char *host_addrs[2];
+	host_addrs[0] = hostaddr;
+    }
+#endif
+
+    /*
+     * Grr.. because a module is not in the service chain during its
+     * initialisation, be have to wait till a callback to enable the
+     * transport 
+     */
+
+    /*
+     * Basically it goes like this. There isnt any point starting if
+     * we dont have freeway up and running...
+     */
+    err = module_find_freeway(&freeway_running);
+    if (!freeway_running) {
+       return (error *)0;
+       }
+    else if (err) {
+       return err;
+       }
+
+    /*
+     * .... _OR_ if we dont have the required templates....
+     */
+    check_templates();
+
+    /* Check templates now finishes initialisation so we dont need to
+     * do that here. This allows for initialisation to be finished as
+     * soon as we can. -- 310195 
+     */
+    return (error *)0;
+}
+
+static error *module_finish_init(void)
+{
+    error *err;
+
+    err = remoted_init();	/* P:3 */
+
+    if (err)
+	lookup_clear();		/* P:0 */
+    else {
+	CallAfter((void (*) ()) turnon, 0);	/* P:3 */
+	/*
+	 * If we get this far we must be running!
+	 */
+	startup=1;
+	}
+
+    return err;			/* P:3 */
+}
+
+void module_service(int service_number, regs *r, void *private_word)
+{
+    service_number = service_number;	/* P:9942 */
+    private_word = private_word;
+
+#ifdef DEBUG
+    Printf("MS>> Recieved Service call: %x\n",service_number);
+#endif
+
+/*
+ * If freeway is running but we dont have the templates yet, check to see
+ * if we can find them. If we can, open them, finish intialisation and 
+ * then service the call.
+ * 
+ * If we enter this code when a FilerClose call is encountered, we 
+ * recurse!
+ */
+
+    if (freeway_running && no_templates) {
+    /*
+     * No need to error check this call since if it find the templates
+     * it will set the correct flag values.
+     */
+        check_templates();
+    }
+
+/*
+ * Otherwise look to see if the service call going around is that for
+ * Freeway starting. If it is, accept that freeway has started, and look
+ * to see if the templates are avaliable.
+ */
+    else if ((!freeway_running)&&(service_number==Service_FreewayStarting)) {
+        freeway_running=1; /* Take freeways word for it. */
+#ifdef DEBUG
+        Printf("MS> Freeway now running - checking for templates.\n");
+#endif
+	check_templates();
+    }
+
+    /*
+     * If we got through all that and/or are now running we can act upon
+     * the service call.
+     */
+    if (startup) {
+#ifdef DEBUG
+        Printf("MS> Evaluating service call: 0x%x.\n",r->r[1]);
+#endif
+        inet_service(r); 
+        fs_service(r);
+        filer_service(r);
+        remoted_service(r);
+	}
+    else {
+	/*
+	 * This is a catchall for the case when we have no templates
+	 * so couldnt act on the freeway starting case. Note that
+	 * this should only be entered in two case:
+	 *
+	 * 1) when we didnt know freeway was active and
+	 * 2) we hadnt been able to access the templates. 
+	 *
+	 * If this is the case, then later on we can fake a 
+	 * freeway starting service call.
+	 *
+	 * No longer used - pwain - 010295
+	 *
+	 * if (r->r[1]==Service_FreewayStarting) {
+	 *    missed_fwstarting=1;
+	 *    }
+	 */
+	}
+}
+
+error *module_command(char *s, int argc, int cmd_no, void *privw)
+{
+    char buf[256];		/* P:27 */
+    char *t;
+    char *argv[20];
+    int c, f, b;
+    argc = argc;
+    privw = privw;
+
+/*
+ * If freeway is running but we dont have the templates yet, check to see
+ * if we can find them. If we can, open them, finish intialisation and 
+ * then service the command line request.
+ * 
+ * If we enter this code when a FilerClose call is encountered, we 
+ * recurse!
+ */
+
+    if (freeway_running && no_templates) {
+    /*
+     * No need to error check this call since if it find the templates
+     * it will set the correct flag values.
+     */
+        check_templates();
+    }
+
+    /* 
+     * If we are not running we need to disable the command line
+     * interface in order to stop Message Token errors. That said we
+     * also need to tell the kernel that we would have claimed the
+     * message but that we cant do anything at the momenmt.
+     */
+    if (!startup)
+    {
+	printf("ShareFS is not fully initialised\n"
+	       "Possible reasons:\n"
+	       "    a)  No Ethernet driver found\n"
+	       "    b)  Freeway is not running\n");
+        return(NULL);
+    }
+
+    /*
+     * Otherwise process the command line.
+     */
+    if (cmd_no == 8)
+    {
+	/* configure */
+	setshareboot(s);
+	return NULL;
+    }
+
+    for (c = 1, f = 0, t = buf;
+	 t < buf + sizeof(buf) && (b = *s++) >= ' ';)	/* P:531 */
+    {
+	if (f)			/* P:225 */
+	    *t++ = (b == ' ') ? f = 0 : b;	/* P:188 */
+	else
+	if (b != ' ')		/* P:225 */
+	    argv[c++] = t, *t++ = b, f = 1;	/* P:37 */
+    }
+
+    *t = 0;
+
+#ifdef DEBUG2
+    {
+	extern _kernel_oserror *lasterror;
+	if (lasterror)
+	    printf("lasterror = %x %s\n",
+		   lasterror->errnum, lasterror->errmess);	/* P:2 */
+    }
+
+    if (argc >= 2 && !stricmp(argv[1], "debug"))	/* P:15 */
+    {
+	debug = atoi(argv[2]);
+	return 0;
+    }				/* P:14 */
+
+    if (argc >= 2 && !strnicmp(argv[1], "rallocDEBUG ", 10))	/* P:8 */
+    {
+	rallocdebug = atoi(argv[2]);	/* P:0 */
+	return NULL;		/* P:0 */
+    }
+    else
+    if (argc >= 1 && !strnicmp(argv[1], "rcheckall", 9))	/* P:29 */
+    {
+	rcheckall();		/* P:0 */
+	return NULL;		/* P:0 */
+    }
+#endif
+
+#ifdef PROFILING
+    else
+    if (argc >= 2 && !stricmp(argv[1], "mapstore"))	/* P:22 */
+    {
+	_fmapstore(argv[2]);
+	return 0;
+    }				/* P:9 */
+#endif
+
+    if (cmd_no==13) /* new command added 150395 to set window size */
+	return setwindowsize(cmd_no, argc, argv);
+    else
+    if (cmd_no < 3)
+	return remoted_command(cmd_no, argc, argv);	/* P:22 */
+    else
+    if (cmd_no < 8)
+	return DoCommand(cmd_no - 3, argc, argv);	/* P:0 */
+    else
+    if (cmd_no < 11)
+	return filer_command(cmd_no - 9, argc, argv);	/* P:3 */
+    else
+	return remoted_command(cmd_no, argc, argv);
+}
+
+error *module_swi(int swinum, regs * r, void *privw)
+{
+    _kernel_oserror *remoted_addexport(char *mountname, char *exportpath,
+				        struct how how, int pin);
+    _kernel_oserror *remoted_removeexport(char *mountname);
+
+    privw = privw;
+
+/*
+ * If freeway is running but we dont have the templates yet, check to see
+ * if we can find them. If we can, open them, finish intialisation and 
+ * then service the call.
+ */
+
+#ifdef DEBUG
+    Printf("SWI> Swi call: %x\n",swinum);
+#endif
+
+    if (freeway_running && no_templates) {
+        check_templates();
+        }
+
+/*
+ * If we have started up then we can service the call.
+ */
+    if (startup) {
+        switch (swinum)		/* P:0 */
+        {
+          case ShareFS_CreateShare & 63:
+	    /* P:0 */
+	    {
+	        struct how how = defaulthow;
+	        how.owner = !(r->r[0] & 01);
+	        how.readonly = !!(r->r[0] & 02);
+	        how.hidden = !!(r->r[0] & 04);
+	        how.subdir = !!(r->r[0] & 010);
+	        how.cdrom = (!!(r->r[0] & 020)) | ((r->r[0] == 040));
+	        how.auth = !!(r->r[0] & 040);
+	        return (remoted_addexport((char *) r->r[1], (char *) r->r[2],
+				      how, r->r[3]));	/* P:0 */
+	    }
+
+          case ShareFS_StopShare & 63:
+	    /* P:0 */
+	    return (remoted_removeexport((char *) r->r[1]));
+	    /* P:0 */
+
+          case ShareFS_EnumerateShared & 63:
+	    /* P:0 */
+	    return (remoted_enumerateexports(r));	/* P:0 */
+
+          default:			/* P:0 */
+	    return (lookuperr(ERRBadSWI, "BadSWI", ModuleName)); /* P:0 */
+	    }
+        }
+
+    return (error *)0;
+}
+
+struct moreproc *makemp(moreproc *mp)
+{
+    moreprocstr m;		/* P:3248 */
+    m.fn = mp;			/* Arh! all this to avoid a compiler
+				 * warning */
+    return (*(struct moreproc **) & m);	/* P:3248 */
+}
+
+_kernel_oserror *domoreproc(struct moreproc *mp, int client, char *next,
+			     int nextsize, char *buf, int bufsize,
+			     char **outbuf, int *outbufsize)
+{
+    return (*((moreprocstr *) & mp)->fn) (client, next, nextsize, buf,
+					  bufsize, outbuf, outbufsize);
+}
+
+/*
+ * Look to see if Freeway is running
+ */
+static error *module_find_freeway(int *found_freeway) 
+{
+    int pos=0;
+    int addr;
+    char descriptor;
+    char name[30];
+    _kernel_oserror *err;
+
+    /*
+     * This is a simple (?) call to Freeway to see if it exists.
+     * If freeway is running, the SWI is claimed, or if it is
+     * dormant it is lost. Basically just check for an error to be
+     * returned.
+     */
+#ifdef DEBUG
+    Printf("SFS> Trying to find Freeway\n");
+#endif
+    err=_swix(Freeway_Enumerate, _INR(0, 7) | _OUTR(6, 7), 0,
+	    DOMAIN_DISCS, sizeof(name), &name, sizeof(descriptor),
+	    &descriptor, 0, pos, &addr, &pos);
+
+    /*
+     * If there is an error it doesnt really mean Freeway isnt running
+     */
+    if (err) {
+	/*
+	 * Since we are doing a probe for known Domain Disks if there is
+	 * an error and it is "Type not registered" we can assume
+	 * that Freeway is running.
+	 */
+        if (err->errnum != 0x809f00) {
+#ifdef DEBUG
+            Printf("SFS> SWI call failed. Waiting for Freeway to start.\n");
+            Printf("SFS> SWI error: %x\n", err->errnum);
+            Printf("SFS> SWI error: %s\n", err->errmess);
+#endif
+            return (error *)0;
+            }
+	}
+    /*
+     * Freeway is up and running!
+     */
+#ifdef DEBUG
+    Printf("SFS> SWI call okay. Freeway is running.\n");
+#endif
+    *found_freeway=1;
+    return (error *)0;
+}
+
+/*
+ * This routine looks to see if templates can be found and if so reads them
+ * in. It also completes the rest of the initialisation, and if freeway is
+ * running tries to tell it we exist. 
+ */
+static void check_templates(void) {
+    _kernel_oserror *err;
+    _kernel_swi_regs r;
+
+    r.r[1]=Service_FreewayStarting;
+
+#ifdef DEBUG
+    Printf("CTP> checking for templates.\n");
+#endif
+
+    /*
+     * Try and open the messages file.
+     */
+    lookup_init("Resources:$.Resources.ShareFS.messages");
+
+    /*
+     * Now try and open the templates file for the Access filer
+     */
+    err = filer_init(&no_templates);
+#ifdef DEBUG
+    Printf("CTP> Done checking for templates. Result: %d\n",no_templates);
+#endif
+
+    /*
+     * If we dont have templates, wait. (i.e. return no error)
+     */
+    if (no_templates) {
+#ifdef DEBUG
+       Printf("CTP> Templates not found - waiting.\n");
+#endif
+       return;
+       }
+
+    /*
+     * This is treated separatly for the debug case.
+     */
+    else if (err) {
+
+#ifdef DEBUG
+       Printf("CTP> General error: %x (%d)\n",err->errnum,err->errnum);
+       Printf("CTP> General error: %s\n",err->errmess);
+#endif
+       return;
+       }
+
+    /*
+     * Finish off the initialisation process now that we have the
+     * messages and templates files loaded.
+     */
+#ifdef DEBUG
+    Printf("CTP> Templates found - initialising.\n");
+#endif
+    module_finish_init();
+
+    /* 
+     * If we missed the Freeway starting call, fake it. This is because
+     * some of the routines need to identify themselves to Freeway.
+     * For some reason this doesnt seem to correctly export the local
+     * disk without prodding from a menu though.
+     *
+     * This code makes bugger all difference :) Removed - PWain 010295
+     *
+     * if (missed_fwstarting || freeway_running) {
+     *    inet_service(&r);
+     *    fs_service(&r);
+     *    filer_service(&r);
+     *    remoted_service(&r);
+     *    }
+     */
+    }
+
+/* EOF sharep.c */

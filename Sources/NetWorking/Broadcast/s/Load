@@ -1,0 +1,355 @@
+        SUBT    Filing system interception ==> &.Arthur.Broadcast.Load
+
+MyFS_FileLoad                                           ; All registers can be trashed
+        Push    lr
+        MOV     r14, #Mode_Normal                       ; Set up for a normal load,
+        ST      r14, Mode                               ; with no "interference"
+        ADR     r14, FileInfo
+        STMIA   r14, { r1, r6 }                         ; Save the special field as well
+        [       Debug
+        DSTRING r6, "Broadcast load of Net#",cc
+        DSTRING r1, ":"
+        ]
+        STR     r2, FileLoadAddress                     ; The actual address to load to
+        SWI     XNetFS_GetObjectUID                     ; Same input registers as Load
+        BVS     ErrorInGetUID
+        [       Debug
+        DREG    r6, "XNetFS_GetObjectUID returns UID = &",cc
+        DREG    r7, ""
+        ]
+        CMP     r0, #1                                  ; Check the returned type, clears V
+        ADRLO   r0, ErrorNetFSFileNotFound              ; Type is 0
+        ADRHI   r0, ErrorIsANetFSDirectory              ; Type is 2
+        [       UseMsgTrans
+        LDRNE   r4, FileInfo                            ; First parameter is the filename
+        BLNE    MessageTransErrorLookup1
+        |
+        SETV    NE
+        ]
+        BVS     ErrorInGetUID
+        ADR     r14, LoadAddress                        ; Returns catalog info as well
+        STMIA   r14, { r2, r3, r4, r5 }                 ; Store for exit registers
+        TEQ     r4, #0                                  ; Check for zero length
+        BEQ     ZeroLength                              ; Nothing to do so exit
+        ADR     r14, UID                                ; Store in UID
+        STMIA   r14, { r6, r7 }
+
+        SWI     XNetFS_ReadFSTimeouts                   ; Read NetFS  Rx time-out time 
+        BVS     ErrorInGetUID                           ; To use for broadcast timeout
+        STR     r4, RxTimeoutTime                       ; Tell server my timeout time
+
+        SUBS    r0, r4, #500                            ; Subtract a bit, using 
+        MOVMI   r0, #100                                ; minimum if required
+        STR     r0, ImHereCallBackTime                  ; Use for ImHere CallBack time
+        MOV     r0, #0
+        ASSERT  (:INDEX:FirstInitialisedWord) = 0
+        ADR     r1, LastInitialisedWord
+
+InitialiseLoop
+        DEC     r1, 4
+        TEQ     r1, wp                                  ; The ASSERT says this is the termination
+        STR     r0, [ r1 ]
+        BNE     InitialiseLoop
+        STR     r0, ErrorBuffer                         ; No error has occured yet
+        MOV     r0, #NIL
+        STR     r0, MissingChunkList                    ; Not a client yet so no missing data
+        SWI     XOS_ReadMonotonicTime
+        STRVC   r0, StartTime
+        BLVC    ClaimEconet                             ; Claim ports and enable Tx/Rx Events
+        BVS     ErrorInGetUID
+        ADR     r8, RxControlHandle1
+        BL      OpenControlServerRx                     ; Expect ConnectGrant from anywhere
+        ADR     r8, RxControlHandle2
+        BLVC    OpenControlServerRx                     ; Expect ConnectGrant from anywhere
+        [       Debug
+        BVS     %94
+        DLINE  "OpenControlServerRx returns OK"
+94
+        ]
+        BLVC    DoBroadcast                             ; Broadcast UID of file required
+        [       Debug
+        BVS     %93
+        DLINE  "First broadcast returns OK"
+93
+        ]
+        BVS     ErrorInFile
+        BL      WaitForNetIdle
+        LD      r0, Mode                                ; Have I had a ConnectGrant ?
+        TEQ     r0, #Mode_Client
+        BEQ     ConnectGrantedBeforeLoad
+        [       Debug
+        DLINE  "Opening file"
+        ]
+        ADR     r14, FileInfo                           ; Didn't get a quick reply so open the file myself
+        LDMIA   r14, { r1, r6 }                         ; Filename and special field
+        MOV     r0, #0
+        MOV     r3, #fsnumber_loader :SHL: 16           ; Fake fileswitch handle
+        ADR     r11, NetFS_OpenVector
+        BL      CallNetFS                               ; File handle is now in R1
+        BVC     OpenedOK
+        LDR     r1, [ r0 ]                              ; Check for special case
+        LDR     r2, =ErrorNumber_TooManyOpenFiles + (fsnumber_net :SHL: 8) + &010000
+        TEQ     r1, r2
+        BNE     ErrorInFile                             ; Not a special case, so exit
+        [       Debug
+        DLINE   "Too Many Open Files"
+        ]
+        BL      UnSetImHereCallBack                     ; Ignore extra errors
+        BL      UnSetBroadcastCallBack                  ; Ignore extra errors
+        BL      ReleaseEconet                           ; Ignore extra errors
+        MOV     r0, #fsfile_Load
+        ADR     r14, FileInfo                           ; Reload the entry registers
+        LDMIA   r14, { r1, r6 }                         ; Get the filename and special field
+        LDR     r2, FileLoadAddress                     ; The actual address to load to
+        MOV     r3, #0                                  ; NetFS has a non standard interface
+        ADR     r11, NetFS_FileVector                   ; Now do an actual LOAD
+        [       Debug
+        DREG    r0, "Calling NetFS_File with R0 = &"
+        DREG    r1, "R1 = &", cc
+        DREG    r2, ",  R2 = &", cc
+        DREG    r6, ",  R6 = &"
+        ]
+        Pull    lr
+        B       CallNetFS
+
+        [       UseMsgTrans
+ErrorNetFSFileNotFound
+        DCD     ErrorNumber_NetFSFileNotFound
+        DCB     "NotFnd", 0
+        ALIGN
+
+ErrorIsANetFSDirectory
+        DCD     ErrorNumber_IsANetFSDirectory
+        DCB     "IsADir", 0
+        ALIGN
+        |
+        Err     NetFSFileNotFound
+        Err     IsANetFSDirectory
+        ALIGN
+        ]
+
+OpenedOK
+        [       Debug
+        DREG    r1, "File handle = &"
+        ]
+        ; Start loading the file.  If a ConnectGrant occurs then abandon
+        ; the load and become a Client.  If a ConnectRequest occurs then
+        ; we become the Server.
+        STR     r1, FileHandle                          ; Mark the "loading" state
+        [       False
+        PLP     r10                                     ; Restore interrupt state
+        ]
+        BL      WaitForNetIdle
+        LD      r0, Mode                                ; Have I had a ConnectGrant ?
+        TEQ     r0, #Mode_Client
+        BEQ     ConnectGrantedDuringLoad
+        MOV     r0, #NetFS_StartLoad                    ; Set an enclosing scope for %age
+        LDR     r1, FileLength
+        BL      DoUpCall
+        BVS     ErrorInLoad
+        MOV     r0, #NetFS_PartLoad                     ; Load the file from the FS
+        LDR     r1, FileHandle
+        LDR     r2, FileLoadAddress
+        LDR     r5, FileLength
+        MOV     r4, #0                                  ; Read from start
+GetBytesLoop
+        BL      ReadEscapeState
+        BCC     NoEscapeInGetBytes
+        MOV     r0, #126                                ; Acknowledge ESCape
+        SWI     XOS_Byte                                ; Ignore the error
+        [       Debug
+        ADRL    r0, ErrorEscape                         ; Get a proper error pointer
+        |
+        ADR     r0, ErrorEscape                         ; Get a proper error pointer
+        ]
+        [       UseMsgTrans
+        BL      MessageTransErrorLookup
+        ]
+        B       ErrorInGetBytes                         ; And get out with it
+
+NoEscapeInGetBytes
+        BL      WaitForNetIdle                          ; Wait to see if anybody sends me a re-request (i.e. granted)
+        BVS     ErrorInGetBytes
+        [       False ; Debug
+        Push    r0
+        MOV     r0, #50
+        BL      Wait
+        Pull    r0
+        ]
+        LD      r3, Mode
+        TEQ     r3, #Mode_Client
+   ;     TEQNE   r0, #Mode_Weak
+        BEQ     ConnectGrantedDuringLoad
+        [       CLIOptions
+        LDR     r11, GetBytesSize
+        |
+        MOV     r11, #DefaultGetBytesSize
+        ]
+        CMP     r5, r11
+        MOVGT   r3, r11
+        MOVLE   r3, r5
+        SUB     r5, r5, r3
+        ADR     r11, NetFS_GetBytesVector
+        Push    r3                                      ; Keep the transfer size
+        [       Debug
+        DREG    r3, "Get &", cc
+        ]
+        BL      CallNetFS                               ; NetFS is known to preserve registers except R3
+        [       Debug
+        DREG    r3, " bytes ... NOT transfered &", cc
+        DLINE   " bytes."
+        ]
+        Pull    r3
+        ADD     r2, r2, r3                              ; Address for next transfer
+        ADD     r4, r4, r3                              ; PTR value for next transfer
+        MOV     r7, r1                                  ; Save handle for a moment
+        MOV     r1, r4                                  ; Use this for the percentage
+        BLVC    DoUpCall                                ; Twiddle the percentage
+        MOV     r1, r7                                  ; Restore the handle
+        BVS     ErrorInGetBytes
+        TEQ     r5, #0
+        BNE     GetBytesLoop
+        MOV     r0, #NetFS_FinishLoad
+        BL      DoUpCall
+        BVS     ErrorInLoad
+        MOV     r0, #0
+        STR     r0, FileHandle
+        ADR     r11, NetFS_CloseVector
+        BL      CallNetFS                               ; Close the file
+        BVS     ErrorInFile
+        LD      r0, Mode
+        TEQ     r0, #Mode_Client
+   ;     TEQNE   r0, #Mode_Weak
+        BLEQ    UnSetImHereCallBack                     ; Ignore errors, we're going home
+        TEQ     r0, #Mode_Server
+        BEQ     StartServer
+        ADR     r0, RxControlHandle1
+        BL      AbandonReceive                          ; Ignore errors, we're going home
+        ADR     r0, RxControlHandle2
+        BL      AbandonReceive                          ; Ignore errors, we're going home
+FileLoadEnd                                             ; File successfully loaded
+        BL      UnSetBroadcastCallBack
+        BL      ReleaseChunkList
+        BL      ReleaseEconet
+ZeroLength
+        ADR     r7, FileInfo
+        LDMIA   r7!, { r1, r6 }                         ; Pickup both components of the file name
+        LDMIA   r7, { r2, r3, r4, r5 }                  ; Pickup file info and attributes
+        [       Debug
+        Push    "r0, r1, r14"
+        ADRL    r0, DebugBuffer
+        LDR     r1, [ r0, #DebugPointer - DebugBuffer ]
+        SUB     r1, r1, r0
+        STR     r0, [ r0, #DebugPointer - DebugBuffer ]
+        SWI     OS_WriteN
+        SWI     OS_NewLine
+        Pull    "r0, r1, r14"
+        ]
+        Pull    lr
+        BICS    pc, lr, #VFlag
+
+ErrorInGetUID
+        LDR     r14, [ r0 ]                             ; Get the error number
+        LDR     r10, =ErrorNumber_FileServerNotCapable ; Of generating a UID
+        TEQ     r14, r10                                ; Is it a special case
+        Pull    lr
+        BNE     ErrorExit                               ; No so return with this error, V still set
+        MOV     r0, #OSFile_Load                        ; Restore all registers to call original code
+        ADR     r1, FileInfo
+        LDMIA   r1, { r1, r6 }                          ; Get the special field as well
+        LDR     r2, FileLoadAddress                     ; The actual address to load into
+        MOV     r3, #load_at_given                      ; NetFS requires this even tho' it's not in the spec!
+        ADR     r11, NetFS_FileVector                   ; Let NetFS do the work in the usual way (drop through)
+
+CallNetFS                                               ; Enter NetFS module
+        Push    "r10, wp, lr"                           ; Preserve our workspace pointer
+        LDR     wp, NetFS_R12                           ; Set entry conditions
+        MOV     lr, pc                                  ; Set return address
+        LDR     pc, [ r11 ]                             ; Call routine, given at entry
+        Pull    "r10, wp, pc"                           ; Restore and exit
+
+ErrorInGetBytes                                         ; Entered with R0 is error pointer
+        MOV     r10, r0                                 ; Got an error from GetBytes or DoUpCall
+        MOV     r0, #NetFS_FinishLoad
+        BL      DoUpCall
+        MOV     r0, r10
+ErrorInLoad                                             ; Entered with R0 is error pointer
+        MOV     r10, r0
+        LDR     r1, FileHandle
+        ADR     r11, NetFS_CloseVector
+        BL      CallNetFS                               ; Try to close the file
+        MOV     r0, r10
+ErrorInFile                                             ; Entered with R0 is error pointer
+        Push    r0                                      ; Save the error
+ErrorInFileR0
+        BL      UnSetImHereCallBack                     ; Ignore extra errors
+        BL      UnSetBroadcastCallBack
+        BL      ReleaseChunkList
+        BL      ReleaseEconet                           ; Ignore extra errors
+        Pull    "r0, lr"
+ErrorExit
+        [       Debug
+        Push    "r0, r1, r14"
+        ADRL    r0, DebugBuffer
+        LDR     r1, [ r0, #DebugPointer - DebugBuffer ]
+        SUB     r1, r1, r0
+        STR     r0, [ r0, #DebugPointer - DebugBuffer ]
+        SWI     OS_WriteN
+        SWI     OS_NewLine
+        Pull    "r0, r1, r14"
+        ]
+        ORRS    pc, lr, #VFlag
+
+WaitForNetIdle  ROUT
+        Push    "r0-r3, lr"
+        [       False ; Debug
+        LDR     r3, =Border_Red
+        ADR     r14, VIDC
+        STR     r3, [ r14 ]
+        ]
+        MOV     r3, psr                                 ; Save mode and interrupt status
+        SWI     XOS_ReadMonotonicTime
+        BVS     ExitWaitForIdle
+        MOV     r1, r0                                  ; Keep the initial entry time in R1
+10
+        SWI     XOS_ReadMonotonicTime
+        BVS     ExitWaitForIdle
+        MOV     r2, r0                                  ; Keep the time of setting R14_FIQ in R2
+        TEQP    psr, #(FFlag+IFlag+FIQ_mode)            ; Mode change to access FIQ register
+        NOP
+        MOV     r14_fiq, #0                             ; R14_fiq not used between calls
+        TEQP    r3, #0                                  ; Restore mode and interrupt status
+        NOP                                             ; next instruction uses mode dependent register!
+20
+        LDR     r14, [ wp, #:INDEX:Mode ]               ; Note the explicit use of wp to remind us it is mode dependent
+        TEQ     r14, #Mode_Client
+   ;     TEQNE   r14, #Mode_Weak
+        BEQ     ExitWaitForIdle                         ; We have achieved the mode we want, so exit
+        SWI     XOS_ReadMonotonicTime
+        BVS     ExitWaitForIdle
+        SUB     r14, r0, r1                             ; Compute total time in routine
+        CMP     r14, #MaxWaitDelay                      ; Has the maximum time expired yet
+        BGE     ExitWaitForIdle                         ; Yes, so exit
+        SUB     r14, r0, r2                             ; Compute time since R14_FIQ was last set
+        CMP     r14, #WaitDelay                         ; Is it long enough to claim the net as "idle"?
+        BLT     %20                                     ; Not yet, so wait some more
+        TEQP    psr, #(FFlag+IFlag+FIQ_mode)            ; Mode change to access FIQ register
+        NOP
+        MOV     r2, r14_fiq                             ; Get a copy of the FIQ register
+        TEQP    r3, #0                                  ; Restore mode and interrupt status
+    ;   NOP                                             ; Not required, next instruction not using a banked register
+        CMP     r2, #0                                  ; Corruption implies an FIQ has occured, clears V
+        BNE     %10                                     ; Start the main loop again, because we are not "idle"
+
+ExitWaitForIdle
+        [       False ; Debug
+        LDR     r3, =Border_Lime
+        ADR     r14, VIDC
+        STR     r3, [ r14 ]
+        ]
+        STRVS   r0, [ sp ]
+        Pull    "r0-r3, pc"
+
+        LTORG
+
+        END

@@ -1,0 +1,383 @@
+/* > clipboard.c
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "event.h"
+#include "file.h"
+#include "macros.h"
+#include "msgs.h"
+#include "werr.h"
+#include "wimpx.h"
+#include "win.h"
+
+#include "taskman.h"
+#include <stdio.h>
+#include <string.h>
+
+#include "xfersend.h"
+
+#include "clipboard.h"
+
+enum
+{
+    datareq_SentRequest,
+    datareq_DataSave,
+    datareq_Bounced
+};
+
+#define FOR_CLIPBOARD           msgs_lookup("Oclipboard0:clipboard structures")
+
+static clipboard_itemstr        clip__item = { 0 };
+
+static const clipboard_itemstr  *clip__list = NULL;
+static clipboard_destroyfn      clip__destroy = 0;
+
+static BOOL         clip__hasclipboard = FALSE;
+static void         *clip__anchor = NULL;
+static void         *clip__handle;
+
+static mem_allocfn  clip__alloc = c_alloc;
+static mem_freefn   clip__free = c_free;
+
+static int          clip__msgid = -1;
+static int          clip__xferstate = datareq_Bounced;
+static wimp_msgstr  clip__msg;
+
+/* ------------------------------------------------------------------------------ */
+
+static int list_contains(int filetype, const int *list)
+{
+    int type = filetype;
+    if (list) while ((type = *list++) != -1)
+        if (type == filetype)
+            break;
+    return type;
+}
+
+static const clipboard_itemstr *find_item(int filetype)
+{
+    const clipboard_itemstr *item;
+    for (item = clip__list; item->filetype != -1; item++)
+        if (item->filetype == filetype)
+            return item;
+    return NULL;
+}
+
+static const clipboard_itemstr *list_bestitem(const int *list)
+{
+    int filetype;
+    while ((filetype = *list++) != -1)
+    {
+        const clipboard_itemstr *item = find_item(filetype);
+        if (item)
+            return item;
+    }
+    return NULL;
+}
+
+static int list_bestmatch(const int *list)
+{
+    const clipboard_itemstr *item = list_bestitem(list);
+    return item ? item->filetype : -1;
+}
+
+/* ------------------------------------------------------------------------------ */
+
+static BOOL clip__saveproc(char *filename, void *handle)
+{
+    return os_err(file_save(filename, clip__anchor, clip__item.estsize, clip__item.filetype)) == NULL;
+    UNUSED(handle);
+}
+
+static BOOL clip__sendproc(void *handle, int *maxbuf)
+{
+    return xfersend_sendfile(clip__anchor, clip__item.estsize, maxbuf);
+    UNUSED(handle);
+}
+
+static BOOL clipboard_eventhandler(wimp_eventstr *e, void *handle)
+{
+    if (e->e == wimp_ESEND || e->e == wimp_ESENDWANTACK)
+    {
+        wimp_msgstr *mp = &e->data.msg;
+        switch (mp->hdr.action)
+        {
+            case Message_ClaimEntity:
+/*
+fprintf(stderr, "clipboard claimed by '%s' flags %x\n", taskmanager_name(mp->hdr.task), mp->data.words[0]);
+ */
+                if (mp->data.words[0] & claimentity_Clipboard &&
+                    clip__hasclipboard &&
+                    mp->hdr.my_ref != clip__msgid)
+                {
+                    clipboard_Destroy();
+                    return TRUE;
+                }
+                break;
+
+            case Message_DataRequest:
+            {
+                wimp_msgdatarequest *dp = (wimp_msgdatarequest *)&mp->data;
+/*
+{
+    int *fp = dp->filetype;
+fprintf(stderr, "data request from '%s' flags %x\n", taskmanager_name(mp->hdr.task), dp->flags);
+while (*fp != -1)
+    fprintf(stderr, "type %03x\n", *fp++);
+}
+ */
+                if (clip__hasclipboard && dp->flags & datarequest_Clipboard)
+                {
+                    wimp_msgdatasave        datasave;
+                    const clipboard_itemstr *item = clip__list ? list_bestitem(dp->filetype) : &clip__item;
+                    datasave.w = dp->w;
+                    datasave.i = dp->i;
+                    datasave.x = dp->x;
+                    datasave.y = dp->y;
+                    datasave.estsize = item->estsize;
+                    datasave.type = item->filetype;
+                    strcpy(datasave.leaf, "clipboard");
+
+                    xfersend_paste(&datasave,
+                        item->save ? item->save : clip__saveproc,
+                        item->send ? item->send : clip__sendproc,
+                        clip__handle, mp->hdr.my_ref, mp->hdr.task);
+
+                    return TRUE;
+                }
+                break;
+            }
+
+            case wimp_MDATASAVE:
+                if (mp->hdr.your_ref == clip__msgid)
+                {
+/*
+fprintf(stderr, "datasave reply type %x\n", mp->data.datasave.type);
+ */
+                    clip__xferstate = datareq_DataSave;
+                    clip__msg = e->data.msg;
+                    return TRUE;
+                }
+                break;
+        }
+    }
+    else if (e->e == wimp_EACK)
+    {
+        wimp_msgstr *mp = &e->data.msg;
+        if (mp->hdr.my_ref == clip__msgid)
+        {
+/*
+fprintf(stderr, "clipboard msg bounced\n");
+ */
+            clip__xferstate = datareq_Bounced;
+        }
+    }
+    return FALSE;
+
+    UNUSED(handle);
+}
+
+/* ------------------------------------------------------------------------------ */
+
+static void claim_clipboard(void)
+{
+    if (!clip__hasclipboard)
+    {
+        wimp_msgstr msg;
+        msg.hdr.size = sizeof(wimp_msghdr) + 4;
+        msg.hdr.your_ref = 0;
+        msg.hdr.action = Message_ClaimEntity;
+        msg.data.words[0] = claimentity_Clipboard;
+        no_err(wimp_sendmessage(wimp_ESEND, &msg, 0));
+
+        clip__msgid = msg.hdr.my_ref;
+        clip__hasclipboard = TRUE;
+    }
+}
+
+/* ------------------------------------------------------------------------------ */
+
+static void *clipboard__Create(const clipboard_itemstr *list, clipboard_destroyfn destroyfn, int filetype, const void *data, int size, void *handle)
+{
+    if (clip__alloc(&clip__anchor, size))
+    {
+        if (data)
+            memcpy(clip__anchor, data, size);
+        clip__item.estsize = size;
+        clip__item.filetype = filetype;
+
+        clip__list = list;
+        clip__destroy = destroyfn;
+        clip__handle = handle;
+        claim_clipboard();
+
+        return clip__anchor;
+    }
+    else
+        oom_err(FOR_CLIPBOARD, size);
+    return NULL;
+}
+
+/*
+ * Register one filetype with data
+ */
+
+void *clipboard_Create(int filetype, const void *data, int size)
+{
+    return clipboard__Create(NULL, 0, filetype, data, size, NULL);
+}
+
+/*
+ * Register list by function
+ */
+
+void *clipboard_CreateList(const clipboard_itemstr *list, clipboard_destroyfn destroyfn, const void *data, int size, void *handle)
+{
+    return clipboard__Create(list, destroyfn, -1, data, size, handle);
+}
+
+void clipboard_Destroy(void)
+{
+    if (clip__hasclipboard)
+    {
+        if (clip__destroy)
+            clip__destroy(clip__handle);
+
+        clip__destroy = 0;
+        clip__handle = NULL;
+
+        clip__free(&clip__anchor);
+        clip__hasclipboard = FALSE;
+
+        clip__list = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------------------- */
+
+void *clipboard_Data(int *psize)
+{
+    if (psize)
+        *psize = clip__item.estsize;
+    return clip__anchor;
+}
+
+BOOL clipboard_Local(void)
+{
+    return clip__hasclipboard;
+}
+
+/* ------------------------------------------------------------------------------- */
+
+/*
+ * Paste related routines
+ */
+
+static int copy_list(int *listto, const int *listfrom)
+{
+    int type, *lpto = listto;
+    if (listfrom) while ((type = *listfrom++) != -1)
+        *lpto++ = type;
+    *lpto++ = -1;
+    return lpto - listto - 1;
+}
+
+/*
+ * If datasave == NULL then we set window to -1 and so DATASAVE message returned
+ * (if any) wil come throught to our unknown event handler.
+ * Otherwise it will get delivered to the appropriate window.
+ */
+
+static void send_request(const int *filetype_list, const wimp_msgdatasave *datasave)
+{
+    int                 nitems;
+    wimp_msgstr         msg;
+    wimp_msgdatarequest *dp = (wimp_msgdatarequest *)&msg.data;
+
+    msg.hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdatarequest);
+    msg.hdr.action = Message_DataRequest;
+    msg.hdr.your_ref = 0;
+
+    dp->flags = datarequest_Clipboard;
+    if (datasave)
+    {
+        dp->w = datasave->w;
+        dp->i = datasave->i;
+        dp->x = datasave->x;
+        dp->y = datasave->y;
+    }
+    else
+        dp->w = 0;
+
+    nitems = copy_list(dp->filetype, filetype_list);
+
+    msg.hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdatarequest) + nitems*4;
+    no_err(wimp_sendmessage(wimp_ESENDWANTACK, &msg, 0));
+
+    clip__msgid = msg.hdr.my_ref;
+    clip__xferstate = datareq_SentRequest;
+}
+
+int clipboard_Contains(const int *filetype_list)
+{
+    int filetype = -1;
+    if (clip__hasclipboard)
+    {
+        filetype = clip__list ? list_bestmatch(filetype_list) :
+                                list_contains(clip__item.filetype, filetype_list);
+    }
+    else
+    {
+        send_request(filetype_list, NULL);
+
+        do
+            event_process();
+        while (clip__xferstate == datareq_SentRequest);
+
+        if (clip__xferstate == datareq_DataSave)
+            filetype = list_contains(clip__msg.data.datasave.type, filetype_list);
+    }
+    return filetype;
+}
+
+BOOL clipboard_Paste(const int *filetype_list, const wimp_msgdatasave *datasave)
+{
+    if (!clip__hasclipboard)
+    {
+        send_request(filetype_list, datasave);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------------------ */
+
+static wimp_msgaction clip__messages[] =
+{
+    Message_ClaimEntity,
+    Message_DataRequest,
+    0
+};
+
+void clipboard_Init(void)
+{
+    win_add_unknown_event_processor(clipboard_eventhandler, NULL);
+    no_err(wimp_addmessages(clip__messages));
+}
+
+void clipboard_RegisterMemFns(mem_allocfn alloc_fn, mem_freefn free_fn)
+{
+    clip__alloc = alloc_fn;
+    clip__free = free_fn;
+}
+
+/* eof clipboard.c */
+
+/* -------------------------------------------------------------------------------
+ * Description:
+ * Parameters:
+ * Returns:
+ * Notes:
+ */

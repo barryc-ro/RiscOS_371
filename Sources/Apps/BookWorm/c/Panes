@@ -1,0 +1,463 @@
+
+#ifndef __Panes_h
+#define __Panes_h
+
+/*
+
+:NOTES
+
+   Pane Management library by Merlyn Kline, 1992
+
+   Manages panes stuck to windows and solves the problems associated
+   with order of opening etc.
+
+   NB: a comment consisting entirely of --- tells my automatic header
+       file creator to export the next object to the header file.
+
+   To use this library, you need to build an array of pane descriptions
+   terminated by an entry with a window handle of zero. When an open
+   request is received for the main parent window, it should be passed to
+   pane_open_window() with a pointer to the pane list. The panes will always
+   be opened so that the first one in the list is on top.
+
+   To date, this code has only been tested in these cases:
+      * Main window with internal pane strips up left edge and across top.
+      * Window with two internal panes across top (one scrolling), and one
+        internal pane up the left edge.
+
+:END
+
+   Revision history:
+
+:HISTORY
+     24/09/92 MK   Added rectangle overlap checks to prevent multiple panes
+                   from obscuring each other.
+     25/09/92 MK   Fixed minimum size bugs, tidied up
+     02/11/92 MK   Fixed to allow passing of huge pane widths/heights (>1e5)
+                   to mean open to full extent of pane
+     28/06/93 MK   Added PANE_XFREE/PANE_YFREE flags
+:END
+
+:MESSAGES
+:END
+
+*/
+
+
+#include "stdlib.h"
+
+/*------------------------------------------------------------------------*/
+#include "wimp.h"
+/*------------------------------------------------------------------------*/
+#include "os.h"
+#include "coords.h"
+
+/*------------------------------------------------------------------------*/
+#define PANE_EXTRAWIDTH 64
+
+
+/* Definitions for pane flags */
+/*------------------------------------------------------------------------*/
+#define PANE_LEFTEDGE  1  /* pane is attached to the left edge of window */
+/*------------------------------------------------------------------------*/
+#define PANE_TOPEDGE   2  /* pane is attached to top edge of window */
+/*------------------------------------------------------------------------*/
+#define PANE_XSCROLL   4  /* pane scrolls in sync with x scroll of window */
+/*------------------------------------------------------------------------*/
+#define PANE_YSCROLL   8  /* pane scrolls in sync with y scroll of window */
+/*------------------------------------------------------------------------*/
+#define PANE_ISOPEN   16  /* pane is open and in use */
+#define PANE_MOVEME   32  /* pane needs opening before window */
+/*------------------------------------------------------------------------*/
+#define PANE_XFREE    64  /* X scrolling is free (controlled by client) */
+                          /* (over-rides PANE_XSCROLL) */
+/*------------------------------------------------------------------------*/
+#define PANE_YFREE    64  /* Y scrolling is free (controlled by client) */
+                          /* (over-rides PANE_YSCROLL) */
+
+#ifndef ERROUT
+#define ERROUT(f) {os_error *EE=(f); if(EE) return(EE);}
+#endif
+
+/*
+   Structure used to describe a pane. The pane is attached to one corner
+   of the parent window (first two bits of flags) and is positioned by
+   specifying the position of its bottom left corner relative to this
+   corner of the window. The pane may scroll with the window (next two
+   bits of flags) or may be closed (next bit). The width and height of the
+   pane may also be specified; these may be zero to have the width/height
+   set to be the same as the current value of the same dimension of the
+   parent window or -be to offset by a fixed amount from the width/height
+   of the parent window.
+*/
+/*------------------------------------------------------------------------*/
+typedef struct pane_data
+  {
+  wimp_w   w;      /* window handle of pane */
+  int      flags;  /* pane flags (see above) */
+  int      x0,y0;  /* position of fixed corner of pane relative to
+                      the corner of the window its fixed to */
+  int      width;  /* width of pane, (0=keep same as main window
+                                      -ve=add to width of main w) */
+  int      height; /* height of pane, (0=keep same as main window
+                                       -ve=add to height of main w) */
+  } pane_data;
+
+
+
+
+
+/*------------------------------------------------------------------------*/
+wimp_w pane_true_behind(wimp_w w)
+{
+/*
+    return the handle of the window the given window, w, is *really* behind
+    (ie ignoring any panes above it). This procedure uses the wimp's pane
+    bit and so does not rely on the data structure passed to the main pane
+    management procedures.
+*/
+if(w!=-1)
+  {
+  wimp_wstate state;
+
+  wimp_get_wind_state(w,&state);
+  do
+    {
+    w=(state.flags&wimp_WOPEN)?state.o.behind:0;
+    if(w) wimp_get_wind_state(w,&state);
+    } while(w>0 && (state.flags&wimp_WPANE));
+  }
+return(w);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int pane__overlap(int a,int b,int c,int d)
+{
+BOOL  flag;
+int   t;
+
+do
+  {
+  flag=FALSE;
+  if(c>d) {t=d; d=c; c=t; flag=TRUE;}
+  if(b>c) {t=c; c=b; b=t; flag=TRUE;}
+  if(a>b) {t=b; b=a; a=t; flag=TRUE;}
+  } while(flag);
+
+return(c-b);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int pane__area_overlap(wimp_box *box1,wimp_box *box2)
+{
+if(coords_boxesoverlap(box1,box2))
+  return(pane__overlap(box1->x0,box1->x1,box2->x0,box2->x1)*
+         pane__overlap(box1->y0,box1->y1,box2->y0,box2->y1));
+return(0);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static void pane__calculate_box(pane_data *pane,wimp_openstr *o,wimp_box *box)
+{
+int w,h;
+
+h=pane->height;
+if(h<=0) h+=o->box.y1-o->box.y0;
+w=pane->width;
+if(w<=0) w+=o->box.x1-o->box.x0;
+if(pane->flags&PANE_LEFTEDGE)
+  box->x0=o->box.x0+pane->x0;
+else
+  box->x0=o->box.x1+pane->x0-w;
+if(pane->flags&PANE_TOPEDGE)
+  box->y0=o->box.y1+pane->y0-h;
+else
+  box->y0=o->box.y0+pane->y0;
+box->x1=box->x0+w;
+box->y1=box->y0+h;
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *pane__open_pane(pane_data *pane,wimp_openstr *o,wimp_w behind)
+{
+wimp_openstr paneopen;
+wimp_wstate  state;
+
+ERROUT(wimp_get_wind_state(pane->w,&state))
+paneopen.w=pane->w;
+pane__calculate_box(pane,o,&paneopen.box);
+if(!(state.flags&wimp_WHSCR) && !(pane->flags&PANE_XFREE))
+  paneopen.x=pane->flags&PANE_XSCROLL?o->x:0;
+else
+  paneopen.x=state.o.x;
+if(!(state.flags&wimp_WVSCR) && !(pane->flags&PANE_YFREE))
+  paneopen.y=pane->flags&PANE_YSCROLL?o->y:0;
+else
+  paneopen.y=state.o.y;
+paneopen.behind=behind;
+return(wimp_open_wind(&paneopen));
+}
+
+/*------------------------------------------------------------------------*/
+os_error *pane_open_window(wimp_openstr *o,pane_data *panes)
+{
+/*
+    panes is a pointer to an array of pane_data structures, terminated
+    by an entry wherein the element w is set to 0
+
+    this opens the window indicated in the wimp_openstr and all its panes.
+    the window is limited to a minimum width/height depending on the max
+    fixed width/height of all the panes plus PANE_EXTRAWIDTH
+*/
+wimp_wstate  state;
+wimp_openstr open;
+int          behind,mode;
+
+/*
+    set mode so that 0 == open at bottom of stack
+                     1 == open at top of stack
+                     2 == open behind self (wimp quirk on mode change)
+                     3 == any other case
+*/
+open=*o;
+behind=open.behind;
+if(panes && behind>=0) /* check to see if we're opening behind one of our own panes */
+  {
+  pane_data *p=panes;
+
+  while(p && p->w)
+    {
+    if(p->w==behind) {behind=open.w; p=NULL;}
+    else p++;
+    }
+  }
+if(behind<0)
+  mode=behind+2;
+else
+  mode=open.w==behind?2:3;
+/*  limit minimum size of window */
+if(panes)
+  {
+  int       minwid,minhgt;
+  pane_data *p=panes;
+
+  /* calculate window size limits and fix */
+  minwid=minhgt=0;
+  while(p && p->w)
+    {
+    if(abs(p->width)>minwid) minwid=abs(p->width);
+    if(abs(p->height)>minhgt) minhgt=abs(p->height);
+    p++;
+    }
+  minhgt+=PANE_EXTRAWIDTH;
+  minwid+=PANE_EXTRAWIDTH;
+  if(open.box.x1-open.box.x0<minwid) open.box.x1=open.box.x0+minwid;
+  if(open.box.y1-open.box.y0<minhgt) open.box.y0=open.box.y1-minhgt;
+  }
+switch(mode)
+  {
+  case 0: /* open at bottom of stack */
+    /* move parent window down first so we don't put the panes behind it
+       and cause un-necessary redraws. */
+    ERROUT(wimp_open_wind(&open))
+    if(panes)
+      {
+      pane_data   *p=panes;
+      wimp_wstate state;
+
+      ERROUT(wimp_get_wind_state(open.w,&state))
+      while(p->w && p->w!=state.o.behind) p++;
+      if(!p->w)
+        {
+        /* if we aren't already at the bottom of the stack (ie the window
+           above is not one of our panes) we must open the panes in reverse
+           order to prevent un-necessary redraws of areas of pane which end
+           up overlaying other panes. If we are already at the bottom, this
+           bit is skipped as it would actually cause un-necessary redraws. */
+        behind=pane_true_behind(open.w);
+        while(--p>=panes)
+         if(p->flags&PANE_ISOPEN)
+           ERROUT(pane__open_pane(p,&state.o,behind))
+        }
+      }
+    break;
+  case 1: /* open at top of stack */
+    if(pane_true_behind(open.w)!=-1) /* not already at top */
+      {
+      /* if we're not already at the top of the stack, we must move the
+         panes there, starting with the top one, and then move the parent
+         window behind the bottom pane. */
+      if(panes)
+        {
+        pane_data  *p=panes;
+
+        behind=-1;
+        while(p->w)
+          {
+          if(p->flags&PANE_ISOPEN)
+            {
+            ERROUT(pane__open_pane(p,&open,behind))
+            behind=p->w;
+            }
+          p++;
+          }
+        open.behind=behind;
+        }
+      ERROUT(wimp_open_wind(&open))
+      break;
+      }
+    /* else drop through to case 2, *** no break ***/
+  case 2: /* open behind self (wimp infelicity on mode change) */
+    open.behind=pane_true_behind(open.w); /* fix infelicity in wimp */
+    /* drop through to default case, *** no break ***/
+  default: /* any other case */
+    if(panes)
+      {
+      pane_data   *p=panes;
+      wimp_wstate state;
+      BOOL        horizontal; /* flag indicating pane horizontal */
+      int         xdir;       /* x direction, -1=left */
+      int         ydir;       /* y direction, -1=down */
+      int         pxdir;      /* x direction pane is in */
+      int         pydir;      /* y direction pane is in */
+      wimp_w      temp;
+      int         counter=0;
+
+      ERROUT(wimp_get_wind_state(open.w,&state))
+      ydir=open.box.y1-state.o.box.y1;
+      xdir=open.box.x0-state.o.box.x0;
+      if(ydir<0) ydir=-1; else if(ydir>0) ydir=1;
+      if(xdir<0) xdir=-1; else if(xdir>0) xdir=1;
+      while(p->w)
+        {
+        if(p->flags&PANE_ISOPEN)
+          {
+          p->flags|=PANE_MOVEME;
+          counter++;
+          horizontal=!p->width || (p->width>p->height && p->height);
+          pxdir=p->width?(p->flags&PANE_LEFTEDGE?-1:1):0;
+          pydir=p->height?(p->flags&PANE_TOPEDGE?1:-1):0;
+          /* see if the window is moving towards the pane */
+          if((pxdir!=xdir && pxdir && xdir) || (pydir!=ydir && pydir && ydir))
+            /* if it is, mark the pane for pre-opening */
+            {
+            p->flags&=~PANE_MOVEME;
+            counter--;
+            }
+          }
+        p++;
+        }
+      /* Now open all panes flagged for pre-opening. */
+      /*  This loops round looking for a pane which, when moved, will not
+          overlap any of the panes still to be moved. It does this by
+          comparing the target rectangle of the pane to move with the
+          current rectangle of the others. When it finds one, it moves it
+          and then repeats the process until all are moved. This messy
+          procedure prevents unecessary redraws of the panes. */
+      p=panes;
+      if(counter) /* if there were any flagged for pre-move */
+        {
+        pane_data   *start=NULL;     /* marks start of search */
+        BOOL        first_time=TRUE; /* flag for first time round loop */
+        BOOL        moved_it=TRUE;   /* flag for success */
+        pane_data   *test;           /* pointer to pane we're trying */
+        pane_data   *first;          /* pointer to first pane tried */
+        BOOL        moveok=TRUE;     /* flag to say its ok to move this pane */
+        wimp_box    moveto;          /* where we're trying to move to */
+        wimp_box    movefrom;        /* where we are now */
+        wimp_wstate state;           /* store for pane state */
+
+        p=first=panes;
+        do
+          {
+          test=panes;
+          moveok=TRUE;
+          if(p->flags&PANE_MOVEME) /* if this pane needs moving */
+            {
+            wimp_get_wind_state(p->w,&state);
+            movefrom=state.o.box; /* find out where we are */
+            pane__calculate_box(p,&open,&moveto); /* find target box */
+            while(test->w && moveok) /* for each pane */
+              {
+              if(test!=p && test->flags&PANE_MOVEME)
+                {
+                /* if it needs moving and its not the current one,
+                   see if it overlaps the target rectangle more than
+                   it overlaps the current rectangle */
+                wimp_get_wind_state(test->w,&state);
+                if(pane__area_overlap(&moveto,&state.o.box)>
+                   pane__area_overlap(&movefrom,&state.o.box))
+                  /* if so, don't allow the move (yet) */
+                  moveok=FALSE;
+                }
+              test++;
+              }
+            if(moveok || (p==first && !first_time))
+              {
+              /* if the current pane can safely be moved or if no pane
+                 can safely be moved, move the current pane */
+              ERROUT(wimp_get_wind_state(p->w,&state))
+              ERROUT(pane__open_pane(p,&open,state.o.behind))
+              p->flags&=~PANE_MOVEME; /* clear the 'needs moving' flag */
+              moved_it=TRUE;          /* and flag success */
+              }
+            }
+          first_time=FALSE; /* flag that we've been round once */
+          start=p;
+          do
+            {
+            /* find the next pane that needs moving */
+            p++;
+            if(!p->w) p=panes;
+            } while(!(p->flags&PANE_MOVEME) && p!=start);
+          if(moved_it)
+            {
+            /* reset flags if we've just moved a pane so the search starts
+               again for a new pane which can be moved */
+            moved_it=FALSE;
+            first=p;          /* record where search started */
+            first_time=TRUE;
+            }
+          } while(p!=start); /* if no more panes can be found, finished */
+        }
+      p=panes;
+      temp=open.behind;
+      /* now step back through the panes to the lowest one */
+      while(p->w)
+        {
+        if(pane_true_behind(p->w)==open.behind) temp=p->w;
+        p++;
+        }
+      open.behind=temp;
+      }
+    /* finally, open the window */
+    ERROUT(wimp_open_wind(&open))
+    break;
+  }
+if(panes)
+  {
+  pane_data  *p=panes;
+
+  /* after doing all else, we must get the parent windows final resting place
+     and open the panes again, in the correct position. This is because all
+     previous pane opens have been based on the target position of the
+     parent window. The window may not end up in this position as it could
+     be restricted (eg at screen boundary). */
+  ERROUT(wimp_get_wind_state(open.w,&state))
+  behind=pane_true_behind(open.w);
+  while(p->w)
+    {
+    if(p->flags&PANE_ISOPEN)
+      {
+      ERROUT(pane__open_pane(p,&state.o,behind))
+      behind=p->w;
+      }
+    p++;
+    }
+  }
+return(NULL);
+}
+
+#endif

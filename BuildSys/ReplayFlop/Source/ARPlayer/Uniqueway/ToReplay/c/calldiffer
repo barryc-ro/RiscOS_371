@@ -1,0 +1,847 @@
+/* > calldiffer.c
+
+ * © SJ Middleton, 1993
+
+ * Code that directly controls the compress/join task windows
+ * and sets everything up beforehand and cleans it up afterwards. 
+
+ */
+
+#include "array.h"
+#include "bbc.h"
+#include "dbox.h"
+#include "kernel.h"
+#include "msgs.h"
+#include "swis.h"
+#include "werr.h"
+#include "wimpx.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "file.h"
+#include "filereason.h"
+#include "macros.h"
+#include "replayhdr.h"
+#include "strfn.h"
+#include "sys.h"
+#include "taskwindow.h"
+#include "tasksum.h"
+
+#include "arutils.h"
+
+#include "compress.h"
+
+/* ------------------------------------------------------------------------------------------ */
+
+static taskwindow   task_handle = NULL;
+static tasksum      task_summary = NULL;
+static BOOL         close_pending = FALSE;
+
+#define DIFFER_WIMPSLOT (1024*2)
+#define DIFFER_TASKNAME msgs_lookup("difftask0")
+#define DIFFER_ACTION   msgs_lookup("difftask1")
+
+#define JOINER_WIMPSLOT (512)
+#define JOINER_TASKNAME msgs_lookup("difftask2")
+#define JOINER_ACTION   msgs_lookup("difftask3")
+
+#define SUMMARY_IDENT   "summary"
+#define SUMMARY_TITLE   msgs_lookup("difftask4")
+
+#define WAITING_ACTION  msgs_lookup("difftask5")
+#define DIFFER_ERROR    msgs_lookup("difftask6")  
+#define BAD_SIZE        msgs_lookup("difftask7")
+
+#define OVERWRITE_MSG       msgs_lookup("difftask8")
+#define OVERWRITE_BUTTONS   msgs_lookup("difftask9") 
+
+#define CANT_WRITE_HDR      msgs_lookup("difftask10") 
+#define CANT_WRITE_SPRITE   msgs_lookup("difftask11")
+#define NOT_STARTED         msgs_lookup("difftask12")
+
+#define HALT_FIELD      11
+
+#define filetype_Text 0xfff
+
+/* ------------------------------------------------------------------------------------------ */
+
+static char *get_splitpoint(char *s, int maxchars)
+{
+    char *arg = s, *last_arg;
+
+    do
+    {
+        last_arg = arg;
+        arg = strstr(last_arg+2, " -");
+    }
+    while (arg && arg < s + maxchars);
+
+    return last_arg;
+}
+
+const char *index_string(const compress_str *cp)
+{
+    if (cp->o.flags & compress_UseIndex)
+    {
+        static char s[2];
+        sprintf(s, "%01.1d", cp->o.index);
+        return s;
+    }
+    return "";
+}
+
+BOOL has_differ_started(const compress_str *cp)
+{
+    char buffer[256];
+
+    if (cp->hdr == NULL)
+        return FALSE;
+
+    sprintf(buffer, "%s.%sImages0.00", cp->work_dir, index_string(cp));
+    return file_size(buffer, NULL) > 0;
+}
+
+BOOL is_differ_continuable(const compress_str *cp)
+{
+    char buffer[256];
+
+    if (cp->hdr == NULL || cp->input_file == NULL)
+        return FALSE;
+
+    sprintf(buffer, "%s.%sStopped*", cp->work_dir, index_string(cp));
+    return file_size(buffer, NULL) != -1;
+}
+
+BOOL can_join(const compress_str *cp)
+{
+    if (cp->hdr == NULL)
+        return FALSE;
+    if (cp->hdr->video_format == 0)
+        return TRUE;
+    return has_differ_started(cp);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+/*
+ * Scan open file handles and close any that relate to
+ * the source file or the Log file
+ */
+
+static void close_files(compress_str *cp)
+{
+    int         length = strlen(cp->work_dir);
+    filehandle  i;
+    for (i = 0; i <= 255; i++)
+    {
+        int info;
+        os_swi2r(os_X|OS_Args, OSArgs_ReadInfo, i, &info, 0);
+        if ((info & args_Unallocated) == 0)
+        {
+            char *filename = NULL;
+            file_handletoname(i, &filename);
+            if ((cp->input_file && strcmpi(filename, cp->input_file) == 0) ||
+                strncmpi(filename, cp->work_dir, length) == 0)
+            {
+                file_close(i);
+            }
+            free(filename);
+        }
+    }
+}
+
+static int read_freeslot(void)
+{
+    int current = -1, next = -1, free;
+    no_err(wimp_slotsize(&current, &next, &free));
+    return free;
+}
+
+static BOOL replay_writehdrfile(const char *filename, armovie_hdr *hdr)
+{
+    BOOL        success = FALSE;
+    filehandle  f;
+
+    if (os_err(file_open(fopt_Write, filename, &f)) == NULL)
+    {
+        success = wrap_err(replay_writetexthdr(f, hdr), CANT_WRITE_HDR) == NULL;
+
+        file_close(f);
+        file_settype(filename, filetype_Text);
+    }
+    return success;
+}
+
+static BOOL armovie_extractsound(const char *movie_file, armovie_hdr *hdr, const char *output_file, int soundtrack)
+{
+    BOOL                success = FALSE;
+    filehandle          f_in = 0,
+                        f_out = 0;
+    void                *buffer = NULL;
+    armovie_soundstr    *sp = &hdr->sound[soundtrack-1];
+    int                 size = sp->max_soundsize;
+
+    if (os_err(file_open(fopt_Read, movie_file, &f_in)) == NULL &&
+        os_err(file_open(fopt_Write, output_file, &f_out)) == NULL &&
+        f_alloc(&buffer, size))
+    {
+        int chunk;
+
+        if (sp->precision == 8)
+            file_bput(f_out, 0);
+
+        for (chunk = 0, success = TRUE; chunk < hdr->nchunks && success; chunk++)
+        {
+            armovie_catentry *cp = &sp->chunks[chunk];
+            success = cp->size == 0 ||
+                    (os_err(file_readfrom(f_in, buffer, cp->size, cp->offset)) == NULL &&
+                    os_err(file_write(f_out, buffer, cp->size)) == NULL);
+        }
+
+/*
+        if (success)
+        {
+            int i;
+            if (sp->sflags & armovie_UnsignedSound)
+                memset(buffer, 0x80, size);
+            else
+                memset(buffer, 0, size);
+            for (i = 0; i < 5; i++)
+                os_err(file_write(f_out, buffer, size));
+        }
+*/
+    }
+
+    f_free(&buffer);
+    file_checkclose(&f_in);
+    file_checkclose(&f_out);
+
+    return success;
+}
+
+static BOOL extract_soundfiles(compress_str *cp)
+{
+    int         i;
+    armovie_hdr *hdr = cp->hdr;
+    if (cp->input_file) for (i = 1; i <= hdr->nsoundtracks; i++)
+    {
+        armovie_soundstr *sp = &hdr->sound[i-1];
+        if (sp && sp->format != 0)
+        {
+            char        buffer[256];
+            const char  *infix = "";
+            int n = sprintf(buffer, "%s.", cp->work_dir);
+            switch (sp->precision)
+            {
+                case 4:
+                    infix = "ADPCM";
+                    break;
+                case 8:
+                    infix = "Sound";
+                    break;
+                case 16:
+                    infix = "Samples";
+                    break;
+            }
+            n += sprintf(buffer+n, infix);
+            if (i != 1)
+                n += sprintf(buffer+n, "%d", i);
+
+            if (file_size(buffer, NULL) == -1 &&
+                !armovie_extractsound(cp->input_file, cp->hdr, buffer, i))
+                return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+/*
+ * Joiner control functions
+ */
+
+static void joiner_events(tasksum ts, tasksum_state state, void *handle)
+{
+    join_str *jp = handle;
+    switch (state)
+    {
+        case tasksum_Closed:
+            task_summary = NULL;
+            hdr_open(jp->compress);
+            break;
+
+        case tasksum_Completed:         /* movie completed */
+            if (tasksum_data(ts, NULL) == NULL)
+            {
+                dbox_savepos((dbox)tasksum_syshandle(task_summary));
+                tasksum_dispose(&task_summary);
+            }
+
+            if (jp->open_saveas)
+                cvtwin_saveas(jp->compress);
+            else
+                cvtwin_joined(jp->compress, jp->joined_file);
+            task_handle = NULL;
+            break;
+
+        case tasksum_Aborted:           /* aborted by user */
+            task_handle = NULL;
+            if (!dbox_persist())
+            {
+                dbox_savepos((dbox)tasksum_syshandle(task_summary));
+                tasksum_dispose(&task_summary);
+            }
+            hdr_open(jp->compress);
+            break;
+
+        case tasksum_SaveButton:
+            tasksum_savetext(ts);
+            break;
+    }
+    UNUSED(ts);
+}
+
+static int joiner_buildcommandline(char **ps, const char *filename, const join_str *jp)
+{
+    int     i, n, nsrcfiles, nsrcmovies;
+    char    *s = *ps;
+
+    n = sprintf(s, "/<ARMovie$Dir>.Tools.Join -source %s -dest %s", jp->work_dir, filename);
+
+    if (jp->flags & compress_UseIndex)
+        n += sprintf(s+n, " -index %0d", jp->index);
+
+    if ((jp->flags & compress_JoinKeyFrames) == 0)
+        n += sprintf(s+n, " -nokeys");
+
+/* check how many sound srcfiles actually come from movies */
+    nsrcfiles = NSRCFILES(jp->srcfile);
+    nsrcmovies = 0;
+    for (i = 0; i < nsrcfiles; i++)
+    {
+        sound_trackstr *sp = SRCFILE_PTR(jp->srcfile, i);
+        if (sp->filename)
+            nsrcmovies++;
+    }
+
+/* write out movies used - extending CL block as necessary */
+    if (jp->flags & compress_ARMovieSound && nsrcmovies)
+    {
+        n += sprintf(s+n, " -armovie %d", nsrcmovies);
+        for (i = 0; i < nsrcfiles; i++)
+        {
+            sound_trackstr *sp = SRCFILE_PTR(jp->srcfile, i);
+            if (sp->filename)
+            {
+                int len = strlen(sp->filename);
+                if (strextend(ps, len+2))
+                    n += sprintf(*ps + n, " %s", sp->filename);
+            }
+        }
+    }
+
+    return n;
+}
+
+void calldiffer_join(const char *filename, join_str *jp)
+{
+    char *buffer = malloc(1024);
+    int n = joiner_buildcommandline(&buffer, filename, jp);
+
+    if (n > TaskWindow_SafeCLLen)
+    {
+        char *split_point = get_splitpoint(buffer, TaskWindow_SafeCLLen);
+
+        setenv("Join$ExtraArgs", split_point, 4);
+        setenv(APP_TITLE"$JoinCL2", split_point, 4);
+        *split_point = '\0';
+    }
+    else
+    {
+        setenv("Join$ExtraArgs", NULL, 0);
+        setenv(APP_TITLE"$JoinCL2", NULL, 0);
+    }
+
+    setenv(APP_TITLE"$JoinCL1", buffer, 4);
+    task_handle = taskwindow_new(taskwindow_Quit, JOINER_WIMPSLOT, JOINER_TASKNAME, "%s", buffer);
+
+    if (task_handle)
+    {
+        if (task_summary)
+            tasksum_reattach(task_summary, task_handle, JOINER_ACTION, jp->input_leaf);
+        else
+            task_summary = tasksum_attach(task_handle, SUMMARY_IDENT, SUMMARY_TITLE, JOINER_ACTION, jp->input_leaf);
+    
+        if (task_summary)
+        {
+            dbox_fadefield((dbox)tasksum_syshandle(task_summary), HALT_FIELD);
+            tasksum_eventhandler(task_summary, joiner_events, jp);
+        }
+    }
+}
+
+static join_str joinblk = { 0 };
+
+/*
+ * Returns success
+ */
+
+static BOOL calldiffer_runjoiner(compress_str *cp, const char *output_file)
+{
+    join_str *jp = &joinblk;
+    jp->flags = cp->o.flags & (compress_UseIndex | compress_JoinKeyFrames | compress_ARMovieSound | compress_CompressAudio);
+    jp->index = cp->o.index;
+    jp->input_leaf = cp->input_leaf;
+    jp->work_dir = cp->work_dir;
+
+    jp->srcfile = cp->srcfile;
+    jp->open_saveas = output_file == NULL;
+
+    jp->compress = cp;
+
+    if (output_file == NULL)
+        output_file = cp->output_file;
+
+    if (file_size(output_file, NULL) == -1 ||
+        werr_question(OVERWRITE_BUTTONS, OVERWRITE_MSG, output_file) == 1)
+    {
+        strrplc(&jp->joined_file, output_file);
+        calldiffer_join(jp->joined_file, jp);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+/*
+ * Differ control functions
+ */
+
+#define DIFFER_STATUS   "ARMovie$CompressionStatus"
+#define DIFFER_SUSPEND  "SUSPEND"
+
+/*
+ * Returns TRUE if the movie was suspended or an error has occurred
+ * in which case we don't want to try and continue with joining.
+ */
+
+static BOOL check_differ_error(void)
+{
+    BOOL dont_join = FALSE;
+    char *s = getenv(DIFFER_STATUS);
+    if (s)
+    {
+        dont_join = TRUE;
+        if (strcmpi(s, DIFFER_SUSPEND) != 0)
+            werr(0, DIFFER_ERROR, s);
+        setenv(DIFFER_STATUS, NULL, 0);
+    }
+    return dont_join;
+}
+
+/*
+ * This function is called whenever differing is finished to decide what to do next.
+ */
+  
+static void differ_completed(compress_str *cp)
+{
+#if 0
+    if (cp->o.flags & compress_Batch)
+    {
+        if (!batch_process(cp))
+            hdr_open(cp);
+    }
+    else
+#endif
+    if (!calldiffer_runjoiner(cp, NULL))
+        hdr_open(cp);
+}
+
+/*
+ * Write the updated header file to disc
+ * It saves the original values of some fields and then
+ * updates them with the new values, writes out the header,
+ * then restores the old values afterwards.
+
+ * Starting is TRUE if we are starting compression afresh.
+ * If Continuing or Joining not all the parameters can be changed.
+ */
+
+static BOOL write_header(compress_str *cp)
+{
+    armovie_hdr         *hdr = cp->hdr;
+
+    armovie_soundstr    *sound, *new;
+
+    char    buffer[256];
+    BOOL    success;
+
+    int     file, i, n, track,
+            format, fpc, nsoundtracks;
+    double  fps;
+
+/* save old values */
+    format = hdr->video_format;
+    fpc = hdr->frames_per_chunk;
+    fps = hdr->fps;
+
+    nsoundtracks = hdr->nsoundtracks;
+    sound = hdr->sound;
+ 
+/* setup inuse values */
+    hdr->video_format = cp->inuse.video_format;
+    hdr->fps = cp->inuse.fps;
+    hdr->frames_per_chunk = cp->inuse.frames_per_chunk;
+
+/* This builds an armovie_soundstr array from the track information */
+    new = malloc(cp->nsoundtracks*sizeof(armovie_soundstr));
+
+    hdr->nsoundtracks = cp->nsoundtracks;
+    hdr->sound = new;
+
+    n = NSRCFILES(cp->srcfile);
+    for (file = 0, track = 0; file < n; file++)
+    {
+        sound_trackstr *sp = SRCFILE_PTR(cp->srcfile, file);
+        for (i = 0; i < sp->ntracks; i++, track++)
+        {
+            armovie_soundstr *newp = &new[track];
+            *newp = sp->sound[i];
+
+            if (cp->o.flags & compress_CompressAudio &&
+                 newp->format == replay_StandardAudio &&
+                 newp->precision == 16)
+            {
+                newp->format = replay_IndirectAudio;
+                strcpy(newp->filename, "adpcm");
+            }
+        }
+    }
+
+/* write header */
+    sprintf(buffer, "%s.%sHeader", cp->work_dir, index_string(cp));
+
+    success = replay_writehdrfile(buffer, cp->hdr);
+
+/* restore original values */
+    hdr->video_format = format;
+    hdr->fps = fps;
+    hdr->frames_per_chunk = fpc;
+    hdr->nsoundtracks = nsoundtracks;
+    hdr->sound = sound;
+
+    free(new);
+
+    return success;
+}
+
+static BOOL write_sprite(compress_str *cp)
+{
+    char buffer[256];
+    sprintf(buffer, "%s.Sprite", cp->work_dir);
+    return wrap_err(spr_area_Save(cp->sprite, buffer), CANT_WRITE_SPRITE) == NULL;
+}
+
+static BOOL prepare_differ(compress_str *cp)
+{
+/* create directories */
+    if (os_err(cdir(WORKROOT_DIR)) != NULL ||
+        os_err(cdir(cp->work_dir)) != NULL)
+        return FALSE;
+
+/* extract all sound files */
+    if ((cp->o.flags & compress_ARMovieSound) == 0)
+        if (!extract_soundfiles(cp))
+            return FALSE;
+
+/* setup inuse values */
+    cp->inuse.video_format = cp->o.compressor;
+    cp->inuse.fps = cp->hdr->fps/cp->o.frame_rate_divisor;
+    cp->inuse.frames_per_chunk = cp->o.frames_per_chunk;
+
+/* write out header, default sprite and track list */
+    if (!write_header(cp) || !write_sprite(cp) || !state_write(cp))
+        return FALSE;
+
+    return TRUE;
+}
+
+static int add_limits(char *s, const compress_str *cp)
+{
+    differ_flag f = cp->o.differ.opts;
+    int n = 0;
+    if (f & differ_LimitARM2)
+        n += sprintf(s+n, " -arm2");
+    if (f & differ_FastMatch)
+        n += sprintf(s+n, " -dirty");
+    return n;
+}
+
+static int get_soundsize(const compress_str *cp)
+{
+    int i, n = NSRCFILES(cp->srcfile),
+        sndsize = 0;
+
+    for (i = 0; i < n; i++)
+    {
+        const sound_trackstr    *filep = SRCFILE_PTR(cp->srcfile, i);
+        const armovie_soundstr  *sp = filep->sound;
+        int track;
+        for (track = 0; track < filep->ntracks; track++, sp++)
+            sndsize += (int) ceil(arsnd_realsamplerate(sp)*sp->channels*sp->precision/8);
+    }
+
+    return sndsize;
+}
+
+static int get_framesize(const compress_str *cp)
+{
+    const differ_options *dif = &cp->o.differ;
+    int     nbufs, fpc, soundbytes, chunksize;
+    double  fps = cp->hdr->fps / cp->o.frame_rate_divisor;
+
+    nbufs = dif->opts & differ_DoubleBuffers ? 2 : 1;
+    fpc = cp->o.frames_per_chunk;
+    soundbytes = (int) ceil(get_soundsize(cp)/fps * fpc);
+    chunksize = (int) (((fpc/fps)*nbufs - ((double)dif->latency/LATENCY_UNIT))/nbufs * dif->data_rate*1024 - soundbytes);
+
+    return ((chunksize - soundbytes) &~ 1023) / fpc;
+}
+
+static int differ_buildcommandline(char *s, const compress_str *cp, BOOL restart)
+{
+    compress_flag   flags = cp->o.flags;
+    differ_flag     opts = cp->o.differ.opts;
+    int             n;
+
+    if (cp->inuse.video_format == 1)
+        n = sprintf(s, "/<ARMovie$Dir>.MovingLine.BatchComp");
+    else
+        n = sprintf(s, "/<ARMovie$Dir>.Decomp%d.BatchComp", cp->inuse.video_format);
+
+    n += sprintf(s+n," -source %s -dest %s", cp->input_file, cp->work_dir);
+
+    if (flags & compress_UseIndex)
+        n += sprintf(s + n, " -index %0d", cp->o.index);
+    if (flags & compress_SingleTask)
+        n += sprintf(s + n, " -display %s", cp->o.screen_mode);
+
+    if (restart)
+        n += sprintf(s + n, " -restart");
+    else
+    {
+        switch (opts & differ_FixBy)
+        {
+            case fixby_Quality:
+                n += sprintf(s + n, " -quality %d", cp->o.differ.quality);
+                break;
+
+            case fixby_Size:
+                n += sprintf(s + n, " -size %d", cp->o.differ.frame_size);
+                n += add_limits(s+n, cp);
+                break;
+
+            case fixby_Bandwidth:
+            {
+                int size = get_framesize(cp);
+                if (size <= 0)
+                {
+                    werr(0, BAD_SIZE);
+                    return -1;
+                }
+                n += sprintf(s + n, " -size %d", size);
+                if (opts & differ_DoubleBuffers)
+                    n += sprintf(s + n, " -double");
+                n += add_limits(s+n, cp);
+                break;
+            }
+        }
+    
+        if ((opts & differ_KeyFrames) == 0)
+            n += sprintf(s + n, " -nokeys");
+        if (flags & compress_StartAt)
+            n += sprintf(s + n, " -startat %d", (int)(cp->o.start_at*100.0/cp->hdr->fps + 0.5));
+    }
+
+/* add on filter list */
+    {
+        int i, nfilters = array_size(cp->o.filters);
+        if (nfilters)
+        {
+            n += sprintf(s+n, " -filter %s", ((filter_entry *)array_ptr(cp->o.filters, 0))->name);
+            for (i = 1; i < nfilters; i++)
+                n += sprintf(s+n, ";%s", ((filter_entry *)array_ptr(cp->o.filters, i))->name);
+        }
+    }
+
+    return n;
+}
+
+static void differ_events(tasksum ts, tasksum_state state, void *handle)
+{
+    compress_str *cp = handle;
+    switch (state)
+    {
+        case tasksum_Closed:
+            task_summary = NULL;
+            hdr_open(cp);
+            break;
+
+        case tasksum_Completed:
+            task_handle = NULL;
+            close_files(cp);
+
+            if (!check_differ_error())
+                differ_completed(cp);
+            else
+            {
+                hdr_open(cp);
+                if (close_pending)
+                {
+                    dbox_savepos((dbox)tasksum_syshandle(task_summary));
+                    tasksum_dispose(&task_summary);
+                }
+            }
+            break;
+
+        case tasksum_Aborted:
+            task_handle = NULL;
+            close_files(cp);
+
+            hdr_open(cp);
+
+            if (!dbox_persist())
+            {
+                dbox_savepos((dbox)tasksum_syshandle(task_summary));
+                tasksum_dispose(&task_summary);
+            }
+            break;
+
+        case tasksum_SaveButton:
+            tasksum_savetext(ts);
+            break;
+
+        case tasksum_UserButton + HALT_FIELD:
+            tasksum_setaction(ts, WAITING_ACTION);
+            taskwindow_sendinput(task_handle, " ");
+            tasksum_continue(ts);
+            close_pending = !dbox_persist();
+            break;
+    }
+}
+
+static BOOL run_differ(compress_str *cp, BOOL restart)
+{
+    BOOL success = FALSE;
+    char buffer[2048];      /* should be enough for two pathnames and a directory of filters */
+
+    int n = differ_buildcommandline(buffer, cp, restart);
+    if (n == -1)
+        return FALSE;
+
+    if (n > TaskWindow_SafeCLLen)
+    {
+        char *split_point = get_splitpoint(buffer, TaskWindow_SafeCLLen);
+
+        setenv("ARMovie$ExtraArgs", split_point, 4);
+        setenv(APP_TITLE"$DifferCL2", split_point, 4);
+        *split_point = '\0';
+    }
+    else
+    {
+        setenv("ARMovie$ExtraArgs", NULL, 0);
+        setenv(APP_TITLE"$DifferCL2", NULL, 0);
+    }
+
+    setenv(APP_TITLE"$DifferCL1", buffer, 4);
+
+    setenv(DIFFER_STATUS, NOT_STARTED, 0);      /* in case differ bmobs out before setting its error handler */
+    if (cp->o.flags & compress_SingleTask)
+    {
+        os_err(wimp_starttask(buffer));
+        success = !check_differ_error();
+        close_files(cp);
+    }
+    else
+    {
+        task_handle = taskwindow_new(taskwindow_Quit, read_freeslot()/1024 - 64, DIFFER_TASKNAME, buffer);
+        if (task_handle != NULL)
+        {
+            tasksum_registermemfns(f_alloc, f_free);
+
+            task_summary = tasksum_attach(task_handle, SUMMARY_IDENT, SUMMARY_TITLE, DIFFER_ACTION, cp->input_leaf);
+            if (task_summary)
+            {
+                close_pending = FALSE;
+                tasksum_eventhandler(task_summary, differ_events, cp);
+                success = TRUE;
+            }
+        }
+    }
+
+    return success;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+BOOL calljoiner_start(compress_str *cp, const char *output_file)
+{
+    if (!write_header(cp) || !write_sprite(cp))
+        return TRUE;
+
+    if (cp->input_file)
+        if (!state_write(cp))
+            return TRUE;
+
+    return !calldiffer_runjoiner(cp, output_file);
+}
+
+/*
+ * These functions return TRUE if the cvt window should remain open
+ */
+
+BOOL calldiffer_restart(compress_str *cp)
+{
+    BOOL stay_open = TRUE;
+    if (!write_header(cp) || !write_sprite(cp) || !state_write(cp))
+        return TRUE;
+
+    if (run_differ(cp, TRUE))
+    {
+        if (cp->o.flags & compress_SingleTask)
+            stay_open = !calldiffer_runjoiner(cp, NULL);
+        else
+            stay_open = FALSE;
+    }
+
+    return stay_open;
+}
+
+BOOL calldiffer_start(compress_str *cp)
+{
+    BOOL stay_open = TRUE;
+
+    if (prepare_differ(cp) && run_differ(cp, FALSE))
+    {
+        if (cp->o.flags & compress_SingleTask)
+            stay_open = !calldiffer_runjoiner(cp, NULL);
+        else
+            stay_open = FALSE;
+    }
+
+    return stay_open;
+}
+
+BOOL calldiffer_busy(void)
+{
+    return task_handle != 0;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+/* eof calldiffer.c */

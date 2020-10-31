@@ -1,0 +1,751 @@
+/*
+ * fonts.c
+ *
+ * This is the module that handles the Fonts window.
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+
+#include "configure.h"
+#include "ConfigFile.h"
+#include "fonts.h"
+#include "cmos.h"
+
+/*#define FONTSDEBUG*/
+/*#define WITHFONTSIZE */
+
+#define FontsWindow_AAScreenValue             1
+#define FontsWindow_AADown                    2
+#define FontsWindow_AAUp                      3
+#define FontsWindow_CachedBitmapScreenValue   6
+#define FontsWindow_CachedBitmapDown          7
+#define FontsWindow_CachedBitmapUp            8
+#define FontsWindow_SubpixelWidthValue       13
+#define FontsWindow_SubpixelWidthDown        14
+#define FontsWindow_SubpixelWidthUp          15
+#define FontsWindow_SubpixelHeightValue      18
+#define FontsWindow_SubpixelHeightDown       19
+#define FontsWindow_SubpixelHeightUp         20
+#define FontsWindow_DeskfontDisplay          25
+#define FontsWindow_DeskfontMenu             26
+#define FontsWindow_DeskfontSize             28
+#define FontsWindow_DeskfontDown             29
+#define FontsWindow_DeskfontUp               30
+#define FontsWindow_FontMergeBox             34
+#define FontsWindow_OK                       35
+#define FontsWindow_Cancel                   36
+
+static int fonts_window=0;
+static char *menubody = NULL;
+static char *menutext = NULL;
+static int bodysize = 0;
+static int textsize = 0;
+static char *selected_wimpfont = NULL;
+
+static int curr_FontMax2, curr_FontMax3, curr_FontMax4, curr_FontMax5;
+
+static int fonts_unknown_event_handler(wimp_eventstr *e,void *handle);
+
+
+/*
+        Returns the type of the file:
+        0 - does not exist/couldn't do the SWI
+        1 - file
+        2 - directory
+        3 - image
+*/
+static int file_type( char *filename )
+{
+        int t;
+
+        if ( _swix( OS_File, _IN(0)|_IN(1)|_OUT(0), 17, filename, &t ) ) return 0;
+
+        return t;
+}
+
+/* -------------------------------------------------------------------
+
+                        Desktop font stuff
+
+------------------------------------------------------------------- */
+
+/*
+        Returns N if found fontname at position N
+        Returns -N if not found and there's N fonts
+        Returns 0 if got error
+*/
+static int rec_wimpfontnumber( char *dirbuf, char *dirtail, char *bufend, int basenumber, char *fontname )
+{
+
+        _kernel_oserror *err;
+        int numread;
+        int pos;
+        char *enumbuf = dirtail + strlen( dirtail ) + 1;
+        int count = 0;
+        int t;
+
+#ifdef FONTSDEBUG
+printf( "Searching for %s in %s base number %d\n", fontname, dirbuf, basenumber );
+#endif
+
+        for ( pos = 0; pos != -1; )
+        {
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, dirbuf, enumbuf, 1, pos, bufend - enumbuf, "*",
+                        &numread, &pos );
+
+                if ( err ) return 0;
+
+                if ( numread > 0 )
+                {
+#ifdef FONTSDEBUG
+printf( "Checking %s\n", enumbuf );
+#endif
+                        enumbuf[-1] = '.';
+                        if ( file_type( dirbuf ) == 1 )
+                        {
+                                if ( strncmp( enumbuf, "IntMetric", 9 ) == 0 )
+                                {
+                                        count++;
+
+                                        enumbuf[-1] = '\0';
+                                        if ( strcmp( dirtail+1, fontname ) == 0 )
+                                        {
+                                                return basenumber + count;
+                                        }
+                                        enumbuf[-1] = '.';
+                                }
+                        }
+                        else /* must be a 2 or 3 */
+                        {
+                                t = rec_wimpfontnumber( dirbuf, dirtail, bufend, basenumber+count, fontname );
+                                if ( t > 0 ) return t;
+                                count -= t;
+                        }
+                        enumbuf[-1] = 0;
+                }
+        }
+
+        return -count;
+}
+
+/*
+        Returns N if fontname's found at position N, 0 if not
+*/
+static int selected_wimpfontnumber( void )
+{
+        char dirbuf[1024];
+        int t;
+        char *qual;
+        char buf[256];
+        char *rover;
+        char *d;
+
+#ifdef FONTSDEBUG
+_swix(OS_WriteI+4,0);
+#endif
+
+        if ( _swix( Font_FindField, _IN(1)|_IN(2)|_OUT(1)|_OUT(2), selected_wimpfont, 'F', &qual, &t ) ) return 0;
+        if ( t==0 ) return 0;
+
+        for ( rover=qual, d=buf; *rover!='\\' && *rover != 0; )
+        {
+                *d++=*rover++;
+        }
+
+        d[0] = 0;
+        d[1] = 0;
+
+        strcpy( dirbuf, "Resources:$.Fonts" );
+
+        t = rec_wimpfontnumber( dirbuf, dirbuf+strlen(dirbuf), dirbuf+sizeof(dirbuf), 0, buf );
+
+#ifdef FONTSDEBUG
+_swix(OS_WriteI+5,0);
+#endif
+        return t>0?t:0;
+}
+
+static void store_deskfont( void )
+{
+        char line1[256];
+#ifdef WITHFONTSIZE
+        char line2[256];
+#endif
+        char buf[256];
+        int thenum;
+        wimp_msgstr msg;
+        wimp_caretstr c;
+
+        if ( !selected_wimpfont )
+        {
+                line1[0] = '\0';
+#ifdef WITHFONTSIZE
+                line2[0] = '\0';
+#endif
+                wimpt_noerr( (os_error *)_swix( OS_CLI, _IN(0), "*Configure WimpFont 1" ));
+        }
+        else
+        {
+                thenum = selected_wimpfontnumber();
+
+                if ( thenum > 0 && thenum < 16 )
+                {
+                        line1[0] = '\0';
+#ifdef WITHFONTSIZE
+                        line2[0] = '\0';
+#endif
+                        sprintf( buf, "*Configure WimpFont %d", thenum+1 );
+                        wimpt_noerr( (os_error *)_swix( OS_CLI, _IN(0), buf ));
+                }
+                else
+                {
+                        sprintf( line1, "Set Wimp$Font %s", selected_wimpfont );
+                        wimpt_noerr( (os_error *)_swix( OS_CLI, _IN(0), "*Configure WimpFont 0" ));
+                        wimpt_noerr( (os_error *)_swix( OS_CLI, _IN(0), line1 ));
+
+#ifdef WITHFONTSIZE
+                        sprintf( line2, "Set Wimp$FontSize %d", (int)(strtod( icontext( fonts_window, FontsWindow_DeskfontSize ), &t )*16.0));
+                        wimpt_noerr( (os_error *)_swix( OS_CLI, _IN(0), line2 ));
+#endif
+                }
+        }
+        configfile_writeline( PreDeskConfigFile, PreDeskFontLine, line1 );
+#ifdef WITHFONTSIZE
+        configfile_writeline( PreDeskConfigFile, PreDeskFontSizeLine, line2 );
+#endif
+
+        msg.hdr.size = 20;
+        msg.hdr.action = 0x400cf;
+        (void)wimp_sendmessage( wimp_ESEND, &msg, 0 );
+
+        c.x = -1;
+        c.y = -1;
+        (void)wimp_set_caret_pos( &c );
+}
+
+#ifdef WITHFONTSIZE
+static void change_deskfontsize( int by )
+{
+        char buf[256];
+        char *t;
+
+        sprintf( buf, "%g", strtod( icontext( fonts_window, FontsWindow_DeskfontSize ), &t ) + (double)by/16.0 );
+        changeicontext( fonts_window, FontsWindow_DeskfontSize, buf );
+}
+#endif
+
+static void open_wimpfont_menu( void )
+{
+        int tbodysize;
+        int ttextsize;
+
+        if ( _swix( Font_ListFonts, _IN(1)|_IN(2)|_IN(4)|_OUT(3)|_OUT(5),
+                0, 0x180000, 0,
+                &tbodysize, &ttextsize ) ) return;
+
+        if ( bodysize < tbodysize )
+        {
+                if ( menubody ) free( menubody );
+                bodysize = 0;
+                menubody = malloc( tbodysize );
+                if ( !menubody ) return;
+                bodysize = tbodysize;
+        }
+        if ( textsize < ttextsize )
+        {
+                if ( menutext ) free( menutext );
+                textsize = 0;
+                menutext = malloc( ttextsize );
+                if ( !menutext ) return;
+                textsize = ttextsize;
+        }
+
+        if ( _swix( Font_ListFonts, _IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6),
+                menubody, 0x380000, bodysize, menutext, textsize, selected_wimpfont?(int)selected_wimpfont:1 ) ) return;
+
+        open_button_menu( Menu_DF, fonts_window, FontsWindow_DeskfontMenu, (wimp_menustr *)menubody, "MHDESKF" );
+}
+
+static void display_selected_wimpfont( void )
+{
+        char *qual;
+        char buf[256];
+        char *rover;
+        char *d;
+        int t;
+
+#ifdef WITHFONTSIZE
+        t = selected_wimpfont==NULL ? wimp_INOSELECT : 0;
+        wimp_set_icon_state( fonts_window, FontsWindow_DeskfontSize, t, wimp_INOSELECT );
+        wimp_set_icon_state( fonts_window, FontsWindow_DeskfontDown, t, wimp_INOSELECT );
+        wimp_set_icon_state( fonts_window, FontsWindow_DeskfontUp, t, wimp_INOSELECT );
+#endif
+
+        if ( selected_wimpfont == NULL )
+        {
+                qual = msgs_lookup( "FOSYS" );
+        }
+        else if ( selected_wimpfont[0] != '\\' )
+        {
+                qual = selected_wimpfont;
+        }
+        else
+        {
+                if ( _swix( Font_FindField, _IN(1)|_IN(2)|_OUT(1)|_OUT(2), selected_wimpfont, 'f', &qual, &t ) ) return;
+
+                if ( t==0 )
+                {
+                        if ( _swix( Font_FindField, _IN(1)|_IN(2)|_OUT(1)|_OUT(2), selected_wimpfont, 'F', &qual, &t ) ) return;
+                        if ( t==0 ) return;
+                }
+                else
+                {
+                        for ( ; *qual>='0' && *qual<='9'; qual++ );
+                }
+
+                for ( rover=qual, d=buf; *rover!='\\' && *rover != 0; )
+                {
+                        *d++=*rover++;
+                }
+
+                *d = 0;
+                qual = buf;
+        }
+
+        changeicontext( fonts_window, FontsWindow_DeskfontDisplay, qual );
+}
+
+static void fonts_readdeskfont( void )
+{
+        int t;
+        int sz;
+#ifdef WITHFONTSIZE
+        char buf[256];
+#endif
+
+        if ( selected_wimpfont ) free( selected_wimpfont );
+        selected_wimpfont = NULL;
+
+        if ( _swix( Wimp_ReadSysInfo, _IN(0)|_OUT(0), 8, &t ) || t == 0 )
+        {
+                return;
+        }
+
+        if ( _swix( Font_ReadDefn, _IN(0)|_IN(1)|_IN(3)|_OUT(2),
+                t, 0, 0x4c4c5546, &sz ) )
+        {
+                return;
+        }
+
+        selected_wimpfont = malloc( sz );
+        if ( !selected_wimpfont ) return;
+
+        (void)_swix( Font_ReadDefn, _IN(0)|_IN(1)|_IN(3)|_OUT(3),
+                t, selected_wimpfont, 0x4c4c5546, &t );
+
+#ifdef WITHFONTSIZE
+        sprintf( buf, "%g", (double)t / 16.0 );
+        changeicontext( fonts_window, FontsWindow_DeskfontSize, buf );
+#endif
+}
+
+/* -------------------------------------------------------------------
+
+                       Font manager control stuff
+
+------------------------------------------------------------------- */
+
+static void getAllFromCMOS (void)
+{
+        curr_FontMax2 = cmos_get(CMOS_FontMax2) ^ 12;
+        curr_FontMax3 = cmos_get(CMOS_FontMax3) ^ 24;
+        curr_FontMax4 = cmos_get(CMOS_FontMax4);
+        curr_FontMax5 = cmos_get(CMOS_FontMax5);
+}
+
+static void setAllToCMOS (void)
+{
+        _kernel_swi_regs r;
+
+        cmos_set(CMOS_FontMax2,curr_FontMax2 ^ 12);
+        cmos_set(CMOS_FontMax3,curr_FontMax3 ^ 24);
+        cmos_set(CMOS_FontMax4,curr_FontMax4);
+        cmos_set(CMOS_FontMax5,curr_FontMax5);
+
+        _kernel_swi(XOS_Bit | Font_ReadFontMax, &r, &r);
+        r.r[2] = curr_FontMax2;
+        r.r[3] = curr_FontMax3;
+        r.r[4] = curr_FontMax4;
+        r.r[5] = curr_FontMax5;
+        r.r[6] = r.r[7] = 0;
+        _kernel_swi(XOS_Bit | Font_SetFontMax, &r, &r);
+}
+
+static void fonts_setaa(void)
+{
+        wimp_icon i;
+
+        wimp_get_icon_info(fonts_window,FontsWindow_AAScreenValue,&i);
+        sprintf(i.data.indirecttext.buffer,"%i", curr_FontMax2);
+        wimp_set_icon_state(fonts_window,FontsWindow_AAScreenValue,0,0);
+}
+
+static void fonts_setcached(void)
+{
+        wimp_icon i;
+
+        wimp_get_icon_info(fonts_window,FontsWindow_CachedBitmapScreenValue,&i);
+        sprintf(i.data.indirecttext.buffer,"%i", curr_FontMax3);
+        wimp_set_icon_state(fonts_window,FontsWindow_CachedBitmapScreenValue,0,0);
+}
+
+
+static void change_aa(int by)
+{
+        int max=curr_FontMax2;
+        int max_cached=curr_FontMax3;
+
+        max+=by;
+        if ((max>=0) && (max <=255))
+        {
+                curr_FontMax2 = max;
+                if (max>max_cached)            /* fonts can only be aa if cached */
+                {
+                        curr_FontMax3 = max;
+                        fonts_setcached();
+                }
+        }
+        fonts_setaa();
+}
+
+static void change_cached(int by)
+{
+        int max=curr_FontMax3;
+        int max_aa=curr_FontMax2;
+
+        max+=by;
+        if ((max>=0) && (max <=255))
+        {
+                curr_FontMax3 = max;
+                if (max<max_aa)                /* Fonts can only be aa if cached */
+                {
+                        curr_FontMax2 = max;
+                        fonts_setaa();
+                }
+        }
+        fonts_setcached();
+}
+
+
+static void fonts_setvertical(void)
+{
+        wimp_icon i;
+
+        wimp_get_icon_info(fonts_window,FontsWindow_SubpixelHeightValue,&i);
+        if (curr_FontMax5 != 0)
+                sprintf(i.data.indirecttext.buffer,"%i", curr_FontMax5);
+        else
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("Off"));
+        wimp_set_icon_state(fonts_window,FontsWindow_SubpixelHeightValue,0,0);
+}
+
+static void change_vertical(int by)
+{
+        int max=curr_FontMax5 + by;
+
+        if ((max>=0) && (max <=255))
+        {
+                curr_FontMax5 = max;
+        }
+        fonts_setvertical();
+}
+
+static void fonts_sethorizontal(void)
+{
+        wimp_icon i;
+
+        wimp_get_icon_info(fonts_window,FontsWindow_SubpixelWidthValue,&i);
+        if (curr_FontMax4 != 0)
+                sprintf(i.data.indirecttext.buffer,"%i", curr_FontMax4);
+        else
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("Off"));
+        wimp_set_icon_state(fonts_window,FontsWindow_SubpixelWidthValue,0,0);
+}
+
+static void change_horizontal(int by)
+{
+        int max=curr_FontMax4+by;
+
+        if ((max>=0) && (max <=255))
+        {
+                curr_FontMax4 = max;
+        }
+        fonts_sethorizontal();
+}
+
+/* -----------------------------------------------------------------------
+
+                          Font Merging
+
+----------------------------------------------------------------------- */
+
+
+static _kernel_oserror *fonts_merge( char *source )
+{
+        _kernel_oserror *err;
+        char tbuf[1024];
+
+        wimpt_noerr( (os_error *)_swix( Hourglass_On, 0 ));
+
+        sprintf( tbuf, "/FontMerge %s", source );
+        err = _swix( Wimp_StartTask, _IN(0), tbuf );
+
+        wimpt_noerr( (os_error *)_swix( Hourglass_Off, 0 ));
+
+        return err;
+}
+
+/* -----------------------------------------------------------------------
+
+                          Glue functions
+
+----------------------------------------------------------------------- */
+
+static void fonts_event_handler(wimp_eventstr *e,void *handle)
+{
+        _kernel_oserror *err;
+        handle = handle;
+
+        switch (e->e)
+        {
+        case wimp_EOPEN:
+                wimp_open_wind(&e->data.o);
+                break;
+        case wimp_ECLOSE:
+               {
+                wimp_mousestr m;
+
+                wimp_get_point_info(&m);
+                if (m.bbits==wimp_BRIGHT)
+                {
+                        wimp_wstate s;
+                        wimp_get_wind_state(fonts_window,&s);
+                        reopen_main_window(s.o.box.x0,s.o.box.y1);
+                }
+                delete_window( &fonts_window );
+                win_remove_unknown_event_processor(fonts_unknown_event_handler,NULL);
+               }
+                break;
+        case wimp_EBUT:
+                switch( e->data.but.m.bbits )
+                {
+                case wimp_BRIGHT:
+                case wimp_BLEFT:
+                       {
+                        int sign=(e->data.but.m.bbits == wimp_BRIGHT) ? 1 : -1;
+
+                        switch (e->data.but.m.i)
+                        {
+                        case FontsWindow_AAUp:
+                                change_aa(-sign);
+                                break;
+                        case FontsWindow_AADown:
+                                change_aa(sign);
+                                break;
+                        case FontsWindow_CachedBitmapUp:
+                                change_cached(-sign);
+                                break;
+                        case FontsWindow_CachedBitmapDown:
+                                change_cached(sign);
+                                break;
+                        case FontsWindow_SubpixelWidthUp:
+                                change_horizontal(-sign);
+                                break;
+                        case FontsWindow_SubpixelWidthDown:
+                                change_horizontal(sign);
+                                break;
+                        case FontsWindow_SubpixelHeightUp:
+                                change_vertical(-sign);
+                                break;
+                        case FontsWindow_SubpixelHeightDown:
+                                change_vertical(sign);
+                                break;
+#ifdef WITHFONTSIZE
+                        case FontsWindow_DeskfontUp:
+                                change_deskfontsize(-sign);
+                                break;
+                        case FontsWindow_DeskfontDown:
+                                change_deskfontsize(sign);
+                                break;
+#endif
+                        case FontsWindow_OK:
+                                /* Register changes with CMOS and the Font Manager */
+                                setAllToCMOS();
+                                store_deskfont();
+                                /* Update the whole screen */
+                               {
+                                _kernel_swi_regs r;
+
+                                r.r[0]=-1;
+                                r.r[1]=-100000;
+                                r.r[2]=-100000;
+                                r.r[3]= 100000;
+                                r.r[4]= 100000;
+                                _kernel_swi(XOS_Bit | Wimp_ForceRedraw,&r,&r);
+                               }
+                                if (sign == -1)
+                                {
+                                        delete_window( &fonts_window );
+                                        win_remove_unknown_event_processor(fonts_unknown_event_handler,NULL);
+                                }
+                                break;
+                        case FontsWindow_DeskfontMenu:
+                                if ( sign < 0 )
+                                        open_wimpfont_menu();
+                                break;
+                        case FontsWindow_Cancel:
+                                if ( sign == -1 )
+                                {
+                                        delete_window( &fonts_window );
+                                        win_remove_unknown_event_processor(fonts_unknown_event_handler,NULL);
+                                }
+                                else
+                                {
+                                        getAllFromCMOS();
+                                        fonts_setaa();
+                                        fonts_setcached();
+                                        fonts_setvertical();
+                                        fonts_sethorizontal();
+                                        fonts_readdeskfont();
+                                        display_selected_wimpfont();
+                                }
+                                break;
+                        }
+                       }
+                        break;
+
+                case wimp_BMID:
+                        switch (e->data.but.m.i)
+                        {
+                        case FontsWindow_DeskfontMenu:
+                                open_wimpfont_menu();
+                                break;
+                        }
+                        break;
+                }
+                break;
+
+        case wimp_ESEND:
+        case wimp_ESENDWANTACK:
+                switch (e->data.msg.hdr.action)
+                {
+                case wimp_MDATALOAD:
+                        if ( e->data.msg.data.dataload.type==0x2000 )
+                        {
+                                err = fonts_merge( e->data.msg.data.dataload.name );
+
+                                if ( err )
+                                {
+                                        wimpt_complain( (os_error *)err );
+                                }
+                                else
+                                {
+                                        wimp_msgstr m;
+                                        m.hdr.action=wimp_MDATALOADOK;
+                                        m.hdr.my_ref=0;
+                                        m.hdr.your_ref=e->data.msg.hdr.my_ref;
+                                        m.hdr.size=256;
+                                        m.data=e->data.msg.data;
+                                        wimp_sendmessage(wimp_ESEND,&m,e->data.msg.hdr.task);
+                                }
+                        }
+                        break;
+                }
+        }
+}
+
+static int fonts_unknown_event_handler(wimp_eventstr *e,void *handle)
+{
+        wimp_mousestr m;
+        char *qual;
+        int i;
+
+        handle=handle;
+        switch (e->e)
+        {
+        case wimp_EMENU:
+                if (current_menu!=Menu_DF) return FALSE;
+
+                if ( e->data.menu[0]==0 )
+                {
+                        qual = msgs_lookup( "FOSYS" );
+                        if ( selected_wimpfont )
+                        {
+                                free( selected_wimpfont );
+                                selected_wimpfont = NULL;
+                        }
+                }
+                else
+                {
+                        if ( _swix( Font_DecodeMenu, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_OUT(4),
+                                0, menubody, e->data.menu, 0, &i ) ) return FALSE;
+                        if ( i == 0 ) return FALSE;
+                        if ( selected_wimpfont ) free( selected_wimpfont );
+                        selected_wimpfont = malloc( i );
+                        if ( _swix( Font_DecodeMenu, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_OUT(4),
+                                0, menubody, e->data.menu, selected_wimpfont, i, &i ) ) return FALSE;
+                        if ( i == 0 ) return FALSE;
+
+                }
+                display_selected_wimpfont();
+
+                wimp_get_point_info(&m);
+                if ( m.bbits & wimp_BRIGHT ) open_wimpfont_menu();
+
+                return TRUE;
+                break;
+        }
+        return FALSE;
+}
+
+int fonts_create_window(void)
+{
+        if (! fonts_window)
+        {
+                fonts_window=create_window("Fonts",fonts_event_handler,"FO");
+                getAllFromCMOS();
+                win_add_unknown_event_processor(fonts_unknown_event_handler,NULL);
+        }
+        fonts_setaa();
+        fonts_setcached();
+        fonts_setvertical();
+        fonts_sethorizontal();
+        fonts_readdeskfont();
+        display_selected_wimpfont();
+        return fonts_window;
+}
+
+void fonts_update_window(void)
+{
+        if (fonts_window) fonts_create_window();
+}

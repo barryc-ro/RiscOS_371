@@ -1,0 +1,377 @@
+;  > $.Source.PMF.oseven
+
+ [ DriversInKernel
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       PrinterIRQ - Process printer acknowledge IRQ
+;
+
+PrinterIRQ ROUT
+        [ AssemblingArthur
+        Push    R14                     ; stack R14 if new MOS IRQ vector
+        |
+        BYTEWS  WsPtr                   ; already set up in new IRQ scheme
+        ]
+        MOV     R0, #pack_bit
+        STRB    R0, [R3, #IOCIRQCLRA]   ; clear interrupt even if centronics
+                                        ; printer not selected (unlike Master!)
+        LDRB    R1, PrinterDrivType
+        TEQ     R1, #1                  ; parallel printer selected ?
+        BLEQ    STROBE                  ; if so, then try to send another char
+        Pull    PC
+
+; *****************************************************************************
+;
+;       STROBE - Remove char from printer buffer and "print" it
+;
+; in:   WsPtr -> OsbyteVars
+;       MUST be called with IRQs disabled
+
+STROBE  ROUT
+        MOV     R1, #Buff_Print                 ; printer buffer id
+        LDRB    R0, PrinterDrivType
+        CMP     R0, #3                          ; is it user/net ?
+        MOVCS   PC, R14                         ; don't do anything
+
+        CMP     R0, #1
+        BCC     FlushThis                       ; printer sink - flush buffer
+        BNE     %FT10                           ; must be RS423
+
+; centronics printer
+
+        Push    R14
+        BL      REMOVE                          ; note V=0 from CMP above
+                                                ; so this is remove
+        MOV     R3, #IOC
+
+; disable FIQs around this bit
+
+        MOV     R14, #F_bit
+        TST     R14, PC                         ; (preserves carry)
+        MOVNE   R14, #0
+        TEQP    R14, PC
+
+        LDRB    R2, [R3, #IOCIRQMSKA]
+        ORRCC   R2, R2, #pack_bit               ; if char, enable printer IRQ
+        BICCS   R2, R2, #pack_bit               ; else disable printer IRQ
+        STRB    R2, [R3, #IOCIRQMSKA]
+
+        TEQP    R14, PC                         ; restore old F bit
+        MOVCC   R2, #1                          ; printer active
+        MOVCS   R2, #0                          ; printer dormant
+        STR     R2, PrinterActive
+
+        Pull    PC, CS                          ; no more chars to print
+
+        LDR     R2, =PrinterData
+        STRB    R0, [R2]                        ; write data out
+
+        Push    R1
+
+        MOV     R0, #pstrobe_bit        ; enable strobe
+        MVN     R1, R0                  ; L:= (L AND NOT strobe) EOR strobe
+        BL      UpdateLatchB
+
+        MOV     R0, #0                  ; and disable it ( >.5 microsecs later)
+        BL      UpdateLatchB            ; L:= (L AND NOT strobe) EOR 0
+
+        Pull    "R1,PC"
+
+10                                              ; RS423 printer
+        STR     R0, PrinterActive               ; mark printer active (R0<>0)
+RSBUSY
+        MOV     R0, #0                          ; mark RS423 in use (+ve)
+        STRB    R0, RS423use
+        LDR     R0, SerialFlags
+        TST     R0, #(1:SHL:SF_XONXOFFOn)       ; if xon/xoff protocol
+        Push    R14, NE
+        BNE     EnableTXI                       ; then enable TXI regardless
+RSETX
+        Push    R14
+        BL      CountRS
+        Pull    PC, CC                          ; RX overflow, so exit
+
+        LDR     R1, SerialFlags
+        TST     R1, #(1:SHL:SF_XONXOFFOn)       ; if not xon/xoff
+        BEQ     EnableTXI                       ; then enable transmit
+                                                ; (pulls PC to exit)
+        BIC     R2, R1, #(1:SHL:SF_IXOFFedHim)  ; clear my XOFF bit
+        STR     R2, SerialFlags                 ; and store back
+        TST     R2, #(1:SHL:SF_UserXOFFedHim)   ; if user still XOFFing him
+        Pull    PC, NE                          ; then return
+        TST     R1, #(1:SHL:SF_IXOFFedHim)      ; else if we weren't XOFFing
+        Pull    PC, EQ                          ; then return
+
+; we were XOFFing him and user wasn't, so XON him now
+
+        MOV     R1, #XONChar
+        B       SendXONXOFF
+
+        LTORG
+
+; *****************************************************************************
+;
+;       CheckBusy - Check for printer being busy
+;
+; in:   R12 -> BYTEWS
+;
+; out:  Z=1 => printer wasn't busy, so OK to send char
+;       Z=0 => printer was busy, so p_ack IRQ has been reenabled
+;
+
+CheckBusy ROUT
+        LDRB    R0, PrinterDrivType             ; centronics printer ?
+        TEQ     R0, #1
+        ORRNES  PC, R14, #Z_bit                 ; no, then can't be busy
+        MOV     R0, #IOC
+        LDRB    R1, [R0, #IOCIRQSTAA]
+        TST     R1, #pbusy_bit                  ; 0 => busy
+        ORRNES  PC, R14, #Z_bit                 ; indicate not busy
+
+        LDRB    R1, [R0, #IOCIRQMSKA]           ; is busy, so enable
+        ORR     R1, R1, #pack_bit               ; pack IRQ
+        STRB    R1, [R0, #IOCIRQMSKA]
+
+        MOV     R1, #1                          ; and mark printer active
+        STR     R1, PrinterActive
+
+        BICS    PC, R14, #Z_bit                 ; indicate busy
+
+ ]
+
+; *****************************************************************************
+;
+;       SWIPrintChar - Entry for SWI OS_PrintChar
+;
+; in:   R0 = character
+
+SWIPrintChar ROUT
+        Push    "R0-R9, R14"            ; save registers
+        BYTEWS  WsPtr
+        CLRV                            ; R14 on entry must have V=0
+        BL      SWIPrintCharEntry
+        STRVS   R0, [R13, #0]           ; if error then poke R0 to stack
+        Pull    "R0-R9, R14"
+        B       SLVK_TestV              ; return appropriately
+
+; *****************************************************************************
+;
+;       MOSDoPrint - Print a character via VDU 1
+;
+; in:   R0 = character
+;
+; out:  V=0 => printed OK
+;       V=1 => error, R0 -> error block
+;
+
+MOSDoPrint ROUT
+        Push    "R12,R14"
+        BYTEWS  WsPtr
+        BL      MOSDoPrintWS
+        Pull    "R12,PC"
+
+MOSDoPrintWS                                    ; entry point when R12-> BYTEWS
+        BIC     R14, R14, #V_bit                ; clear V by default
+        LDRB    R1, WrchDest
+        TST     R1, #4                          ; is printer disabled ?
+        MOVNES  PC, R14                         ; yes, then return (and V:=0)
+SWIPrintCharEntry
+        LDRB    R1, PrinterDrivType             ; is it user/net ???
+ [ DriversInKernel
+        CMP     R1, #3
+        BCS     FudgePrinterInsert              ; then output to stream
+
+        Push    R14
+        SETPSR  I_bit, R2                       ; disable IRQs
+
+        MOV     R1, #Buff_Print                 ; printer buffer id
+        BL      WRITE                           ; write char to buffer,
+                                                ; waiting if necessary
+        Pull    R14, CS
+        MOVCSS  PC, R14                         ; escape, so bomb out,
+                                                ; clearing V and restoring I
+
+        LDR     R0, PrinterActive
+        TEQ     R0, #0                          ; 0 => dormant
+
+        BLEQ    CheckBusy                       ; check for busy signal
+        BLEQ    STROBE                          ; dormant, so wake it up
+        Pull    R14
+        MOVS    PC, R14                         ; go back
+                                                ; clearing V and restoring I
+ |
+        B       FudgePrinterInsert
+ ]
+
+; *****************************************************************************
+;
+;       WRITE - Insert character into buffer
+;       Retries until successful or ESCAPE condition
+;
+; in:   R0 = character
+;       R1 = buffer number
+;
+
+WRITE   ROUT
+        Push    R14
+10
+        BL      INSRT
+        Pull    PC, CC
+
+; insert code here to turn LEDs on
+
+        MOV     R2, #0
+        LDRB    R2, [R2, #ESC_Status]
+        MOVS    R2, R2, LSL #(32-6)
+        Pull    PC, CS                  ; escape
+
+        MVN     R2, #I_bit              ; mask to clear I_bit
+        MOV     R14, PC
+        TSTP    R2, PC                  ; CLI
+        TEQP    PC, R14                 ; restore I
+        B       %BT10
+
+; *****************************************************************************
+;
+;       FudgePrinterInsert - Write byte to net printer
+;
+; in:   R0 = character to send
+;       R1 = printer type (3..255)
+;       R12 -> BYTEWS
+;       R14 has V_bit clear
+;
+; out:  V=0 => printed OK
+;       V=1 => error, R0 -> error block
+;
+
+FudgePrinterInsert ROUT
+        Push    R14
+
+        LDR     R2, PrinterActive               ; R1=handle for printer stream
+        TEQ     R2, #0
+        MOVNE   R1, R2                          ; already have handle, so can
+        BNE     %FT10                           ; corrupt R1
+
+        Push    R0                              ; save character
+        ADR     R0, PrinterTypeString
+        ADR     R2, PrinterTypeName
+05
+        LDRB    R3, [R0], #1                    ; copy string from ROM to RAM
+        TEQ     R3, #0
+        STRNEB  R3, [R2], #1
+        BNE     %BT05
+
+        BL      OutputDecimalR1ToR2
+        
+        MOV     R0, #0                          ; terminate with 0
+        STRB    R0, [R2]
+        ADR     R0, PrinterTypeName+1           ; pointer to variable name
+        MOV     R1, R2                  ; dummy expansion pointer
+                                        ; (saving ptr to end of string!)
+        MOV     R2, #-1                         ; don't accept chars
+        MOV     R3, #0                          ; no wildcarding
+        MOV     R4, #VarType_Expanded
+        SWI     XOS_ReadVarVal                  ; on exit, R2=0 => no such var
+        TEQ     R2, #0
+        Pull    "R0,PC", EQ, ^                  ; so ignore this stream (V:=0)
+
+        MOV     R0, #">"                        ; now stick ">",13 on end
+        STRB    R0, [R1], #1
+        MOV     R0, #13
+        STRB    R0, [R1]
+
+        ADR     R1, PrinterTypeName             ; point to "<PrinterType$nnn>"
+        MOV     R0, #(open_write + open_mustopen + open_nodir)
+        SWI     XOS_Find
+        BLVS    StopPrinting                    ; stop printing
+        Pull    "R1, PC", VS                    ; exit V set, not corrupting R0
+
+        MOV     R1, R0                          ; will always be non-zero
+        Pull    R0                              ; restore character
+
+        STR     R1, PrinterActive               ; store new handle
+10
+        SWI     XOS_BPut                        ; R0 = byte to send
+        Pull    PC, VC                          ; no error, so exit
+
+        BL      StopPrinting                    ; preserves R0,R1
+        Push    R0                              ; save error pointer
+        MOV     R0, #0                          ; CLOSE reason code
+        STR     R0, PrinterActive               ; zero handle
+        SWI     XOS_Find                        ; close channel
+        Pull    "R0,R14"
+        ORRS    PC, R14, #V_bit                 ; return V set
+
+
+PrinterTypeString
+        =       "<",PrinterPrefix,0
+        ALIGN
+
+MakePrinterDormant
+ [ DriversInKernel
+        LDRB    R3, PrinterDrivType
+        CMP     R3, #3                          ; only dormitorise user/net (will clear V)
+        MOVCC   PC, R14
+ ]
+        LDR     R3, PrinterActive               ; printer handle
+        CMP     R3, #0                          ; no active handle if 0 (also clears V if zero)
+        MOVEQ   PC, R14
+        Push    "R0,R1,R14"
+        MOV     R1, R3                          ; R1 = handle
+        MOV     R0, #0                          ; close reason code
+        STR     R0, PrinterActive               ; zero handle
+        SWI     XOS_Find
+        BLVS    StopPrinting
+        Pull    R0, VC                          ; if no error, preserve R0
+        ADDVS   R13, R13, #4                    ; else junk R0
+        Pull    "R1,PC"
+
+; *****************************************************************************
+;
+;       StopPrinting - Clear bits 3 and 5 of FX3, bit 0 of VduStatus
+;
+;       Preserves all registers (including status)
+;
+
+StopPrinting ROUT
+        Push    "R0,R1"
+        LDRB    R0, WrchDest
+        BIC     R0, R0, #(1:SHL:3) :OR: (1:SHL:5)
+        STRB    R0, WrchDest
+        VDWS    R1
+        LDR     R0, [R1, #VduStatus]
+        BIC     R0, R0, #1                      ; clear VDU 2 bit
+        STR     R0, [R1, #VduStatus]
+        Pull    "R0,R1"
+        MOVS    PC, R14                         ; returning preserving flags
+
+; *****************************************************************************
+;
+;       OutputDecimalR1ToR2 - Output a decimal byte
+;
+; in:   R1 = number to output
+;       R2 = buffer to accept chars
+;
+; out:  R0, R3 corrupt
+
+OutputDecimalR1ToR2 ROUT
+        MOV     R0, #100                        ; do hundreds first
+10
+        MOV     R3, #"0"
+20
+        SUBS    R1, R1, R0
+        ADDCS   R3, R3, #1
+        BCS     %BT20
+        ADD     R1, R1, R0
+        CMP     R3, #"0"                        ; if digit non-zero
+        STRNEB  R3, [R2], #1                    ; then output
+        TEQ     R0, #10
+        MOVNE   R0, #10                         ; then do tens digit
+        BNE     %BT10
+
+        ORR     R1, R1, #"0"
+        STRB    R1, [R2], #1                    ; output units digit
+        MOV     PC, R14
+
+
+        END

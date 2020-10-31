@@ -1,0 +1,1903 @@
+; > Sources.PDriverDP.PageBox
+
+; ***********************************************************
+; printer specific setup to produce a list of boxes. Should also
+; initialise the printer/driver as required to produce the correct
+; transformation and number of copies.
+;
+; because there is a counting pass over all user rectangles (eg. to
+; find out SpriteExtend memory requirements for any JPEG's), the memory
+; allocation of pagebox_setup is deferred, and implemented by
+; pagepbox_memory_setup
+;
+;  Entry: R0 = number of copies to print
+;         R10 = file handle for this print job
+;         The rectangle list has been set up.
+;  Exit:  R0 can be modified on return, but should be non-zero
+;         All registers preserved (except R0 on an error)
+; ***********************************************************
+pagebox_setup
+        Push    "LR"
+        Debug   PageBox, "pagebox_setup"
+        Debug   PageBox, "  Copies",R0
+        Debug   PageBox, "  Handle",R10
+        LDR     LR, counting_pass       ; counting pass flag
+        CMP     LR, #0
+        LDRNE   LR, rectlist
+        STR     LR, counting_nextrect   ; 1st rectangle to count (0 for none)
+        MOV     LR, #0
+        STR     LR, jpeg_maxmemory      ; ready to find max
+        BL      pagebox_real_setup
+        LDR     LR, counting_pass
+        CMP     LR, #0
+        BLEQ    pagebox_memory_setup    ; allocate memory now, if no pre-scan
+        Pull    "PC"
+
+; ***********************************************************
+; printer specific routine to produce the next box to be printed,
+; and to terminate the page if there are no boxes left.
+;
+; because there is a counting pass over all user rectangles (eg. to
+; find out SpriteExtend memory requirements for any JPEG's), the real
+; work of pagebox_nextbox is done in pagebox_real_nextbox
+;
+;  Entry: R0 = number of copies still to print
+;         R10 = file handle for this print job
+;  Exit:  R0 = number of copies remaining to print
+;         R2 = rectangle identification word
+;         R3 = left X of next box, OS units
+;         R4 = bottom Y of next box, OS units
+;         R5 = right X of next box, OS units
+;         R6 = top Y of next box, OS units
+;         R2-R6 are only valid if R0<>0
+;         All other registers preserved.
+;  usersbg, usersoffset, usersbox, userstransform,
+;  usersbottomleft all set up (if real pass)
+; ***********************************************************
+pagebox_nextbox
+        Push    "R9, LR"
+
+        LDR     R9, counting_pass
+        Debug   PageBox, "pagebox_nextbox, countpass = ", R9
+        CMP     R9, #0
+        Pull    "R9, LR", EQ
+        BEQ     pagebox_real_nextbox
+
+        LDR     R9, counting_nextrect
+        Debug   PageBox, "pagebox_nextbox, countnextrect = ", R9
+        CMP     R9, #0
+        BNE     pagebox_nextbox_morecounting
+        STR     R9, counting_pass       ; counting done if nextrect=0
+        BL      pagebox_memory_setup    ; allocate memory now
+        Pull    "R9, PC", VS            ; return error if allocation failed
+        Pull    "R9, LR"
+        B       pagebox_real_nextbox
+
+pagebox_nextbox_morecounting
+        ASSERT  rectbox = rectoffset + 8
+        ADR     LR, rectoffset
+        LDMIA   LR, {R3-R6}
+        ADD     R5, R5, R3              ; R5,R6 from size ...
+        ADD     R6, R6, R4              ; ... to top right
+        LDR     R2, rectangleid
+        Debug   PageBox, "counting pass R2-R6",R2,R3,R4,R5,R6
+
+        LDR     R9, nextrectangle
+        STR     R9, counting_nextrect
+        Debug   PageBox, "next rect = ", R9
+
+        Pull    "R9, PC"        ; done, counting pass
+
+
+pagebox_real_setup ROUT
+          Push   "r0-r7, r9, lr"
+          
+          Debug  PageBox,"pagebox_real_setup"
+          Debug  PageBox,"  Copies",R0
+          Debug  PageBox,"  Handle",R10
+
+  ; vet the rectangle list for bad rotations, figure out how wide a sprite
+  ; we need.
+
+          MOV     r0, #&7FFFFFFF
+          STR     r0, job_print_area     ; minimum X of area on the paper
+          STR     r0, job_print_area+4   ; minimum Y
+          MOV     r0, #&80000000
+          STR     r0, job_print_area+8   ; maximum X of area on the paper
+          STR     r0, job_print_area+12  ; maximum Y
+          STRB    r0, job_rotation_id    ; zero rotation id
+
+          LDR     r9, rectlist
+10        CMP     r9, #0
+          BEQ     %FT11
+         
+
+;   [ Debug :LAND: DebugPageBox
+;          DREG    r9, "rectangle @ ",cc
+;          LDR     r0, rectangleid
+;          DREG    r0, " id "
+;          LDR     r0, rectoffset
+;          DREG    r0, "     corner ",cc
+;          LDR     r0, rectoffset+4
+;          DREG    r0, ",",cc
+;          LDR     r0, rectbox
+;          DREG    r0, " size ",cc
+;          LDR     r0, rectbox+4
+;          DREG    r0, ","
+;          LDR     r0, recttransform
+;          DREG    r0, "  transform ",cc
+;          LDR     r0, recttransform+4
+;          DREG    r0, ",",cc
+;          LDR     r0, recttransform+8
+;          DREG    r0, ",",cc
+;          LDR     r0, recttransform+12
+;          DREG    r0, ","
+;          LDR     r0, rectbottomleft
+;          DREG    r0, "     origin ",cc
+;          LDR     r0, rectbottomleft+4
+;          DREG    r0, ","
+;       ]
+
+  ; check that the transformation is a rotation through a multiple of 90deg:
+  ; one of the diagonals must be zero, the other diagonal must have two
+  ; non-zero terms
+          LDR     r0, recttransform
+          LDR     r1, recttransform+12
+          CMP     r0, #0
+          CMPEQ   r1, #0
+          BEQ     %FT12
+          CMP     r0, #0
+          CMPNE   r1, #0
+          BEQ     pagebox_singularmatrix
+          LDR     r0, recttransform+4
+          LDR     r1, recttransform+8
+          CMP     r0, #0
+          CMPEQ   r1, #0
+          BNE     %FT98
+
+13 ; now transform the box, get its coordinates on the paper
+          LDR     r0, rectbottomleft
+          LDR     r1, rectbottomleft+4
+          BL      update_limits         ; where bottom left goes
+          LDR     r0, rectbox           ; we can just use these
+          LDR     r1, rectbox+4         ; as we can't have wacky
+          BL      transform_point       ; transformations anyway
+          LDR     r2, rectbottomleft
+          ADDVCS  r0, r0, r2
+          BVS     %FT97
+          LDR     r2, rectbottomleft+4
+          ADDS    r1, r1, r2
+          BVS     %FT97
+          BL      update_limits
+
+          LDR     r9, nextrectangle
+          B       %BT10
+
+12 ; check for singular matrix
+  [ {TRUE} ;STRB pc is well out of order
+          MOV     r0, pc
+          STRB    r0, job_rotation_id ; flag rotation through 90 or 270
+  |
+          STRB    pc, job_rotation_id ; flag rotation through 90 or 270
+  ]
+          LDR     r0, recttransform+4
+          LDR     r1, recttransform+8
+          CMP     r0, #0
+          CMPNE   r1, #0
+          BNE     %BT13                ; both non-zero: allow it
+pagebox_singularmatrix
+          ADR     r0, ErrorBlock_PrintSingularMatrix
+          BL      LookupSingle         ; Always sets the V bit
+          B       %FT99
+
+          MakeInternatErrorBlock PrintSingularMatrix,,SingMat
+          ALIGN
+
+11  ; now clip calculated region against the page area
+
+          [ debugPageBox
+            LDR     r0, job_print_area
+            Debuga  , "pcminim X ",r0
+            LDR     r0, job_print_area+4
+            Debuga  , ", Y ",r0
+            LDR     r0, job_print_area+8
+            Debuga  , ", maximum  X ",r0
+            LDR     r0, job_print_area+12
+            Debug   , ", Y ",r0
+          ]
+
+          LDR     r0, job_print_area
+          LDR     r1, size_leftX
+          CMP     r0, r1
+          STRLT   r1, job_print_area
+          LDR     r0, job_print_area+8
+          CMP     r0, r1
+          STRLT   r1, job_print_area+8
+          MOVLT   r0, r1
+          LDR     r1, size_rightX
+          CMP     r0, r1
+          STRGT   r1, job_print_area+8
+          LDR     r0, job_print_area
+          CMP     r0, r1
+          STRGT   r1, job_print_area
+
+          LDR     r0, job_print_area+4
+          LDR     r1, size_bottomY
+          CMP     r0, r1
+          STRLT   r1, job_print_area+4
+          LDR     r0, job_print_area+12
+          CMP     r0, r1
+          STRLT   r1, job_print_area+12
+          MOVLT   r0, r1
+          LDR     r1, size_topY
+          CMP     r0, r1
+          STRGT   r1, job_print_area+12
+          LDR     r0, job_print_area+4
+          CMP     r0, r1
+          STRGT   r1, job_print_area+4
+               
+          [ debugPageBox
+            LDR     r0, job_print_area
+            Debuga  ,"minimum X",R0
+            LDR     r0, job_print_area+4
+            Debuga  , ", Y ",r0
+            LDR     r0, job_print_area+8
+            Debuga  , ", maximum  X ",r0
+            LDR     r0, job_print_area+12
+            Debug   , ", Y ",r0
+          ]
+
+        Debug   PageBox, "pagebox_real_setup returning"
+          Pull   "r0-r7, r9, pc"
+
+99
+        STR     r0, [stack]
+        Pull   "r0-r7, r9, pc"
+
+97      ADR     r0, ErrorBlock_PrintBadRectangle
+        BL      LookupSingle                   ; Always sets V flag
+        B       %BT99
+        MakeInternatErrorBlock PrintBadRectangle,,BadRect
+
+98   ; bad rotation
+        ADR     r0, ErrorBlock_PrintBadTransform
+        addr    r1, title                       ; %0 -> "PDriverDP"
+        BL      LookupSingle                    ; Always sets V flag
+        B       %BT99
+        MakeInternatErrorBlock PrintBadTransform,,BadTran
+
+
+pagebox_memory_setup ROUT
+          Push   "r0-r7, r9, lr"
+          
+          Debug  PageBoxMem,"pagebox_memory_setup"
+;          Debug  PageBoxMem,"  Copies",R0
+;          Debug  PageBoxMem,"  Handle",R10
+
+ ;   calculate the number of rows we will need to print
+          LDR     r6, =72000
+          LDR     r0, job_print_area+4
+          LDR     r1, job_print_area+12
+          SUBS    r1, r1, r0              ; height of rectangle in 72000
+          BLE     %FT96
+          LDR     r0, info_ypixelres
+          MUL     r0, r1, r0
+          MOV     r1, r6
+          BL      Divide
+          STR     r0, job_totalheight
+
+ ;    need to move down to top of printing area
+
+          LDR     r0, job_print_area+12   ; top of rectangle
+        [ RealPageSize
+          LDR     r1, size_height
+        |
+          LDR     r1, size_topY
+        ]
+
+;            Debuga  PageBox,"Top of user rect",R0
+;            Debuga  PageBox,", to of paper",R1
+
+          SUB     r1, r1, r0              ; height of blank area in 72000
+          LDR     r0, info_ypixelres
+            Debug   PageBoxMem," ypixres",R0  
+          MUL     r0, r1, r0
+          MOV     r1, r6
+          BL      Divide
+            Debug   PageBoxMem,"Rows to top of printing area",R0
+          STR     r0, job_topmargin
+
+; calculate linelength, margin
+
+      [ RealPageSize
+        LDR     R3, job_print_area
+        MOV     R0, R3
+      |
+        LDR     r3, job_print_area
+        LDR     r0, size_leftX
+        SUB     r0, r3, r0
+      ]
+        LDR     r2, info_xpixelres
+        MUL     r0, r2, r0
+        MOV     r1, r6
+        BL      Divide
+        STR     r0, job_leftmargin      ; no of blank columns to do
+;
+        LDR     r0, job_print_area+8
+        SUBS    r0, r0, r3              ; width
+        BLE     %FT96
+        MUL     r0, r2, r0
+        BL      Divide
+        [ Libra1
+;make width a multiple of 8 (may be assumed by newer, faster
+;code in PDumperSpt and dumper modules)
+        ADD     R0, R0, #7
+        BIC     R0, R0, #7
+        ]
+        STR     r0, job_linelength
+
+; calculate the size of the sprite header and the block required
+
+
+        [ Libra1
+        LDRB    LR,job_strip_type
+        CMP     LR, #4
+        CMPNE   LR, #5
+        MOVEQ   R3, #0                  ; if output sprite is 16/32bpp don't need space for palette
+        LDRNEB  LR, job_output_bpp
+        MOVNE   R3, #8                  ; else two words for each palette entry
+        MOVNE   R3, R3, LSL LR          ;  and shift by the pits per pixel
+        |
+        LDRB    LR, job_output_bpp
+        MOV     R3, #8                  ; two words for each palette entry
+        MOV     R3, R3, LSL LR          ; shift by the bits per pixel
+        ]
+
+
+        ADD     R3,R3,#SpriteCBsize
+        STR     R3,job_sprheadsize      ;Store the header size
+        ADD     R3,R3,#SpriteAreaCBsize
+        STR     R3,job_sprblocksize     ;Store the header + control block size
+
+; r3 := memory required for dump depth * required row width
+        MOV     r3, r0
+        LoadDumpDepth r4
+    Debug PageBoxMem," -- linelength, dumpdepth = ",R3,R4
+        BL      calculate_pixel_memory
+        [ Libra1
+        ; if colourtrans might generate a 32K table ensure there
+        ; is sufficient space in the RMA
+
+        ; only need to do this if we are running on a Medusa
+        Push    "R0,R1"
+        LDR     R0, magic_value
+        MOV     R1, #4
+        SWI     XOS_ReadModeVariable
+        Pull    "R0,R1"
+        BCS     %FT20   ; is not a medusa !
+
+        Push    "R0-R3,R6-R8"
+
+        LDRB    R0, job_strip_type
+        CMP     R0, #3
+        BGE     %FT19   ; output bpp will not require a 32K table!
+
+        ; this works on the assumption that RMA can be claimed & then 
+        ; freed in order for it to grow the RMA space. Hopefully 
+        ; Wimp_ClaimFreeMemory won't pinch this space back!
+
+        ; allocate space for colourtrans tables!
+
+        Debug   PageBoxMem,"Allocate some RMA space just in case"
+       
+        MOV     R0, #ModHandReason_Claim         ; need to grow RMA
+        MOV     R3, #33 *1024                   ; magic numbers from AMG
+        SWI     XOS_Module
+        BVS     no_allocate1
+
+        MOV     R6, R2
+        MOV     R3, #32*1024+256                ; magic number from AMG
+        SWI     XOS_Module
+        BVS     no_allocate2
+        MOV     R7, R2
+
+       ; allocate space for PdriverDP internal 32K table, allocated in PDriverDP.Sprite
+
+        MOV     R3, #32 *1024
+        SWI     XOS_Module
+        MOVVC   R8, R2
+        BVC     %FT18
+
+        ; if V set automatically fall through to no_allocate3
+
+no_allocate3
+        MOV     R0, #ModHandReason_Free                  ; remove space for 2nd 32K Table
+        MOV     R2, R7
+        SWI     XOS_Module
+no_allocate2
+        MOV     R0, #ModHandReason_Free                  ; remove space for 1st 32K Table
+        MOV     R2, R6
+        SWI     XOS_Module
+no_allocate1
+        
+        MOV     R0, #1                  ; shrink the RMA back down
+        LDR     R1, =-100*1024
+        SWI     XOS_ChangeDynamicArea   
+        Pull    "R0-R3,R6-R8"
+        B       %FT95
+
+18
+        ; free all the chunks that have been claimed in RMA
+        ; there shouldn't be any errors, but reload R0 just in case
+
+        MOV     R0, #ModHandReason_Free
+        MOV     R2, R6
+        SWI     XOS_Module
+
+        MOV     R0, #ModHandReason_Free
+        MOV     R2, R7
+        SWI     XOS_Module
+
+        MOV     R0, #ModHandReason_Free
+        MOV     R2, R8
+        SWI     XOS_Module
+19
+        Pull    "R0-R3,R6-R8"
+20
+        ]
+
+        [ Libra1        ; calculate memory need for error diffusion buffer
+        Push    "R0,R3"
+        MOV      R9, #0
+        ADD     R3, R0, #2
+        LDRB    R0, job_strip_type
+        CMP     R0, #1
+        MOVEQ   R3, R3, LSL #2  ;for grey strip type - 4 bytes per pixel
+        BEQ     skip_past
+        CMP     R0, #0
+        BEQ     skip_past
+        MOV     R3, R3, LSL #4  ;for colour strip types - 16 bytes per pixel (4 per component)
+skip_past
+        LDR     R0, job_halftoneX
+        AND     LR, R0, #255
+        CMP     LR, #1
+        BGT     halftoned
+
+        ; allocate sufficent RMA for the error diffusion buffer to stop
+        ; the sprite stuff from grabbing all the available memory
+
+        MOV     r0, #ModHandReason_Claim 
+        SWI     XOS_Module
+        BVC     %FT01
+        ADD     SP, SP, #8              ; avoid crapping on stack
+        B       %FT99
+01
+        MOV     R9, R2
+        Debug   PageBoxMem,"error diffusion buff (bytes, at) ",R3,R9
+halftoned
+        Pull    "R0,R3"
+        ]
+
+; r3 pulled, now = memory required for dump depth * required row width
+
+; Account for multiple passes. These are the output dumps.
+      [ MultiplePasses
+        LDRB    lr, job_strip_type
+        CMP     lr, #3              ;multiple pass 16m colour
+        LDRB    lr, job_no_passes   ;no_passes 8-bit buffers
+        ADDEQ   lr,lr,#4            ;strip type 3: + one '32-bit' buffer (4x sized buffer)
+        MUL     r3, lr, r3
+      ]
+
+; If doing it in landscape then allow for a single pass transposed bitmap dump prior to copying to the output dumps above.
+        LDRB    lr, job_rotation_id
+        CMP     lr, #0
+        MOVNE   r0, r3
+        LoadDumpDepth r3, NE
+        LDRNE   r4, job_linelength
+        BLNE    calculate_pixel_memory
+        ADDNE   r3, r0, r3
+
+; so R3 is now the number of bytes for a set of buffer pixels dump_depth high
+
+          Debug   PageBoxMem,"bytes per set of buffer pixels",R3
+        Push   "r3"                     ; while we sort out buffer areas, etc
+
+; r0 := the maximum useful number of minimum output dump depths
+
+        LDR     r0, job_totalheight     ; number of dots high
+        ReduceDotsToStrips
+        ADD     r0, r0, #1              ; number of strips high
+        
+          Debug   PageBoxMem,"Max useful strips",R0
+; r0 := max number of dump depths * dump depth strip size
+        MUL     r0, r3, r0
+
+; r7 := absolute maximum size of sprite area
+      [ MultiplePasses
+        LDR     lr, job_sprheadsize
+        MOV     r7, #max_passes+2
+        MLA     r7, lr, r7, r0
+        ADD     r7, r7, #SpriteAreaCBsize
+;<<     ADD     r7, r0, #SpriteCBsize*(max_passes+2) + SpriteAreaCBsize
+      |
+        LDR     lr, job_sprheadsize
+        ADD     lr, r0, lr, LSL #1
+        ADD     lr, lr, #SpriteCBsize
+;<<     ADD     r7, r0, #SpriteCBsize+SpriteAreaCBsize*2
+      ]
+                                        ; absolute upper bound on memory
+
+          Debug   PageBoxMem,"maximum bytes needed, before JPEG",R7
+        LDR     lr, jpeg_maxmemory
+        ADD     r7,r7,lr
+          Debug   PageBoxMem,"maximum bytes needed, after JPEG (+JPEG)",R7,LR
+
+   ; ascertain whether wimp free pool is meaningful by trying to claim it
+
+        SWI     XOS_ReadMemMapInfo      ;; <== ADDED BY NRAINE, 26-Apr-89
+        BVS     no_wimp_slot            ;; shouldn't happen!
+        MOV     r4, r0                  ;; r4 = page size
+
+        MOV     r0, #1
+      [ MultiplePasses
+        ADD     r1, r3, #SpriteAreaCBsize
+        LDR     r5, job_sprheadsize
+;<<     MOV     r5, #SpriteCBsize
+        LDRB    lr, job_strip_type
+        CMP     lr,#3              ;multiple-pass 16m colour
+        LDRB    lr, job_no_passes
+        ADDEQ   lr,lr,#1           ;plus 1 for 32bpp buffer
+        MLA     r1, lr, r5, r1
+      |
+        LDR     lr, job_sprblocksize
+        ADD     r1, r3, lr
+;<<     ADD     r1, r3, #SpriteCBsize+SpriteAreaCBsize
+      ]
+        LDRNE   LR,job_sprheadsize
+        ADDNE   R1,R1,LR                ; NE => 2 sprites needed
+;<<        ADDNE   r1, r1, #SpriteCBsize   ; NE => 2 sprites needed
+
+        Debug PageBoxMem,"min bytes needed, before JPEG, =",R1
+        LDR     lr, jpeg_maxmemory
+        ADD     r1,r1,lr
+        Debug PageBoxMem,"min bytes needed, after JPEG, =",R1
+
+        MOV     r5, r1                  ;; keep for later
+
+; mjs fudge - respond to system variable 'PDriverDP$MaxMem' - assumed
+; to be maximum grabbable in Kbytes
+  Debug PageBoxMem,"before PDriverDP$MaxMem, min max = ",R5,R7
+  Push "R0-R4"
+  ADRL R0, PDriverDPMaxMemName
+  ADRL R1, PDriverDPMaxMemBuff
+  MOV  R2,#31
+  MOV  R3,#0
+  MOV  R4,#0
+  SWI  XOS_ReadVarVal
+  BVS  no_dpmaxmem
+  CMP  R4,#0      ;must be string
+  BNE  no_dpmaxmem
+  CMP  R2,#0
+  BLE  no_dpmaxmem
+  CMP  R2,#31
+  BGE  no_dpmaxmem
+  MOV  R4,#0
+  STRB R4,[R1,R2] ;terminate it
+  MOV  R0,#10
+  SWI  XOS_ReadUnsigned
+  BVS  no_dpmaxmem
+  MOV  R4,R2      ;value
+  Debug PageBoxMem,"PDriverDP$MaxMem (kbytes) = ",R4
+  MOV   R4,R4,LSL #10 ;it's in kbytes
+  CMP   R4,R5
+  MOVLT R4,R5 ;can't use less than minimum
+  CMP   R7,R4
+  MOVGT R7,R4 ;ok, so set max useful to read value
+  Debug PageBoxMem,"after PDriverDP$MaxMem, min max = ",R5,R7
+no_dpmaxmem
+  Pull  "R0-R4" ;ignore errors - treat as variable not there
+
+        Debug PageBoxMem,"try Wimp_ClaimFreeMemory, bytes = ",R1
+        SWI     XWimp_ClaimFreeMemory
+        [ {FALSE} ; Libra1 - don't want to check v bit
+        BVS     no_wimp_slot
+        ]
+        CMP     r2, #0
+        BEQ     no_wimp_slot
+        MOV     r0, #0                  ; release it again
+        SWI     XWimp_ClaimFreeMemory
+
+   ; free pool is available, and large enough: R1 holds the bytes available
+
+          Debug   PageBoxMem,"WimpPool available, page-size",R1,R4
+
+        Push    "r4"
+        MOV     r4, r1, LSR #4         ; try to leave about 1/16th of space free
+        CMP     r4, #32*1024           ; but at least 32k
+        MOVLT   r4, #32*1024
+        SUB     r6, r1, r4             ; if this is -ve, will be fixed by clamping below
+          Debug   PageBoxMem,"available, free, leaving max(32k,1/16 space) free ",R6,R4
+        Pull    "r4"
+
+        CMP     r6, r7
+        MOVGT   r6, r7                        ; don't take more than useful
+        CMP     r6, r5                        ;;
+        MOVLT   r6, r5                        ;; or less than required
+
+        LDR     lr, jpeg_maxmemory
+        SUB     r6,r6,lr                      ; must leave JPEG amount free
+
+        Debug PageBoxMem,"decided to go for (bytes,min,max,JPEG) ",R6,R5,R7,LR
+
+        MOV     r0, #3                        ; read current size of
+        SWI     XOS_ReadDynamicArea           ; system sprite pool
+        [ Libra1
+        Push    "R0,R1"
+        LDR     R0, magic_value
+        MOV     R1, #4
+        SWI     XOS_ReadModeVariable
+        Pull    "R0,R1"
+        BCC     is_a_Medusa ; no maximum size for sprite pool!
+
+        ]
+
+        [ {TRUE} ; Maximum area we want to have in the system sprite pool is 4MB
+        ; set to {FALSE} to stop hardware stiffing is not enough memory
+        ADD     r0, r1, r6
+        CMP     r0, #4*1024*1024
+        MOVGT   r0, #4*1024*1024
+        SUBGT   r6, r0, r1
+        ]
+        [ Libra1
+is_a_Medusa
+        ]
+        MOV     r3, r1
+        MOV     r0, #3
+        MOV     r1, r6
+          Debug   PageBoxMem,"Trying to claim more memory for the system sprite area",R1
+
+
+        SWI     XOS_ChangeDynamicArea
+        [ Libra1        ; cludge to stop machine stiffing if insufficient memory
+        BVS     no_wimp_slot
+        ]
+        Pull   "r7"                    ; r7 = bytes per row
+    [ {FALSE} ; Either 'Unable to move memory' or 'Can't increase beyond 4MB'. Either case is okay - we read the size back
+        BVS     %FT95                         ; should have worked: cop out
+    ]
+        SWI     XOS_ReadDynamicArea           ; read new size
+        SUB     r3, r1, r3
+        STR     r3, job_sarea_change          ; mark us as using system
+          Debug   PageBoxMem,"Using system sprites as buffers"
+
+        MOV     lr, #0                        ; sprites as buffers
+        STR     lr, job_spritearea
+
+  ; now need to set R6 to number of strips we can do:
+  ; R6 is bytes for us, R7 is bytes per row.
+
+      [ MultiplePasses
+        SUB     r6, r6, #SpriteAreaCBsize
+        LDR     r0, job_sprheadsize
+;<<     MOV     r0, #SpriteCBsize
+        LDRB    lr, job_strip_type
+        CMP     lr, #3
+        LDRB    lr, job_no_passes
+        ADDEQ   lr, lr,#1
+        MUL     r0, lr, r0
+        SUB     r6, r6, r0
+      |
+        LDR     lr, job_sprblocksize
+        SUB     r6, r6, lr
+;<<     SUB     r6, r6, #SpriteCBsize+SpriteAreaCBsize
+      ]
+        LDRB    lr, job_rotation_id
+        CMP     lr, #0
+        LDRNE   lr, job_sprheadsize
+        SUBNE   r6, r6, lr
+;<<     SUBNE   r6, r6, #SpriteCBsize
+
+        Debug PageBoxMem,"bytes-for-strips, bytes-per-strip",R6,R7
+        DivRem  r0, r6, r7, lr
+        Debug PageBoxMem,"no. of strips, remainder",R0,R6
+        CMP     r6, #0
+        BLE     buff_no_shrink
+        Push    "r0,r1"
+        MOV     r1, #0
+        SUB     r1, r1, r6 ; shrink amount (-ve)
+        MOV     r0, #3     ; sprite area
+        Debug PageBoxMem,"try shrink SpriteArea",R1
+        SWI     XOS_ChangeDynamicArea
+        Debug PageBoxMem,"shrink was",R1
+        Pull    "r0,r1"
+
+buff_no_shrink
+        MOV     r6, r0
+
+        B       buffer_area_set
+
+        LTORG
+
+magic_value
+  DCD &301680B5
+
+no_wimp_slot
+        Debug PageBoxMem,"no_wimp_slot case"
+        MOV     r0, #ModHandReason_RMADesc
+        SWI     XOS_Module             ; R2 / R3 = largest / total free
+        Pull   "r3", VS
+        BVS     %FT99
+        Debug PageBoxMem,"RMA largest, total ",R2,R3
+
+        MOV     lr, r3, LSR #2         ;; ADDED BY NRAINE, 26-Apr-89
+        CMP     lr, #4096              ;;
+        MOVLT   lr, #4096              ;; always leave some behind
+        Debug PageBoxMem," leave free = max(4k,1/4 of largest) = ",lr
+
+        SUB     r3, r3, lr             ; only ask for 3/4 of the free pool
+        CMP     r2, r3
+        MOVGT   r2, r3                 ; block size we can ask for
+        Debug PageBoxMem,"can ask for, max worthwhile = ",R2,R7
+        CMP     r2, r7
+        MOVGT   r2, r7                 ; max worth asking for (R2)
+        Pull   "r3"
+    
+          Debug   PageBoxMem,"Divisor ",R3
+             
+        LDRB    lr, job_rotation_id     ;Get the rotation value
+        CMP     lr, #0                  ;If non-zero then we are attempting to rotate
+        LDRNE   lr, job_sprheadsize
+        SUBNE   r2, r2, lr
+;<<     SUBNE   r2, r2, #SpriteCBsize   ;Is non-zero so subtract enough for another sprite header
+      [ MultiplePasses
+        SUB     r2, r2, #SpriteAreaCBsize ;Grab enough space for both control block
+        LDR     r6, job_sprheadsize
+;<<     MOV     r6, #SpriteCBsize
+        LDRB    lr, job_strip_type
+        CMP     lr, #3
+        LDRB    lr, job_no_passes       ;Get size of the control block and the number of passes
+        ADDEQ   lr,lr,#1
+        MUL     r6, lr, r6              ;Yeilds: Control block size*number of passes
+        SUBS    r2, r2, r6              ;Remove from the remaining space
+      |
+        LDR     lr, job_sprblocksize
+        SUBS    r2, r2, lr
+;<<     SUBS    r2, r2, #SpriteCBsize+SpriteAreaCBsize  ;Do same though assuming that the size is fixed
+      ]
+        MOVLT   r2, #0                  ;Avoid -ve numbers!
+
+      ; r2 is bytes available for pixels
+      Debug PageBoxMem,"bytes available for pixels (before JPEG) = ",R2
+        LDR     lr, jpeg_maxmemory
+        SUBS    r2,r2,lr
+        MOVLT   r2, #0                  ;Avoid -ve numbers!
+      Debug PageBoxMem,"bytes available for pixels, JPEG subtract = ",R2,LR
+
+        DivRem  r6, r2, r3, lr
+        Debug   PageBoxMem,"Try for depth ",R6
+        CMP     r6, #0
+        BEQ     didnt_get_1ormore
+
+retry_buffer_claim
+        Push   "r3"
+        MUL     r3, r6, r3
+      [ MultiplePasses
+        ADD     r3, r3, #SpriteAreaCBsize
+        LDR     r0, job_sprheadsize
+;<<     MOV     r0, #SpriteCBsize
+        LDRB    lr, job_strip_type
+        CMP     lr, #3
+        LDRB    lr, job_no_passes
+        ADDEQ   lr,lr,#1
+        MUL     r0, lr, r0
+        ADD     r3, r3, r0
+      |
+        LDR     lr, job_sprblocksize
+        ADD     r3, r3, lr
+;<<     ADD     r3, r3, #SpriteCBsize+SpriteAreaCBsize
+      ]
+        LDRB    lr, job_rotation_id
+        CMP     lr, #0
+        LDRNE   lr, job_sprheadsize
+        ADDNE   r3, r3, lr
+;<<     ADDNE   r3, r3, #SpriteCBsize
+    
+        Debug   PageBoxMem,"RMA sprite area size",R3
+
+        MOV     r0, #ModHandReason_Claim
+        SWI     XOS_Module
+        BVC     %FT23
+        Pull   "r3"
+        SUBS    r6, r6, #1
+        BGT     retry_buffer_claim            ; background claim threw us
+
+; didn't get at least one row, so give up
+didnt_get_1ormore
+        Debug   PageBoxMem,"giving up, error diff buffer = ", R9
+        CMP     R9, #0                        ; did we allocate an error diff buffer?
+        MOVNE   R2, R9                        ; if so, free it
+        MOVNE   r0, #ModHandReason_Free
+        SWINE   XOS_Module
+        B       %FT95                         ; generate error
+
+23      STR     r2, job_spritearea
+        Debug   PageBoxMem,"RMA sprite area at",R2
+
+        STR     r3, [r2, #saEnd]
+        MOV     r3, #SpriteAreaCBsize
+        STR     r3, [r2, #saFirst]
+        STR     r3, [r2, #saFree]
+        MOV     r3, #0
+        STR     r3, [r2, #saNumber]
+        ADD     stack, stack, #4              ; discard old R3
+
+buffer_area_set
+ ; got number of dump depth height strips in buffer in R6: create sprites
+
+        Debug   PageBoxMem,"Number of strips",R6
+
+        [ Libra1        ; free any memory allocated for temp RMA error diffusion buffer
+        Push    "R0, R2"
+        MOV     R2, R9
+        CMP     R2, #0
+        BEQ     %FT01
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+01
+        Pull    "R0, R2"
+        ]
+
+        LDRB    lr, job_rotation_id
+        CMP     lr, #0
+        ADR     r2, job_rotationbuffer
+        LDR     r5, job_linelength
+        MultiplyByDumpDepth r4, r6, NE
+        BLNE    create_buffer_sprite
+
+        ADR     r2, job_linebuffer
+        LDR     r4, job_linelength 
+        MultiplyByDumpDepth r5, r6
+
+      [ MultiplePasses
+; Create no_passes(+1) sprites; the extra one (strip type 3 only) is 4x sized, used to
+; create 32bpp format for new 16m colour code in PDumperSpt
+        LDRB    r8, job_strip_type
+        CMP     r8, #3              ;multiple pass 16m colour mode
+        LDRB    r8, job_no_passes
+        ADDEQ   r8,r8,#1
+        ADD     r2, r2, #12
+01
+        Push    "r8"
+        LDRB    r8, job_strip_type
+        CMP     r8, #3
+        Pull    "r8"
+        CMPEQ   r8,#0
+        MOVEQ   r4,r4,LSL #2 ; 4x size for last one, strip type 3
+      ]
+        BLVC    create_buffer_sprite
+        BVS     %FT99
+      [ MultiplePasses
+        Push    "r8"
+        LDRB    r8, job_strip_type
+        CMP     r8, #3
+        Pull    "r8"
+        CMPEQ   r8,#0
+        MOVEQ   r4,r4,LSR #2  ;undo 4x for last one, strip type 3
+        ADD     r2, r2, #12
+        SUBS    r8, r8, #1
+        BGT     %BT01
+
+        MOV     r8, #1
+        STRB    r8, job_pass
+        LDR     r8, job_linebuffer + 12
+        STR     r8, job_linebuffer +  0
+        LDR     r8, job_linebuffer + 16
+        STR     r8, job_linebuffer +  4
+        LDR     r8, job_linebuffer + 20
+        STR     r8, job_linebuffer +  8
+      ]
+
+        ADR     lr, job_linebuffer
+        STR     lr, job_currentbuffer
+
+        MOV     r4, r4, LSL #bufferpix_l2size
+        MOV     r5, r5, LSL #bufferpix_l2size
+        STR     r4, job_clipwidth
+        STR     r5, job_clipheight
+
+        MOV     r0, #SpriteReason_ReadSaveAreaSize
+        ADR     r2, job_linebuffer
+        BL      myspriteop
+
+        MOVVC   r0, #ModHandReason_Claim
+        SWIVC   XOS_Module               ; claim save area block
+        MOVVC   r0, #0
+        STRVC   r0, [r2]                 ; mark save block as unused
+        STRVC   r2, job_VDUsavearea
+        BLVC    redirect_output
+
+        [ Libra1
+        BLVC    set_sprite_background
+        ]
+       
+        ADRVC   r0, set_sprite_output_state
+        BLVC    vdu_counted_string
+
+        BVS     %FT99                   ;Return if it fails           
+
+        LDRB    lr, disabled
+        ORR     lr, lr, #disabled_nullclip
+        STRB    lr, disabled
+
+        MOV     lr, #0
+        STRB    lr, job_rotation_id
+        STRB    lr, job_buffer_marked
+        LDR     r0, [stack]          ; number of copies
+        BL      start_page
+99
+        STR     r0, [stack]
+        Pull   "r0-r7, r9, pc"
+95
+        Debug   PageBoxMem,"No free memory error being returned"
+
+        ADR     r0, ErrorBlock_PrintNoFreeMemory
+        BL      LookupSingle                   ; Always sets V flag
+        B       %BT99
+        MakeInternatErrorBlock PrintNoFreeMemory,,NoMem
+
+96      ADR     r0, ErrorBlock_PrintRectanglesMiss
+        BL      LookupSingle                   ; Always sets V flag
+        B       %BT99
+        MakeInternatErrorBlock PrintRectanglesMiss,,RecMiss
+
+
+set_sprite_output_state
+        [ MonoBufferOK
+          = 33
+        |
+          = 26
+        ]
+
+        [ Libra1
+          = 26, 23,17,3,0, 0,0,0,0,0,0, 16 ; full sprite, full 
+                ; Will need to change this line - get ridof vdu 18 to stop black border
+        |
+          = 26, 18,0,128, 23,17,3,0, 0,0,0,0,0,0, 16 ; full sprite, full 
+        ]
+                                                     ; white background, CLG
+          = 5, 23,16,2_1000000,0, 0,0,0,0,0,0        ; set VDU 5 mode,
+                                                     ; cursor actions
+       [ MonoBufferOK
+          = 23, 17, 4, 1, 0,0,0,0,0,0                ; Archie mode ECFs
+       ]
+
+          ALIGN
+          LTORG
+
+        [ Libra1
+set_sprite_background ROUT
+        ; this section should deal with the black border present on some prints
+        ; set up OS_SETCOLOUR
+
+        Push    "R0-R2,LR"
+
+        MOV     R2, #&FF
+        MOV     R0, R2, LSL #8
+        ORR     R0, R0, R2, LSL #16
+        ORR     R0, R0, R2, LSL #24
+
+        BL      colour_rgbto256colpixval
+
+        MOV     R1, R0
+        MOV     R0, #16         ; set bit 4 - alter background 
+        SWI     XOS_SetColour
+
+        Pull    "R0-R2,PC"
+        ]
+
+;
+;uses fast code if possible
+;
+do_copysprite_withrotate
+     Push    "LR"
+     LDRB    R14,job_strip_type
+     CMP     R14,#1             ;8bpp
+     CMPNE   R14,#3             ;24bpp multipass (3x8bpp)
+     BEQ     do_cswr_8bpp
+     CMP     R14,#5
+     BNE     do_cswr_slow
+     LDRB    R14,job_rotation_id
+     AND     R14,R14,#7
+     CMP     R14,#1
+     BEQ     do_cswr_fast_90
+     CMP     R14,#7
+     BEQ     do_cswr_fast_270
+do_cswr_slow
+     BL      copysprite_withrotate
+     Pull    "PC"
+do_cswr_fast_90
+     BL      copysprite_withrotate_32bpp90
+     Pull    "PC"
+do_cswr_fast_270
+     BL      copysprite_withrotate_32bpp270
+     Pull    "PC"
+do_cswr_8bpp
+     LDRB    R14,job_rotation_id
+     AND     R14,R14,#7
+     CMP     R14,#1
+     BEQ     do_cswr_fast8_90
+     CMP     R14,#7
+     BEQ     do_cswr_fast8_270
+     B       do_cswr_slow
+do_cswr_fast8_90
+     BL      copysprite_withrotate_8bpp90
+     Pull    "PC"
+do_cswr_fast8_270
+     BL      copysprite_withrotate_8bpp270
+     Pull    "PC"
+
+
+; entered with R0 = number of pages
+; returns with R0 modified to contain the real number of copies.
+start_page
+          BuildStartPageCode
+
+; ***********************************************************
+; printer specific routine to produce the next box to be printed,
+; and to terminate the page if there are no boxes left.
+;  Entry: R0 = number of copies still to print
+;         R10 = file handle for this print job
+;  Exit:  R0 = number of copies remaining to print
+;         R2 = rectangle identification word
+;         R3 = left X of next box, OS units
+;         R4 = bottom Y of next box, OS units
+;         R5 = right X of next box, OS units
+;         R6 = top Y of next box, OS units
+;         R2-R6 are only valid if R0<>0
+;         All other registers preserved.
+;  usersbg, usersoffset, usersbox, userstransform, usersbottomleft all set up.
+; ***********************************************************
+
+pagebox_real_nextbox ROUT
+        Push   "r7-r9, lr"
+
+; see &.Text.RectMaths for an explanation of this code.
+; first flip the buffer so that it is correctly aligned for output
+
+;skip flips if simple rotation in 8bpp grey or 24bpp multipass or 32bpp mode (flips
+;will be accounted for in fast rotate code)
+     LDRB    R7,job_strip_type
+     CMP     R7,#1   ;8bpp
+     CMPNE   R7,#3   ;24bpp multipass (3x8bpp)
+     CMPNE   R7,#5   ;32bpp
+     BNE     %FT50
+     LDRB    R7,job_rotation_id
+     AND     R7,R7,#7
+     CMP     R7,#1
+     CMPNE   R7,#7
+     BEQ     %FT51
+50
+  Debug PageBoxMem,"pagebox_real_nextbox calling flip_buffer"
+        BL      flip_buffer
+        BVS     %FT99
+51
+        LDR     r7, job_currentbuffer
+        ADR     r2, job_linebuffer
+        CMP     r7, r2                       ; test for rotated output
+        BEQ     %FT01
+
+; previous rectangle was rotated: we must copy the current buffer
+; into the line buffer with rotation.
+; This actually copies from r0 to r7, i.e. currentbuffer to linebuffer
+; Note that this gratuitously corrupts job_rotation_id, job_currentbuffer etc. Why ??
+
+        STR     r2, job_currentbuffer
+        Push   "r0, r1"
+        LDR     r0, job_clipwidth
+        LDR     r1, job_clipheight
+        STR     r0, job_clipheight
+        STR     r1, job_clipwidth
+        MOV     r0, r7
+        MOV     r1, r2
+        BL      do_copysprite_withrotate
+        Pull   "r0, r1"
+
+01      MOV     r3, #0
+        STRB    r3, job_rotation_id          ; buffer now ready for dumping
+        LDR     r9, job_currentrect
+        CMP     r9, #0
+        LDREQ   r9, rectlist
+        LDRNE   r9, nextrectangle
+        CMP     r9, #0
+        BNE     %FT02
+
+  ; finished one buffer full: need to dump the current buffer and move down
+
+          Debug   PageBox,"A buffer is ready -> dump to file"
+
+      [ MultiplePasses
+        BVS     %FT22
+        LDRB    r2, job_pass
+        ADD     r2, r2, #1
+        LDRB    r3, job_no_passes
+        CMP     r2, r3
+        MOVGT   r2, #1
+        STRB    r2, job_pass
+        ADR     r3, job_linebuffer
+        ADD     r4, r3, r2, LSL #3
+        ADD     r4, r4, r2, LSL #2
+        LDR     r5, [r4], #4
+        STR     r5, [r3], #4
+        LDR     r5, [r4], #4
+        STR     r5, [r3], #4
+        LDR     r5, [r4], #4
+        STR     r5, [r3], #4
+        MOVGT   r5, #-1
+        MOVLE   r5, #0
+        BLGT    dump_current_buffer
+        BLVC    restore_output_state
+        BLVC    redirect_output
+22
+      |
+        BL      dump_current_buffer
+      ]
+
+        Push    "r0"
+
+        [ Libra1
+        BLVC    set_sprite_background
+        ]
+        ADRVC   r0, set_sprite_output_state
+        BLVC    vdu_counted_string
+        LDRB    lr, disabled
+        ORR     lr, lr, #disabled_nullclip
+        STRB    lr, disabled
+        MOV     lr, #0
+        STRB    lr, job_buffer_marked
+        Pull    "r0", VC
+        ADDVS   stack, stack, #4
+
+      [ MultiplePasses
+        TEQ     r5, #0
+        BEQ     %FT03
+      ]
+
+        ADRVC   r2, job_linebuffer      ;; <== ADDED BY NRAINE, 28-Apr-89
+        BLVC    get_sprite_address      ;; BVS moved to catch more cases
+        BVS     %FT99
+
+        LDR     r2, [r2, #spHeight]
+        ADD     r2, r2, #1                   ; r2 = height of sprite
+        LDR     r3, job_currentline
+        ADD     r3, r3, r2
+        STR     r3, job_currentline
+        LDR     r2, job_totalheight
+
+          Debuga  PageBox,"Rows printed",R3
+          Debug   PageBox,", total height",R2
+
+        CMP      r2, r3
+        BGT      %FT03
+
+        FinishPage           ; form feed the page, branch out if more to do
+
+  ; need to free the sprite areas, as more pages may now be done
+  ; in the same job.
+
+        Push    "r3"    
+        MOV      r3,#0                        ; non-fatal death!
+        BL       managejob_abortalt
+        MOV      r7, #0
+        STR      r7, job_currentrect
+        Pull    "r3,r7-r9, pc"                ; job completed
+
+pagebox_morepages
+          StartAnotherCopy
+
+03        LDR      r9, rectlist
+
+02        STR      r9, job_currentrect   ; step the rectangle
+          ADR      r2, recttransform
+          LDMIA    r2, {r3, r4, r5, r6}
+          ADR      r2, userstransform
+          STMIA    r2, {r3, r4, r5, r6}
+
+            Debuga   PageBox,"Transform",R3
+            Debuga   PageBox,",",R4
+            Debuga   PageBox,",",R5
+            Debug    PageBox,",",R6    
+
+          ORRS     r2, r3, r6
+          MOVNE    r2, #0
+          MOVEQ    r2, #1              ; rotation through 90 necessary
+          MOVEQ    r3, r4              ; our adjusted X scale (b)
+          RSBEQ    r6, r5, #0          ; our adjusted Y scale (-a)
+
+     ; note that the passed matrix has the non-leading diagonal transposed
+     ; from the way &.Text.RectMaths considers things.
+
+          CMP      r3, #0              ; X scale
+          ORRLT    r2, r2, #2
+          RSBLT    r3, r3, #0
+          CMP      r6, #0              ; Y scale
+          ORRLT    r2, r2, #4
+          RSBLT    r6, r6, #0
+
+      ; r2 is rotation ID:
+      ;  0 => 0 degrees, +ve scaling
+      ;  1 => 90 degrees, +ve scaling
+      ; bit 1 = 1 => X scale is -ve
+      ; bit 2 = 1 => Y scale is -ve
+      ; want to also have r3 = X scale factor as scaled integer
+      ;                   r6 = Y scale factor as scaled integer
+
+          STRB     r2, job_rotation_id
+          STR      r3, job_currentXscale         ; will be changed later
+          STR      r6, job_currentYscale
+
+            Debug    PageBox,"Rotation ID",R2
+            Debuga   PageBox,"X scale",R3
+            Debug    PageBox,", Y scale",R6
+
+;  need to see if the strip and the rectangle intersect,
+;  and calculate the origin to set in our buffer
+;  first calculate the position of the strip in the rectangles coordinate
+;  space, but with 1/72000" units.
+
+          LDR     r2, job_totalheight
+          LDR     r3, job_currentline
+
+            Debug   PageBox,"job_total height",R2
+            Debug   PageBox,"job_currentline",R3
+
+          SUB     r3, r2, r3               ; how far we are from the bottom
+                                           ; of the print area
+          ADR     r2, job_linebuffer
+          BL      get_sprite_address
+
+          [ debugPageBox
+            LDR     lr, [r2, #spHeight]
+            Debuga  ,"sprite adress",R2
+            Debug   ,", height -1",LR
+          ]
+
+          LDR     r2, [r2, #spHeight]
+          ADD     r2, r2, #1
+          SUB     lr, r3, r2               ; and the bottom of the strip
+          MOV     r2, r3
+          MOV     r3, lr
+         
+            Debuga  PageBox,"Pixel coords of strip in paper space bottom Y",R3
+            Debug   PageBox,", top y",R2
+
+          LDR     lr, =72000
+          MUL     r2, lr, r2               ; r2 = pixel coord of top * 72000
+          MUL     r3, lr, r3               ; r3 = pixel coord of bottom * 72000
+          Push   "r0, r1"
+          LDR     r1, info_ypixelres
+          MOV     r0, r2
+          BL      Divide
+          MOV     r5, r0                   ; r5 = coord of top (millipoints)
+          MOV     r0, r3
+          BL      Divide
+          MOV     r2, r0                   ; r2 = coord of bottom (millipoints)
+          Pull   "r0, r1"
+          LDR     r3, job_print_area+4
+          ADD     r5, r5, r3               ; position of top of current strip
+          ADD     r3, r2, r3               ; position of bottom of strip
+          LDR     r2, job_print_area       ; leftX
+          LDR     r4, job_print_area+8     ; rightX
+           
+            Debuga  PageBox,"Strip in paper space: left X",R2
+            Debuga  PageBox,", bottom Y",R3
+            Debuga  PageBox,", right X",R4
+            Debug   PageBox,", top Y",R5
+    
+      ; now de_translate the strip
+          LDR     r6, rectbottomleft
+          SUB     r2, r2, r6
+          SUB     r4, r4, r6
+          LDR     r6, rectbottomleft+4
+          SUB     r3, r3, r6
+          SUB     r5, r5, r6
+
+     ; now rotate the coordinates through 270 if rect is rotated
+          LDRB   r6, job_rotation_id
+          TST    r6, #1
+          BEQ    %FT05
+          MOV    lr, r2
+          MOV    r2, r3             ; x'=y
+          RSB    r3, lr, #0         ; y'=-x
+          MOV    lr, r4
+          MOV    r4, r5             ; x'=y
+          RSB    r5, lr, #0         ; y'=-x
+05
+     ; now de-transform the strip:
+     ; simply apply the current scale factors in reverse
+     ; and also take account of any current flip states
+
+          Push  "r0, r1"
+          TST    r6, #2
+          LDR    r1, job_currentXscale
+          MOV    r0, r2
+          BL     divide_and_scale
+          RSBNE  r2, r0, #0
+          MOVEQ  r2, r0
+          MOV    r0, r4
+          BL     divide_and_scale
+          RSBNE  r4, r0, #0
+          MOVEQ  r4, r0
+          TST    r6, #4
+          LDR    r1, job_currentYscale
+          MOV    r0, r3
+          BL     divide_and_scale
+          RSBNE  r3, r0, #0
+          MOVEQ  r3, r0
+          MOV    r0, r5
+          BL     divide_and_scale
+          RSBNE  r5, r0, #0
+          MOVEQ  r5, r0
+          Pull  "r0, r1"
+
+          Push  "r0-r2"
+
+      ; r2-r5 are the coordinates of the current strip
+      ; in 1/72000 inch, in the user's coordinate space, relative to rectoffset
+      ; Pick the appropriate point (depends on how the buffer will be flipped)
+      ; and scale it appropriately, to get the offset to the origin to apply
+      ; to user coordinates while plotting.
+
+          TST    r6, #1
+          LDREQ  lr, info_xpixelres
+          LDRNE  lr, info_ypixelres
+          TST    r6, #2                       ; X flip?
+
+;; Avoid overflow by multiplying up the scale factor, not the coordinate.
+;; We hope that dpi * scale factor does not overflow.
+;; Typically scale factor is <= (4 << 16), and dpi <= 300, so we're OK.
+
+     ;;    MULEQ  r0, lr, r2
+     ;;    MULNE  r0, lr, r4
+     ;;    MOV    r0, r0, LSL #bufferpix_l2size
+
+          MOVEQ  r0, r2, LSL #bufferpix_l2size
+          MOVNE  r0, r4, LSL #bufferpix_l2size
+          LDR    r7, job_currentXscale
+          MUL    r7, lr, r7             ;; ADDED BY NRAINE, 2-May-89
+          BL     full_multiply
+          LDR    r2, =72000*256
+          BL     extended_divide
+          
+            Debuga PageBox,"Pseudo origin",R0
+
+          STR    r0, job_currentXoffset
+          TST    r6, #1
+          LDREQ  lr, info_ypixelres
+          LDRNE  lr, info_xpixelres
+          TST    r6, #4                       ; Y flip?
+          AND    r6, r6, #1
+          MOV    r6, r6, LSL #30
+          TEQP   r6, pc                       ; invert Z bit iff rotation
+
+;; Avoid overflow by multiplying up the scale factor, not the coordinate.
+;; We hope that dpi * scale factor does not overflow.
+;; Typically scale factor is <= (4 << 16), and dpi <= 300, so we're OK.
+
+     ;;    MULEQ  r0, r3, lr
+     ;;    MULNE  r0, r5, lr
+     ;;    MOV    r0, r0, LSL #bufferpix_l2size
+
+          MOVEQ  r0, r3, LSL #bufferpix_l2size
+          MOVNE  r0, r5, LSL #bufferpix_l2size
+          LDR    r7, job_currentYscale
+          MUL    r7, lr, r7             ;; ADDED BY NRAINE, 2-May-89
+          BL     full_multiply
+          LDR    r2, =72000*256
+          BL     extended_divide
+
+            Debug  PageBox,",",R0
+          STR    r0, job_currentYoffset
+  
+          Pull  "r0-r2"
+
+     ; now got our strip relative to user rectangle, 1/72000: reorder coords
+          CMP    r2, r4
+          MOVGT  lr, r2
+          MOVGT  r2, r4
+          MOVGT  r4, lr
+          CMP    r3, r5
+          MOVGT  lr, r3
+          MOVGT  r3, r5
+          MOVGT  r5, lr
+
+            Debuga  PageBox,"Strip in user space: left X",R2
+            Debuga  PageBox,", bottom Y",R3
+            Debuga  PageBox,", right X",R4
+            Debug   PageBox,", top Y",R5
+
+     ; check the strip intersects the rectangle; move coords to
+     ; be relative to bottom left of rectangle
+
+          CMP    r4, #0
+          CMPPL  r5, #0
+          BMI    %BT01                 ; rectangles dont overlap anywhere
+          LDR    lr, rectbox
+          MOV    r7, #400              ; conversion between OS units/72000"
+          MUL    lr, r7, lr
+          CMP    r2, lr
+          BGT    %BT01
+          LDR    lr, rectbox+4
+          MUL    lr, r7, lr
+          CMP    r3, lr
+          BGT    %BT01
+
+          Push  "r0, r1"
+
+    ; scale into user's coordinate system
+
+          MOV    r0, r2
+          MOV    r1, #400
+          BL     Divide
+          MOV    r2, r0
+          MOV    r0, r4
+          BL     Divide
+          MOV    r4, r0
+          MOV    r0, r3
+          BL     Divide
+          MOV    r3, r0
+          MOV    r0, r5
+          BL     Divide
+          MOV    r5, r0
+
+          Pull  "r0, r1"
+
+            Debuga  PageBox,"box being returned: left X",R2
+            Debuga  PageBox,", bottom Y",R3
+            Debuga  PageBox,", right X",R4
+            Debug   PageBox,", top Y",R5
+
+          Push   "r2-r5"
+
+   ; now apply the appropriate inverse transform to the current buffer
+
+          LDRB    lr, job_rotation_id
+          TST     lr, #1
+          BEQ     %FT05
+
+   ; invert rotation through 90: rotate through 270
+
+          Push   "r0, r1"
+          BL      restore_output_state
+          ADR     r0, job_linebuffer     ; source
+          ADR     r1, job_rotationbuffer ; destination
+          BL      copysprite_withrotate  ; spin through 90deg
+          STR     r1, job_currentbuffer
+          BL      redirect_output
+          LDRB    r0, job_rotation_id
+
+          MOV     r1, #6
+          STRB    r1, job_rotation_id
+          BL      flip_buffer            ; spin through 180deg.
+          STRB    r0, job_rotation_id    ; copy back will do another 90deg.
+                                         ; i.e. back to where we started!
+          LDR     lr, job_clipwidth
+          LDR     r2, job_clipheight
+          STR     lr, job_clipheight
+          STR     r2, job_clipwidth
+          Pull   "r0, r1"
+
+05        BL      flip_buffer       ; flip the main buffer ready to receive
+                                    ; data from flipped/rotated rectangle
+
+          LDRB    lr, job_rotation_id
+          TST     lr, #1
+          LDREQ   r2, info_xpixelres
+          LDRNE   r2, info_ypixelres
+          LDR     r3, job_currentXscale
+          Push   "r0, r1"
+          MUL     r0, r3, r2           ; xpix*xscale*2^16
+          STR     r0, job_currentXscale
+          LDRB    lr, job_rotation_id
+          TST     lr, #1
+          LDREQ   r2, info_ypixelres
+          LDRNE   r2, info_xpixelres
+          LDR     r6, job_currentYscale
+          MUL     r0, r6, r2
+          STR     r0, job_currentYscale
+          Pull   "r0, r1"
+
+ ;     set the required info
+          ADR     r2, rectoffset
+       ASSERT rectbox-rectoffset = 8
+          LDMIA   r2, {r3, r4, r5, r6}
+         
+            Debuga  PageBox,"Rectangle at",R9
+            Debuga  PageBox," offset",R3
+            Debuga  PageBox,",",R4
+            Debuga  PageBox,", box",R5
+            Debug   PageBox,",",R6 
+
+          ADR     r2, usersoffset
+       ASSERT usersbox-usersoffset = 8
+          STMIA   r2, {r3, r4, r5, r6}
+          ADR     r2, rectbottomleft
+          LDMIA   r2, {r3, r4}
+
+            Debuga  PageBox,"Bottom left",R3
+            Debug   PageBox,",",R4
+
+          ADR     r2, usersbottomleft
+          STMIA   r2, {r3, r4}
+
+          LDR     r2, rectanglebg
+          STR     r2, usersbg
+
+          BL      pagebox_setmaxbox
+
+        [ MonoBufferOK
+
+ ; set ECF origin to bottom left of printable area: we need to
+ ; reverse transform 0,0 in the printable area into user rectangle
+ ; (dot address) coordinates
+
+          Push   "r0, r1"
+          LDR     r0, job_currentline       ; distance down to top-left
+          ADR     r2, job_linebuffer
+          BL      get_sprite_address
+          LDR     r2, [r2, #spHeight]
+          ADD     r0, r0, r2                ; distance down to bottom-left
+          LDR     r1, job_totalheight
+          SUB     r1, r0, r1                ; - (y-coordinate of bottom-left)
+
+ ; bottom of printable area is  (0, -r1) (dots) from bottom left of strip
+ ; in paper space
+
+          LDRB    lr, job_rotation_id
+          TST     lr, #1
+          MOVNE   r0, r1
+          MOVNE   r1, #0
+          MOVEQ   r0, #0        ; r0,r1 are possibly rotated coordinates
+          TST     lr, #2
+          RSBNE   r0, r0, #0    ; apply X flip
+          TST     lr, #4
+          RSBNE   r1, r1, #0    ; apply Y flip
+
+ ; convert from dot position to OS units in our buffer
+
+          MOV     r0, r0, LSL #bufferpix_l2size
+          MOV     r1, r1, LSL #bufferpix_l2size
+          
+            Debuga  PageBox,"ECF X",R0
+            Debug   PageBox,", Y",R1
+
+          SWI     XOS_SetECFOrigin
+          STRVS   r0, [stack]
+          Pull   "r0, r1"
+      ]
+98
+          Pull   "r3-r6"               ; our calculated box
+          SUB     r3, r3, #2           ; widen the box a bit
+          SUB     r4, r4, #2
+          ADD     r5, r5, #2
+          ADD     r6, r6, #2
+          LDR     r2, rectangleid
+  [ {TRUE}  ; STRB pc is well out of order
+          MOV     r7, pc
+          STRB    r7, job_buffer_marked
+  |
+          STRB    pc, job_buffer_marked
+  ]
+99
+          Pull   "r7-r9, pc"
+          LTORG
+
+; ***********************************************************
+; printer specific routine to return to the maximum clip box
+; for the area currently being printed.
+;  Entry: -
+;  Exit:  All registers preserved (except R0 on an error)
+; ***********************************************************
+
+pagebox_setmaxbox ROUT
+          Push   "r0-r5, lr"
+
+          ADR     r1, usersbox
+          LDMIA   r1, {r3, r4}
+          MOV     r1, #0
+          MOV     r2, #0
+          B       %FT01
+
+; ***********************************************************
+; printer specific routine to set a new clip box. This should set
+; the intersection between the specified box and the the maximum clip
+; box for the area currently being printed.
+;  Entry: R1 = left X of new box, units OS units      (inclusive)
+;         R2 = bottom Y of new box, units OS units
+;         R3 = right X of new box, units OS units     #### exclusive?
+;         R4 = top Y of new box, units OS units
+;  Exit:  All registers preserved (except R0 on an error)
+; ***********************************************************
+
+pagebox_setnewbox
+          Push   "r0-r5, lr"
+01
+     ; first scale/translate the coordinates
+
+          MOV     r0, r1, LSL #8    ; scale r1
+          BL      XScale
+          LDR     r5, job_currentXoffset
+          SUB     r1, r0, r5
+          MOV     r1, r1, ASR #8
+          MOV     r0, r3, LSL #8
+          BL      XScale
+          SUB     r3, r0, r5
+          MOV     r3, r3, ASR #8
+          MOV     r0, r2, LSL #8
+          BL      YScale
+          LDR     r5, job_currentYoffset
+          SUB     r2, r0, r5
+          MOV     r2, r2, ASR #8
+          MOV     r0, r4, LSL #8
+          BL      YScale
+          SUB     r4, r0, r5
+          MOV     r4, r4, ASR #8
+
+    ; r1-r4 = clip window coords relative to current buffer
+
+    ; round to a whole number of pixels
+
+          BIC     r1, r1, #bufferpix_mask       ;; by NRaine 19-Apr-89
+          BIC     r2, r2, #bufferpix_mask       ;;
+          BIC     r3, r3, #bufferpix_mask       ;;
+          BIC     r4, r4, #bufferpix_mask       ;;
+
+    ; ensure correct order (should really be done much earlier)
+
+          CMP     r1, r3
+          Swap    r1, r3, GT
+          CMP     r2, r4
+          Swap    r2, r2, GT
+
+    ; now clip this against the window we can set
+
+          CMP     r3, #0
+          CMPGE   r4, #0
+          BLT     %FT02
+          LDR     r0, job_clipwidth
+          LDR     r5, job_clipheight
+          CMP     r1, r0
+          CMPLE   r2, r5
+          BGT     %FT02
+
+          LDRB    lr, disabled
+          BIC     lr, lr, #disabled_nullclip
+          STRB    lr, disabled
+
+          CMP     r1, #0                ; clip to bottom-left
+          MOVLT   r1, #0
+          CMP     r2, #0
+          MOVLT   r2, #0
+          CMP     r3, r0
+          MOVGT   r3, r0
+          CMP     r4, r5
+          MOVGT   r4, r5                ;; FIXED by NRaine 19-Apr-89
+          SUB     r3, r3, #1            ;;
+          SUB     r4, r4, #1            ;; make inclusive again
+
+          MOV     r0, #24
+          BL      vdu_char
+          MOVVC   r0, r1
+          BLVC    vdu_pair
+          MOVVC   r0, r2
+          BLVC    vdu_pair
+          MOVVC   r0, r3
+          BLVC    vdu_pair
+          MOVVC   r0, r4
+          BLVC    vdu_pair
+          STRVS   r0, [stack]
+03
+          Pull   "r0-r5, pc"
+
+02  ; window misses the strip: disable the VDU
+
+          Debug  PageBox,"Window misses -> disable output"
+
+          LDRB    lr, disabled
+          ORR     lr, lr, #disabled_nullclip
+          STRB    lr, disabled
+          B       %BT03
+
+; ****************************************************************
+; printer specific routine to fill the clip box for the
+; area currently being printed to its background colour (i.e. to 'usersbg').
+;  Entry: -
+;  Exit:  All registers preserved (except R0 on an error)
+;
+
+pagebox_cleartobg ROUT
+          Push   "r0, lr"
+          CLRV
+          LDRB    lr, disabled
+          TST     lr, #disabled_nullclip
+          Pull   "r0, pc", NE
+
+          LDR     r0, usersbg
+            Debug   PageBox,"pagebox_cleartobg",R0
+
+          BL      setbackground_colour
+          MOVVC   r0, #16
+          BLVC    vdu_char            ; clg
+          STRVS   r0, [stack]
+          Pull  " r0, pc"
+
+setbackground_colour
+        Push   "r0, r1, lr"
+        [ Libra1
+        Push    "R0"
+        LDRB    R0, job_strip_type
+        CMP     R0, #4
+        CMPNE   R0, #5
+        Pull    "R0"
+        BEQ     %FT02
+        ]
+
+     [ MonoBufferOK
+        BL      colour_rgbto256colpixval
+
+      [ NbppBufferOK
+        LDRB    lr, job_output_bpp
+        CMP     lr, #8
+      |
+        LDRB    lr, job_use_1bpp
+        CMP     lr, #0
+      ]
+        BEQ     %FT01
+
+        LDRB    lr, job_halftoneX
+        CMP     lr, #4
+      [ PDumperColours
+        MOVEQ   r0, r0, LSR #8
+        MOVNE   r0, r0, LSR #16
+        AND     r0, r0, #255
+      ]
+        ADDR    lr, fourbyfourECFbytes, EQ
+        ADDR    lr, eightbyeightECFbytes, NE
+        ADD     r1, lr, r0, LSL #3        ; table + colour*8
+        ADR     r0, setbcolourandECF
+        BL      vdu_counted_string
+        LDRVC   r0, [r1], #4
+        BLVC    vdu_pair
+        MOVVC   r0, r0, LSR #16
+        BLVC    vdu_pair
+        LDRVC   r0, [r1], #4
+        BLVC    vdu_pair
+        MOVVC   r0, r0, LSR #16
+        BLVC    vdu_pair
+        STRVS   r0, [stack]
+        Pull   "r0, r1, pc"
+
+        [ Libra1
+setbcolourandECF = 5, 18, 48, 128, 23, 4
+        |
+setbcolourandECF = 5, 18, 48, 128, 23, 4
+        ]
+        ALIGN
+
+01
+    |
+        BL      colour_rgbtopixval
+    ]
+
+        [ Libra1
+        Push    "R0, R1"
+
+        MOV     R1, R0
+        MOV     R0, #16         ; set bit 4 - alter background 
+        SWI     XOS_SetColour
+        Pull    "R0, R1"
+        |
+    ; so we now need to munge this to get GCOL & TINT values
+    ; want to rotate bits 3-6 right
+          AND     r1, r0, #2_10000111     ; bits already correct
+          AND     lr, r0, #2_01110000
+          ORR     r1, r1, lr, LSR #1
+          AND     lr, r0, #2_00001000
+          ORR     r1, r1, lr, LSL #3
+
+            Debug   PageBox,"Byte",R1
+
+   ; so now set R1 as the (background) GCOL.
+
+          MOV     r0, #18
+          BL      vdu_pair
+          MOVVC   r0, r1, LSR #2
+          ORRVC   r0, r0, #128
+          BLVC    vdu_char                ; gcol set
+        ]
+          ADRVC   r0, colour_backtint
+          BLVC    vdu_counted_string
+          MOVVC   r0, r1, LSL #6
+          BLVC    vdu_char
+
+          MOVVC   r0, #0
+          BLVC    vdu_pair
+          BLVC    vdu_pair
+          BLVC    vdu_pair
+
+          STRVS   r0, [stack]
+          Pull  " r0, r1, pc"
+        [ Libra1
+02      
+        Push    "R0-R2"
+
+        BL      colour_rgbto256colpixval
+        MOV     R1, R0
+        MOV     R0, #16         ; set bit 4 - alter background 
+        SWI     XOS_SetColour
+        Pull    "R0-R2"
+        Pull    "R0,R1,PC"
+        ]
+
+
+colour_backtint = 3, 23, 17, 3
+          ALIGN
+
+; Subroutine to pass the character in R0 through to the real VDU drivers
+
+vdu_char
+        Push    "r1, lr"
+        LDRB    r1, passthrough
+        ORR     lr, r1, #passthrough_wrch
+        STRB    lr, passthrough
+        SWI     XOS_WriteC
+        STRB    r1, passthrough
+        Pull    "r1, pc"
+
+; Subroutine to pass the counted string pointed to by R0 and with length in
+; R1 through to the real VDU drivers
+
+vdu_stringN
+        Push    "r2, lr"
+
+        LDRB    r2, passthrough
+        ORR     lr, r2, #passthrough_wrch
+        STRB    lr, passthrough
+        SWI     XOS_WriteN
+        STRB    r2,passthrough
+        Pull    "r2, pc"
+
+; calculate the number of bytes needed for R3xR4 dots
+
+calculate_pixel_memory ROUT
+        Push   "lr"
+
+     [ MonoBufferOK
+      [ NbppBufferOK
+        LDRB    lr, job_output_bpp
+        CMP     lr, #8
+      |
+        LDRB    lr, job_use_1bpp
+        CMP     lr, #0
+      ]
+        ADDNE   r3, r3, #7
+        MOVNE   r3, r3, LSR #3          ; convert to no of bytes needed
+     ]
+
+        ADD     r3, r3, #3
+        BIC     r3, r3, #3              ; round up to word sized
+        MUL     r3, r4, r3
+        [ Libra1
+        LDRB    LR, job_strip_type      ; if output is 16/32bpp make sure size of line accounts for extra bytes needed
+        CMP     LR, #4
+        MOVEQ   R3, R3, LSL #1
+        CMP     LR, #5
+        MOVEQ   R3, R3, LSL #2
+        ]
+        Pull   "pc",,^
+
+PDriverDPMaxMemName
+  DCB "PDriverDP$MaxMem",0
+  ALIGN
+
+        END

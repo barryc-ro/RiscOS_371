@@ -1,0 +1,572 @@
+/* > setup.c
+
+ * © SJ Middleton, 1993
+
+ * This file contains the code to handle the Setup dialogue box.
+ * Currently nothing takes effect until OK is pressed.
+
+ * Unlike the info window there is only one setup window. However there
+ * is a different setup structure associated with each open movie
+ * display window.
+
+ */
+
+#include "event.h"
+#include "menu.h"
+#include "msgs.h"
+#include "visdelay.h"
+#include "werr.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "xferrecv.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "dboxes.h"
+#include "dboxinc.h"
+#include "file.h"
+#include "iconmenu.h"
+#include "macros.h"
+#include "memalloc.h"
+#include "popup.h"
+#include "strfn.h"
+#include "wmisc.h"
+
+#include "artools.h"
+#include "replaytype.h"
+
+#define SETUP_IDENT     "Controls"
+
+#define OK_FIELD        0
+#define CANCEL_FIELD    1
+
+#define CHANGE_MODE_FIELD   3
+#define CHANGE_TO_FIELD     4
+#define BIG_FIELD           26
+#define USE_TRAJ_FIELD      7
+#define TRAJ_NAME_FIELD     8
+#define USE_SHAPE_FIELD     11
+#define SHAPE_NAME_FIELD    9
+#define LOOP_FIELD          12
+#define LOOP_FOR_FIELD      13
+#define LOOP_FOREVER_FIELD  16
+#define TRACK_NUMBER_FIELD  18
+#define USE_VIDEO_FIELD     21
+#define USE_ARGS_FIELD      27
+#define USE_RATE_FIELD      33
+#define RATE_FIELD          28
+#define EXTRA_ARGS_FIELD    31
+
+#define TRAJ_MENU_FIELD     10
+#define SHAPE_MENU_FIELD    22
+
+#define filetype_Application            0x2000
+#define filetype_Directory              0x1000
+#define filetype_Text                   0xFFF
+#define filetype_Data                   0xFFD
+
+static icon_menu_str setup_menus[] =
+{
+#define TRAJECTORY_MENU 0
+    { "traj", TRAJ_NAME_FIELD, TRAJ_MENU_FIELD },
+#define SHAPE_MENU      1
+    { "shap", SHAPE_NAME_FIELD, SHAPE_MENU_FIELD },
+    { NULL }
+};
+
+static artoolsetup_updatefn_t artoolsetup__updatefn = 0;
+static void *artoolsetup__updatehandle;
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * Convert from internal to external form and vice versa for the rate adjustment.
+ */
+
+static void write_rate(char *buffer, int val)
+{
+    sprintf(buffer, "%g", (double)val/RATE_UNIT);
+}
+
+static int read_rate(const char *buffer)
+{
+    int val = (int) (strtod(buffer, NULL)*RATE_UNIT + 0.5);
+    return val;
+}
+
+/* -------------------------------------------------------------------------------- */
+
+static dbox_incstr  change_inc =
+{
+    1, 10,
+    0, 127,
+    0, 0, 0,
+    dboxinc_NoFullIcons | dboxinc_NoValidateOnReturn
+},                  rate_inc =
+{
+    1, 10,
+    1, 10*RATE_UNIT,
+    read_rate, write_rate, 0,
+    dboxinc_NoFullIcons
+},                  loop_inc =
+{
+    1, 10,
+    1, 1000,
+    0, 0, 0,
+    dboxinc_NoFullIcons
+},                  track_inc =
+{
+    1, 0,
+    1, 100,
+    0, 0, 0
+};
+
+static int  setup__hasvideo,
+            setup__nsoundtracks;
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * Set all the dbox fields
+ */
+
+static void set_fields(dbox d, const artool_playstr *t)
+{
+    artool_flag f = t->flags;
+    dbox_setnumeric(d, CHANGE_MODE_FIELD, f & artool_ChangeMode);
+    dbox_setnumeric(d, BIG_FIELD, f & artool_Big);
+    dbox_setnumeric(d, USE_TRAJ_FIELD, f & artool_Trajectory);
+    dbox_setnumeric(d, USE_SHAPE_FIELD, f & artool_Shape);
+    dbox_setnumeric(d, LOOP_FIELD, f & artool_Loop);
+    dbox_setnumeric(d, LOOP_FOREVER_FIELD, f & artool_LoopForever);
+    dbox_setnumeric(d, USE_VIDEO_FIELD, f & artool_Video);
+    dbox_setnumeric(d, USE_ARGS_FIELD, f & artool_ExtraArgs);
+    dbox_setnumeric(d, USE_RATE_FIELD, f & artool_RateAdjust);
+
+    dbox_setfield(d, CHANGE_TO_FIELD, (char *)t->mode);
+    dbox_setfield(d, TRAJ_NAME_FIELD, t->trajectory_file ? t->trajectory_file : "");
+    dbox_setfield(d, SHAPE_NAME_FIELD, t->shape_file ? t->shape_file : "");
+
+    dboxinc_setfield(d, RATE_FIELD, &rate_inc, t->rate_change);
+    dbox_setnumeric(d, LOOP_FOR_FIELD, t->loop_for);
+    dbox_setnumeric(d, TRACK_NUMBER_FIELD, t->soundtrack);
+    dbox_setfield(d, EXTRA_ARGS_FIELD, t->extra_args ? t->extra_args : "");
+}
+
+/*
+ * Set the various fade options.
+ * all dependant on what the current selections are
+ */
+
+static void set_fade_mode(dbox d)
+{
+    BOOL fade = !setup__hasvideo || !dbox_getnumeric(d, USE_VIDEO_FIELD);
+    dbox_fadestate(d, CHANGE_MODE_FIELD, fade);
+    fade = fade || !dbox_getnumeric(d, CHANGE_MODE_FIELD);
+    dboxinc_fade(d, CHANGE_TO_FIELD, fade, FALSE);
+}
+
+static void set_fade_traj(dbox d)
+{
+    BOOL fade = !setup__hasvideo || !dbox_getnumeric(d, USE_VIDEO_FIELD);
+    dbox_fadestate(d, USE_TRAJ_FIELD, fade);
+    fade = fade || !dbox_getnumeric(d, USE_TRAJ_FIELD);
+    dbox_fadestate(d, TRAJ_NAME_FIELD, fade);
+    dbox_fadestate(d, TRAJ_MENU_FIELD, fade || setup_menus[TRAJECTORY_MENU].text == NULL);
+}
+
+static void set_fade_shape(dbox d)
+{
+    BOOL fade = !setup__hasvideo || !dbox_getnumeric(d, USE_VIDEO_FIELD);
+    dbox_fadestate(d, USE_SHAPE_FIELD, fade);
+    fade = fade || !dbox_getnumeric(d, USE_SHAPE_FIELD);
+    dbox_fadestate(d, SHAPE_NAME_FIELD, fade);
+    dbox_fadestate(d, SHAPE_MENU_FIELD, fade || setup_menus[SHAPE_MENU].text == NULL);
+}
+
+static void set_fade_loop(dbox d)
+{
+    BOOL fade = !dbox_getnumeric(d, LOOP_FIELD);
+    dbox_fadestate(d, LOOP_FOREVER_FIELD, fade);
+    fade = fade || dbox_getnumeric(d, LOOP_FOREVER_FIELD);
+    dboxinc_fade(d, LOOP_FOR_FIELD, fade, FALSE);
+}
+
+static void set_fade_sound(dbox d)
+{
+    BOOL fade = setup__nsoundtracks == 0;
+    dboxinc_fade(d, TRACK_NUMBER_FIELD, fade, FALSE);
+}
+
+static void set_fade_video(dbox d)
+{
+    dbox_fadestate(d, USE_VIDEO_FIELD, !setup__hasvideo);
+}
+
+static void set_fade_rate(dbox d)
+{
+    BOOL fade = !setup__hasvideo || !dbox_getnumeric(d, USE_VIDEO_FIELD);
+    dbox_fadestate(d, USE_RATE_FIELD, fade);
+    fade = fade || !dbox_getnumeric(d, USE_RATE_FIELD);
+    dboxinc_fade(d, RATE_FIELD, fade, FALSE);
+}
+
+static void set_fade_args(dbox d)
+{
+    BOOL fade = !setup__hasvideo || !dbox_getnumeric(d, USE_VIDEO_FIELD);
+    dbox_fadestate(d, USE_ARGS_FIELD, fade);
+    fade = fade || !dbox_getnumeric(d, USE_ARGS_FIELD);
+    dbox_fadestate(d, EXTRA_ARGS_FIELD, fade);
+}
+
+/*
+ * Read back the entire state of the dialogue box.
+ * Also store a copy of the state in the global options structure.
+ */
+
+static void get_fields(dbox d, artool_playstr *t)
+{
+    t->flags =  (dbox_getnumeric(d, CHANGE_MODE_FIELD) ? artool_ChangeMode : 0) |
+                (dbox_getnumeric(d, BIG_FIELD) ? artool_Big : 0) |
+                (dbox_getnumeric(d, USE_TRAJ_FIELD) ? artool_Trajectory : 0) |
+                (dbox_getnumeric(d, USE_SHAPE_FIELD) ? artool_Shape : 0) |
+                (dbox_getnumeric(d, LOOP_FIELD) ? artool_Loop : 0) |
+                (dbox_getnumeric(d, LOOP_FOREVER_FIELD) ? artool_LoopForever : 0) |
+                (dbox_getnumeric(d, USE_VIDEO_FIELD) ? artool_Video : 0) |
+                (dbox_getnumeric(d, USE_RATE_FIELD) ? artool_RateAdjust : 0) |
+                (dbox_getnumeric(d, USE_ARGS_FIELD) ? artool_ExtraArgs : 0);
+
+    dbox_getfield(d, CHANGE_TO_FIELD, t->mode, sizeof(t->mode));
+
+    dbox_getxfield(d, TRAJ_NAME_FIELD, &t->trajectory_file);
+    dbox_getxfield(d, SHAPE_NAME_FIELD, &t->shape_file);
+    dbox_getxfield(d, EXTRA_ARGS_FIELD, &t->extra_args);
+
+    t->loop_for = dboxinc_getfield(d, LOOP_FOR_FIELD, &loop_inc);
+    t->soundtrack = dboxinc_getfield(d, TRACK_NUMBER_FIELD, &track_inc);
+    t->rate_change = dboxinc_getfield(d, RATE_FIELD, &rate_inc);
+}
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * Handle the popup menus for shape and trajectory.
+ */
+
+static void menuhit(void *handle, char *hit)
+{
+    dbox    d = handle;
+    char    buffer[32];
+    int     menu_num = iconmenu_extracthit(setup_menus, buffer, hit);
+    setup_menus[menu_num].selection = -1;
+    dbox_setfield(d, setup_menus[menu_num].display_field, buffer);
+}
+
+static menu menumake(void *handle)
+{
+    return iconmenu_make(setup_menus);
+    UNUSED(handle);
+}
+
+/*
+ * Build up a menu of all files in a directory
+ */
+
+static int scanfn(const char *filename, int filetype, int size, void *handle)
+{
+    if (filetype != filetype_Application)
+    {
+        char **filep = handle;
+        if (*filep)
+            strcatx(filep, ",");
+        strcatx(filep, file_leaf(filename, NULL));
+    }
+    return 1;
+    UNUSED(size);
+}
+
+static int scan_count;
+
+static int scanfn2(const char *filename, int filetype, int size, void *handle)
+{
+    menu m = handle;
+
+    if (filetype != filetype_Application)
+        scan_count++;
+
+    if (filetype == filetype_Directory)
+    {
+        char *filelist = NULL;
+        file_scandir(filename, FALSE, scanfn, &filelist);
+        menu_submenu(m, scan_count, menu_new(file_leaf(filename, NULL), filelist));
+        free(filelist);
+    }
+    return 1;
+    UNUSED(size);
+}
+
+static BOOL done_setup_menu = FALSE;
+
+/*
+ * Setup the trajectory and shape menus by scanning the appropriate directories
+ */
+
+static void setup_menu(dbox d)
+{
+    BOOL has_traj = file_size(ARMOVIE_TRAJECTORY_DIR, NULL) != -1,
+        has_shape = file_size(ARMOVIE_SHAPE_DIR, NULL) != -1;
+
+    visdelay_begin();
+
+    if (!done_setup_menu)
+    {
+        done_setup_menu = TRUE;
+    
+        if (has_traj)
+            file_scandir(ARMOVIE_TRAJECTORY_DIR, FALSE, scanfn, &setup_menus[TRAJECTORY_MENU].text);
+    
+        if (has_shape)
+            file_scandir(ARMOVIE_SHAPE_DIR, FALSE, scanfn, &setup_menus[SHAPE_MENU].text);
+    
+        if (iconmenu_setup(setup_menus))
+        {
+            if (has_traj)
+            {
+                scan_count = 0;
+                file_scandir(ARMOVIE_TRAJECTORY_DIR, FALSE, scanfn2, setup_menus[TRAJECTORY_MENU].m);
+            }
+    
+            if (has_shape)
+            {
+                scan_count = 0;
+                file_scandir(ARMOVIE_SHAPE_DIR, FALSE, scanfn2, setup_menus[SHAPE_MENU].m);
+            }
+        }
+    }
+
+    if (has_traj || has_shape)
+        event_attachmenumaker(dbox_syshandle(d), menumake, menuhit, d);
+
+    visdelay_end();
+}
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * Handle a shape or trajectory file being dropped onto the
+ * appropriate icon in the Setup window.
+ */
+
+static BOOL raw_setup_events(dbox d, void *event, void *handle)
+{
+    wimp_eventstr   *e = event;
+    char            *filename;
+    int             filetype = xferrecv_checkinsert(&filename);
+    if (filetype == filetype_Data || filetype == filetype_Text)
+    {
+        wimp_msgdataload *mp = &e->data.msg.data.dataload;
+        if (mp->i == SHAPE_NAME_FIELD || mp->i == TRAJ_NAME_FIELD)
+        {
+            dbox_setfield(d, mp->i, filename);
+            xferrecv_insertfileok();
+            return TRUE;
+        }
+    }
+    return FALSE;
+    UNUSED(handle);
+}
+
+/*
+ * Handle user events in the Setup window.
+ * Generally hadle OK and Cancel and check the fade states of the
+ * various groups when a controlling icon is selected
+ */
+
+static void setup_events(dbox d, void *handle)
+{
+    artool_playstr *t = handle;
+    dbox_field action = dbox_get(d);
+    switch (action)
+    {
+        case OK_FIELD:
+            get_fields(d, t);
+            copy_playstr(t, &options.play);
+
+            if (artoolsetup__updatefn)
+                artoolsetup__updatefn(artoolsetup__updatehandle);
+
+            if (dbox_persist())
+                artoolsetup_refresh(t, -1, -1);
+            else
+                artoolsetup_dispose(NULL);
+            break;
+
+        case CANCEL_FIELD:
+            if (dbox_persist())
+                artoolsetup_refresh(t, -1, -1);
+            else
+                artoolsetup_dispose(NULL);
+            break;
+
+        case dbox_CLOSE:
+            artoolsetup_dispose(NULL);
+            break;
+
+        case CHANGE_MODE_FIELD:
+            set_fade_mode(d);
+            break;
+
+        case USE_TRAJ_FIELD:
+            set_fade_traj(d);
+            break;
+
+        case USE_SHAPE_FIELD:
+            set_fade_shape(d);
+            break;
+
+        case USE_RATE_FIELD:
+            set_fade_rate(d);
+            break;
+
+        case LOOP_FIELD:
+        case LOOP_FOREVER_FIELD:
+            set_fade_loop(d);
+            break;
+
+        case USE_ARGS_FIELD:
+            set_fade_args(d);
+            break;
+
+        case USE_VIDEO_FIELD:
+            set_fade_mode(d);
+            set_fade_traj(d);
+            set_fade_shape(d);
+            set_fade_args(d);
+            set_fade_rate(d);
+            break;
+
+        case TRAJ_MENU_FIELD:
+            popup_menu(dbox_syshandle(d));
+            break;
+
+        case SHAPE_MENU_FIELD:
+            popup_menu(dbox_syshandle(d));
+            break;
+
+        default:
+            if (dboxinc_processinc(d, CHANGE_TO_FIELD, action, &change_inc, t) ||
+                dboxinc_processinc(d, RATE_FIELD, action, &rate_inc, t) ||
+                dboxinc_processinc(d, LOOP_FOR_FIELD, action, &loop_inc, t) ||
+                dboxinc_processinc(d, TRACK_NUMBER_FIELD, action, &track_inc, t))
+                    skip();
+            break;
+    }
+}
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * External functions
+ */
+
+static dbox             setup_d = NULL;
+static artool_playstr   *setup_t = NULL;
+
+/*
+ * Dispose of the setup window if it attached to the given structure
+ */
+
+void artoolsetup_dispose(artool_playstr *t)
+{
+    if (setup_d && (t == NULL || t == setup_t))
+    {
+        dbox_dispose(&setup_d);
+        setup_d = NULL;
+        setup_t = NULL;
+    }
+}
+
+/*
+ * Open (or update) the setup window
+ */
+
+void artoolsetup_popup(artool_playstr *t, int nsoundtracks, int has_video)
+{
+    dbox d = setup_d;
+    if (d)
+        bring_to_front(dbox_syshandle(d));
+
+    else if ((d = dbox_new(SETUP_IDENT)) != NULL)
+    {
+        setup_d = d;
+        dbox_showstatic(d);
+    }
+
+    if (d && t != setup_t)
+    {
+        set_fields(d, t);
+        artoolsetup_refresh(t, nsoundtracks, has_video);
+    }
+}
+
+/*
+ * Refresh the setup window
+ */
+
+void artoolsetup_refresh(artool_playstr *t, int nsoundtracks, int has_video)
+{
+    dbox d = setup_d;
+    if (d)
+    {
+        setup_t = t;
+
+        if (nsoundtracks != -1)
+        {
+            setup__nsoundtracks = nsoundtracks;
+            track_inc.max = nsoundtracks ? nsoundtracks : 1;
+        }
+        if (has_video != -1)
+            setup__hasvideo = has_video;
+
+        dbox_setnumeric(d, TRACK_NUMBER_FIELD, t->soundtrack);
+
+        setup_menu(d);
+
+        set_fade_mode(d);
+        set_fade_traj(d);
+        set_fade_shape(d);
+        set_fade_loop(d);
+        set_fade_sound(d);
+        set_fade_args(d);
+        set_fade_rate(d);
+        set_fade_video(d);
+
+        dbox_eventhandler(d, setup_events, t);
+        dbox_raw_eventhandler(d, raw_setup_events, t);
+
+        dbox_setcaret(d, CHANGE_TO_FIELD);
+    }
+}
+
+void artoolsetup_setupdatefn(artoolsetup_updatefn_t updatefn, void *handle)
+{
+    artoolsetup__updatefn = updatefn;
+    artoolsetup__updatehandle = handle;
+}
+
+BOOL is_artoolsetup_open(void)
+{
+    return setup_d != NULL;
+}
+
+void artoolsetup_readoptions(artool_playstr *t)
+{
+    if (setup_d)
+        get_fields(setup_d, t);
+}
+
+/* -------------------------------------------------------------------------------- */
+
+/* eof setup.c */

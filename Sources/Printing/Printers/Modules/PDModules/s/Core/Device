@@ -1,0 +1,1087 @@
+; > Core.Device
+
+;----------------------------------------------------------------------------
+;
+; Printer dependent subroutines
+;
+;----------------------------------------------------------------------------
+
+; General comments about interceptions:
+;
+; The printer driver always intercepts the sprite vector to keep track of
+; where plotting output is currently supposed to be directed. (It assumes
+; that output is directed to the screen when it is initialised, and tracks
+; the current state from then on.) Printer specific code should not try to
+; do anything special with this interception.
+;
+; When inside a print job, it is also usually intercepting WrchV, ColourV,
+; DrawV and SpriteV (a second time), and is being told about various Font
+; Manager calls via the PDriver_FontSWI interface. There are four standard
+; exceptions to this rule:
+;   a) While the Wimp error handler is in use (which is tracked via
+;      Service_WimpReportError), all of these cease to be intercepted.
+;   b) While output is redirected to a sprite and that sprite is not the
+;      one registered as belonging to the current print job (via the
+;      'jobspriteparams' variables in the job's workspace), all of these
+;      cease to be intercepted.
+;   c) When inside any routine that may produce output, all OS_Wrch calls
+;      are intercepted, but then immediately passed through to the previous
+;      owner of the vector (by setting the 'passthrough_wrch' bit of the
+;      'passthrough' byte - described below). This is a precaution against
+;      accidental recursive invocation of the printer driver if printing to
+;      the "vdu:" or "rawvdu:" devices!
+;        This applies to all the calls described below as having R10 equal
+;      to the print job's file handle below.
+;   d) While processing Font_Paint, the Font Manager is instructed to stop
+;      calling PDriver_FontSWI. This affects entry to the 'font_xxxx'
+;      routines as follows:
+;        'font_fg', 'font_bg', 'font_absfg', 'font_absbg', 'font_coloffset',
+;           'font_fontslost': PDriver_FontSWI may be being called or may not.
+;           Should the printer specific code need one or other of these to be
+;           the case, it should use the technique described below to set the
+;           appropriate state.
+;        'font_savecolours', 'font_stringstart', 'font_passstart',
+;        'font_paintchunk', 'font_passend', 'font_stringend':
+;           PDriver_FontSWI is definitely not being called. In the unlikely
+;           event that the printer specific code requires it to be, it should
+;           use the technique described below to force it to be called.
+;        'font_losefont': PDriver_FontSWI is definitely being called. It is
+;           important (as described in the section on 'font_losefont' below)
+;           that it should continue to be called for any recursive calls to
+;           SWI Font_LoseFont. It may be stopped at other times if desired
+;           by the technique described below.
+;
+; The printer specific code may wish to stop the interception of one or more
+; of these calls. There are two main techniques for doing this:
+;
+; The simpler technique is to set one or more of the 'passthrough_wrch',
+; 'passthrough_col', 'passthrough_draw' and 'passthrough_spr' bits in the
+; global 'passthrough' byte. Doing so will cause the interception routines
+; indicated to return fairly quickly and without claiming the call. The
+; disadvantages of this technique are firstly that it cannot be used to stop
+; SWI PDriver_FontSWI being called, and secondly that if a lot of calls are
+; going to be made to the routine concerned, it may be more efficient to
+; actually stop the interception by using the second technique, described
+; below.
+;   The 'passthrough' byte should always be returned to its original value
+; before exiting the printer specific routine.
+;
+; The second technique is to read the global byte 'shouldintercept', which
+; contains bits 'intercept_wrch', 'intercept_col', 'intercept_draw',
+; 'intercept_spr' and 'intercept_font', modify it appropriately (each bit is
+; set to indicate that the corresponding calls should be intercepted) and
+; call the routine 'changeintercept' with it in R3 and V clear. The routine
+; may produce an error; if it doesn't, all registers and flags are preserved.
+; It will write the value passed in R3 back to 'shouldintercept' and adjust
+; the interceptions in effect appropriately. It may take a few hundred
+; microseconds or even more to execute if adjustments are required, but will
+; return fairly quickly if no change turns out to be needed to the
+; interceptions.
+;   If this technique is used, the original value of 'shouldintercept' should
+; be preserved and 'changeintercept' should be called again with R3 equal to
+; the original value before exiting the printer specific routine. This call
+; should be made with V clear if the printer specific code is not producing
+; an error, or V set if it is.
+
+; A note about ESCAPEs:
+;
+; The printer-independent shell does all the enabling, disabling and
+; acknowledging of the ESCAPE condition that needs to occur. It also
+; generates the 'Escape' error as and when appropriate. The printer-dependent
+; code has to rely on the underlying filing system to check for ESCAPEs
+; during filing system operations, so that one can escape out of the filing
+; system if e.g. a BPUT hangs. Thus the printer-dependent code doesn't
+; actually have to pay any attention to ESCAPEs.
+;   However, if a particular operation is going to take a long time (e.g.
+; the copying of a PostScript prologue file to the output file), it is a
+; good idea to test for an ESCAPE condition at regular intervals (using
+; SWI OS_ReadEscapeState); if one occurs, return with V set (there is no
+; need to point R0 at an error message: the top level ESCAPE-handling code
+; will generate the error message).
+;   Note however that this should only be done in the routines that are
+; protected by the top level ESCAPE-handling code - i.e. the ones that have
+; R10 equal to the job's file handle on entry.
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own configuration routines. These should
+; be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; configure_init       - printer specific initialisation of configuration.
+;                        This routine must initialise the variables in
+;                        'info_globalvalues' and 'size_globalvalues', as well
+;                        as any variables of its own. It should preserve all
+;                        registers.
+;
+; configure_finalise   - printer specific finalisation of the configuration.
+;                        This routine must free the RMA claimed in initialisation
+;                        It should preserve all registers.
+;
+; configure_vetinfo    - printer specific code to vet parameters passed to
+;                        PDriver_SetInfo.
+;                        Entry: R1-R7 as on entry to PDriver_SetInfo.
+;                        Exit:  All registers preserved (except R0 on error).
+;
+; configure_makeerror  - printer specific production of an error for
+;                        PDriver_CheckFeatures.
+;                        Entry: R0 is the PDriver_CheckFeatures mask
+;                                  parameter.
+;                               R1 is ((PDriver_CheckFeatures value
+;                                  parameter) AND R0).
+;                               R2 is ((features) AND R0) and is known not to
+;                                  be the same as R1.
+;                        Exit:  Appropriate error should have been produced,
+;                                  if sensible.
+;
+; configure_setprinter - printer specific PDriver_SetPrinter implementation.
+;                        Entry and exit as for PDriver_SetPrinter, except
+;                        that R12 holds the module workspace pointer.
+;
+; configure_setdriver  - printer specific PDriver_SetDriver implementation.
+;                        Entry and exit as for the PDriver_SetPrinter, except
+;                        that R12 holds the module workspace pointer.
+
+                GET     s.PDriver$DirSuffix..Configure
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own job management routines. These should
+; be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; managejob_allocate - printer specific allocation of workspace for a job.
+;                      Entry: -
+;                      Exit:  R11 = job's workspace pointer
+;
+; managejob_init     - printer specific initialisation of a job. If the print
+;                      job is going to redirect output to a sprite, the
+;                      sprite and its save area should be allocated here and
+;                      'jobspriteparams' should be filled with the correct
+;                      values. Note that the R0 value should be &23C (or just
+;                      possibly &23D), not &13C (or &13D).
+;                      Entry: R1 = zero or points to control or topbit
+;                                  character terminated title string.
+;                             R10 = file handle of job
+;                             R11 = job's workspace pointer
+;                             'ilustrationjob' contains 0 if the job is
+;                             normal, 1 if it is a single page illustration
+;                             job started with PDriver_SelectIllustration.
+;
+; managejob_suspend  - printer specific suspension of a job. If the print job
+;                      is redirecting output to a sprite, it should return
+;                      output to the original destination at this point. Note
+;                      that this routine may not produce any printer output.
+;                      Entry: R11 = job's workspace pointer
+;                      Exit:  Should not produce an error
+;
+; managejob_resume   - printer specific resumption of a job. If the print job
+;                      normally has output redirected to a sprite, it should
+;                      restart the redirection at this point. Note that this
+;                      routine may not produce any printer output.
+;                      Entry: R11 = job's workspace pointer
+;                      Exit:  Should not produce an error
+;
+; managejob_finalise - printer specific finalisation of a job. If the print
+;                      job is redirecting output to a sprite, it should
+;                      return output to the original destination at this
+;                      point.
+;                      Entry: R10 = file handle of job
+;                             R11 = job's workspace pointer
+;
+; managejob_abort    - printer specific aborting of a job. Note that this
+;                      routine may not produce any printer output.
+;                      Entry: R11 = job's workspace pointer
+;                      Exit:  Should not produce an error
+;
+; Each of these routines should preserve all registers. It should leave all
+; the obvious store management, etc., to the printer independent code in this
+; file.
+
+                GET     s.PDriver$DirSuffix..ManageJob
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own routines to do page and box
+; management. These should be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; pagebox_setup     - printer specific setup to produce a list of boxes.
+;                     Should also initialise the printer/driver as required
+;                     to produce the correct transformation and number of
+;                     copies.
+;                     Entry: R0 = number of copies to print
+;                            R2 = 0 or sequence number of page
+;                            R3 = 0 or points to a page number string,
+;                                 terminated by characters outside ASCII
+;                                 33-126
+;                            R10 = file handle for this print job
+;                            R11 = job's workspace pointer
+;                            The rectangle list has been set up.
+;                            'numberofpages' has been incremented for the
+;                            current page - i.e. it contains the number of
+;                            the current page.
+;                     Exit:  All registers preserved (except R0 on an error)
+;
+; pagebox_nextbox   - printer specific routine to produce the next box to be
+;                     printed, and to terminate the page if there are no
+;                     boxes left.
+;                     Entry: R0 = number of copies still to print
+;                            R10 = file handle for this print job
+;                            R11 = job's workspace pointer
+;                     Exit:  R0 = number of copies remaining to print
+;                            R2 = rectangle identification word
+;                            R3 = left X of next box, OS units
+;                            R4 = bottom Y of next box, OS units
+;                            R5 = right X of next box, OS units
+;                            R6 = top Y of next box, OS units
+;                            R2-R6 are only valid if R0<>0
+;                            All other registers preserved.
+;                            usersbg, usersoffset, usersbox, userstransform,
+;                            usersbottomleft all set up.
+;
+; pagebox_setmaxbox - printer specific routine to return to the maximum clip
+;                     box for the area currently being printed.
+;                     Entry: R10 = file handle for this print job
+;                            R11 = job's workspace pointer
+;                     Exit:  All registers preserved (except R0 on an error)
+;
+; pagebox_cleartobg - printer specific routine to fill the clip box for the
+;                     area currently being printed to its background colour
+;                     (i.e. to 'usersbg').
+;                     Entry: R10 = file handle for this print job
+;                            R11 = job's workspace pointer
+;                     Exit:  All registers preserved (except R0 on an error)
+;
+; pagebox_setnewbox - printer specific routine to set a new clip box. This
+;                     should set the intersection between the specified box
+;                     and the maximum clip box for the area currently being
+;                     printed.
+;                     Entry: R1 = left X of new box, units OS units
+;                            R2 = bottom Y of new box, units OS units
+;                            R3 = right X of new box, units OS units
+;                            R4 = top Y of new box, units OS units
+;                            R10 = file handle for this print job
+;                            R11 = job's workspace pointer
+;                     Exit:  All registers preserved (except R0 on an error)
+;
+; Note that all user co-ordinates are supplied to the printer specific parts
+; of the system relative to the lower left corner of the user's box, and that
+; all user co-ordinates returned by the printer specific routines should be
+; provided in the same form. The translation by 'usersoffset' is done by the
+; routines in the main source file.
+;
+; Also note that all boxes are supplied as true mathematical edges - i.e. in
+; pixel terms, they are generally left- and bottom-inclusive, right- and
+; top-exclusive.
+
+                GET     s.PDriver$DirSuffix..PageBox
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own colour handling routines. These should
+; be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; colour_setrealrgb  - printer specific routine to set a "real" RGB
+;                      combination (i.e. values really in range 0-255).
+;                      Entry: R1 = &BBGGRR00
+;                             R10 = file handle for this print job
+;                             R11 = job's workspace pointer
+;                      Exit:  All registers preserved (except R0 on an
+;                             error).
+;
+; colour_rgbtopixval - printer specific routine to convert an RGB
+;                      combination to as close a "pixel value" as possible
+;                      ("pixel values" are values that can be used in
+;                      sprite translation tables).
+;                      Entry: R0 = &BBGGRR00
+;                             R11 = job's workspace pointer
+;                      Exit:  R0 = pixel value (1 byte)
+;
+; colour_rgbtopixvalwide - printer specific routine to convert an RGB
+;                          combination to as close a "wide pixel value" as possible
+;                          ("wide pixel values" are values that can be used in
+;                          sprite translation tables of width matching mode depth).
+;                          Entry: R0 = &BBGGRR00
+;                                 R11 = job's workspace pointer
+;                          Exit:  R0 = pixel value (1,2 or 4 bytes)
+;                                 R1 = no. sig bytes in R0
+
+                GET     s.PDriver$DirSuffix..Colour
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own VDU-style plotting routines. These
+; should be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; plot_linebothends
+; plot_linestartonly
+; plot_dottedbothends
+; plot_dottedstartonly
+; plot_lineendonly
+; plot_linenoends
+; plot_dottedendonly
+; plot_dottednoends
+; plot_point
+; plot_triangle
+; plot_rectangle
+; plot_parallelogram
+; plot_strokecircle
+; plot_fillcircle
+; plot_strokearc
+; plot_fillchord
+; plot_fillsector
+; plot_strokeellipse
+; plot_fillellipse
+;
+; Each of these implements the corresponding plot call for the printer
+; concerned.
+; Entry: R2 is the X co-ordinate of the new graphics cursor position
+;        R3 is the Y co-ordinate of the new graphics cursor position
+;        R4 is the X co-ordinate of the old graphics cursor position
+;        R5 is the Y co-ordinate of the old graphics cursor position
+;        R6 is the X co-ordinate of the older graphics cursor position
+;        R7 is the Y co-ordinate of the older graphics cursor position
+;        R10 is the file handle for this print job
+;        R11 = job's workspace pointer
+;        For the four "plot_dottedxxx" calls, the correct dot pattern is
+;          in the 2 word variable "dottedpattern" and its length is in
+;          "dottedlength".
+; Exit:  All registers preserved.
+; All co-ordinates are relative to the bottom left corner of the user's
+; box.
+;
+; plot_fillclipbox - fill the current clipping box.
+;                    Entry: R10 = file handle for this print job
+;                           R11 = job's workspace pointer
+;                    Exit:  all registers preserved unless there's an error.
+
+                GET     s.PDriver$DirSuffix..Plot
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own Draw call handling routines. These
+; should be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; draw_boundaryonly     - thin stroke the specified path, closing all open
+;                         subpaths.
+;                         Entry: R0 -> path
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; draw_interiornobdry   - fill the interior of the specified path, excluding
+;                         boundary pixels if possible.
+;                         Entry: R0 -> path
+;                                Bit 1 of R1 is set if the even-odd winding
+;                                  rule is to be used (otherwise, use the
+;                                  non-zero winding number rule).
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; draw_interior         - fill the interior of the specified path.
+;                         Entry: R0 -> path
+;                                Bit 1 of R1 is set if the even-odd winding
+;                                  rule is to be used (otherwise, use the
+;                                  non-zero winding number rule).
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; draw_interiorwithbdry - fill the interior and boundary of the specified
+;                         path.
+;                         Entry: R0 -> path
+;                                Bit 1 of R1 is set if the even-odd winding
+;                                  rule is to be used (otherwise, use the
+;                                  non-zero winding number rule).
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; draw_strokenobdry     - stroke the specified path, using as close an
+;                         approximation to "plot interior, excluding interior
+;                         boundary" as possible.
+;                         Entry: R0 -> path
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R4 = thickness (non-zero)
+;                                R5 -> Draw cap and join specification
+;                                R6 -> Draw dash pattern, or is zero
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; draw_stroke           - stroke the specified path, using as close an
+;                         approximation to "plot interior and interior
+;                         boundary" as possible.
+;                         Entry: R0 -> path
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R4 = thickness (non-zero)
+;                                R5 -> Draw cap and join specification
+;                                R6 -> Draw dash pattern, or is zero
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; draw_strokewithbdry   - stroke the specified path, using as close an
+;                         approximation to "plot interior and all of
+;                         boundary" as possible.
+;                         Entry: R0 -> path
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R4 = thickness (non-zero)
+;                                R5 -> Draw cap and join specification
+;                                R6 -> Draw dash pattern, or is zero
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; draw_thinstroke       - thin stroke the specified path.
+;                         Entry: R0 -> path
+;                                R2 -> Draw transformation matrix, or is zero
+;                                R3 = flatness, in user co-ordinates
+;                                R6 -> Draw dash pattern, or is zero
+;                                R10 is the file handle for this print job
+;                                R11 = job's workspace pointer
+;                         Exit:  R0,R9 corrupt (except R0 on an error)
+;                                All other registers preserved.
+;
+; Note that all co-ordinates in the paths are strictly user co-ordinates, and
+; (unlike e.g. the plot_xxx calls above), the draw_xxx calls are responsible
+; for adding 256*origin to them and subtracting 256*usersoffset from them as
+; it processes them.
+
+                GET     s.PDriver$DirSuffix..Draw
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own sprite handling routines. These should
+; be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; sprite_put        - this tells the printer specific code to plot the given
+;                     sprite.
+;                     Entry: R0 is SpriteOp reason code and controls how R1
+;                               and R2 should be interpreted.
+;                            R1 -> sprite area if R0 >= &100; otherwise the
+;                               sprite area concerned is the system area.
+;                            R2 -> sprite name if R0 < &200.
+;                            R2 -> sprite if R0 >= &200.
+;                            R3 is the X co-ordinate relative to the bottom
+;                               left of the current rectangle (in OS units).
+;                            R4 is the Y co-ordinate relative to the bottom
+;                               left of the current rectangle (in OS units).
+;                            R5 is the GCOL action and is guaranteed to be 
+;                               clear except for bit 3 (use mask) and bit 4
+;                               (use palette in preference to trans table).
+;                               Bits 0-2 will be 0 meaning "overwrite".
+;                            R6 <= 0 for no scaling, or points to 4 scaling
+;                               factors (x-mag, y-mag, x-div, y-div).
+;                            R7 <= 0 for no translation, or points to a
+;                               translation table.
+;                            R10 is the file handle for this print job
+;                            R11 = job's workspace pointer
+;                     Exit:  All registers preserved.
+;
+; sprite_greyscaled - this tells the printer specific code to plot the given
+;                     sprite, anti-aliased to improve its quality if this is
+;                     appropriate for the printer concerned. (If it isn't,
+;                     the routine should be identical to 'sprite_put'.)
+;                     Entry: R0 is SpriteOp reason code and controls how R1
+;                               and R2 should be interpreted.
+;                            R1 -> sprite area if R0 >= &100; otherwise the
+;                               sprite area concerned is the system area.
+;                            R2 -> sprite name if R0 < &200.
+;                            R2 -> sprite if R0 >= &200.
+;                            R3 is the X co-ordinate relative to the bottom
+;                               left of the current rectangle (in OS units).
+;                            R4 is the Y co-ordinate relative to the bottom
+;                               left of the current rectangle (in OS units).
+;                            R5 is zero.
+;                            R6 <= 0 for no scaling, or points to 4 scaling
+;                               factors (x-mag, y-mag, x-div, y-div).
+;                            R7 <= 0 for no translation, or points to a
+;                               translation table.
+;                            R10 is the file handle for this print job
+;                            R11 = job's workspace pointer
+;                     Exit:  All registers preserved.
+;
+; sprite_mask       - this tells the printer specific code to plot the given
+;                     sprite's mask.
+;                     Entry: R0 is SpriteOp reason code and controls how R1
+;                               and R2 should be interpreted.
+;                            R1 -> sprite area if R0 >= &100; otherwise the
+;                               sprite area concerned is the system area.
+;                            R2 -> sprite name if R0 < &200.
+;                            R2 -> sprite if R0 >= &200.
+;                            R3 is the X co-ordinate relative to the bottom
+;                               left of the current rectangle (in OS units).
+;                            R4 is the Y co-ordinate relative to the bottom
+;                               left of the current rectangle (in OS units).
+;                            R6 <= 0 for no scaling, or points to 4 scaling
+;                               factors (x-mag, y-mag, x-div, y-div).
+;                            R10 is the file handle for this print job
+;                            R11 = job's workspace pointer
+;                            The correct colour has been set up (via a call
+;                               to 'colour_setrealrgb').
+;                     Exit:  All registers preserved.
+;
+; In all three routines, the routine is responsible for determining the
+; correct size to print the sprite, based on how large it would be plotted
+; with the specified scaling factors to a screen mode with XEigFactor and
+; YEigFactor equal to the values in the variables "currxeig" and "curryeig".
+;
+; It should be emphasised that all three of these routines should take great
+; care to ensure that sprites have the correct tiling properties - i.e. that
+; if the edges of two sprites are supposed to coincide, then they really do
+; coincide. This is usually not much trouble if the printer driver is
+; generating a printer-independent language like PostScript. It can cause
+; problems with printer drivers that are trying to produce output for a
+; specific resolution pixel grid - e.g. dot matrix printer drivers.
+;   The correct technique to use in such a case is:
+;
+; (1) working from the relative sizes of printer pixels and of sprite pixels
+;     (the latter depends on the scale factors), work out the correct
+;     positions of the four boundaries of the printed sprite;
+;
+; (2) round these to printer pixel boundaries;
+;
+; (3) work out scale factors to take the original sprite to these four
+;     boundaries;
+;
+; (4) use these scale factors to plot the sprite.
+;
+; Note (a) that it is not in general correct to simply multiply the scale
+; factors by the ratio of the pixel sizes; (b) that the same sized sprite
+; plotted with the same scale factors in different places may come out
+; marginally differently sized - this is an unfortunate but inevitable
+; consequence of the requirement about the tiling property.
+;
+; An example may make this clearer: suppose we are plotting a 19 pixel by
+; 19 pixel mode 12 sprite to position (0,0) with scale factors 5/4, 3/2,
+; with currxeig=1, curryeig=2 (the correct values for mode 12), and that
+; the printer being driven has 300 dots/inch.
+;
+; (a) The correct size for the sprite to be plotted in OS units is
+;     (5/4)*(19<<1) = 95/2 by (3/2)*(19<<2) = 114. Its boundaries are
+;     therefore at 0, 0, 95/2, 114 (in left, bottom, right, top order).
+;       The scaling factor between OS units and printer pixels is 300/180
+;     = 5/3 in both directions, which results in boundaries in printer
+;     pixels of 0, 0, 475/6, 190.
+;
+; (b) These are rounded to 0, 0, 79, 190 printer pixels.
+;
+; (c) We therefore want scaling factors of 79/19, 190/19 when plotting to
+;     the printer image bitmap.
+;
+; If we had plotted to position (2,2) instead, we would have got:
+;
+; (a) The correct size for the sprite to be plotted in OS units is
+;     (5/4)*(19<<1) = 95/2 by (3/2)*(19<<2) = 114. Its boundaries are
+;     therefore at 2, 2, 99/2, 116 (in left, bottom, right, top order).
+;       The scaling factor between OS units and printer pixels is 300/180
+;     = 5/3 in both directions, which results in boundaries in printer
+;     pixels of 10/3, 10/3, 165/2, 580/3.
+;
+; (b) These are rounded to 3, 3, 83, 193 printer pixels.
+;
+; (c) We therefore want scaling factors of 80/19, 190/19 when plotting to
+;     the printer image bitmap.
+
+                GET     s.PDriver$DirSuffix..Sprite
+                      
+; ***PRINTER SPECIFIC INFORMATION*** 
+;
+; These features apply to RISC OS 3.00
+;
+; Each printer driver needs to implement its own handling of transformed
+; sprites, these are handled by the following two entry points, for handling
+; transformed sprites and masks.  These can be plotted either via a 
+; matrix or into a parallelogram.
+;
+; sprite_plotmasktransformed
+; sprite_plotspritetransformed
+; 
+;   in: R0  = reason code, tells you how r1, r2 should be handled.
+;       R1 -> sprite control block
+;       R2 -> sprite name / pointer to sprite (if r0 =&2xx).
+;       R3  = flags word
+;                   bit 0 set => R6 -> destination co-ords, else matrix.
+;                   bit 1 set => R4 -> source rectangle within sprite.
+;                   others are reserved for future expansion.
+;
+;       R4  -> source rectangle block (if R3 bit 1 set).
+;               r6!0,4,8,12 =lowx,lowy,highx,highy (lowx,y inclusive) (highx,y exclusive)
+;
+;       R5   = GCOL action (bit 3 for masking, bit 4 for using the sprite's palette)
+;       R6  -> matrix (if R3 bit 0 clear):
+;               r6!0,4,8,12,16,20 = matrix (as for Draw module)
+;       R6  -> destination co-ordinates
+;               r6!0,4 = X0,Y0 screen (1/256ths OS unit)
+;               r6!8,12 = X1,Y1 on screen (1/256ths OS unit)
+;               r6!16,20 = X2, Y2 on screen (1/256ths OS unit)
+;               r6!24,28 = X3, Y3 on screen (1/256ths OS unit)
+;       R7  -> translation table ( <= 0 => none).
+;
+; The source cordinates are inclusive at the bottom-left, and exclusive at the
+; top right.
+;
+; When specifying a destination parallelogram, the source rectangle is mapped as onto
+; the destination as follows:
+;
+;       x0, y1  ->  X0, Y0
+;       x1, y1  ->  X1, Y1
+;       x1, y0  ->  X2, Y2
+;       x0, y0  ->  X3, Y3
+; 
+; In the future it may be possible to set the destination to an arbitary
+; quadrilateral, rather than a parallelogram.   ** THIS IS NOT YET SUPPORTED **
+;
+; The routine handling this call should ensure that the resulting image covers exactly
+; the area that a call to Draw_Fill would produce if passed the same rectangle
+; and relevant transformation matrix, where it is filling to half-way through
+; the boundary.
+;
+; If your printer driver supports transformed sprites then it should set bit 27
+; of the printer driver info word to reflect this, so that applications 
+; authors can take advantage of the new features. 
+; 
+                GET      s.PDriver$DirSuffix..TranSprite
+
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own VDU 5 character subroutines. These
+; routines should be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+; vdu5_char    - printer specific code to deal with a VDU 5 character. On
+;                some printer drivers (e.g. the PostScript one, to avoid
+;                generating massive numbers of "show" commands), this will
+;                usually result in the characters concerned being buffered up
+;                until they have to be output; other printer drivers will
+;                simply deal with characters as and when they arrive.
+;                  Note that this routine is NOT expected to try to change
+;                the graphics cursor position - this will be done by the
+;                printer independent code. If it buffers characters, it
+;                should print them separated by the amount specified in
+;                'vdu5autoadvance'.
+;                Entry: R0 holds the character.
+;                       R1 holds the X co-ordinate of the top left corner of
+;                          the character. It is in OS units, relative to the
+;                          bottom left corner of the user's box.
+;                       R2 holds the Y co-ordinate of the top left corner of
+;                          the character. It is also in OS units, relative to
+;                          the bottom left corner of the user's box.
+;                            It should be noted that this is NOT the same as
+;                          the Y co-ordinate of the graphics cursor, but one
+;                          screen pixel line above it. (Things are done this
+;                          way essentially because the top left corner of the
+;                          character is a resolution independent concept,
+;                          whereas the bottom left corner of the top left
+;                          pixel of the character is not. PostScript and
+;                          similar printer drivers can use this position
+;                          directly. Dot matrix and similar printer drivers
+;                          which are going to invoke the VDU drivers to print
+;                          the character to a sprite will need to subtract
+;                          one sprite pixel line from this Y co-ordinate to
+;                          get the appropriate graphics cursor position.)
+;                       R10 is the file handle for the print job.
+;                       R11 = job's workspace pointer.
+;                       'vdu5charsize' (2 words) contains the required VDU 5
+;                          character size, in OS units (not pixels, as
+;                          supplied to VDU 23,17,7,...).
+;                       'vdu5autoadvance' (2 words) contains the required VDU
+;                          5 character advance, again in OS units. If the
+;                          printer driver is buffering characters up, it only
+;                          needs to remember the first character's position,
+;                          then move by this amount between characters.
+;                       The correct colour has been set up (note that this
+;                          makes it a very good idea for printer drivers that
+;                          buffer their output to ensure they only produce
+;                          output for one colour change if a large number of
+;                          identical colour changes occur in succession).
+;                       Printer drivers which wish to buffer VDU 5 characters
+;                          may use 'textbuffer', a buffer of 'textbufferlen'
+;                          (which is a constant) bytes, and 'textbufferpos'
+;                          (a byte variable, containing the number of
+;                          characters currently in 'textbuffer'), provided
+;                          they take care to empty the buffer whenever
+;                          'vdu5_flush' (see below) is called, and that they
+;                          take care not to overfill the buffer. They may
+;                          also assume that 'textbufferpos' is zero when
+;                          'vdu5_char' is called for the first time, and that
+;                          its value and the valid characters in the buffer
+;                          are preserved between calls to 'vdu_char' and
+;                          'vdu5_flush'.
+;                Exit:  R0 to R3 may be corrupted.
+;                       All other registers preserved.
+;
+; vdu5_delete  - printer specific code to write a solid block character in
+;                the current (background) colour, to do a VDU 5 DELETE.
+;                Entry and exit conditions are as for 'vdu5_char', except:
+;                  (a) the background colour has been set up, not the
+;                      foreground.
+;                  (b) R0 is irrelevant on entry.
+;                  (c) the printer specific code is not allowed to buffer
+;                      DELETEs, and hence 'vdu5autoadvance' is irrelevant on
+;                      entry.
+;
+; vdu5_flush   - this printer specific call is of interest to printer drivers
+;                which try to buffer up VDU 5 characters in 'textbuffer' or
+;                elsewhere. It is called at the following points:
+;                  (a) when an intercepted call is going to (or is likely to)
+;                      produce some output, so that the VDU 5 characters must
+;                      be printed to get the overwriting order right.
+;                  (b) when any VDU control sequence is about to be obeyed.
+;                  (c) when a PDriver_DrawPage/PDriver_GetRectangle-supplied
+;                      rectangle is about to be finished.
+;                The printer specific code should respond by flushing any
+;                buffered VDU 5 characters to the printer and ensuring that
+;                'textbufferpos' is set to zero.
+;                  If the printer driver does not use 'textbuffer' and/or
+;                'textbufferpos' to buffer characters, it should provide a
+;                null implementation of this routine. It may safely assume
+;                that 'textbufferpos' is zero if none of its routines change
+;                it.
+;                Entry: R10 is the file handle for the print job.
+;                       R11 = job's workspace pointer.
+;                Exit:  All registers preserved (except R0 on an error).
+;
+; vdu5_changed - this call informs the printer specific code that the
+;                definition of a VDU 5 character (or of the entire VDU 5
+;                character set) has changed, or at least may have changed. It
+;                is called for a specific character if that character is
+;                redefined, and is called for the entire character set
+;                whenever the printer driver turns interception of VDU calls
+;                on (as character definitions may have been changed while it
+;                was off). Note that this call is made to all existing print
+;                jobs under both these circumstances - not just the current
+;                print job.
+;                Entry: R1 = character that may have changed, or anything
+;                          else to indicate that all characters may have
+;                          changed.
+;                       R11 = job's workspace pointer.
+;                Exit:  All registers preserved. May not produce an error.
+
+                GET     s.PDriver$DirSuffix..Vdu5
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own font handling subroutines. These
+; routines should be implemented in the following file.
+;   This file needs to implement the following routines:
+;
+;   This interface changed quite alot in the V3 printer drivers
+; the interface to font_paintchunk is the main culprit.
+;
+; font_bg          - printer specific code to deal with a background colour
+;                    change to a GCOL.
+;                    Entry: R1 is the background GCOL.
+;                           R10 is the file handle for this print job.
+;                           R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_fg          - printer specific code to deal with a first foreground
+;                    colour change to a GCOL.
+;                    Entry: R2 is the first foreground GCOL.
+;                           R10 is the file handle for this print job.
+;                           R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_absbg       - printer specific code to deal with a background colour
+;                    change to a absolute RGB value.
+;                    Entry: R1 is the background &BBGGRRXX.
+;                           R10 is the file handle for this print job.
+;                           R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_absfg       - printer specific code to deal with a first foreground
+;                    colour change to an absolute RGB value.
+;                    Entry: R2 is the first foreground &BBGGRRXX.
+;                           R10 is the file handle for this print job.
+;                           R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_coloffset   - printer specific code to set the offset associated with
+;                    the current font colour. If the current foreground
+;                    colour is an absolute RGB value, this is simply a hint
+;                    as to how many intermediate colours might be used, and
+;                    its sign should be ignored. If the current foreground
+;                    colour is a GCOL, it should be added to the first
+;                    foreground GCOL (modulo 16) to get the full foreground
+;                    colour.
+;                    Entry: R3 is the colour offset.
+;                           R10 is the file handle for this print job.
+;                           R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_savecolours - printer specific code to remember the current font
+;                    colour state. This is called before the first pass
+;                    through the string; if more than one pass is going to be
+;                    made through the string, the current colours should be
+;                    remembered here so that they can be restored at the
+;                    start of each pass.
+;                    Entry: R10 is the file handle for this print job.
+;                           R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (except R0 on an error).
+;                         
+;
+; font_stringstart - printer specific code to get ready to do a Font_Paint
+;                    call. There are three main purposes for this call:
+;                      (a) to allow the printer specific code to prepare for
+;                          the main sequence of 'font_paintchunk' calls that
+;                          that follow, e.g. by using Service_Print to turn
+;                      (b) to allow the printer specific code to say how many
+;                          passes it wants over the main data (many find it
+;                          easier to deal with rubout boxes properly in two
+;                          passes).
+;                      (c) to allow the printer specific code to specify the
+;                          maximum number of characters it is prepared to
+;                          deal with at a time. This can be helpful for a
+;                          number of reasons - e.g. to limit the length of a
+;                          PostScript output line or to prevent internal
+;                          buffer overflow.
+;                    Entry: R9 points to the end of the full string.
+;                           R10 contains the print job's file handle.
+;                           R11 points to the print job's workspace.
+;                           'fontpaint_stringaddr' points to the start of the full string.
+;                           'fontpaint_flags' contains the justification, rubout, kerning, reversing flags.
+;                           'fontpaint_startpos' contains the X,Y coordinates to paint at in millipoints.
+;                           'fontpaint_spacecount' number of spaces in the entire string.
+;                           'fontpaint_initfont' contains the font to be used at start of string.
+;                           'fontpaint_initmatrix' contians the six word paint matrix.
+;                           'fontpaint_rubout' contains the rubout box.
+;                           'fontpaint_spaceaddX,Y/charaddX,Y' contain the justification values used to 
+;                            paint the string.
+;                           'fontpaint_lastcharacter' contains the address of the last character in the string.
+;                            All co-ordinates are in millipoints, and are
+;                              relative to the bottom left corner of the
+;                              user's box.
+;                    Exit:  R7 = (maximum number of characters to be passed
+;                                in one call to 'font_paintchunk') - 1.
+;                           R8 = number of passes required over the string
+;                                (must be at least 1).
+;                           All other registers preserved (except R0 on an
+;                           error.
+;
+; font_passstart   - printer specific code to start a pass over the string
+;                    being printed. If multiple passes are being made over
+;                    the string, the printer specific code should restore
+;                    to the colour remembered by 'font_savecolours' earlier.
+;                    Entry: R8 is the pass over the string, in countdown
+;                              format (e.g. if there are two passes, it is 2
+;                              on the first pass, 1 on the second).
+;                           R10 contains the print job's file handle.
+;                           R11 points to the print job's workspace.
+;                           Variables set as for 'font_stringstart' above.
+;                    Exit:  All registers preserved (except R0 on an error).
+;                         
+; font_paintchunk    Printer specific code to handle the painting of a string
+;                    section at a specified area on the page.  The routine will
+;                    be passed a string in which all control sequences will have been
+;                    interpreted or faulted by the independent code, which will
+;                    therefore in general have broken the string supplied to Font_Paint
+;                    up into the number of strings to be passed to this routine with
+;                    various parameters.
+;
+;                    Entry: R1 ->Start of printable chunk (will only contain printable
+;                                 characters)
+;                           R3 Contains the X position to paint the sub-section at
+;                           R4 Contains the Y position to paint the sub-section at
+;                           R5 Contains the number of characters in the chunk, never
+;                               greater than the maximum chunk size returned
+;                           R8 Pass number over the string in the usual countdown
+;                               format
+;                           R10 Contains the print job's file handle
+;                           R11 Contains the pointer to the print jobs workspace
+;
+;                           'fontpaint_flags' contains the flags that indicate if
+;                             rubout, kerning transformed and reversed text to be plotted.
+;                           'fontpaint_rubout' contains the rubout region to be painted
+;                             below the text.
+;                           'fontpaint_font' handle of the font to be used for painting
+;                             the text.
+;                           'fontpaint_ulpos' and 'fontpaint_ulthick' contain the current
+;                             underline position and thickness.
+;                           'fontpaint_matrix' contains the current transformation matrix to use to
+;                             plot the text - only need to if matrix bit set in flags.
+;                           'fontpaint_spaceaddX,Y/charaddX,Y' contain the information required
+;                             to justify the text correctly.
+;                           'fontpaint_paintendxy' end coordinates of the paint end sequence, also
+;                             used to update the painting position.
+;                           'fontpaint_paintendxy' contain the start position of the next 
+;                             block of text to be painted.
+;                           'fontpaint_spacecount' number of spaces in the entire string.
+;                           'fontpaint_ruboutstart' start position of rubout region.
+;                           'fontpaint_ruboutend' end coordinate of rubout region.
+;
+;                           All co-ordinates are in millipoints, and are relative to the
+;                             bottom left corner of the user's box.
+;
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_passend     - printer specific code to end a pass over the string
+;                    being printed.
+;                    Entry: R8 is the pass over the string, in countdown
+;                              format (e.g. if there are two passes, it is 2
+;                              on the first pass, 1 on the second).
+;                           R10 contains the print job's file handle.
+;                           R11 points to the print job's workspace.
+;                           Variables set as for 'font_stringend' below.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_stringend   - printer specific code to tidy up at the end of a
+;                    Font_Paint call.
+;                    Entry: R10 contains the print job's file handle.
+;                           R11 points to the print job's workspace.
+;                           The variables 'fontpaint_flags',
+;                           'fontpaint_startpos', 'fontpaint_endpos',
+;                           'fontpaint_ruboutbox', 'fontpaint_spacecount' and
+;                           'fontpaint_deficit' are initialised to correct
+;                           values as appropriate.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_losefont    - some printer drivers use the font manager recursively,
+;                    translating each "master" screen font used in a print
+;                    job into a "slave" printer font which is then plotted
+;                    into an in-store page image. Those that do so need to
+;                    implement this call in order to tidy up behind
+;                    themselves (otherwise the font manager is likely to get
+;                    clogged up with forgotten fonts). Other printer drivers
+;                    should provide a null implementation (e.g.
+;                    "font_losefont BICS PC,LR,#V_bit").
+;                      This call is made under two circumstances:
+;                    (1) When the font manager is about to forget a font
+;                        permanently (i.e. a call to Font_LoseFont reduces
+;                        the font's usage count to zero), each print job is
+;                        told that the font concerned is disappearing. If the
+;                        print job has a font slaved to the given font, it
+;                        should tell the font manager to lose the slave font.
+;                    (2) When a print job is about to be deleted, this call
+;                        is made with R0=0. It should tell the font manager
+;                        to lose all the fonts it regards as "slave" fonts.
+;                    Note that it is possible (though unlikely) for a font to
+;                    be both a "master" font and a "slave" font. This means
+;                    that a call made to Font_LoseFont by this procedure may
+;                    cause this procedure to be called recursively. This
+;                    should happen and is quite legitimate. To make certain
+;                    that the code works correctly, authors implementing this
+;                    routine should ensure:
+;                      (a) that their implementation can be called
+;                          recursively;
+;                      (b) that they do NOT use the Service_Print service
+;                          call to turn interception of font manager calls
+;                          off and on again in their implementation;
+;                      (c) that they delete their internal record of the
+;                          master-slave relationship BEFORE using
+;                          Font_LoseFont to lose the slave font (otherwise
+;                          the very unusual case of a font slaved to itself
+;                          will produce an infinite loop or an error).
+;                    Entry: R0 = zero to forget all fonts, or the handle of
+;                                the font being forgotten.
+;                           R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (except R0 on an error).
+;
+; font_fontslost   - a call to this routine informs the printer specific code
+;                    that a soft reset has occurred, causing the font manager
+;                    to lose all its fonts. Printer drivers that use slaved
+;                    fonts should respond by clearing their master-slave data
+;                    WITHOUT calling Font_LoseFont on the slave fonts. Other
+;                    printer drivers can have a null implementation of this
+;                    routine.
+;                    Entry: R11 = job's workspace pointer.
+;                    Exit:  All registers preserved (errors may not occur).
+;
+; font_declare     - a call is made to this routine to declare to the printer
+;                    specific code that this font is being used within a 
+;                    document, it is then upto the printer specific code
+;                    to process this request as required.
+;                    Entry: R1 -> name of font to be declared.
+;                           R2  = flags word
+;                                       bit 0 set => give error if download 
+;                                                    fails.
+;                                       bit 1 set => font will be kerned when
+;                                                    used.
+;                           R11 = pointer to job workspace.
+;                    Exit:  All registers preserved (except r0 on an error)
+
+                GET     s.PDriver$DirSuffix..Font
+
+; &&&&& JPEG &&&&&
+
+                GET     s.PDriver$DirSuffix..JPEG
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own screen dumping subroutine. This
+; routine should be implemented in the following file. Note that this file
+; is required even if the printer driver does not support screen dumps: in
+; this case, it should just generate an error.
+;   This file needs to implement the following routines:
+;
+; screendump_dump  - printer specific code to do a screen dump.
+;                    Entry: R0 = file handle of file to receive the screen
+;                                dump.
+;                    Exit:  All registers preserved (except R0 on an error).
+
+                GET     s.PDriver$DirSuffix..ScreenDump
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own illustration insertion subroutine.
+; This routine should be implemented in the following file. Note that this
+; file is required even if the printer driver does not support illustration
+; insertion: in this case, it should just generate an error.
+;   This file needs to implement the following routines:
+;
+; picture_insert  - printer specific code to insert an illustration file.
+;                   Entry: R0 = file handle for file containing
+;                             illustration. Should be open for input.
+;                          R1 points to Draw module path to be used as a
+;                             clipping path, or contains zero if no clipping
+;                             is required.
+;                          R2,R3 contain the co-ordinates of where the
+;                             bottom left corner of the illustration is to
+;                             go.
+;                          R4,R5 contain the co-ordinates of where the
+;                             bottom right corner of the illustration is to
+;                             go.
+;                          R6,R7 contain the co-ordinates of where the top
+;                             left corner of the illustration is to go.
+;                   Exit:  All registers preserved (except R0 on an error).
+
+                GET     s.PDriver$DirSuffix..Picture
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs its own private subroutines - what these do
+; is entirely up to the printer driver concerned. These routines should be
+; implemented in the following file.
+
+                GET     s.PDriver$DirSuffix..Private
+
+
+; ***PRINTER SPECIFIC INFORMATION***
+;   Each type of printer needs to handle bit 31 set MiscOp calls - what
+; these do is entirely up to the printer driver concerned.  The routine
+; gets called as follows:
+;
+; miscop_decode - pass on device specific MiscOp call
+;
+;   in: r0  = reason code with bit 31 set
+;
+;  out: V set => r0 -> error block
+;       V clear => registers as defined by call.              
+;  
+                GET     s.PDriver$DirSuffix..MiscOp
+
+        END

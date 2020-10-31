@@ -1,0 +1,250 @@
+; > Core.Intercept
+
+
+;----------------------------------------------------------------------------
+;
+; Interception subroutines
+;
+;----------------------------------------------------------------------------
+
+; Routine to initialise the interception data to its standard state just
+; after the printer driver is initialised or after a soft reset. Assumptions
+; made:
+;   (a) Output is directed to the screen at the time.
+;   (b) We are not in a Wimp error report.
+;   (c) No interceptions are currently in effect.
+; All three of these assumptions are necessarily true on a soft reset, and
+; (c) is necessarily true on initialisation. It is a mistake to initialise
+; the PDriver module when (a) or (b) is not true.
+;   NB does not return errors. V insignificant on exit.
+
+initintercept
+        Push    "R0,LR"
+        MOV     R0,#intercept_all:SHL:8
+        STR     R0,intercepting
+        ASSERT  (:INDEX:intercepting:AND:3) = 0
+        ASSERT  shouldintercept = intercepting + 1
+        ASSERT  passthrough = shouldintercept + 1
+        ASSERT  wimpreportflag = passthrough + 1
+        ADR     R0,spriteparams
+        BL      setscreenparams
+        Pull    "R0,PC"
+
+; Routine to adjust the interceptions being made at a time that the
+; 'shouldintercept' byte has not changed, but other circumstances (e.g.
+; existence of an active print job, output to sprite status, Wimp error
+; reporting) have.
+;   If an error occurs during OS_Claim or OS_Release, an attempt will be made
+; to clear all interceptions. The error will be reported only if V was clear
+; on entry (i.e. there was no error). Under all other circumstances, the
+; routine preserves all registers and flags.
+
+adjustintercept
+        Push    "R0-R7,R10,R11,LR"
+        LDRB    R3,shouldintercept
+        B       changeintercept_common
+
+; Routine to change the current interceptions to fit the circumstances. The
+; rules are:
+;   (a) If a Wimp error is currently being reported, turn off all
+;       interceptions.
+;   (b) If there is no active print job, turn off all interceptions.
+;   (c) If there is an active print job and output is neither directed to
+;       the screen nor to that job's sprite, turn off all interceptions.
+;   (d) Otherwise set up the interceptions indicated by 'shouldintercept'.
+;
+; R3 contains the interceptions wanted on entry.
+;   If an error occurs during OS_Claim or OS_Release, an attempt will be made
+; to clear all interceptions. The error will be reported only if V was clear
+; on entry (i.e. there was no error). Under all other circumstances, the
+; routine preserves all registers and flags.
+
+changeintercept
+        Push    "R0-R7,R10,R11,LR"
+        STRB    R3,shouldintercept
+changeintercept_common
+        MOV     R7,#0
+changeintercept_common2
+        TEQ     R3,#0                           ;No point checking up on
+                                                ;  cases above if we're
+                                                ;  turning off interceptions
+        LDRNEB  LR,wimpreportflag               ;Otherwise, check for being
+        TEQNE   LR,#1                           ;  inside Wimp error report
+
+        ASSERT  :BASE:currenthandle = R12       ;Otherwise, check for there
+        ASSERT  :INDEX:currenthandle = 0        ;  being a print job, loading
+        ASSERT  currentws = currenthandle + 4   ;  print job workspace
+        LDMNEIA R12,{R10,R11}                   ;  pointer if there is
+        TEQNE   R10,#0
+        BEQ     changeintercept_nointercepts
+
+        ADR     LR,spriteparams                 ;Otherwise, check output
+        LDMIA   LR,{R0-R2}                      ;  destination
+        ADR     LR,jobspriteparams
+        LDMIA   LR,{R4-R6}
+        TEQ     R0,R4                           ;If output to job's sprite
+        TEQEQ   R1,R5
+        TEQEQ   R2,R6
+        TEQNE   R2,#0                           ;  or output to screen,
+        BEQ     changeintercept_intercepts      ;  use R3 value supplied
+changeintercept_nointercepts
+        MOV     R3,#0                           ;No intercepts wanted
+changeintercept_intercepts
+
+; We now know exactly what intercepts we want. Find out what intercepts we
+; have got and which need changing. If none, return quickly, restoring flags.
+
+        LDRB    R4,intercepting
+        EORS    R5,R3,R4
+        Pull    "R0-R7,R10,R11,PC",EQ,^
+
+        MOV     R2,R12                          ;Set up common value
+
+; Deal with change to OS_Wrch interception.
+
+        TST     R5,#intercept_wrch
+        BEQ     changeintercept_notwrch
+        MOV     R0,#WrchV
+        ADRL    R1,interceptwrch
+        TST     R3,#intercept_wrch
+        BNE     changeintercept_wrchon
+        SWI     XOS_Release
+        B       changeintercept_wrchdone
+changeintercept_wrchon
+        SWI     XOS_Claim
+        MOV     R1,#-1
+        BL      broadcast_vdu5_changed
+changeintercept_wrchdone
+        BVS     changeintercept_error
+        EOR     R4,R4,#intercept_wrch
+changeintercept_notwrch
+
+; Deal with change to ColourTrans calls interception.
+
+        TST     R5,#intercept_col
+        BEQ     changeintercept_notcol
+        MOV     R0,#ColourV
+        ADRL    R1,interceptcolour
+        TST     R3,#intercept_col
+        BNE     changeintercept_colon
+        SWI     XOS_Release
+        B       changeintercept_coldone
+changeintercept_colon
+        SWI     XOS_Claim
+changeintercept_coldone
+        BVS     changeintercept_error
+        EOR     R4,R4,#intercept_col
+changeintercept_notcol
+
+; Deal with change to Draw calls interception.
+
+        TST     R5,#intercept_draw
+        BEQ     changeintercept_notdraw
+        MOV     R0,#DrawV
+        ADRL    R1,interceptdraw
+        TST     R3,#intercept_draw
+        BNE     changeintercept_drawon
+        SWI     XOS_Release
+        B       changeintercept_drawdone
+changeintercept_drawon
+        SWI     XOS_Claim
+changeintercept_drawdone
+        BVS     changeintercept_error
+        EOR     R4,R4,#intercept_draw
+changeintercept_notdraw
+
+; Deal with change to OS_SpriteOp interception.
+
+        TST     R5,#intercept_spr
+        BEQ     changeintercept_notspr
+        MOV     R0,#SpriteV
+        ADRL    R1,interceptsprite
+        TST     R3,#intercept_spr
+        BNE     changeintercept_spron
+        SWI     XOS_Release
+        B       changeintercept_sprdone
+changeintercept_spron
+        SWI     XOS_Claim
+changeintercept_sprdone
+        BVS     changeintercept_error
+        EOR     R4,R4,#intercept_spr
+changeintercept_notspr
+
+; Deal with change to OS_Byte interception.
+
+        TST     R5,#intercept_byte
+        BEQ     changeintercept_notbyte
+        MOV     R0,#ByteV
+        ADRL    R1,interceptbyte
+        TST     R3,#intercept_byte
+        BNE     changeintercept_byteon
+        SWI     XOS_Release
+        B       changeintercept_bytedone
+changeintercept_byteon
+        SWI     XOS_Claim
+changeintercept_bytedone
+        BVS     changeintercept_error
+        EOR     R4,R4,#intercept_byte
+changeintercept_notbyte
+
+; Deal with changes to font manager calls interception
+
+        TST     R5,#intercept_font
+        BEQ     changeintercept_notfont
+        MOV     R1,#Service_Print
+        TST     R3,#intercept_font
+        MOVNE   R2,#-1
+        MOVEQ   R2,#0
+        SWI     XOS_ServiceCall
+        EOR     R4,R4,#intercept_font
+changeintercept_notfont
+
+; Deal with changes to JPEG plot interception
+
+        TST     R5,#intercept_jpeg
+        BEQ     changeintercept_notjpeg
+        TST     R3,#intercept_jpeg
+        MOVNE   R0,#1
+        MOVEQ   R0,#0
+        SWI     XJPEG_PDriverIntercept
+        EOR     R4,R4,#intercept_jpeg
+changeintercept_notjpeg
+
+        STRB    R4,intercepting
+        Pull    "R0-R7,R10,R11,PC",,^
+
+changeintercept_error
+        STRB    R4,intercepting
+        TEQ     R7,#0                   ;Try to clear intercepts if this
+        BLEQ    changeintercept_clear   ;  is not a recursive call. Note V
+                                        ;  is set, so R0 and V are preserved
+        LDR     LR,[R13,#40]            ;Recover entry LR value
+        TST     LR,#V_bit
+        Pull    "R0-R7,R10,R11,PC",NE,^
+        STR     R0,[R13]
+        Pull    "R0-R7,R10,R11,PC"      ;Note V is still set
+
+changeintercept_clear
+        Push    "R0-R7,R10,R11,LR"
+        MOV     R3,#0
+        STRB    R3,shouldintercept
+        MOV     R7,#-1
+        B       changeintercept_common2
+
+; A subroutine to broadcast the information that VDU 5 characters may have
+; been redefined to all print jobs. Entered with R1 = character that may have
+; changed, or anything else to mean that all characters may have changed.
+; Preserves all registers and flags.
+
+broadcast_vdu5_changed
+        Push    "R11,LR"
+        ADR     R11,printjoblist - (:INDEX:joblink)
+        ASSERT  :BASE:joblink = R11
+broadcast_vdu5_changed_loop
+        LDR     R11,joblink
+        TEQ     R11,#0
+        Pull    "R11,PC",EQ,^
+        BL      vdu5_changed
+        B       broadcast_vdu5_changed_loop
+
+        END

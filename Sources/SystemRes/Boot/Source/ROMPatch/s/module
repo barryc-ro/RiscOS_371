@@ -1,0 +1,203 @@
+
+
+; s.module
+
+; - required to handle removing patches on a Service_PreReset
+; - also removes patches when rmkill'ed, but this should be used with caution
+; - designed for insertion into RMA (not ROM-able)
+; - has local cache/TLB flushing code, currently copes with ARM 6,7,StrongARM
+
+        AREA    |main|, CODE, READONLY
+
+        EXPORT |myflush|
+
+        EXPORT |module|
+        EXPORT |modDAhandler|
+        EXPORT |moddata|
+        EXPORT |moduleend|
+
+              GBLS   VersionString
+VersionString SETS   "2.02 (24-Feb-97)"
+
+        GET   UK.s.messages
+
+
+; - valid kernel workspace address for RISC OS 3.70, 3.71
+; - does not exist and not used for RISC OS 3.60
+ARMA_Cleaner_flipflop        * &178
+
+
+Service_PreReset             * &45
+Service_DynamicAreaRenumber  * &92
+XOS_DynamicArea              * &20066
+I_bit                        * &8000000 ;interrupt disable
+
+module
+        DCD     0               ; start entry
+        DCD     0               ; init entry
+        DCD     module_bye      - module
+        DCD     module_service  - module
+        DCD     module_title    - module
+        DCD     module_helpstr  - module
+        DCD     0               ; command table
+        DCD     0               ; swi chunk
+        DCD     0               ; swi code
+        DCD     0               ; swi strings
+        DCD     0               ; swi name decode code
+
+module_title
+        DCB    "ROMPatches",0
+        ALIGN
+module_helpstr
+        DCB    "ROM Patches",9,VersionString,0
+        ALIGN
+
+module_service
+        TEQ     r1, #Service_PreReset
+        TEQNE   r1, #Service_DynamicAreaRenumber
+        MOVNE   pc, r14
+        TEQ     r1, #Service_PreReset
+        BEQ     serv_prereset
+;serv_DArenum
+        STMFD   r13!,{r14}
+        LDR     r14,modDAN
+        CMP     r14,#0
+        LDMEQFD r13!,{pc}
+        CMP     r14,r2
+        STREQ   r3,modDAN
+        LDMFD   r13!,{pc}
+serv_prereset
+        STMFD   r13!, {r14}
+        BL      unpatchrom
+        LDMFD   r13!, {pc}
+
+module_bye
+        STMFD   r13!, {r0,r1,r14}
+        BL      unpatchrom
+        MOV     r0,#1
+        LDR     r1,modDAN
+        CMP     r1,#0
+        SWINE   XOS_DynamicArea       ;remove dynamic area
+        MOV     r1,#0
+        STR     r1,modDAN             ;mark as removed
+        LDMFD   r13!, {r0,r1,pc}
+
+unpatchrom
+        STMFD   r13!,{r0-r4,lr}
+        LDR     r0,modL1PT
+        CMP     r0,#0
+        BEQ     unpatchromdone
+        ADR     r1,modL1PTentries
+        MOV     r2,#4
+        MOV     r4,pc
+        ORR     r3,r4,#I_bit
+        TEQP    r3,#0                 ;disable interrupts
+unpatchromloop
+        LDR     r3,[r1],#4
+        STR     r3,[r0],#4
+        SUBS    r2,r2,#1
+        BNE     unpatchromloop
+        BL      myflush
+        TEQP    r4,#0                 ;restore IRQ state
+        MOV     r0,#0
+        STR     r0,modL1PT            ;mark as unpatched
+unpatchromdone
+        LDMFD   r13!,{r0-r4,pc}
+
+
+;flush cache(s) and TLB(s), without using any ROM code, since
+;ROM mapping is being arsed about with
+;
+;copes with ARM 6,7 or StrongARM (not currently ARM 8)
+;
+;this routine is part of module, but also called by app
+;
+myflush
+        STMFD   r13!,{r0-r4,lr}
+        MRC     p15,0,r4,c0,c0,0    ;read ID reg
+        AND     r4,r4,#&F000
+;flush cache
+        CMP     r4,#&A000
+        MCRNE   p15,0,r0,c7,c0,0    ;flush ARM 6/7 cache
+        BNE     flushTLB
+;StrongARM then (must also therefore be RISC OS 3.70 or later)
+        MOV     r2,#ARMA_Cleaner_flipflop
+        LDR     r1,[r2]
+        EOR     r1,r1,#16*1024      ;next cleaner area
+        STR     r1,[r2]       
+        ADD     r2,r1,#16*1024      ;16k data cache
+cleanDCloop
+        LDR     r3,[r1],#32         ;read (clean/flush) next cache line
+        TEQ     r2,r1
+        BNE     cleanDCloop
+        MCR     p15,0,r0,c7,c10,4   ;drain WB
+        MCR     p15,0,r0,c7,c5,0    ;flush IC
+        NOP
+        NOP
+        NOP
+        NOP
+flushTLB
+        CMP     r4,#&A000
+        MCREQ   p15,0,r0,c8,c7,0    ;flush StrongARM TLB(s)
+        MCRNE   p15,0,r0,c5,c0,0    ;flush ARM 6/7 TLB
+        LDMFD   r13!,{r0-r4,pc}
+
+modDAhandler
+        CMP     r0,#2           ;preshrink?
+        BEQ     mdah_preshrink
+        CMP     r0,#0           ;pregrow?  (NB clears V)
+        MOVNE   pc,r14
+;pregrow
+        STMFD   r13!,{r0-r3}
+        LDR     r0,modnextpageneeded
+        LDR     r3,modfirstpagenotneeded
+        CMP     r0,r3           ;allow pregrow only if not fully grown yet
+        BHS     mdah_pregrowerror
+mdah_pregrowloop
+        STR     r0,[r1],#12     ;fill in next required page number in block
+        ADD     r0,r0,#1
+        SUBS    r2,r2,#1
+        BNE     mdah_pregrowloop
+        STR     r0,modnextpageneeded
+        LDMFD   r13!,{r0-r3}
+        MOV     pc,r14
+mdah_pregrowerror
+        ADR     r0,errorNaffOff
+        CMP     pc,#&80000000   ;refuse (set V flag)
+        LDMFD   r13!,{r0-r3}
+        MOV     pc,r14
+;
+mdah_preshrink
+        LDR     r0,modL1PT
+        CMP     r0,#0           ;refuse preshrink unless patches removed
+        MOVEQ   r0,#2           ;restore r0=2 reason code, preshrink allowed
+        MOVNE   r3,#0           ;no shrinkage
+        ADRNE   r0,errorNaffOff
+        CMPNE   pc,#&80000000   ;refuse (set V flag)
+        MOV     pc,r14
+
+errorNaffOff
+        DCD     0
+        DCB     HandlerSaysNaffOff,0
+        ALIGN
+
+;values will be poked in by C (after module is inserted, and copied to RMA)
+moddata
+modnextpageneeded            ;next page number required for DA on next grow
+        DCD     0
+modfirstpagenotneeded        ;pages modfirstpageneeded..modfirstpagenotneeded-1 still required
+        DCD     0
+modDAN
+        DCD     0            ;dynamic area number for patches
+modL1PT
+        DCD     0            ;L1PT address for ROM
+modL1PTentries
+        DCD     0            ;4 entries to map unpatched ROM as 4 sections
+        DCD     0
+        DCD     0
+        DCD     0
+
+moduleend
+        DCD     0
+
+        END

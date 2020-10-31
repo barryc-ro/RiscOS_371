@@ -1,0 +1,251 @@
+/* > taskwindow.c
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "kernel.h"
+#include "msgs.h"
+#include "werr.h"
+#include "wimpt.h"
+#include "wimpx.h"
+#include "win.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "macros.h"
+#include "taskwindow.h"
+
+#define CANT_START_TASK msgs_lookup("Etaskwindow0:Error running taskwindow for '%s'.")
+
+typedef struct taskwindow__str
+{
+    char    *cmd_line;
+
+    int     txt_id;     /* handle used to identify child */
+    wimp_t  child_id;   /* child's task handle */
+
+    taskwindow_eventfn  event_fn;
+    void                *event_handle;
+
+    int     event_depth;
+    BOOL    dispose_pending;
+};
+
+static int              tasks_running = 0;
+static wimp_msgaction   msgs_list[] =
+{
+    TaskWindow_Output,
+    TaskWindow_Ego,
+    TaskWindow_Morio,
+    0
+};
+
+static BOOL send_event(taskwindow t, wimp_msgstr *mp)
+{
+    if (t && t->event_fn)
+    {
+        t->event_depth++;
+        if (mp)
+            t->event_fn(t, &mp->data.chars[4], mp->data.words[0], t->event_handle);
+        else
+            t->event_fn(t, NULL, -1, t->event_handle);
+        t->event_depth--;
+
+        if (t->dispose_pending)
+            taskwindow_dispose(&t);
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL taskwindow__events(wimp_eventstr *e, void *handle)
+{
+    taskwindow t = handle;
+    switch (e->e)
+    {
+        case wimp_ESEND:
+        case wimp_ESENDWANTACK:
+        {
+            wimp_msgstr *mp = &e->data.msg;
+            switch (mp->hdr.action)
+            {
+                case TaskWindow_Output:
+                    if (t->child_id == mp->hdr.task)
+                    {
+                        send_event(t, mp);
+                        return TRUE;
+                    }
+                    break;
+
+                case TaskWindow_Ego:
+                    if (mp->data.words[0] == t->txt_id)
+                    {
+                        t->child_id = mp->hdr.task;
+                        return TRUE;
+                    }
+                    break;
+
+                case TaskWindow_Morio:
+                    if (t->child_id == mp->hdr.task)
+                    {
+                        t->child_id = 0;
+                        if (!send_event(t, NULL))
+                            taskwindow_dispose(&t);
+                        return TRUE;
+                    }
+                    break;
+            }
+            break;
+        }
+    }
+    return FALSE;
+}
+
+taskwindow taskwindow_new(taskwindow_flag flags, int wimpslot, const char *name, const char *fmt, ...)
+{
+    taskwindow t = calloc(sizeof(struct taskwindow__str), 1);
+    if (t)
+    {
+        char        *buffer = malloc(1024);
+        int         n;
+        va_list     ap;
+        wimp_t      newtask;
+
+        strcpy(buffer, "taskwindow \"");
+        n = strlen(buffer);
+
+        va_start(ap, fmt);
+        n += vsprintf(buffer + n, fmt, ap);
+        va_end(ap);
+
+        t->txt_id = time(NULL);
+        n += sprintf(buffer + n, "\" -task &%08x -txt &%08x", wimpt_task(), t->txt_id);
+
+        if (wimpslot != -1)
+            n += sprintf(buffer + n, " %dK", wimpslot);
+        if (name)
+            n += sprintf(buffer + n, " %s", name);
+        if (flags & taskwindow_Ctrl)
+            strcat(buffer, " -ctrl");
+        if (flags & taskwindow_Display)
+            strcat(buffer, " -display");
+        if (flags & taskwindow_Quit)
+            strcat(buffer, " -quit");
+
+        t->cmd_line = realloc(buffer, strlen(buffer));
+
+#ifndef NDEBUG
+        _kernel_setenv("Usr$TaskWindow$LastCmdLine", buffer);
+#endif
+        if (tasks_running++ == 0)
+            no_err(wimp_addmessages(msgs_list));
+
+        win_add_unknown_event_processor(taskwindow__events, t);
+
+        if (os_err(wimp_starttask_rp(t->cmd_line, &newtask)) != NULL)
+            return taskwindow_dispose(&t);
+        if (newtask == 0)
+        {
+/*          werr(0, CANT_START_TASK, name); */
+            return taskwindow_dispose(&t);
+        }
+    }
+    return t;
+}
+
+taskwindow taskwindow_dispose(taskwindow *pt)
+{
+    taskwindow t = *pt;
+    if (t)
+    {
+        taskwindow_kill(t);
+
+        if (t->event_depth)
+            t->dispose_pending = TRUE;
+        else
+        {
+            win_remove_unknown_event_processor(taskwindow__events, t);
+
+            free(t->cmd_line);
+            free(t);
+
+            if (--tasks_running == 0)
+                no_err(wimp_removemessages(msgs_list));
+        }
+        *pt = NULL;
+    }
+    return NULL;
+}
+
+void taskwindow_eventhandler(taskwindow t, taskwindow_eventfn fn, void *handle)
+{
+    t->event_fn = fn;
+    t->event_handle = handle;
+}
+
+static void taskwindow__sendmessage(taskwindow t, int message)
+{
+    if (t->child_id)
+    {
+        wimp_msgstr msg;
+        msg.hdr.size = sizeof(wimp_msghdr);
+        msg.hdr.your_ref = 0;
+        msg.hdr.action = message;
+        no_err(wimp_sendmessage(wimp_ESEND, &msg, t->child_id));
+    }
+}
+
+void taskwindow_suspend(taskwindow t)
+{
+    taskwindow__sendmessage(t, TaskWindow_Suspend);
+}
+
+void taskwindow_resume(taskwindow t)
+{
+    taskwindow__sendmessage(t, TaskWindow_Resume);
+}
+
+void taskwindow_kill(taskwindow t)
+{
+    taskwindow__sendmessage(t, TaskWindow_Morite);
+    t->child_id = 0;
+}
+
+void taskwindow_sendinput(taskwindow t, const char *data)
+{
+    if (t->child_id)
+    {
+        int sent = 0, len = strlen(data);
+        while (len > 0)
+        {
+            wimp_msgstr msg;
+            int tosend = lowest(sizeof(msg.data)-4, len);
+            msg.hdr.size = sizeof(wimp_msghdr) + 4 + (tosend + 3)&~3;
+            msg.hdr.your_ref = 0;
+            msg.hdr.action = TaskWindow_Input;
+            msg.data.words[0] = tosend;
+            memcpy(&msg.data.words[1], data, tosend);
+            no_err(wimp_sendmessage(wimp_ESEND, &msg, t->child_id));
+            sent += tosend;
+            len -= tosend;
+        }
+    }
+}
+
+char *taskwindow_cmdline(taskwindow t)
+{
+    return t->cmd_line;
+}
+
+wimp_t taskwindow_syshandle(taskwindow t)
+{
+    return t->child_id;
+}
+
+/* eof taskwindow.c */

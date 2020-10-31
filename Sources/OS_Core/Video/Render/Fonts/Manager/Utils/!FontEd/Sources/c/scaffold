@@ -1,0 +1,931 @@
+/*  c.scaffold
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.drag"
+#include "h.editchar"
+#include "h.loadsave"
+#include "h.main"
+#include "h.menu"
+#include "h.redraw"
+#include "h.scaffold"
+#include "h.sprites"
+
+
+typedef struct tree {
+  struct tree * sibling;
+  int child;
+} tree;
+
+typedef struct treestr {
+  char *onoff;
+  int *xcoord, ycoord;
+  tree **head;
+  int nchars;
+  Char_Block **charray;
+  os_error * (*subr1)(struct treestr *, int, int *, int);
+  os_error * (*subr2)(struct treestr *, int, int, int);
+  os_error * (*subr3)(struct treestr *, int, int, int);
+  char * checkarray;
+  int mousex, mousey, foundchar;             /* for mouse click matching */
+  wimp_box *wimpbox;                         /* for returning bbox */
+} treestr;
+
+treestr maketreestr(int nchars);
+void freetreestr(treestr * t);
+
+os_error * scantree1(treestr *t, Font_Block *font);
+os_error * scantree2(treestr *t,
+                             os_error *(*subr1)(treestr *t, int chcode, int *x, int y),
+                             os_error *(*subr2)(treestr *t, int x, int y, int sp),
+                             os_error *(*subr3)(treestr *t, int x, int y, int sp));
+os_error * ptree(treestr *t, int chcode, int sp);
+os_error * pchar(treestr *t, int chcode, int *x, int y);
+os_error * renewchar(treestr *t, int chcode, int *x, int y);
+os_error * findtreechar(treestr *t, int chcode, int *x, int y);
+os_error * pstem1(treestr *t, int x, int y, int sp);
+os_error * pstem2(treestr *t, int x, int y, int sp);
+void freetree(treestr * t);
+
+os_error *displaycharcolours(wimp_w handle, Font_Block *font, char *checkarray);
+
+os_error *redrawscaffoldselect(Font_Block *font, char *checkarray);
+
+os_error *cpscaff(Char_Block *char1, Char_Block *char2, int i, char *flags, char *check);
+
+
+/* ------------------------------------------------------------------------- */
+
+/* Returns the scaffold selection status of a given character
+ * SEL_NONE, SEL_SCAFFOLDX or SEL_SCAFFOLDY are possible
+ */
+
+seltype scafftype(Char_Block *ch)
+{
+  register int i = ch->parent->scaffold.index;
+  if (ch->scaffold.xchar[i] == ch->parent->scaffold.selchar &&
+      ch->scaffold.xcoord[i] != NULL_SCAFFOLD) {
+    return((i<8) ? SEL_SCAFFOLDX : SEL_SCAFFOLDY);
+  } else return SEL_NONE;
+}
+
+
+/* Selects the indicated scaffold line in the specified character.
+ * The selection applies to the whole font, so many skeleton windows may need updating
+ */
+
+os_error * selectscaffold(Char_Block *charptr, seltype type,int index)
+{
+  Font_Block *font = charptr->parent;
+  int newchar;
+  os_error *err = NULL;
+
+  if (type != SEL_NONE)
+  if (scafftype(charptr) == SEL_NONE) er(selectline(charptr, NULL));
+
+  if (type == SEL_SCAFFOLDY) index += 8;
+  newchar = (type==SEL_NONE) ? 0 : charptr->scaffold.xchar[index];
+
+  if (index != font->scaffold.index ||
+      newchar != font->scaffold.selchar) {
+    int oldchar = font->scaffold.selchar;
+    int oldindex = font->scaffold.index;
+    Char_Block *chr, **charray = font->chars;
+    int i;
+    char * checkarray = heap_alloc(font->nchars);
+
+    if (!checkarray) returnerr("Heap full");
+
+    font->scaffold.selchar = newchar;
+    font->scaffold.index = index;
+
+    for (i=0;i<font->nchars;i++) {
+      checkarray[i] = 0;
+      if ((chr = charray[i]) != NULL) {
+        int index1 = (chr->scaffold.xchar[oldindex] == oldchar) ? oldindex : 0;
+        int index2 = (chr->scaffold.xchar[index] == newchar) ? index : 0;
+        if (index1 != index2) checkarray[i] = 1;
+      }
+    }
+    err = redrawscaffoldselect(font, checkarray);
+
+    heap_free(checkarray);
+  }
+
+  return(err);
+}
+
+
+/* Called from selectscaffold and changescaffold to update the display,
+ * when either the selected line changes, or where a scaffold line changes so that:
+ * (a) it was selected, and now isn't, or (b) it wasn't selected, and now is
+ */
+
+os_error *redrawscaffoldselect(Font_Block *font, char *checkarray)
+{
+  Wind_Link *wlink = Wind_Head.next;
+
+  while(wlink)
+  {
+    switch(wlink->type)
+    {
+      case W_SKELETON:
+           {
+             Char_Block *charptr = wlink->info;
+             if (charptr->parent == font)
+             if (checkarray[charptr->charno])
+               invalidate(wlink->wind_handle, -big,-big,big,big);
+           }
+           break;
+
+      case W_FONTINDEX:
+           {
+             Font_Block *font2 = wlink->info;
+             if (font2 == font || font2->parent == font) {
+               er(displaycharcolours(wlink->wind_handle, font, checkarray));
+             }
+           }
+           break;
+
+      case W_TREE:
+           if (wlink->info == font) {
+             treestr t = maketreestr(font->nchars);
+             if (t.nchars < 0) {
+               freetreestr(&t);
+               returnerr("Heap full");
+             } else {
+               handle = wlink->wind_handle;    /* global variable for renewchar */
+               bx = 0; by = 0;                          /* draw tree in work area coords */
+               t.checkarray = checkarray;         /* renewchar draws all relevent characters */
+               scantree1(&t, font);
+               scantree2(&t, renewchar, NULL, NULL);
+               freetreestr(&t);
+             }
+           }
+    } /* switch */
+    wlink = wlink->next;
+  } /* while */
+  return(NULL);
+}
+
+
+/* Update characters in font window whose colour has changed
+ * t->checkarray[] indicates which chars need redrawing
+ */
+
+os_error *displaycharcolours(wimp_w handle, Font_Block *font, char *checkarray)
+{
+  wimp_redrawstr rblk;
+  BOOL more;
+
+  rblk.w      = handle;
+  rblk.box.x0 = -big;
+  rblk.box.y0 = -big;
+  rblk.box.x1 = big;
+  rblk.box.y1 = big;
+  er(wimp_update_wind(&rblk,&more));
+
+  bx = rblk.box.x0 - rblk.scx;
+  by = rblk.box.y1 - rblk.scy;
+
+  while(more) {
+    int i;
+    for (i=0; i<font->nchars; i++)
+    if (checkarray[i]) {
+      Char_Block *charptr = font->chars[i];
+      int charno = charptr->charno;
+      int cx = FontIndexOrgX + FONT_BOXX*((charno-font->grid.skip) % font->grid.across),
+          cy = FontIndexOrgY - FONT_BOXX*((charno-font->grid.skip) / font->grid.across);
+      wimp_gcol(0, charcolour(charptr));
+      if (font->display.charnames) {
+        bbc_move(bx+cx,by+cy-4);
+        puts(charname(charno));       /* some chars have funny names */
+      }
+    }
+     er(wimp_get_rectangle(&rblk,&more));
+  }
+  return(NULL);
+}
+
+
+/* Subroutine 1 passed to scantree2 to update the char colours
+ * Updates character in tree window if its colour has changed
+ * t->checkarray[] indicates which chars need redrawing
+ */
+
+os_error * renewchar(treestr *t, int chcode, int *x, int y)
+{
+  char * name = charname(chcode);
+  if (t->checkarray[chcode]) {
+    wimp_redrawstr rblk;
+    BOOL more;
+    int fakex;
+    rblk.w = handle;                    /* update relevant portion of tree window */
+    rblk.box.x0 = *x;
+    rblk.box.y0 = y-16;                /* *x, y are in work area coords */
+    rblk.box.x1 = *x+(strlen(charname(chcode)) << 4);
+    rblk.box.y1 = y+16;
+    erx(wimp_update_wind(&rblk,&more));
+    bx = rblk.box.x0 - rblk.scx;
+    by = rblk.box.y1 - rblk.scy;
+    while(more) {
+      gx0 = rblk.g.x0;                              /* needed for pchar */
+      gy0 = rblk.g.y0;
+      gx1 = rblk.g.x1;
+      gy1 = rblk.g.y1;
+      fakex = *x + bx;
+      pchar(t, chcode, &fakex, y+by);            /* updated x is ignored */
+      erx(wimp_get_rectangle(&rblk,&more));
+    }
+  }
+  *x += strlen(name)*16;       /* must be consistent with pchar */
+  return(NULL);
+}
+
+
+/* Returns name associated with a given character code */
+
+char * charname(int ch)
+{
+  static char str[5] = "XXXX";     /* used for returning a 1-char string */
+  switch(ch)
+  {
+    case 0x7F: return("del");
+    case ' ':  return("sp");
+    case 0xA0: return("NBSP");
+#if 0
+    case 0xAD: return("SHY");
+#endif
+  }
+  if (ch < 0x20 || ch > 255) {
+    sprintf(str,"&%X",ch);        /* unprintable characters */
+  } else {
+    str[0] = ch; str[1] = '\0';
+  }
+  return(str);
+}
+
+
+/* Returns colour that this char should be painted in:
+ * red if scaffold line selected, black otherwise
+ */
+
+int charcolour(Char_Block *charptr)
+{
+  Font_Block *font = charptr->parent;
+  if (font->filedata->bpp == 1) {
+    font = font->parent;
+    charptr = charptr->template;
+  }
+  if (charptr != NULL)
+    if (charptr->scaffold.xchar[font->scaffold.index] == font->scaffold.selchar)
+      return(11);
+  return(5);
+}
+
+
+/* Find which character in the tree window is pointed to by the mouse
+ * Assumes getwindowstate() has already been called
+ * Coordinates are absolute (subtract bx,by to make relative)
+ */
+
+int findintree(Wind_Link *wlink, int mousex, int mousey, wimp_box *b)
+{
+  Font_Block * font = wlink->info;
+  treestr t = maketreestr(font->nchars);
+
+  if (t.nchars < 0) return(-1);       /* can't report error properly */
+
+  t.wimpbox = b;
+  t.mousex = mousex;
+  t.mousey = mousey;
+
+  t.foundchar = -1;
+
+  scantree1(&t, font);
+  scantree2(&t, findtreechar, NULL, NULL);
+
+  freetreestr(&t);
+
+  return(t.foundchar);
+}
+
+
+os_error * findtreechar(treestr *t, int chcode, int *x, int y)
+{
+  int width = strlen(charname(chcode))*16;
+
+  if ((t->mousey >= y-16    ) &&
+      (t->mousey <  y+16    ) &&
+      (t->mousex >= *x      ) &&
+      (t->mousex <  *x+width))
+  {
+    register wimp_box *result = t->wimpbox;
+    t->foundchar = chcode;
+    if (result) {
+      result->x0 = *x;        /* return bbox of this char */
+      result->y0 = y - 16;
+      result->x1 = *x + width;
+      result->y1 = y + 16;
+    }
+  }
+
+  *x += width;       /* must be consistent with pchar */
+
+  return(NULL);
+}
+
+
+/* Prints out a tree diagram representing the structure of scaffold
+ * inheritance in a font
+ */
+
+#define XTREE 40
+#define YTREE 40
+
+os_error * redraw_tree(BOOL more,wimp_redrawstr *rptr, Font_Block *font)
+{
+  os_error * err = NULL;
+  treestr t = maketreestr(font->nchars);           /* required by scantree1/2 */
+
+  if (t.nchars < 0) { static os_error e = { 1, "Heap full" }; err = &e; }
+
+  if (more && !err) {
+
+    err = scantree1(&t, font);    /* build up forward-pointing table */
+
+    if (!err) {
+      while (more)
+      {
+        gx0 = rptr->g.x0;         /* for source clipping */
+        gy0 = rptr->g.y0;
+        gx1 = rptr->g.x1;
+        gy1 = rptr->g.y1;
+        e( { freetree(&t); return(e); }, scantree2(&t, pchar, pstem1, pstem2));
+        e( { freetree(&t); return(e); },wimp_get_rectangle(rptr,&more));
+      }
+      freetree(&t);
+
+      if (maxx != font->treebox.x1 || t.ycoord-by != font->treebox.y0) {
+        font->treebox.x1 = maxx;
+        font->treebox.y0 = t.ycoord-by;
+        err = setextent(findwindlink(handle));
+      }
+    }
+  }
+
+  freetreestr(&t);
+
+  return(err);
+}
+
+
+/* Builds up a tree structure from the scaffold inheritance of the given font
+ */
+
+os_error * scantree1(treestr *t, Font_Block *font)
+{
+  Char_Block *charptr;
+  tree *ptr;
+  int i;
+
+  t->charray = font->chars;
+  for(i=0; i<font->nchars; i++) { t->head[i] = NULL; t->onoff[i] = 0; }
+  for(i=font->nchars-1; i>=0; i--) if ((charptr=t->charray[i]) != NULL)
+  {
+    register int ch = charptr->scaffold.basechar;
+    e( { freetree(t); return(e); }, getheap(tree, &ptr));
+    ptr->sibling = t->head[ch];
+    ptr->child = i;
+    t->head[ch] = ptr;
+  }
+  return(NULL);
+}
+
+
+/* Scan a tree structure, applying the given function
+ * Calls ptree(), which calls itself recursively
+ */
+
+os_error *scantree2(treestr *t,
+                            os_error *(*subr1)(treestr *t, int chcode, int *x, int y),
+                            os_error *(*subr2)(treestr *t, int x, int y, int sp),
+                            os_error *(*subr3)(treestr *t, int x, int y, int sp))
+{
+  t->subr1 = subr1;
+  t->subr2 = subr2;
+  t->subr3 = subr3;
+  t->xcoord[0] = bx + 32;
+  t->ycoord = by-32;
+  maxx = 0;
+  return(ptree(t, 0, 0));      /* char code 0 at level 0 */
+}
+
+
+/* Free the tree created by scantree1() */
+
+void freetree(treestr *t)
+{
+  tree **head = t->head;
+  tree *ptr;
+  int i;
+  for (i=0; i<t->nchars; i++) {
+    ptr=head[i];
+    while(ptr) {
+      register tree *ptr2 = ptr->sibling;
+      heap_free(ptr);                                   /* get rid of the tree */
+      ptr = ptr2;
+    }
+  }
+}
+
+
+/* Recursive subroutine for printing the tree (called by scantree2)
+ */
+
+os_error * ptree(treestr *t, int chcode, int sp)
+{
+  tree * ptr;
+  int x = t->xcoord[sp], y = t->ycoord;
+
+  if (chcode) {
+    er(t->subr1(t, chcode, &x, y));       /* user routine updates x */
+    if (x+8-bx > maxx) maxx = x+8-bx;
+    t->xcoord[sp+1] = x+XTREE;
+  } else {
+    t->xcoord[sp+1] = x;
+  }
+
+  if ((ptr = t->head[chcode]) == NULL) {
+    t->ycoord -= YTREE;                                     /* go down to next line */
+  } else {
+    t->onoff[sp] = (ptr->sibling) ? 1 : 0;
+    if (chcode) if (t->subr2) er(t->subr2(t,x,y,sp));    /* draw stem for char at same level */
+    er(ptree(t, ptr->child, sp+1));                          /* updates t->ycoord */
+    while((ptr=ptr->sibling) != NULL) {
+      y = t->ycoord;
+      t->onoff[sp] = (ptr->sibling) ? 1 : 0;                           /* set flag for deeper stuff */
+      if (chcode) if (t->subr3) er(t->subr3(t,x,y,sp));
+      er(ptree(t, ptr->child, sp+1));                        /* next row down */
+    }
+  }
+  return(NULL);
+}
+
+
+/* Subroutine 1 passed to scantree2 - print the character
+ * May be called with or without the stems being drawn
+ */
+
+os_error * pchar(treestr *t, int chcode, int *x, int y)
+{
+  char * name = charname(chcode);
+
+/* mytracef("pchar(%p,%d)\n",t,chcode); */
+
+  if (y+YTREE/2 >= gy0 && y-YTREE/2 <= gy1) {
+    register int c = charcolour(t->charray[chcode]);    /* red if line selected */
+    if (c==5) c=7;        /* use black rather than grey */
+    wimp_gcol(0,c);
+    bbc_move(*x, y+16-dy); puts(name);
+  }
+  *x += strlen(name)*16;
+  return(NULL);
+}
+
+
+/* Subroutine 2 passed to scantree2 - draw stem for char at same level
+ */
+
+os_error *pstem1(treestr *t, int x, int y, int sp)
+{
+  if (y+YTREE/2 >= gy0 && y-YTREE/2 <= gy1) {
+    wimp_gcol(0,7);
+    bbc_move(x+4, y); bbc_draw(x+XTREE-4, y);      /* draw stem from char */
+    if (t->onoff[sp]) {
+      bbc_move(x+XTREE/2, y); bbc_draw(x+XTREE/2, y-YTREE/2); /* draw stem going down */
+    }
+  }
+  return(NULL);
+}
+
+
+/* Subroutine 3 passed to scantree2 - draw stem for char at deeper level
+ */
+
+os_error *pstem2(treestr *t, int x, int y, int sp)
+{
+  if (y+YTREE/2 >= gy0 && y-YTREE/2 <= gy1) {       /* NB: only draw within this region */
+    register int i;
+    wimp_gcol(0, 7);
+    for(i=1; i<sp; i++) if (t->onoff[i]) {
+      x = t->xcoord[i+1] - XTREE/2;
+      bbc_move(x, y-YTREE/2);                      /* verticals for higher levels */
+      bbc_draw(x, y+YTREE/2);
+    }
+    x = t->xcoord[sp+1];
+    bbc_move(x-XTREE/2, y+YTREE/2);        /* upper vertical and horizontal */
+    bbc_draw(x-XTREE/2, y);
+    bbc_draw(x-4, y);
+    if (t->onoff[sp]) {
+      bbc_move(x-XTREE/2, y);                      /* lower vertical (if required) */
+      bbc_draw(x-XTREE/2, y-YTREE/2);
+    }
+  }
+  return(NULL);
+}
+
+
+/* Routines to allocate and deallocate arrays needed by treestr's */
+
+treestr maketreestr(int nchars)
+{
+  treestr t;
+
+  t.onoff = heap_alloc(nchars*sizeof(char));
+  t.xcoord = heap_alloc(nchars*sizeof(int));
+  t.head = heap_alloc(nchars*sizeof(tree *));
+  t.nchars = nchars;
+
+  if (!t.onoff || !t.xcoord || !t.head) freetreestr(&t);
+
+  return(t);
+}
+
+void freetreestr(treestr * t)
+{
+  if (t->onoff) { heap_free(t->onoff); t->onoff = NULL; }
+  if (t->onoff) { heap_free(t->onoff); t->onoff = NULL; }
+  if (t->onoff) { heap_free(t->onoff); t->onoff = NULL; }
+  t->nchars = -1;
+}
+
+
+/* ---------------------------------------------------------------------------- */
+
+/*
+ * Link/unlink a scaffold line to another.
+ * This is a special case of changescaffold(), where the BASE character is the one altered.
+ * This is because no local line is being created: rather, the master copy is altered.
+ */
+
+os_error * linkscaffold(int index, int link)
+{
+  Char_Block *charptr = thischar->parent->chars[thischar->scaffold.xchar[index]];
+  return(changescaffold(charptr, index,
+                                 charptr->scaffold.xchar[index],
+                                 charptr->scaffold.xcoord[index],
+                                 charptr->scaffold.xwidth[index],
+                                 link, NULL));
+}
+
+/*
+ * Update the appropriate coordinate of a scaffold line during and after dragging
+ */
+
+os_error * changescaffoldcoord(Char_Block *charptr, int index, int oldx, int *newxp)
+{
+  int x0 = charptr->scaffold.xcoord[index];
+  int x2 = charptr->scaffold.xwidth[index];
+  int newx = *newxp;
+  Char_Block *chr, **charray = charptr->parent->chars;
+  int nchars = charptr->parent->nchars;
+  int basechar = charptr->scaffold.xchar[index];
+  int i;
+
+  if (x2 >= WID_LTANGENT) {
+    x0 = newx;
+    x2 = x0 + x2;
+  } else {
+    x2 = x0 + x2;
+    if (oldx == x0) {
+      if (newx <= x2) { x0 = newx; } else { x0 = x2; x2 = newx; }
+    } else {
+      if (newx > x0) { x2 = newx; } else { x2 = x0; x0 = newx; }
+    }
+
+    if (x2-x0 >= WID_LTANGENT) {
+      if (newx == x0) *newxp = x0 = x2-(WID_LTANGENT-1);
+      else *newxp = x2 = x0+(WID_LTANGENT-1);
+    }
+  }
+
+  /* first check we wouldn't change any inherited character's scaffolding */
+
+  for (i=0;i<nchars;i++) {
+    if ((chr = charray[i]) != NULL)
+    if (chr->scaffold.xchar[index] == basechar) {
+      if (inbasefile(chr->parent,i)) returnerr("Can't alter scaffold lines in inherited characters");
+      chr->scaffold.xcoord[index] = x0;
+      chr->scaffold.xwidth[index] = x2-x0;
+    }
+  }
+
+  /* update all chars in the font with this scaffold line in them */
+
+  for (i=0;i<nchars;i++) {
+    if ((chr = charray[i]) != NULL)
+    if (chr->scaffold.xchar[index] == basechar) {
+      chr->scaffold.xcoord[index] = x0;
+      chr->scaffold.xwidth[index] = x2-x0;
+    }
+  }
+
+  return(NULL);
+}
+
+/*
+ * Link char1's scaffolding to char2 (ie. set char2->scaffold.basechar = char1->charno)
+ * Disallows cyclic links (ie. where char2 is already a parent of char1)
+ * char1 may be null, in which case char2's parent becomes 0
+ * Any (non-null) lines local to char2 are not affected.
+ * Linked lines are copied in order, children first
+ *
+ * #### If the base char is in a different font, inherited lines should be copied instead
+ *
+ */
+
+os_error *copyscaffold(Char_Block *char1, Char_Block *char2)
+{
+  int i;
+  int nchars = char2->parent->nchars;
+  char * mycheck = heap_alloc(nchars * sizeof(char));
+  char flags[16];
+  os_error * err = NULL;
+
+  if (!mycheck) returnerr("Heap full");
+
+  if (inbasefile(char2->parent,char2->charno)) returnerr("Can't alter scaffolding of inherited characters");
+
+  if (char1) {
+    Char_Block **charray = char1->parent->chars;
+    i=char1->scaffold.basechar;
+    while(i) {
+      if (i==char2->charno) returnerr("Cyclic scaffolding is not allowed");
+      i=charray[i]->scaffold.basechar;
+    }
+  }
+
+  for (i=0; i<nchars; i++) mycheck[i] = 0;
+
+  for (i=0; i<16; i++) flags[i]=TRUE;
+  for (i=0; i<16; i++) if (flags[i]) err = cpscaff(char1, char2, i, flags, mycheck);
+
+  if (!err) {
+    char2->scaffold.basechar = (char1) ? char1->charno : 0;
+    err = redrawtree(char2->parent);
+    if (!err) {
+      Wind_Link *wlink = findwindinfo(W_SKELETON, char2);
+      if (wlink) err = setextent(wlink);                    /* extent depends on scaffold lines */
+      if (!err) err = redrawscaffold(char2->parent, mycheck);
+    }
+  }
+
+  heap_free(mycheck);
+
+  return(err);
+}
+
+
+/* Copy scaffold lines, ensuring that children are done before parents
+ * Allow for char1 and char2 having different design sizes
+ */
+
+os_error *cpscaff(Char_Block *char1, Char_Block *char2, int i, char *flags, char *check)
+{
+  int link = (char1->scaffold.xlink[i] & 7) | (i & 8);
+
+  flags[i] = FALSE;           /* don't loop if there is a cycle */
+  if (flags[link]) er(cpscaff(char1, char2, link, flags, check));
+
+  if (char2->scaffold.xchar[i] != char2->charno ||
+      char2->scaffold.xcoord[i] == NULL_SCAFFOLD) {
+    if (char1) {
+      er( changescaffold(char2, i, char1->scaffold.xchar[i],
+                                   char1->scaffold.xcoord[i],
+                                   char1->scaffold.xwidth[i],
+                                   char1->scaffold.xlink[i], check) );
+    } else {
+      er(changescaffold(char2, i, 0, NULL_SCAFFOLD, 0, 0, check));
+    }
+  }
+  return(NULL);
+}
+
+
+/*
+ * Redraw tree window of font, if visible.
+ * This is called by copyscaffold() and newchar()
+ */
+
+os_error *redrawtree(Font_Block *font)
+{
+  Wind_Link *wlink = Wind_Head.next;
+  while(wlink) {
+    if (wlink->type == W_TREE)               /* redraw tree if displayed */
+    if (wlink->info == font) {
+      invalidate(wlink->wind_handle, -big,-big,big,big);
+    }
+    wlink = wlink->next;
+  }
+  return(NULL);
+}
+
+
+/* line colour is:
+ *         red => selected line (1 per font)
+ *         light blue => local line
+ *         dark blue => inherited line
+ * blob colour is:
+ *         light green => normal
+ *         red => this line is linked (normally) to the selected line
+ *         orange => this line is linked (linearly) to the selected line
+ *         dark green => the selected line is linked to this line
+ */
+
+int scaffoldcolour(Char_Block *charptr, int index)
+{
+  int i, j, k, colour;
+
+  i = charptr->parent->scaffold.index;
+  if (charptr->scaffold.xchar[i] != charptr->parent->scaffold.selchar) i = -1;
+
+  if (i == index) colour = 11;
+  else if (charptr->scaffold.xchar[index] == charptr->charno) colour=15;
+  else colour = 8;
+
+  j = charptr->scaffold.xlink[index];
+  k = (i<0) ? -1 : ((charptr->scaffold.xlink[i] & 7) + (i & 8));
+  colour |= ((j & 7) + (index & 8) == i) ? ((j & 8) ? 14<<8 : 11<<8)        /* red/orange blob */
+                                                     : ((k==index) ? 13<<8 : 10<<8);  /* light/dark green */
+  return(colour);
+}
+
+/*
+ * Used to change any of the properties associated with a scaffold line,
+ * ie. its coordinate, width, link or base char.
+ * Checks for illegal scaffold linkages (ie. where a link is made to a null line,
+ * or a line which is linked to is deleted).
+ */
+
+os_error *changescaffold(Char_Block *charptr,
+                                    int index,
+                                    int newchar,
+                                    int newcoord,
+                                    char newwidth,
+                                    char newlink,
+                                    char *checkarray)
+{
+  int oldchar = charptr->scaffold.xchar[index];
+  int oldcoord = charptr->scaffold.xcoord[index];
+  int oldwidth = charptr->scaffold.xwidth[index];
+  int oldlink = charptr->scaffold.xlink[index];
+  int i, j;
+  int nchars = charptr->parent->nchars;
+  char * localcheck = heap_alloc(nchars * sizeof(char));
+  Char_Block *ch, **charray;
+  int checkvalue;
+  os_error * err = NULL;
+
+  if (!localcheck) returnerr("Heap full");
+
+  { register Font_Block *font = charptr->parent;
+    register int selchr = font->scaffold.selchar;
+    if (index == font->scaffold.index &&
+      ((oldchar==selchr)?1:0) != ((newchar==selchr)?1:0)) {
+      checkvalue = 3;            /* changes affect the selected line */
+    } else checkvalue = 1;      /* changes do not affect the selected line */
+  }
+
+  if (checkarray == NULL) {
+    checkarray = localcheck;
+    for (i=0;i<nchars;i++) checkarray[i] = 0;
+  }
+
+  charray = charptr->parent->chars;
+
+  /* first ensure that no illegal linkages will be set up */
+
+  for (i=0; i<nchars; i++)
+  {
+    if ((ch=charray[i])->scaffold.xchar[index] == oldchar) {
+      j=i;
+      while (j) {
+        if (j==charptr->charno) {
+          char xlink[16];
+          short int xcoord[16];
+          int k, kstart = index & 8;
+          for (k=kstart; k<kstart+8; k++) {
+            xlink[k] = (k==index) ? newlink : ch->scaffold.xlink[k];
+            xcoord[k] = (k==index) ? newcoord : ch->scaffold.xcoord[k];
+          }
+          for (k=kstart; k<kstart+8; k++) {
+            register int lk = xlink[k];
+            register BOOL linear = ((lk & 8) != 0);
+            lk = (lk & 7) | kstart;
+            if (lk & 7) {
+              if ((xcoord[lk] == NULL_SCAFFOLD) || (linear && xlink[lk] == 0)) {
+                static os_error err;
+                err.errnum = 1;
+                sprintf(err.errmess, "Incomplete scaffold link in '%s'", charname(i));
+                return(&err);
+              }
+            }
+          }
+          for (k=kstart; k<kstart+8; k++) {
+            register int k2 = k;
+            while(k2 & 7) {
+              k2 = (xlink[k2] & 7) | kstart;
+              if (k2==k) {
+                static os_error err;
+                err.errnum = 1;
+                sprintf(err.errmess, "Cyclic scaffold link in '%s'", charname(i));
+                return(&err);
+              } /* if */
+            } /* while */
+          } /* for */
+          j=0;
+        } else {
+          j=charray[j]->scaffold.basechar;
+        }
+      } /* while */
+    } /* if */
+  } /* for */
+
+  /* now check that we wouldn't alter any inherited characters */
+
+  for (i=0; i<nchars; i++)
+  {
+    if ((ch=charray[i])->scaffold.xchar[index] == oldchar) {
+      j=i;
+      while (j) {
+        if (j==charptr->charno) {
+          if (inbasefile(charptr->parent, j)) returnerr("Can't alter inherited characters' scaffolding");
+          j=0;
+        } else {
+          j=charray[j]->scaffold.basechar;
+        }
+      } /* while */
+    } /* if */
+  } /* for */
+
+  /* now make the required changes */
+
+  for (i=0; i<nchars; i++)
+  {
+    if ((ch=charray[i])->scaffold.xchar[index] == oldchar) {
+      j=i;
+      while (j) {
+        if (j==charptr->charno) {
+          if (newchar != oldchar ||           /* this is required because the line may change colour */
+              newcoord != oldcoord || newwidth != oldwidth || newlink != oldlink)
+            checkarray[i] = checkvalue;   /* 1 or 3 depending on whether the selection is involved */
+          ch->scaffold.xchar[index] = (newcoord == NULL_SCAFFOLD) ? i : newchar;
+          ch->scaffold.xcoord[index] = newcoord;
+          ch->scaffold.xwidth[index] = newwidth;
+          ch->scaffold.xlink[index] = newlink;
+          j=0;
+        } else {
+          j=charray[j]->scaffold.basechar;
+        }
+      } /* while */
+    } /* if */
+  } /* for */
+
+  if (checkarray == localcheck) {
+    Wind_Link *wlink = findwindinfo(W_SKELETON, charptr);
+    if (wlink) err = setextent(wlink);
+    if (!err) err = redrawscaffold(charptr->parent, checkarray);
+  }
+
+  heap_free(localcheck);
+
+  return(err);
+}
+
+
+os_error *redrawscaffold(Font_Block *font, char *checkarray)
+{
+  Wind_Link *wlink = &Wind_Head;
+  Char_Block *charptr;
+  int i;
+
+  while ((wlink=wlink->next) != NULL)
+  if (wlink->type == W_SKELETON)
+  if ((charptr=wlink->info)->parent == font)
+  if (checkarray[charptr->charno])
+    invalidate(wlink->wind_handle,-big,-big,big,big);
+
+  for (i=1; i<font->nchars; i++) {
+    if (checkarray[i])
+    if ((charptr=font->chars[i]) != NULL) {
+      er(updatecopies(charptr,FALSE));     /* recalculates 1-bpp copies */
+      checkarray[i] >>= 1;     /* leave bit 1 around */
+    }
+  }
+
+  return(redrawscaffoldselect(font, checkarray));    /* update the selection display if necessary */
+}

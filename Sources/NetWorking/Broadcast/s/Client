@@ -1,0 +1,195 @@
+        SUBT    Client (broadcast reception) ==> &.Arthur.Broadcast.Client
+
+ConnectGrantedDuringLoad ROUT                           ; Someone replied to our
+        LDR     r1, FileHandle
+        ADR     r11, NetFS_CloseVector                  ; Connect Request broadcast
+        BL      CallNetFS                               ; So close the file
+        [       False
+        BLVC    SetupConnect                            ; Now accept the call
+        ]
+        MOVVC   r0, #NetFS_FinishLoad
+        BLVC    DoUpCall
+        BVS     ErrorInFile
+
+ConnectGrantedBeforeLoad                                ; I'm connected to a Server
+        MOV     r0, #NetFS_StartBroadcastLoad           ; I'm the Client
+        LDR     r1, FileLength                          ; So start the hourglass
+        BL      DoUpCall
+        BVS     ErrorInFile                             ; Calls ReleaseEconet
+  
+WaitTillLoaded
+        BL      ReadEscapeState
+        BCC     NoEscapeInWait
+        [       Debug
+        DLINE   "Escape has been pressed during ClientTime"
+        ]
+        MOV     r0, #126                                ; Acknowledge ESCape
+        SWI     XOS_Byte                                ; Ignore the error
+        ADR     r0, ErrorEscape
+        [       UseMsgTrans
+        BL      MessageTransErrorLookup
+        ]
+        B       ErrorInClient
+
+NoEscapeInWait
+        LDR     r0, RxTimeoutTime                       ; Check if had RxTimeout Event
+        TEQ     r0, #0
+        [       Debug
+        BNE     %97
+        DLINE   "The server has timed out"
+97
+        ]
+        [       UseMsgTrans
+        BNE     %60
+        ADR     r0, ErrorBroadcastServerDead
+        BL      MessageTransErrorLookup
+        B       ErrorInClient
+
+ErrorBroadcastServerDead
+        DCD     ErrorNumber_BroadcastServerDead
+        DCB     "BSrvrDd", 0
+
+ErrorEscape
+        DCD     ErrorNumber_Escape
+        DCB     "Escape", 0
+        ALIGN
+60
+        |
+        ADREQ   r0, ErrorBroadcastServerDead
+        BEQ     ErrorInClient
+        ]
+        ADR     r0, ErrorBuffer                         ; Check for an error reported from the event code
+        LDR     r1, [ r0 ]                              ; See if it has happened
+        TEQ     r1, #0                                  ; If it has this will be the error number
+        BNE     ErrorInClient
+        MOV     r0, #NetFS_PartBroadcastLoad            ; Update hourglass percentage
+        LDR     r1, FileLoadedLength
+        BL      DoUpCall
+        BVS     ErrorInClient
+        LD      r0, Mode
+        TEQ     r0, #Mode_Served
+        BNE     WaitTillLoaded                          ; Wait until 'Thanks' sent
+        MOV     r0, #NetFS_FinishBroadcastLoad          ; Remove hourglass
+        BL      DoUpCall                      
+        BLVC    UnSetRxTimeoutCallBack                  ; Clear away
+        BVS     ErrorInFile
+        B       FileLoadEnd                             ; Good exit
+
+ErrorInClient
+        Push    r0                                      ; Save the error pointer
+        BL      UnSetRxTimeoutCallBack                  ; Ignore erors
+        MOV     r0, #NetFS_FinishBroadcastLoad
+        BL      DoUpCall                                ; Ignore erors
+        B       ErrorInFileR0
+
+        [       :LNOT: UseMsgTrans
+        Err     BroadcastServerDead
+        Err     Escape
+        ALIGN
+        ]
+
+ClaimEconet     ROUT
+        Push    lr
+        MOV     r0, #14
+        MOV     r1, #Event_Econet_Rx
+        SWI     XOS_Byte                                ; Enable Rx event
+        Pull    pc, VS
+        MOV     r0, #14
+        MOV     r1, #Event_Econet_Tx
+        SWI     XOS_Byte                                ; Enable Tx event
+        BVS     ReleaseRxEvent
+        ;       Link into the event vector to receive Econet Tx/Rx events
+        MOV     r0, #EventV
+        ADRL    r1, Event
+        MOV     r2, wp
+        SWI     XOS_Claim
+        BVS     ReleaseTxEvent
+        Pull    pc
+
+ReleaseEconet   ROUT
+        Push    "r0-r2, r11, lr"                        ; Release resources in the opposite order
+        MOV     r11, #0                                 ; Initialise no-error flag
+        ADR     r0, TxControlHandles
+        ADR     r1, TxControlHandlesEnd
+ReleaseTxLoop
+        BL      AbandonTransmit
+        MOVVS   r11, r0                                 ; Store error
+        BVS     ReleaseBroadcastHandle
+        INC     r0, Tx_RecordSize
+        TEQ     r0, r1
+        BNE     ReleaseTxLoop
+ReleaseBroadcastHandle
+        ADR     r0, BroadcastHandle
+        BL      AbandonTransmit
+        MOVVS   r11, r0                                 ; Store error
+        ADR     r0, TxImHereHandle
+        BL      AbandonTransmit
+        MOVVS   r11, r0                                 ; Store error
+        ADR     r0, RxDataHandle1
+        BL      AbandonReceive
+        MOVVS   r11, r0                                 ; Store error
+        ADR     r0, RxDataHandle2
+        BL      AbandonReceive
+        MOVVS   r11, r0                                 ; Store error
+        ADR     r0, RxControlHandle1
+        BL      AbandonReceive
+        MOVVS   r11, r0                                 ; Store error
+        ADR     r0, RxControlHandle2
+        BL      AbandonReceive
+ReleaseEvents
+        MOVVS   r11, r0                                 ; Store error
+        MOV     r0, #EventV
+        [       Debug
+        ADRL    r1, Event
+        |
+        ADR     r1, Event
+        ]
+        MOV     r2, r12
+        SWI     XOS_Release
+ReleaseTxEvent
+        MOVVS   r11, r0                                 ; Store error
+        MOV     r0, #13
+        MOV     r1, #Event_Econet_Tx
+        SWI     XOS_Byte
+ReleaseRxEvent
+        MOVVS   r11, r0                                 ; Store error
+        MOV     r0, #13
+        MOV     r1, #Event_Econet_Rx
+        SWI     XOS_Byte
+        MOVVS   r11, r0
+        MOVS    r0, r11
+        STRNE   r0, [ sp ]
+        SETV    NE
+        Pull    "r0-r2, r11, pc"
+
+ReleaseChunkList                                        ; Never returns errors
+        Push    "r0-r2, lr"
+        LDR     r2, MissingChunkList
+ReleaseChunkLoop
+        TEQ     r2, #NIL                                ; If we reach the end of the list
+        STREQ   r2, MissingChunkList                    ; Show that the list is empty
+        Pull    "r0-r2, pc", EQ                         ; And go home
+        LDR     r0, [ r2, #Chunk_Identifier ]
+        LDR     r1, =ChunkIdentifier
+        TEQ     r0, r1
+        BNE     ReleaseChunkError
+        LDR     r1, [ r2, #Chunk_Link ]                 ; Get the next record's address
+        MOV     r0, #ModHandReason_Free                 ; Free this record
+        SWI     XOS_Module
+        MOV     r2, r1                                  ; Record address, or NIL
+        B       ReleaseChunkLoop
+
+ReleaseChunkError
+        Pull    "r0-r2, lr"
+        [       Debug
+        ADRL    r0, ErrorFatalInternal
+        |
+        ADR     r0, ErrorFatalInternal
+        ]
+        [       UseMsgTrans
+        B       MessageTransErrorLookup
+        |
+        ORRS    pc, lr, #VFlag
+        ]
+
+        END

@@ -1,0 +1,905 @@
+; > asm.replayspt
+
+; © SJ Middleton, 1994
+
+; module header for ReplaySupport module
+
+                        GET     asm:ListOpts
+                        GET     asm:Macros
+                        GET     asm:System
+
+                        GET     asm:ModHand
+                        GET     asm:Proc
+                        GET     asm:Sprite
+                        GET     asm:Debug
+
+                        GBLL    Debug
+Debug                   SETL    False
+
+ReplaySupport_SWIChunk  *       &48B00
+
+ErrorNumber_NoSuchSWI   *       &1E6
+
+; ------------------------------------------------------------------------------
+
+                MACRO
+$var            bit     $n
+$var            *       1 :SHL: $n
+                MEND
+
+; ------------------------------------------------------------------------------
+
+; sprites recognised
+
+SprPause        *       0
+SprExit         *       1
+SprSingle       *       2
+SprMute         *       3
+
+NSprites        *       4
+
+; sprite info structure
+
+                ^ 0
+sprAddress      #       4               ; actual address of sprite header
+sprOffset       #       4               ; offset in bytes from screen start (rounded down to words)
+
+SpriteInfoSize          *       :INDEX:@
+SpriteInfoSizeShift     *       3
+
+        ASSERT  SpriteInfoSize = 1 :SHL: SpriteInfoSizeShift
+
+; Timebar info
+
+pixel_precision *       12
+
+; ------------------------------------------------------------------------------
+; Global Workspace
+
+                ^ 0, r12
+ [ Debug
+RegDump         #       4*16
+ ]
+
+; Button variables
+OldState        #       4                               ; Player Mouse interface old state buttons
+SpriteInfo      #       NSprites*SpriteInfoSize*2
+ButtonSprites   #       4
+Semaphore       #       1
+reserved        #       3
+
+; Timebar variables
+PixelsPerFrame  #       4               ; (bar_width << pixel_precision) / n_frames
+LastPixel       #       4               ; last pixel almost painted
+TimebarAddress  #       4               ; offset from screen base
+FGColour        #       4
+BGColour        #       4
+TimebarHeight   #       4               ; in lines
+
+; Workspace
+ARMovieVersion  #       256
+
+WorkspaceSize   *       :INDEX:@
+
+; ===================================================================================================
+
+; MODULE HEADER
+
+Module_BaseAddr
+        DCD     0
+        DCD     ReplaySupport_Init    -Module_BaseAddr
+        DCD     ReplaySupport_Die     -Module_BaseAddr
+        DCD     ReplaySupport_Service -Module_BaseAddr
+        DCD     ReplaySupport_Title   -Module_BaseAddr
+        DCD     ReplaySupport_HelpStr -Module_BaseAddr
+        DCD     ReplaySupport_HC_Table-Module_BaseAddr
+        DCD     ReplaySupport_SWIChunk
+        DCD     ReplaySupport_SWIEntry -Module_BaseAddr
+        DCD     ReplaySupport_NameTable -Module_BaseAddr
+
+ReplaySupport_Title
+        =       "ReplaySupport", 0
+
+ReplaySupport_HelpStr
+        =       "ReplaySupport", 9
+        =       "0.04 (25 Apr 1994)", 0
+        ALIGN
+
+; ------------------------------------------------------------------------------
+
+; Command keyword table
+
+ReplaySupport_HC_Table
+        Command ReplayCheckVer, 255, 2
+        DCD     0
+
+; ------------------------------------------------------------------------------
+;
+;       ReplaySupport_Init - Initialisation entry point
+;
+; r10 = environment ptr (ie command tail)
+; r11 = IO base or instantiation number
+; r12 = private word pointer
+; r13 = supervisor stack
+; preserve r7-r11, r13, mode, flags
+; SVC mode, IRQs and FIQs are enabled
+
+ReplaySupport_Init      ENTRY
+                LDR     r2, [wp]
+                CMP     r2, #0
+                MOVNE   wp, r2
+                BNE     %ft10
+
+; claim workspace
+                MOV     r0, #ModHandReason_Claim
+                MOV     r3, #WorkspaceSize
+                SWI     XOS_Module
+                EXIT    VS
+                STR     r2, [wp]
+                STR     r2, WorkspaceCopy
+                MOV     wp, r2
+
+; clear workspace
+                MOV     r0, #0
+                MOV     r1, r2
+                ADD     r3, r2, #WorkspaceSize
+00              STR     r0, [r1], #4
+                CMP     r1, r3
+                BLT     %bt00
+
+; if being reinitialised
+10
+                EXITS
+
+; ------------------------------------------------------------------------------
+;
+;       ReplaySupport_Die - Die entry
+;
+; preserve r7-r11, r13, mode
+; SVC mode, IRQs indeterminate, FIQs enabled
+
+ReplaySupport_Die
+                ENTRY
+                LDR     wp, [wp]
+                BL      DeRegisterSprites
+                EXITS
+
+; ------------------------------------------------------------------------------
+;
+;       ReplaySupport_Service - Main entry point for services
+;
+; in:   r1 = service reason code
+; SVC or IRQ mode, IRQs indeterminate, FIQs enabled
+;
+
+ReplaySupport_Service   *       Module_BaseAddr
+
+; ------------------------------------------------------------------------------
+; SWI entry points
+
+; r11 = SWI number modulo 64
+; r12 = wp
+; SVC mode, IRQs indeterminate, FIQs enabled
+
+ReplaySupport_SWIEntry
+                CMP     r11, #(%ft21 - %ft20)/4
+                ADRHS   r0, UnknownSWI_ErrorBlock
+                ORRHSS  pc, lr, #V_bit
+
+                LDR     wp, [wp]
+                BIC     lr, lr, #V_bit
+                ADD     pc, pc, r11, LSL #2
+                MOV     r0, r0
+
+20              B       RegisterSprites
+                B       DeRegisterSprites
+                B       TimebarPaintAddress
+                B       ReplayGetVersion
+21
+
+UnknownSWI_ErrorBlock
+                DCD     ErrorNumber_NoSuchSWI
+                =       "Unknown ReplaySupport operation", 0
+                ALIGN
+
+; ------------------------------------------------------------------------------
+; SWI name table
+
+ReplaySupport_NameTable
+                = "Replay", 0
+
+                = "RegisterSprites", 0
+                = "DeRegisterSprites", 0
+                = "TimebarPaintAddress", 0
+                = "Version", 0
+
+                = 0
+
+                ALIGN
+
+; ===============================================================================
+
+; INPUT
+;  r0 -> sprite area with button sprites suitably preprocessed
+;  r1 -> array of offset in bytes from screen base (8)
+;  r2 -> array of sprite names (8)
+;  r3 = initial button state word
+; OUTPUT
+;  VC, r0 -> address of update routine
+;  VS, r0 -> error
+
+RegisterSprites ENTRY   "r1-r11"
+
+                MOV     r10, r0                 ; r10 -> original sprites
+                MOV     r9, r1                  ; r9 -> offset array
+                MOV     r8, r2                  ; r8 -> sprite names
+
+                STR     r3, OldState
+
+                BL      DeRegisterSprites       ; just in case
+                EXIT    VS
+
+; claim space for sprites
+                MOV     r0, #ModHandReason_Claim
+                LDR     r3, [r10]               ; get size of area
+                SWI     XOS_Module
+                EXIT    VS
+
+; save ptr
+                STR     r2, ButtonSprites
+
+; copy sprites into new home in the RMA
+10              LDR     r0, [r10], #4           ; copy sprites
+                STR     r0, [r2], #4
+                SUBS    r3, r3, #4
+                BGT     %bt10
+
+; cache the addresses of the sprites
+                ADR     r3, SpriteInfo
+                MOV     r5, #NSprites*2
+
+                MOV     r0, #SpriteReason_SelectSprite + 256
+                LDR     r1, ButtonSprites
+
+20              LDR     r2, [r8], #4
+                SWI     XOS_SpriteOp
+                EXIT    VS
+
+                LDR     r4, [r9], #4
+                BIC     r4, r4, #3
+                STMIA   r3!, {r2,r4}
+
+                SUBS    r5, r5, #1
+                BGT     %bt20
+
+; setup ptr to routine for foreground
+                ADR     r0, PlayerMouseInterface
+
+                PullEnv
+                BICS    pc, lr, #V_bit
+
+; INPUT
+;  none
+; OUTPUT
+;  VS, r0 -> error
+
+DeRegisterSprites
+                BIC     lr, lr, #V_bit
+                ENTRY   "r1-r3"
+
+                LDR     r2, ButtonSprites
+                CMP     r2, #0
+                EXITS   EQ
+
+                MOV     r0, #ModHandReason_Free
+                SWI     XOS_Module
+                MOVVC   r1, #0
+                STRVC   r1, ButtonSprites
+
+                EXIT
+
+
+; ===============================================================================
+
+; Input
+; r3 row bytes
+; r4 base screen address
+; r9 sprite hdr ptr
+; r14 return
+
+; Work
+; r0,r1,r2 scrap
+; r5  sprite data
+; r6  work screen adress
+; r7  left mask
+; r8  right mask
+; r10 sprite width
+; r11 sprite height
+
+                MACRO
+$L              PlotSprite
+
+$L              LDR     r5, [r9, #spImage]
+                ADD     r5, r9, r5              ; r5 -> sprite data
+
+                ADR     r0, masks
+                LDR     r7, [r9, #spLBit]
+                LDR     r7, [r0, r7, LSL #2]    ; r7 = left mask
+                LDR     r8, [r9, #spRBit]
+                ADD     r8, r8, #1
+                LDR     r8, [r0, r8, LSL #2]    ; r8 = right mask
+
+                LDR     r10, [r9, #spWidth]     ; r10 = width
+                LDR     r11, [r9, #spHeight]    ; r11 = height
+
+; check for single word
+                CMP     r10, #0
+                BNE     %ft20
+
+; special case when only one word involved
+
+                BIC     r2, r7, r8              ; setup mask 
+
+15
+                LDR     r0, [r4]                ; read screen
+                LDR     r1, [r5], #4            ; read sprite
+                AND     r0, r0, r2
+                BIC     r1, r1, r2
+                ORR     r0, r0, r1
+                STR     r0, [r4], r3            ; store screen
+                SUBS    r11, r11, #1            ; decrement line count
+                BGE     %bt15
+
+                B       %ft99
+
+20 ; general case
+                MOV     r6, r4                  ; setup screen ptr
+                LDR     r10, [r9, #spWidth]     ; r10 = width
+
+21 ; first word
+                LDR     r0, [r6]                ; r0 = screen data
+                LDR     r1, [r5], #4            ; r1 = sprite data
+                AND     r0, r0, r7
+                BIC     r1, r1, r7
+                ORR     r0, r0, r1              ; combine with l mask
+                STR     r0, [r6], #4
+                SUBS    r10, r10, #1
+                BEQ     %ft40                   ; is next word the last ?
+
+30 ; main loop
+                LDR     r1, [r5], #4            ; r1 = sprite data
+                STR     r1, [r6], #4
+                SUBS    r10, r10, #1
+                BGT     %bt30
+
+40 ; last word
+                LDR     r0, [r6]                ; r0 = screen data
+                LDR     r1, [r5], #4            ; r1 = sprite data
+                BIC     r0, r0, r8
+                AND     r1, r1, r8
+                ORR     r0, r0, r1              ; combine with l mask
+                STR     r0, [r6], #4
+
+   ; check end of line
+                ADD     r4, r4, r3              ; add row bytes to screen address
+                SUBS    r11, r11, #1            ; decrement line count
+                BGE     %bt20
+
+99
+                MEND
+
+
+; Player interface values
+
+;     r0: address of state bits word:
+;     r1: mouse x
+;     r2: mouse y
+;     r3: mouse buttons
+;     r4: mouse button which changed (bit set for each button which changed)
+;     r5: points to struc
+;     r6: points to button data structure:
+;         4 words per button being: left x, bottom y, right x, top y
+;         buttons ordered: pause, exit, capture, single frame advance,
+;                          ffwd, half speed, quiet, loud, mute
+;     r7..r12: nothing
+;    r13: RISC OS Irq stack
+;    r14: return address
+
+; r0 state bits
+
+bPaused         bit 0
+bMuted          bit 1
+bExiting        bit 2
+bSingle         bit 3
+bCapture        bit 4   ; true if capture class exit (bit 2 true too)
+bInvisible      bit 5   ; true if playing invisible frames (i.e. don't change screen)
+bEndLoop        bit 6   ; true if end of loop
+
+        ^ 0
+oNX             # 4
+oNY             # 4
+oNColours       # 4
+oScreenBase     # 4
+oRowBytes       # 4
+oNRows          # 4
+oVertRatio      # 4
+oMovieX         # 4
+oMovieY         # 4
+oFPS            # 4
+
+WorkspaceCopy   DCD     0
+
+                ALIGN   16
+
+PlayerMouseInterface    ENTRY   "r12"
+
+                LDR     wp, WorkspaceCopy
+
+                LDRB    r7, Semaphore           ; check for reentry
+                CMP     r7, #0
+                EXITS   NE
+
+                MOV     r7, #1
+                STRB    r7, Semaphore           ; mark entered
+
+                LDR     r0, [r0]                ; load state word
+
+                LDR     r7, OldState
+                EOR     r7, r7, r0              ; r7 has bits that have changed
+                STR     r0, OldState            ; r0 has current state of bits
+
+                MOV     r8, #bPaused
+                TST     r7, r8
+                MOVNE   r1, #SprPause
+                BLNE    UpdateSprite
+
+                MOV     r8, #bMuted
+                TST     r7, r8
+                MOVNE   r1, #SprMute
+                BLNE    UpdateSprite
+
+                MOV     r8, #bSingle
+                TST     r7, r8
+                MOVNE   r1, #SprSingle
+                BLNE    UpdateSprite
+
+                MOV     r8, #bExiting
+                TST     r7, r8
+                MOVNE   r1, #SprExit
+                BLNE    UpdateSprite
+
+                MOV     r7, #0
+                STRB    r7, Semaphore           ; mark exited
+
+                EXITS
+
+
+; r0 = current state
+; r1 = sprite number
+; r8 = bit to check
+
+UpdateSprite    ENTRY   "r0-r7"
+
+; find pushed versions if bit is set
+                TST     r0, r8
+                ADDNE   r1, r1, #NSprites
+
+; find our button info
+                ADR     r0, SpriteInfo
+                ADD     r0, r0, r1, LSL #SpriteInfoSizeShift
+
+; setup values for PlotSprite, checking that button is on screen
+                LDR     r4, [r0, #sprOffset]    ; offset from screen base
+                CMP     r4, #0
+                EXITS   LT
+
+                LDR     r2, [r5, #oScreenBase]
+                ADD     r4, r4, r2
+
+                LDR     r3, [r5, #oRowBytes]    ; r3 = row bytes
+                LDR     r9, [r0, #sprAddress]   ; sprite header address
+
+                PlotSprite
+
+                EXITS
+
+; ===============================================================================
+
+masks           DCD     &00000000
+                DCD     &00000001
+                DCD     &00000003
+                DCD     &00000007
+                DCD     &0000000f
+                DCD     &0000001f
+                DCD     &0000003f
+                DCD     &0000007f
+                DCD     &000000ff
+                DCD     &000001ff
+                DCD     &000003ff
+                DCD     &000007ff
+                DCD     &00000fff
+                DCD     &00001fff
+                DCD     &00003fff
+                DCD     &00007fff
+                DCD     &0000ffff
+                DCD     &0001ffff
+                DCD     &0003ffff
+                DCD     &0007ffff
+                DCD     &000fffff
+                DCD     &001fffff
+                DCD     &003fffff
+                DCD     &007fffff
+                DCD     &00ffffff
+                DCD     &01ffffff
+                DCD     &03ffffff
+                DCD     &07ffffff
+                DCD     &0fffffff
+                DCD     &1fffffff
+                DCD     &3fffffff
+                DCD     &7fffffff
+                DCD     &ffffffff
+
+; ===============================================================================
+
+; SWI
+
+; INPUT
+; r0 = PixelsPerFrame - (bar_width << pixel_precision) / n_frames
+; r1 = TimebarAddress - offset from screen base
+; r2 = TimebarHeight  - in lines
+; r3 = FGColour
+; r4 = BGColour
+; r5 = log2bpp for routine wanted
+
+; OUTPUT
+; r0 = 0 or -> timebar paint routine
+
+TimebarPaintAddress
+                ENTRY
+
+                STR     r0, PixelsPerFrame
+                STR     r1, TimebarAddress
+                STR     r2, TimebarHeight
+                STR     r3, FGColour
+                STR     r4, BGColour
+
+                MOV     r0, #0
+                STR     r0, LastPixel
+
+                CMP     r5, #2
+                ADREQ   r0, TimebarPaint4
+                CMP     r5, #3
+                ADREQ   r0, TimebarPaint8
+                CMP     r5, #4
+                ADREQ   r0, TimebarPaint16
+                CMP     r5, #5
+                ADREQ   r0, TimebarPaint32
+
+                EXITS
+
+; Time bar painting support routines
+
+;   Player will call a supplied routine after painting each frame. The value
+;   supplied is checked to see if it is a valid decimal number (VALx$>0) or
+;   it is treated as a position independent file which is loaded into memory
+;   by Player at some quad word aligned address (determined at run time). The
+;   routine is called immediately after a frame has been painted; the CPU is
+;   in interrupt mode and the routine is entered with a BL. The registers
+;   contain:
+;
+;     r0: points to: screen structure (see above)
+;     r1: movie base address on screen
+;     r2: frame number of just painted frame
+;     r3..r12: nothing
+;    r13: RISC OS Irq stack
+;    r14: return address
+;
+;   If interrupts are to be reenabled, the routine need not worry about being
+;   called recursively - Player is in a semaphored area which will not be
+;   reentered until this thread terminates. Returning as soon as possible is
+;   advised - playing a movie can be quite short of processor time... Note that
+;   the routine is only called when a frame is actually painted and this does
+;   not happen if processor time is running short.
+
+TimebarPaint4   ROUT
+
+                LDR     wp, WorkspaceCopy
+
+; see if frame needs painting
+                LDR     r5, PixelsPerFrame
+                MUL     r8, r5, r2
+                MOV     r8, r8, LSR #pixel_precision
+                LDR     r9, LastPixel
+                CMP     r8, r9
+                MOVEQ   pc, r14
+
+                STR     r8, LastPixel
+
+                MOVLT   r10, r8
+                MOVLT   r8, r9
+                MOVLT   r9, r10
+                LDRLT   r6, BGColour
+
+                LDRGT   r6, FGColour
+
+; get base address of timebar
+                LDR     r10, TimebarAddress
+                LDR     r3, [r0, #oScreenBase]
+                ADD     r10, r10, r3
+                ADD     r10, r10, r9, ASR #1    ; add in next pixel to plot
+
+                LDR     r11, [r0, #oRowBytes]
+
+30              MOV     r5, r10
+
+                LDR     r4, TimebarHeight
+
+31              LDRB    r3, [r5]
+                TST     r9, #1                  ; even pixel is in low nybble
+                BICEQ   r3, r3, #&0f
+                ORREQ   r3, r3, r6
+                BICNE   r3, r3, #&f0
+                ORRNE   r3, r3, r6, LSL #4
+                STRB    r3, [r5], r11
+
+                SUBS    r4, r4, #1
+                BGT     %bt31
+
+                TST     r9, #1
+                ADDNE   r10, r10, #1            ; increment base address
+
+                ADD     r9, r9, #1              ; check for having caught up
+                CMP     r9, r8
+                BLT     %bt30
+                
+                MOV     pc, r14
+                
+
+TimebarPaint8   ROUT
+
+                LDR     wp, WorkspaceCopy
+
+; see if frame needs painting
+                LDR     r5, PixelsPerFrame
+                MUL     r8, r5, r2
+                MOV     r8, r8, LSR #pixel_precision
+                LDR     r9, LastPixel
+                CMP     r8, r9
+                MOVEQ   pc, r14
+
+                STR     r8, LastPixel
+
+                MOVLT   r10, r8
+                MOVLT   r8, r9
+                MOVLT   r9, r10
+                LDRLT   r6, BGColour
+
+                LDRGT   r6, FGColour
+
+; get base address of timebar
+                LDR     r10, TimebarAddress
+                LDR     r3, [r0, #oScreenBase]
+                ADD     r10, r10, r3
+                ADD     r10, r10, r9            ; add in next pixel to plot
+
+                LDR     r11, [r0, #oRowBytes]
+
+30              MOV     r5, r10
+                LDR     r4, TimebarHeight
+
+31              STRB    r6, [r5], r11
+
+                SUBS    r4, r4, #1
+                BGT     %bt31
+
+                ADD     r10, r10, #1
+                ADD     r9, r9, #1              ; check for having caught up
+                CMP     r9, r8
+                BLT     %bt30
+
+                MOV     pc, r14
+                
+
+TimebarPaint16  ROUT
+
+                LDR     wp, WorkspaceCopy
+
+; see if frame needs painting
+                LDR     r5, PixelsPerFrame
+                MUL     r8, r5, r2
+                MOV     r8, r8, LSR #pixel_precision
+                LDR     r9, LastPixel
+                CMP     r8, r9
+                MOVEQ   pc, r14
+
+                STR     r8, LastPixel
+
+                MOVLT   r10, r8
+                MOVLT   r8, r9
+                MOVLT   r9, r10
+                LDRLT   r6, BGColour
+
+                LDRGT   r6, FGColour
+
+                MOV     r7, r6, LSR #8
+
+; get base address of timebar
+                LDR     r10, TimebarAddress
+                LDR     r3, [r0, #oScreenBase]
+                ADD     r10, r10, r3
+                ADD     r10, r10, r9, ASL #1    ; add in next pixel to plot
+
+                LDR     r11, [r0, #oRowBytes]
+                SUB     r11, r11, #1
+
+; get colour
+
+30              MOV     r5, r10
+                LDR     r4, TimebarHeight
+
+31              STRB    r6, [r5], #1
+                STRB    r7, [r5], r11
+
+                SUBS    r4, r4, #1
+                BGT     %bt31
+
+                ADD     r10, r10, #2
+                ADD     r9, r9, #1              ; check for having caught up
+                CMP     r9, r8
+                BLT     %bt30
+                
+                MOV     pc, r14
+                
+
+TimebarPaint32  ROUT
+
+                LDR     wp, WorkspaceCopy
+
+; see if frame needs painting
+                LDR     r5, PixelsPerFrame
+                MUL     r8, r5, r2
+                MOV     r8, r8, LSR #pixel_precision
+                LDR     r9, LastPixel
+                CMP     r8, r9
+                MOVEQ   pc, r14
+
+                STR     r8, LastPixel
+
+                MOVLT   r10, r8
+                MOVLT   r8, r9
+                MOVLT   r9, r10
+                LDRLT   r6, BGColour
+
+                LDRGT   r6, FGColour
+
+; get base address of timebar
+                LDR     r10, TimebarAddress
+                LDR     r3, [r0, #oScreenBase]
+                ADD     r10, r10, r3
+                ADD     r10, r10, r9, ASL #2    ; add in next pixel to plot
+
+                LDR     r11, [r0, #oRowBytes]
+
+30              MOV     r5, r10
+                LDR     r4, TimebarHeight
+
+31              STR     r6, [r5], r11
+
+                SUBS    r4, r4, #1
+                BGT     %bt31
+
+                ADD     r10, r10, #4
+                ADD     r9, r9, #1              ; check for having caught up
+                CMP     r9, r8
+                BLT     %bt30
+                
+                MOV     pc, r14
+
+; ===============================================================================
+
+; OUT:
+;   VC, r0 = ARMovie version
+;   VS, r0 -> error
+
+ReplayGetVersion
+                ENTRY   "r1-r4"
+
+                ADR     r0, ReplayVersionVar
+                ADR     r1, ARMovieVersion
+                MOV     r2, #?ARMovieVersion
+                MOV     r3, #0
+                MOV     r4, #0
+                SWI     XOS_ReadVarVal
+                BLVC    ReadVersion     ; get ARMovie version
+                EXIT
+
+; ===============================================================================
+
+; Commands
+
+; r0 -> command tail
+; r1 = no. parameters
+
+ReplayCheckVer_Code
+                ENTRY   "r1-r11"
+                LDR     r12, [r12]
+                MOV     r11, r0         ; r11 -> command line
+
+                ADR     r0, ReplayVersionVar
+                ADR     r1, ARMovieVersion
+                MOV     r2, #?ARMovieVersion
+                MOV     r3, #0
+                MOV     r4, #0
+                SWI     XOS_ReadVarVal
+                EXIT    VS
+
+                BL      ReadVersion     ; get ARMovie version
+                EXIT    VS
+                MOV     r10, r0         ; r10 = ARMovie version
+
+                MOV     r1, r11         ; get requested version
+                BL      ReadVersion
+                EXIT    VS
+
+                CMP     r10, r0         ; if OK then exit
+                EXITS   GE
+
+                MOV     r0, r1          ; else call OSCLI with remainder of line
+                SWI     XOS_CLI
+
+                EXIT                    ; return any error from OSCLI
+
+ReplayVersionVar =      "ARMovie$Version", 0
+                ALIGN
+
+ReplayCheckVer_Help
+                =       "*ReplayCheckVer checks the version number of the ARMovie resources "
+                =       "against the version given "
+                =       "and executes the command if they are out of date. ",10,13
+                =       "It is identical in concept to RMEnsure and can be used in the same way.",10,13
+ReplayCheckVer_Syntax
+                =       "*Syntax: ReplayCheckVer <version> <command>",0
+                ALIGN
+
+; ===============================================================================
+
+; IN
+;      r1 -> version string
+; OUT
+;  VS, r0 -> error
+;  VC, r1 -> end of version string
+;      r0 = value
+
+ReadVersion     ENTRY   "r2,r3"
+
+                MOV     r0, #10         ; return first part of version
+                SWI     XOS_ReadUnsigned
+                EXIT    VS
+
+                MOV     lr, #100
+                MUL     r0, r2, lr      ; r0 = version*100
+
+                LDRB    r3, [r1]        ; if terminator is not a dot then return
+                CMP     r3, #"."
+                EXITS   NE
+
+                ADD     r1, r1, #1      ; inc over .
+                MOV     r3, r0          ; move value into r3
+
+                MOV     r0, #10
+                SWI     XOS_ReadUnsigned        ; return second part of version
+                EXIT    VS
+
+                ADD     r0, r3, r2      ; add on second bit of version
+
+                EXITS
+
+; ===============================================================================
+
+ [ Debug
+                InsertDebugRoutines
+ ]
+
+                END
+
+eof asm.replayspt

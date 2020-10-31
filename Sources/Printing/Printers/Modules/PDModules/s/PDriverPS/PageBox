@@ -1,0 +1,809 @@
+; > Sources.PDriverPS.PageBox
+
+        GET Hdr:Territory
+        GET Hdr:MakePSFont
+
+; Page control and box generation routines for the PostScript printer driver
+
+;----------------------------------------------------------------------------
+;
+; Page setup routine
+;
+;----------------------------------------------------------------------------
+
+pagebox_setup
+        Push    "R0,R1,R4-R9,LR"
+        PrError pagebox_setup_return                    ;Set up error label
+
+        MOV     LR, #0
+        STR     LR, counting_pass                       ; never pre-scan in PostScript
+
+        [       PSDebugPageBox
+        PrLnIm  "% pagebox_setup"
+        ]
+
+        LDRB    r9, sendprologue
+        TEQ     r9, #255                                ; TRUE as stored in a byte
+        MOVEQ   r9, #0                                  ; FALSE, only send once
+        STREQB  r9, sendprologue
+        BLEQ    pagebox_generateprologue
+        BVS     pagebox_setup_return
+
+; Next rectangle to be plotted is the first on the list.
+
+        LDR     R9,rectlist
+        STR     R9,currentrect
+
+; Initialise the page level bounding box.
+
+        MOV     R4,#&7FFFFFFF
+        MOV     R5,#&7FFFFFFF
+        MOV     R6,#&80000000
+        MOV     R7,#&80000000
+
+; Work through list of rectangles, merging them into the page bounding box.
+
+pagebox_setup_boundingboxloop
+        TEQ     R9,#0
+        BEQ     pagebox_setup_endboundingboxloop
+        MOV     R0,#0
+        MOV     R1,#0
+        BL      pagebox_mergepointintopagebbox
+        LDR     R0,rectbox
+        BL      pagebox_mergepointintopagebbox
+        LDR     R1,rectbox+4
+        BL      pagebox_mergepointintopagebbox
+        MOV     R0,#0
+        BL      pagebox_mergepointintopagebbox
+        LDR     R9,nextrectangle
+        B       pagebox_setup_boundingboxloop
+pagebox_setup_endboundingboxloop
+
+; Now merge the page bounding box into the job bounding box.
+
+        ADR     LR,jobboundingbox
+        LDMIA   LR,{R0,R1,R8,R9}
+        CMP     R0,R4
+        MOVGT   R0,R4
+        CMP     R1,R5
+        MOVGT   R1,R5
+        CMP     R8,R6
+        MOVLT   R8,R6
+        CMP     R9,R7
+        MOVLT   R9,R7
+        STMIA   LR,{R0,R1,R8,R9}
+
+; Output page header comment
+
+        PrStrIm "%%Page: "
+        MOVS    R0,R3
+        BEQ     pagebox_setup_nopagenumber
+        PrStr   R0,33,126
+        B       pagebox_setup_continue1
+pagebox_setup_nopagenumber
+        PrChrIm "?"
+pagebox_setup_continue1
+        PrChrIm " "
+        LDR     R0,numberofpages
+        PrNum   R0,CorruptR0 
+        PrNewLn
+
+; Output page bounding box comment
+
+        CMP     R4,R6
+        MOVGT   R4,#0
+        MOVGT   R5,#0
+        MOVGT   R6,#0
+        MOVGT   R7,#0
+        PrStrIm "%%PageBoundingBox: "
+        PrPair  R4,R5,CorruptR0andR1
+        PrNumSp R6,CorruptR0
+        PrNum   R7,CorruptR0
+        PrNewLn
+
+; Enter our library dictionary.
+
+        PrLnIm  "PDdict begin"
+
+; Save VM state (for restoration at the end of the page).
+
+        BL      output_save
+        BVS     pagebox_setup_return
+
+        [ 1 = 1
+; Do the 'paper margins' clipping as set by user in the printer config
+; window, or else set up by the app
+        ASSERT  size_leftX = size_values + 8
+        ADR     R0,size_leftX
+        LDMIA   R0,{R4-R7}
+
+        PrNumSp R4
+        PrStrIm "MP "
+        PrNumSp R5
+        PrStrIm "MP "
+        PrNumSp R6
+        PrStrIm "MP "
+        PrNumSp R7
+        PrLnIm  "MP "
+
+        ]
+
+; Do standard graphics state set-up (done here because the PostScript
+; prologue is not supposed to change the graphics state).
+
+        PrLnIm  "PS",FallThroughOnError
+
+; And return
+
+        PrError                                         ;Cancel error label
+pagebox_setup_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,R4-R9,PC"
+
+; Subroutine to merge a point specified in the rectangle co-ordinate system
+; (OS units before transformation, relative to the rectangle's bottom left
+; corner) into the page bounding box so far (in points, relative to the
+; bottom left corner of the paper).
+;   Entry: R0,R1 = point
+;          R4-R7 = page bounding box so far
+;          R9 points to rectangle
+;   Exit:  R4-R7 updated
+;          All other registers preserved
+;
+; This requires some rather messy arithmetic. We start with the specified
+; point, which is given in OS units before transformation - i.e. units of 2/5
+; point. Then the rectangle's transformation is applied, resulting in a
+; transformed point given in units of 1/(5*2^15) point. Then we need to add
+; in the bottom left point of the rectangle, given in units of 1/1000 point.
+; This is done by adding 25 times the transformed point and 2^12 times the
+; bottom left point, giving us the desired position in units of 1/(1000*2^12)
+; point.
+;   Finally, we divide by 1000*2^12 to get the required position in points,
+; and merge the result into the bounding box so far. During this, we take
+; care to use a rounded up quotient for upper bounds and a rounded down
+; position for lower bounds.
+;   These calculations definitely require double precision work. By strict
+; mathematical standards, they require triple precision, but this has not
+; been done because paper that big just isn't used!
+
+pagebox_mergepointintopagebbox
+        Push    "R0-R3,R8,LR"
+
+        Push    "R4-R7"
+        ADR     LR,recttransform        ;Get the transformation
+        LDMIA   LR,{R2-R5}
+        BL      arith_dpmult            ;R7,R8 := dy
+        =       R5,R1,R7,0
+        BL      arith_dpmult            ;R5,R6 := cy
+        =       R4,R1,R5,0
+        BL      arith_dpmult            ;R3,R4 := bx
+        =       R3,R0,R3,0
+        BL      arith_dpmult            ;R1,R2 := ax
+        =       R2,R0,R1,0
+        ADDS    R1,R1,R5                ;R1,R2 := ax+cy
+        ADC     R2,R2,R6
+        ADDS    R3,R3,R7                ;R3,R4 := bx+dy
+        ADC     R4,R4,R8
+        ADDS    R5,R1,R1,LSL #2         ;R5,R6 := 5*(ax+cy)
+        ADC     R6,R2,R2,LSL #2
+        ADD     R6,R6,R1,LSR #30
+        ADDS    R7,R3,R3,LSL #2         ;R7,R8 := 5*(bx+dy)
+        ADC     R8,R4,R4,LSL #2
+        ADD     R8,R8,R3,LSR #30
+        ADDS    R1,R5,R5,LSL #2         ;R1,R2 := 25*(ax+cy)
+        ADC     R2,R6,R6,LSL #2
+        ADD     R2,R2,R5,LSR #30
+        ADDS    R3,R7,R7,LSL #2         ;R3,R4 := 25*(bx+dy)
+        ADC     R4,R8,R8,LSL #2
+        ADD     R4,R4,R7,LSR #30
+        ADR     LR,rectbottomleft
+        LDMIA   LR,{R5,R6}
+        ADDS    R1,R1,R5,LSL #12        ;R1,R2 := 25*(ax+cy) + left
+        ADC     R2,R2,R5,ASR #20
+        ADDS    R3,R3,R6,LSL #12        ;R3,R4 := 25*(bx+dy) + bottom
+        ADC     R4,R4,R6,ASR #20
+        MOV     R5,#1000:SHL:12         ;The required divisor to get points
+        BL      arith_dpdivmod          ;R0 := required X, R1=0 <=> exact
+        =       R1,R5,R0,R1
+        BL      arith_dpdivmod          ;R2 := required Y, R3=0 <=> exact
+        =       R3,R5,R2,R3
+        Pull    "R4-R7"
+        CMP     R4,R0                   ;Update left X
+        MOVGT   R4,R0
+        CMP     R5,R2                   ;Update bottom Y
+        MOVGT   R5,R2
+        TEQ     R1,#0                   ;For upper bound checks, convert to
+        ADDNE   R0,R0,#1                ;  rounded up quotients by adding
+        TEQ     R3,#0                   ;  one to them if they weren't exact
+        ADDNE   R2,R2,#1
+        CMP     R6,R0                   ;Update right X
+        MOVLT   R6,R0
+        CMP     R7,R2                   ;Update top Y
+        MOVLT   R7,R2
+        Pull    "R0-R3,R8,PC"
+
+;----------------------------------------------------------------------------
+;
+; Box generation routine
+;
+;----------------------------------------------------------------------------
+
+pagebox_nextbox
+        Push    "R1,LR"
+        PrError pagebox_nextbox_return
+        [       PSDebugPageBox
+        PrLnIm  "% pagebox_nextbox"
+        ]
+
+; Get the current rectangle, its ID and the next rectangle.
+
+        LDR     R9,currentrect
+        ASSERT  :BASE:nextrectangle = R9
+        ASSERT  :INDEX:nextrectangle = 0
+        ASSERT  rectangleid = nextrectangle+4
+        LDMIA   R9,{R1,R2}              ;R1:=nextrectangle; R2:=rectangleid
+        STR     R1,currentrect
+
+; Unless this is the first rectangle in the list, restore to the VM state
+; that was in effect at the start of the page.
+
+        LDR     R1,rectlist
+        TEQ     R9,R1
+        BEQ     pagebox_nextbox_norestore
+        BL      pagebox_setmaxbox               ;First make sure 'gsave's and
+        BLVC    output_restore                  ;  'grestore's balance
+        BVS     pagebox_nextbox_return
+pagebox_nextbox_norestore
+
+; If there are no rectangles left, we've finished printing.
+
+        TEQ     R9,#0
+        BEQ     pagebox_nextbox_printingdone
+
+; Otherwise, the VM state is currently more or less that supplied by the
+; PostScript prologue. In particular, this means that no VDU 5 characters
+; are defined.
+
+        MOV     R1,#-1
+        BL      vdu5_changed
+
+; Otherwise, save the VM state for the next rectangle.
+
+        BL      output_save
+        BVS     pagebox_nextbox_return
+
+; Copy background colour to job workspace.
+
+        LDR     LR,rectanglebg
+        STR     LR,usersbg
+
+; Copy requested origin to job workspace and set it up in PostScript
+
+        ADR     LR,rectbottomleft
+        LDMIA   LR,{R3,R4}
+        ADR     LR,usersbottomleft
+        STMIA   LR,{R3,R4}
+
+        PrNumSp R3
+        PrStrIm "MP "
+        PrNumSp R4
+        PrLnIm  "MP T"
+
+; Copy matrix to job workspace and set it up in PostScript
+
+        ADR     LR,recttransform
+        LDMIA   LR,{R3-R6}
+        ADR     LR,userstransform
+        STMIA   LR,{R3-R6}
+
+        PrPair  R3,R4
+        PrPair  R5,R6
+        PrLnIm  "UM"
+
+        [       PSCoordSpeedUps
+
+; Register fact that we are now in the standard "OS co-ordinate system".
+
+        MOV     LR,#0
+        STR     LR,coordsystem
+
+        ]
+
+; Copy box offset and size to job workspace
+
+        ADR     LR,rectoffset
+        ASSERT  rectbox = rectoffset+8
+        LDMIA   LR,{R3-R6}
+        ADR     LR,usersoffset
+        ASSERT  usersbox = usersoffset+8
+        STMIA   LR,{R3-R6}
+
+; Note that no clipping has been done as yet. We should clip by the current
+; rectangle's boundary.
+
+        PrPair  R5,R6
+        PrLnIm  "MC",FallThroughOnError
+
+        MOVVC   LR,#0
+        STRVCB  LR,jobclipped
+
+; Set up user's box relative to its bottom left corner and return.
+
+        MOVVC   R3,#0
+        MOVVC   R4,#0
+        Pull    "R1,PC"
+
+pagebox_nextbox_printingdone
+
+; Tidy up by restoring the standard VM state
+
+        BL      output_restore
+        BVS     pagebox_nextbox_return
+
+; Print the right number of copies
+
+        PrNumSp R0
+        PrLnIm  "Copies"
+
+; Get out of the 'PDdict' dictionary.
+
+        PrLnIm  "end",FallThroughOnError
+
+; Return, indicating there's nothing more to do.
+
+        MOVVC   R0,#0
+
+        PrError                                         ;Cancel error label
+pagebox_nextbox_return
+        Pull    "R1,PC"
+
+;----------------------------------------------------------------------------
+;
+; Routine to return to the maximum box to be plotted
+;
+;----------------------------------------------------------------------------
+
+pagebox_setmaxbox
+        Push    "LR"
+        PrError pagebox_setmaxbox_return
+        [       PSDebugPageBox
+        PrLnIm  "% pagebox_setmaxbox"
+        ]
+
+        [       PSCoordSpeedUps
+        BL      ensure_OScoords
+        BVS     pagebox_setmaxbox_return
+        ]
+
+        LDRB    LR,jobclipped
+        CMP     LR,#0                   ;NB clears V
+        BLNE    output_grestore
+        MOVVC   LR,#0
+        STRVCB  LR,jobclipped
+
+        PrError
+pagebox_setmaxbox_return
+        Pull    "PC"
+
+;----------------------------------------------------------------------------
+;
+; Routine to clear the current box to 'usersbg'.
+;
+;----------------------------------------------------------------------------
+
+pagebox_cleartobg
+        Push    "R1,LR"
+        PrError pagebox_cleartobg_return
+        [       PSDebugPageBox
+        PrLnIm  "% pagebox_cleartobg"
+        ]
+
+        LDR     R1,usersbg
+        BL      colour_setrealrgb
+        [       PSCoordSpeedUps
+        BLVC    colour_ensure
+        ]
+        BVS     pagebox_cleartobg_return
+
+        PrLnIm  "CP fill",FallThroughOnError
+
+        PrError
+pagebox_cleartobg_return
+        Pull    "R1,PC"
+
+;----------------------------------------------------------------------------
+;
+; Routine to set the intersection of the maximum box to be plotted and a new
+; clip box (passed in R1-R4, units OS units).
+;
+;----------------------------------------------------------------------------
+
+pagebox_setnewbox
+        Push    "R0,R1,LR"
+        PrError pagebox_setnewbox_return
+        [       PSDebugPageBox
+        PrLnIm  "% pagebox_setnewbox"
+        ]
+
+        BL      pagebox_setmaxbox
+
+        BLVC    output_gsave
+        BVS     pagebox_setnewbox_return
+        MOV     R0,#1
+        STRB    R0,jobclipped
+
+        PrPair  R1,R2,CorruptR0andR1
+        PrPair  R3,R4,CorruptR0andR1
+        PrLnIm  "Cp",FallThroughOnError
+
+        PrError
+pagebox_setnewbox_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,PC"
+
+;----------------------------------------------------------------------------
+; Now insert the prologue files, namely the files <PDriver$PSprologue> and
+; <PDriver$PSprologue2> in directory <PDriver$Dir> or PDriver:. The first of
+; these should contain the '%%DocumentFonts' and '%%EndComments' lines at
+; its start: it is intended to contain readable and editable PostScript to
+; do things like setting up the font translation or changing the screen
+; resolution.
+;   The second is intended to contain compressed (and essentially fixed)
+; PostScript definitions for the operators built into the PDriver module.
+
+pagebox_generateprologue
+        Push    "r2, r3, lr"                            ; Corrupt R0-R9 now
+        PrError pagebox_generateprologue_return
+
+        PrLnIm  "%%BeginProlog"
+
+        [ VersionNumber >= 436
+; Insert the feed code from the specified file
+; It is done here rather than later on because it may redefine
+; certain PostScript terms which then get used later in the
+; prologue, eg showpage
+        LDRB    r0, illustrationjob
+        CMP     r0, #0                                  ; Clears V
+        ADREQL  r0, psfeed_filename
+        BLEQ    pagebox_insertfile
+        BVS     pagebox_generateprologue_return
+        ]
+
+        LDR     r0, declaredfonts
+        CMP     r0, #0                                  ; Is this an old style application
+        BLT     pagebox_generateprologue_oldstyle
+                
+pagebox_generateprologue_newstyle
+        Debug   PageBox, "XXXX Entered pagebox_generateprologue_newstyle"
+
+; Force the Verbose Prologue flag off - it is meaningless in a new-style
+; job, and the code in font_paintchunk relies on it.
+
+        MOV     r0, #0
+        STRB    r0, jobverbose
+
+; First send the standard definitions down.  These are shared
+
+
+        ADRL    r0, prologue2_filename
+        BL      pagebox_insertfile
+        BVS     pagebox_generateprologue_return
+
+
+; Send each fontname in the list to the font maker.
+; r0 contains the head of the font list.
+
+        LDR     r5, declaredfonts       ; head of font list
+        TEQ     r5, #0
+        BEQ     %FT03                   ; avoid pointless begins/ends if none
+
+        PrNewLn
+        PrLnIm  "PDdict begin userdict begin"
+
+01      TEQ     r5, #0
+        BEQ     %FT02
+        
+; Set up the flags for MakePSFont_MakeFont, with reference to the
+; flags value attached to the font list entry
+; XXXX replace with symbolic constants
+
+; Flags: force do "extra" declarations | non-permanent
+; and request RF and RFE to remap if jobaccents is set
+
+        LDRB    r4, jobaccents
+        TEQ     r4, #0
+        MOVNE   r4, #16         ; remap with RF/RFE
+        MOVEQ   r4, #0          ; remap with inline code that does not auto-accent
+
+        ORR     r4, r4, #1:OR:4 ; do "extra" declarations | non-permanent
+
+        LDR     r1, [r5, #4]    ; read flags word from font list entry
+        TST     r1, #1          ; is the "no downloading" bit set?
+        ORRNE   r4, r4, #2      ; yes, so disallow downloading
+
+        TST     r1, #2          ; is the "needs kerning" bit set?
+        ORRNE   r4, r4, #8      ; yes, turn it on
+
+        ADD     r1, r5, #8      ; address of start of the string
+        MOV     r0, r10         ; output file handle
+        MOV     r2, #0          ; don't want alien name returned
+
+        SWI     XMakePSFont_MakeFont    ; ignore errors here
+        CLRV
+
+        LDR     r5, [r5, #0]        ; get next font
+        B       %BT01
+
+02      
+        PrLnIm  "end end",FallThroughOnError
+03
+        PrNewLn
+
+        B       pagebox_generateprologue_endprologue
+
+        ; **NOTREACHED**
+
+pagebox_generateprologue_oldstyle
+        LDRB    r0, jobverbose
+        TEQ     r0, #0
+        BNE     pagebox_generateprologue_verbose
+
+        Debug   PageBox, "XXXX Entered pagebox_generateprologue_oldstyle"
+
+; Now intersect the list of fonts whose mappings we know ie the fonts
+; available on the printer (held in the MiscOp list) with the full list
+; of RISC OS fonts as known to the font manager and then generate
+; a new style prologue from that.  Stick the fonts into the list of 
+; declared fonts and then generate the prologue as usual.
+
+; Add the Font_ListFonts name rather than the one from the printer
+; font list, as this is more likely to be exactly what the program
+; requests.
+
+; Assuming that Font_ListFonts will be slower than looking at the MiscOp
+; list, which we can do without calling a SWI.  We will get each font
+; from the Font_ListFonts SWI and compare it with the MiscOp list.  Note
+; that font names are compared case insensitively.
+
+        DEC     sp, 48                                  ; Space for the RISC OS name
+        MOV     r9, #0                                  ; Index for ListFonts
+        STR     r9, declaredfonts                       ; Initialise the list as empty
+
+pagebox_generateprologue_oldstyle_fontloop
+        MOV     r1, sp                                  ; Address of buffer
+        MOV     r2, r9
+        MOV     r3, #-1                                 ; Use Font$Path
+        SWI     XFont_ListFonts
+        BVS     pagebox_generateprologue_oldstyle_return
+        CMP     r2, #-1
+        BEQ     pagebox_generateprologue_oldstyle_returnOK
+
+        MOV     r9,r2                                   ; Preserve next listfonts handle
+
+; The string returned by ListFonts is ^M terminated, but that's
+; OK because font_compareR4andR5 (etc) allow control-termination
+
+        DebugS  PageBox, ">>> ListFonts returned ", r1
+
+        MOV     r0, r1                  ; r1 still holds Font_ListFonts return ptr
+        BL      font_locatename         ; find the name field (to r0)
+        BVS     pagebox_generateprologue_oldstyle_fontloop
+        MOV     r4, r0                  ; stash start of name field in R4
+
+        LDR     r3, jobfontlist - fontblock_next
+
+pagebox_generateprologue_oldstyle_scanloop
+        TEQ     r3, #0
+        BEQ     pagebox_generateprologue_oldstyle_fontloop
+        LDR     r14, [ r3, #fontblock_flags ]
+        TEQ     r14, #PDriverMiscOp_PS_Font
+        BNE     pagebox_generateprologue_oldstyle_scanend
+        ADD     r0, r3, #fontblock_namestart
+
+        DebugS  PageBox, ">>>>>>> compare with ", r0
+
+        BL      font_locatename         ; find the name field
+        BVS     pagebox_generateprologue_oldstyle_scanend
+        MOV     r5, r0                  ; stash start of name field in R5
+
+        BL      font_compareR4andR5
+        BVC     pagebox_generateprologue_oldstyle_found
+
+pagebox_generateprologue_oldstyle_scanend
+        LDR     r3, [ r3, #fontblock_next ]
+        B       pagebox_generateprologue_oldstyle_scanloop
+
+pagebox_generateprologue_oldstyle_found
+        MOV     r2, #0                  ; All flags zero
+        BL      font_declare            ; r1 still holds Font_ListFonts return ptr
+        B       pagebox_generateprologue_oldstyle_fontloop
+
+pagebox_generateprologue_oldstyle_returnOK
+        CLRV
+pagebox_generateprologue_oldstyle_return
+        INC     sp, 48
+        BVS     pagebox_generateprologue_return
+        LDR     r0, declaredfonts
+        B       pagebox_generateprologue_newstyle
+
+pagebox_generateprologue_verbose
+        ADR     r0, prologue_filename
+        BL      pagebox_insertfile
+        ADRVC   r0, prologue2_filename
+        BLVC    pagebox_insertfile
+        BVS     pagebox_generateprologue_return
+
+; End of the prologue section
+pagebox_generateprologue_endprologue
+
+        PrLnIm  "%%EndProlog"
+        PrNewLn
+
+; Skip the setup section if this is an illustration job
+
+        LDRB    r14, illustrationjob
+        CMP     r14, #0                                 ; Clears V
+        BNE     pagebox_generateprologue_return
+
+; Beginning of the setup section
+
+        PrLnIm  "%%BeginSetup"
+
+        [ VersionNumber >= 436
+; Insert the paper code from the specified file
+        ADRL    r0, pspaper_filename
+        BL      pagebox_insertfile
+        BVS     pagebox_generateprologue_return
+        ]
+
+; Now insert the setup code, from the OS variable <PDriver$PSextra>.
+
+        PrGLnIm "<PDriver$PSextra>"
+
+; End of the setup section
+
+        PrLnIm  "%%EndSetup",FallThroughOnError
+        PrNewLn
+
+pagebox_generateprologue_return
+        Pull    "r2, r3, pc"
+
+
+prologue_filename       DCB     "<PDriver$PSprologue>",0
+                        ALIGN
+
+prologue2_filename      DCB     "<PDriver$PSprologue2>",0
+                        ALIGN
+
+epilogue_filename       DCB     "<PDriver$PSepilogue>",0
+                        ALIGN
+
+        [ VersionNumber >= 436
+psfeed_filename         DCB     "<PDriver$PSFeed>",0
+                        ALIGN
+                        
+pspaper_filename        DCB     "<PDriver$PSPaper>",0
+                        ALIGN
+        ]
+
+; Subroutine to insert a file into the PostScript output. Strips comments
+; and compresses multiple new lines. Rules:
+;   (a) Lines starting "%%" or "%!" are copied verbatim.
+;   (b) Lines starting "%" but not "%%" or "%!" are removed completely.
+;   (c) If a "%" appears in a line that doesn't start "%%" or "%!", it and
+;       all characters up to but not including the next new line are removed.
+; This is done using a finite state machine driven by the characters read.
+; Entry: R0 -> name of variable holding file name (relative to <PDriver$Dir>
+;              or PDriver:).
+; Exit:  All registers preserved
+
+pagebox_insertfile
+        Push    "R0-R4,LR"
+      [ {FALSE} ; Not using any prefix anymore
+        ASSERT  ?prologue_dirname <= 16
+        ADR     LR,prologue_dirname
+        LDMIA   LR,{R1-R4}
+        ADR     LR,expansionbuffer
+        STMIA   LR,{R1-R4}
+        ADD     R1,LR,#?prologue_dirname
+        MOV     R2,#?expansionbuffer-?prologue_dirname
+      |
+        ADR     R1,expansionbuffer
+        MOV     R2,#?expansionbuffer
+      ]
+        SWI     XOS_GSTrans
+        BVS     pagebox_insertfile_return
+        TEQ     R2,#0
+        BEQ     pagebox_insertfile_return
+        MOV     R3,#0                           ;Make certain result is
+        STRB    R3,[R1,R2]                      ;  zero-terminated
+
+        MOV     R0,#OSFind_ReadFile
+        ADR     R1,expansionbuffer
+        SWI     XOS_Find
+        BVS     pagebox_insertfile_return
+
+        MOV     R1,R0
+        PrError pagebox_insertfile_closeanderror
+
+pagebox_insertfile_linestart
+        [       PSDebugEscapes
+        BL      readescapestate
+        |
+        SWI     XOS_ReadEscapeState
+        ]
+        BCS     pagebox_insertfile_closeanderror
+        SWI     XOS_BGet
+        BVS     pagebox_insertfile_closeanderror
+        BCS     pagebox_insertfile_closeandreturn
+        TEQ     R0,#10
+        BEQ     pagebox_insertfile_linestart
+        TEQ     R0,#"%"
+        BEQ     pagebox_insertfile_linestartpercent
+        PrChr   R0
+
+pagebox_insertfile_copy
+        SWI     XOS_BGet
+        BVS     pagebox_insertfile_closeanderror
+        BCS     pagebox_insertfile_closeandreturn
+        TEQ     R0,#"%"
+        BEQ     pagebox_insertfile_ignoreuptonewline
+        PrChr   R0
+        TEQ     R0,#10
+        BNE     pagebox_insertfile_copy
+        B       pagebox_insertfile_linestart
+
+pagebox_insertfile_linestartpercent
+        SWI     XOS_BGet
+        BVS     pagebox_insertfile_closeanderror
+        BCS     pagebox_insertfile_closeandreturn
+        TEQ     R0,#10
+        BEQ     pagebox_insertfile_linestart
+        TEQ     R0,#"%"
+        TEQNE   R0,#"!"
+        BNE     pagebox_insertfile_ignoreline
+        PrChrIm "%"
+        PrChr   R0
+
+pagebox_insertfile_copyverbatim
+        SWI     XOS_BGet
+        BVS     pagebox_insertfile_closeanderror
+        BCS     pagebox_insertfile_closeandreturn
+        PrChr   R0
+        TEQ     R0,#10
+        BNE     pagebox_insertfile_copyverbatim
+        B       pagebox_insertfile_linestart
+
+pagebox_insertfile_ignoreuptonewline
+        SWI     XOS_BGet
+        BVS     pagebox_insertfile_closeanderror
+        BCS     pagebox_insertfile_closeandreturn
+        TEQ     R0,#10
+        BNE     pagebox_insertfile_ignoreuptonewline
+        PrChr   R0
+        B       pagebox_insertfile_linestart
+
+pagebox_insertfile_ignoreline
+        SWI     XOS_BGet
+        BVS     pagebox_insertfile_closeanderror
+        BCS     pagebox_insertfile_closeandreturn
+        TEQ     R0,#10
+        BNE     pagebox_insertfile_ignoreline
+        B       pagebox_insertfile_linestart
+
+pagebox_insertfile_closeanderror
+        STR     R0,[R13]
+        MOV     R0,#0
+        SWI     XOS_Find
+        SETV
+        Pull    "R0-R4,PC"
+
+pagebox_insertfile_closeandreturn
+        MOV     R0,#0
+        SWI     XOS_Find
+pagebox_insertfile_return
+        STRVS   R0,[R13]
+        Pull    "R0-R4,PC"
+
+
+        END

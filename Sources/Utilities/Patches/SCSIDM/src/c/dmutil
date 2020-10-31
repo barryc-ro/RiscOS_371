@@ -1,0 +1,877 @@
+/*
+ * $Header: /smsa/bsd:etc/scsidm/dmutil.c:bsd  1.6  $
+ * $Source: /smsa/bsd:etc/scsidm/dmutil.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	dmutil.c,v $
+ * Revision 1.6  90/08/13  15:24:08  jroach
+ * Bring Risc OS and RISCiX version in line with each other.
+ * 
+ * Revision 1.5  90/08/02  15:48:36  kwelton
+ * getfailure() now tests whether or not info bytes are valid and returns an
+ * error if they are not.
+ * 
+ * Revision 1.4  89/06/20  18:29:31  kwelton
+ * Added code to restrict a partition's length to a multiple of BLKDEV_IOSIZE.
+ * This is a restriction imposed by the kernel's block device I/O routines.
+ * 
+ * Revision 1.3  89/05/25  10:19:47  kwelton
+ * Created a new function alignpart() which ensures partitions are
+ * aligned on a DEV_BSIZE byte boundary.
+ * 
+ * Revision 1.2  89/04/18  17:42:44  kwelton
+ * struct scsiop flags (ps_scsi.h) changed from I_... to SC_...
+ * 
+ * Revision 1.1  89/04/06  11:22:20  kwelton
+ * Initial revision
+ * 
+ *
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /smsa/bsd:etc/scsidm/dmutil.c:bsd  1.6  $";
+#endif
+
+#include <stdio.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "param.h"
+#include "ps_scsi.h"
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <sys/param.h>
+#include <dev/ps_scsi.h>
+#endif
+#include "scsidm.h"
+#include "dmcmds.h"
+
+	/* import externals */
+import struct d_parms *cdev;		/* parameters for current SCSI device */
+import struct sesc extscodes[];		/* list of extended sense codes */
+import int nextcodes;			/* no. of extended sense codes */
+import char **iphelp;			/* help for input data */
+import DefectList defects;		/* list of known defects */
+
+	/* declare external routines */
+import int vdbool(), vdstr();
+import unsigned long ipdata();
+import void *malloc(), *realloc();
+
+	/* declare statics */
+static char rptprompt[] = "Device was busy, repeat the command? >";
+static char *rpthelp[] = {
+	"Answer yes  if you wish to  retry the command with  the same",
+	"data, otherwise answer no.",
+	""
+};
+
+static char irptprompt[] = "Do you wish to continue with the operation? >";
+static char *irpthelp[] = {
+	"A `device busy' message  was received when trying to execute",
+	"an internal SCSI command. Answer yes if you wish to continue",
+	"with the current operation, otherwise answer no.",
+	""
+};
+
+static bool diagcmdfail(), getsense();
+
+	/* declare routines defined this segment */
+long fetchlong();
+u_long getfailure();
+bool runcmd(), addbad();
+void bldskelcb(), clrdata(), storelong(), dumpdef(), clrdef(), prpmap();
+
+/**********************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, dmutil.c:
+ *
+ * 1) bool gotdev() - check that a device name has been given
+ *
+ * 2) void bldskelcb() - build a skeleton command block
+ *
+ * 3) void clrdata() - clear data bytes
+ *
+ * 4) void storelong() - pack a long into sequential chars
+ *
+ * 5) long fetchlong() - unpack a long from sequential chars
+ *
+ * 6) bool runcmd() - run a SCSI command
+ *
+ * 7) int runicmd() - run an internal SCSI command
+ *
+ * 8) int getcmdstat() - analyse return status from a command
+ *
+ * 9) int geticstat() - analyse return status from an internal command
+ *
+ * 10) static bool diagcmdfail() - interpret extended sense data
+ *
+ * 11) static bool getsense() - read extended sense information
+ *
+ * 12) u_long getfailure() - get bad block number from extended sense info
+ *
+ * 13) bool addbad() - add a bad block into the defect list
+ *
+ * 14) void dumpdef() - offer to dump the defect list into a file
+ *
+ * 15) void clrdef() - clear the defects list
+ *
+ * 16) int alignpart() - align partition start on a 512 byte boundary
+ *
+ * 17) int scalepart() - scale partition length to a multiple of 2048 bytes
+ *
+ */
+
+/**********************************************************************/
+
+bool gotdev(cname)
+
+char *cname;
+
+{
+	/*
+	 * subroutine gotdev() -
+	 *
+	 * routine checks that a device driver name has been given.
+	 * if yes, it returns TRUE, otherwise it prints an error
+	 * message & returns FALSE.
+	 *
+	 */
+
+	if( cdev != NULL )
+	 return(TRUE);
+	else
+	{
+	 printf("%s: no SCSI device has been selected yet\n",cname);
+	 return(FALSE);
+	}
+
+	/*NOTREACHED*/
+}
+
+/**********************************************************************/
+
+void bldskelcb(command,cmdptr)
+
+int command;
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine bldskelcb() -
+	 *
+	 * routine builds as much of a SCSI command block as it can,
+	 * clearing the rest for the specific command to fill in. no
+	 * value is returned.
+	 *
+	 */
+
+	/* declare autos */
+	register int cdbsize;
+
+	/* get the command size & clear the block */
+	cdbsize = GETCMDSIZ(command);
+	clrdata(cmdptr->cdb,cdbsize);
+
+	/* fill in the operation code */
+	*(cmdptr->cdb) = GETOPCODE(command);
+
+	/* clear extended sense info & completion status */
+	clrdata(cmdptr->sense,SCSI_SENSE);
+	cmdptr->status = STGOOD;
+
+	/* clear remaining fields */
+	cmdptr->xfer = cmdptr->flags = 0;
+	cmdptr->addr = NULL;
+
+	/* finished */
+	return;
+}
+
+/**********************************************************************/
+
+void clrdata(dptr,nbytes)
+
+register char *dptr;
+register int nbytes;
+
+{
+	/*
+	 * subroutine clrdata() -
+	 *
+	 * routine clears a block of data starting at dptr. no value
+	 * is returned.
+	 *
+	 */
+
+	/* no autos */
+
+	while( nbytes-- > 0 )
+	 *dptr++ = 0;
+
+	return;
+}
+
+/**********************************************************************/
+
+void storelong(bytptr,data,nbytes)
+
+char *bytptr;
+long data;
+int nbytes;
+
+{
+	/*
+	 * subroutine storelong() -
+	 *
+	 * routine packs the passed data into the sequential string
+	 * of chars at bytptr. no value is returned.
+	 *
+	 */
+
+	/* no autos */
+
+	/* check the limits */
+	if( nbytes > sizeof(long) )
+	 nbytes = sizeof(long);
+
+	/* store the bytes away */
+	while( --nbytes >= 0 )
+	 *bytptr++ = ((data >> (NBBY * nbytes)) & 0xff);
+
+	return;
+}
+
+/**********************************************************************/
+
+long fetchlong(bytptr,nbytes)
+
+char *bytptr;
+int nbytes;
+
+{
+	/*
+	 * subroutine fetchlong() -
+	 *
+	 * routine unpacks the passed data into a long,
+	 * which is returned.
+	 *
+	 */
+	
+	/* declare autos */
+	long retc;
+
+	/* check the limits */
+	if( nbytes > sizeof(long) )
+	 nbytes = sizeof(long);
+
+	/* unpack the data */
+	for( retc = 0, --nbytes; nbytes >= 0; --nbytes )
+	 retc |= ((unsigned char)*bytptr++ << (nbytes * NBBY));
+
+	return(retc);
+}
+
+/************************************************************************/
+
+bool runcmd(cmdptr)
+
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine runcmd() -
+	 *
+	 * routine runs the SCSI command defined by cmdptr. returned
+	 * value is GOOD if command OK, BADARG if the device rejected
+	 * the operation, else BAD.
+	 *
+	 */
+
+	/* declare autos */
+	register int cmdstat, repeat;
+	register bool retc;
+	char inpbuf[CANBSIZ];
+
+	/* execute the command until it fails, or no more repeats required */
+	do
+	{
+	 /* send the command */
+	 if( sendcmd(cmdptr) == FALSE )
+	  return(BADARG);
+
+	 /* get the return status of the command */
+	 if( (cmdstat = getcmdstat(cmdptr)) == RETRY )
+	 {
+	  /* assume the command is going to fail */
+	  retc = BAD;
+
+	  /* ask whether to repeat the command */
+	  iphelp = rpthelp;
+	  repeat = (int)ipdata(inpbuf,rptprompt,vdbool,FALSE);
+	 }
+	 else
+	 {
+	  /* set return code */
+	  retc = (cmdstat == GOOD) ? GOOD : BAD;
+
+	  /* do not repeat */
+	  repeat = FALSE;
+	 }
+
+	} while(repeat);
+	
+	/* finished */
+	return(retc);
+}
+
+/************************************************************************/
+
+int runicmd(cmdptr)
+
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine runicmd() -
+	 *
+	 * routine runs the internal SCSI command defined by cmdptr.
+	 * returned value is GOOD if the caller should continue its
+	 * operation, BAD if the caller should stop, BADARG if the
+	 * device rejected the operation.
+	 *
+	 */
+
+	/* declare autos */
+	register int retc;
+	register int repeat;
+	char inpbuf[CANBSIZ];
+
+	/* send the command until it fails or no more repeats required */
+	do
+	{
+	 if( sendcmd(cmdptr) == FALSE )
+	  return(BADARG);
+
+	 /* analyse the return status */
+	 switch((retc = getcmdstat(cmdptr)))
+	 {
+	 case GOOD:
+	  repeat = FALSE;
+	  break;
+
+	 case BAD:
+	  fputs("Internal SCSI command failed - abort operation\n",
+		 stdout);
+	  return(BAD);
+
+	 case RETRY:
+	  fputs("Device was busy for an internal command\n",stdout);
+	  iphelp = irpthelp;
+	  if( (repeat = (int)ipdata(inpbuf,irptprompt,vdbool,FALSE)) == FALSE )
+	   return(BAD);
+
+	  break;
+
+	 default:
+	  printf("Internal error: bad code from getcmdstat() `%d'\n",
+	 	 retc);
+	  return(BAD);
+	 }
+	} while( repeat );
+
+	/* finished OK */
+	return(GOOD);
+}
+
+/**********************************************************************/
+
+int getcmdstat(cmdptr)
+
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine getcmdstat() -
+	 *
+	 * routine analyses the exit status from a SCSI command.
+	 * returned value is GOOD if command succeeded, BAD if
+	 * it did not, or RETRY if the device was busy.
+	 *
+	 */
+
+	/* declare autos */
+	register int retstat;
+	register int retc = BAD;
+
+	/* extract the completion status */
+	retstat = GETST(cmdptr->status);
+
+	/* decide what to do with this status */
+	switch( retstat )
+	{
+	case STGOOD:
+	 /* command OK */
+	 retc = GOOD;
+	 break;
+
+	case STCHKCD:
+	 /* `check condition' - diagnose the failure */
+	 retc = diagcmdfail(cmdptr) ? BAD : GOOD;
+	 break;
+
+	case STTIMEOUT:
+	 /* no hardware */
+	 printf("No response from the hardware\n");
+	 break;
+
+	case STBUSY:
+	 /* device was busy, give the chance to repeat the command */
+	 retc = RETRY;
+	 break;
+
+	case STEXPIRED:
+	 /* command timed out before finishing */
+	 printf("Device failed to finish task before timeout expired\n");
+	 break;
+
+	case STKILLED:
+	case STABORTED:
+	 printf("command was stopped prematurely\n");
+	 break;
+
+	case STRSCNF:
+	 /* reservation conflict */
+	 printf("Command failed because someone has reserved the device\n");
+	 break;
+
+	default:
+	 /* bad status */
+	 printf("Internal error: unknown status code `%d'\n",retstat);
+	 break;
+	}
+
+	return(retc);
+}
+
+/**********************************************************************/
+
+static bool diagcmdfail(cmdptr)
+
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine diagcmdfail() -
+	 *
+	 * routine interprets the extended sense data returned by a
+	 * SCSI device following a check condition. returned value
+	 * is TRUE if the condition is a hard error, else FALSE.
+	 *
+	 */
+
+	/* declare autos */
+	register long logblok;
+	register char sensekey, escode;
+	register char *esdata;
+	struct sesc *ecptr;
+	static struct {
+		char *ccmsg;
+		bool harderror;
+	} skeymsg[] = {
+	 "No sense",		TRUE,
+	 "Recovered error",	FALSE,
+	 "Not ready",		TRUE,
+	 "Medium error",	TRUE,
+	 "Hardware error",	TRUE,
+	 "Illegal request",	TRUE,
+	 "Unit Attention",	TRUE,
+	 "Data protect",	TRUE,
+	 "Blank Check",		TRUE,
+	 "",			TRUE,	/* should never have this */
+	 "Copy aborted",	TRUE,
+	 "Aborted command",	TRUE,
+	 "Equal",		FALSE,
+	 "Volume overflow",	TRUE,
+	 "Miscompare",		FALSE,
+	 "",			TRUE	/* should never have this either */
+	};
+	static char hardmsg[] = "Command failed";
+	static char softmsg[] = "Device returned a warning";
+	static char blockmsg[] = " for logical block %#lx -\n";
+
+	/* check that the extended sense is valid */
+	esdata = cmdptr->sense;
+	if( GET_ERRCLASS(*esdata) != XTSENSERRCLASS ||
+	    (cmdptr->flags & SC_SENSE_VALID) != SC_SENSE_VALID )
+	{
+	 /* try to read extended sense manually */
+	 if( !getsense(cmdptr) )
+	 {
+	  fputs("Warning: Check condition signalled, cannot read extended sense data\n",
+	        stdout);	 
+	  return;
+	 }
+	}
+
+	/* fetch the sense key & print the appropriate message */
+	sensekey = *(esdata + 2) & SKEYMASK;
+	fputs((skeymsg[sensekey].harderror) ? hardmsg : softmsg,stdout);
+
+	/* print the failing logical block number if necessary */
+	logblok = fetchlong(esdata + 3,4);
+	printf((INFOVALID(*esdata)) ? blockmsg : "\n",logblok);
+
+	/* print the sense key message */
+	fputs(skeymsg[sensekey].ccmsg,stdout);
+
+	/* try to find the extended sense code */
+	if( *(esdata + 7) == 0 )
+	{
+	 /* no additional sense bytes */
+	 fputc('\n',stdout);
+	 return;
+	}
+	else
+	 escode = *(esdata + 12);
+
+	/* print the message associated with this code */
+	for( ecptr = extscodes; ecptr < (extscodes + nextcodes); ++ecptr )
+	 /* does this code match? */
+	 if( ecptr->scode == escode )
+	 {
+	  /* yes - print the associated message */
+	  printf(": %s",ecptr->cdtxt);
+	  break;
+	 }
+
+	/* that's all */
+	putchar('\n');
+	return(skeymsg[sensekey].harderror);
+}
+
+/************************************************************************/
+
+static bool getsense(cmdptr)
+
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine getsense() -
+	 *
+	 * routine is used to read extended sense information when
+	 * diagcmdfail() has no valid sense bytes. this routine MUST
+	 * NOT call runcmd() or runicmd(), as an infinitely recursive
+	 * loop may occur. instead it must run the SCSI command directly.
+	 * returned value is TRUE if sense read OK, else FALSE.
+	 *
+	 */
+
+	/* declare autos */
+	struct scsiop cmd;
+
+	/* build the skeleton command block */
+	bldskelcb(REQSEN,&cmd);
+
+	/* fill in the command specific stuff */
+	cmd.cdb[4] = NSENBYTES;
+	cmd.xfer = NSENBYTES;
+	cmd.addr = cmdptr->sense;
+	cmd.timeout = REQSENTIMEO;
+	cmd.flags |= SC_READ;
+
+	/* send the command */
+	if( !sendcmd(&cmd) )
+	 /* something went wrong */
+	 return(FALSE);
+
+	/*
+	 * must have a GOOD status & extended sense error
+	 * class signalled before we can say command is OK
+	 */
+	if( GETST(cmd.status) != STGOOD ||
+	    GET_ERRCLASS(*(cmdptr->sense)) != XTSENSERRCLASS )
+	 return(FALSE);
+	else
+	{
+	 /* signal sense info valid */
+	 cmdptr->flags |= SC_SENSE_VALID;
+
+	 /*
+	  * set flag so any further commands will not mistakenly read
+	  * the sense information we supply this time.
+	  */
+	 cmdptr->flags |= SC_NO_SENSE;
+	 return(TRUE);
+	}
+
+	/* done */
+}
+
+/************************************************************************/
+
+u_long getfailure(cmdptr)
+
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine getfailure() -
+	 *
+	 * routine reads the bad block number from the extended sense
+	 * information held in cmdptr. returned value is the block
+	 * number, -1 if it cannot be read.
+	 *
+	 */
+
+	/* declare autos */
+	register char *esdata;
+
+	/* set pointer to extended sense info & return block number */
+	esdata = cmdptr->sense;
+	if( GET_ERRCLASS(*esdata) != XTSENSERRCLASS ||
+	     (cmdptr->flags & SC_SENSE_VALID) != SC_SENSE_VALID )
+	 /* extended sense info is invalid */
+	 return(-1);
+	else if( !INFOVALID(*esdata) )
+	    /*
+	     * info. bytes not defined: cannot determine
+	     * block number
+	     */
+	    return(-1);
+	else
+	 return((u_long)fetchlong(esdata + 3,4));
+}
+
+/************************************************************************/
+
+bool addbad(bloknum)
+
+u_long bloknum;
+
+{
+	/*
+	 * subroutine addbad() -
+	 *
+	 * routine adds the passed block into deflist. returned value is
+	 * TRUE if all OK, FALSE if no more core could be allocated.
+	 *
+	 */
+
+	/* declare autos */
+	register u_int ndef;
+
+	/* get the number of defects */
+	ndef = (u_int)(defects.dl_header & 0xffff);
+
+	/* is more core required? */
+	if( ndef == 0 )
+	{
+	 /* no space allocated at all - use malloc() */
+	 if( (defects.dl_data = malloc(ALLOCUNIT * sizeof(u_long))) == NULL )
+	  return(FALSE);
+	}
+	else if( (ndef % ALLOCUNIT) == 0 )
+	{
+	 /* allocate some more space */
+	 if( (defects.dl_data = realloc(defects.dl_data,
+	      ((ndef / ALLOCUNIT) + 1) * ALLOCUNIT * sizeof(u_long)) ) == NULL )
+	  return(FALSE);
+	}
+
+	/* assign the next block */
+	*(defects.dl_data + ndef++) = bloknum;
+	defects.dl_header &= 0xffff0000;
+	defects.dl_header |= ndef;
+
+	/* finished */
+	return(TRUE);
+}
+
+/************************************************************************/
+
+void dumpdef()
+
+{
+	/*
+	 * subroutine dumpdef() -
+	 *
+	 * routine is called when verify has detected bad blocks, but the
+	 * device cannot add them to its glist for whatever reason. it
+	 * offers to save the list of defects to a file so the user can
+	 * try again later when the device is being more reasonable.
+	 *
+	 */
+
+	/* declare autos */
+	register int dodump, i, ndef;
+	register u_long *srcptr;
+	register FILE *fp;
+	char inpbuf[CANBSIZ];
+
+	static char *dumpiphelp[] =
+	{
+	 "The  current device  could not map  out the defects detected",
+#if defined(SCSIDM_FOR_RISCOS)
+	 "during the  verify command  or has  been told  not to do so.",
+	 "Enter `yes'  if you wish  the list of these  defects to be  ",
+	 "saved to a file of your choice, else enter `no'.",
+#elif defined(SCSIDM_FOR_RISCiX)
+	 "during the verify command.  Enter `yes' if you wish the list",
+	 "of these defects to  be saved to a file of your choice, else",
+	 "enter `no'.",
+#endif
+	 ""
+	};
+
+	static char *fnameiphelp[] =
+	{
+	 "Enter the name of the file  to store the current defect list",
+	 "in.",
+	 ""
+	};
+
+	/* ask whether the user wants the data saved */
+	iphelp = dumpiphelp;
+	if( (dodump = (int)ipdata(inpbuf,"Save the defects to a file? (yes) >",
+			     vdbool,TRUE)) == USEDEFAULT )
+	 dodump = TRUE;
+
+	if( dodump )
+	{
+	 do
+	 {
+	  iphelp = fnameiphelp;
+	  ipdata(inpbuf,"Filename? >",vdstr,FALSE);
+	  if( (fp = fopen(inpbuf,"w")) == NULL )
+	   printf("Cannot open file %s for writing\n",inpbuf);
+	 } while( fp == NULL );
+
+	 /* read the no. of defects, set source pointer */
+	 ndef = defects.dl_header & 0xffff;
+	 srcptr = defects.dl_data;
+
+	 /* print all these to file */
+	 for( i = 0; i < ndef; )
+	 {
+	  fprintf(fp,"%9lx ",*srcptr++);
+	  if( !(++i % 5) )
+	   /* add some spacing */
+	   putc('\n',fp);
+	 }
+
+	 /* close the file */
+	 fclose(fp);
+	}
+
+	/* empty defect list & return */
+	clrdef();
+	return;
+}
+
+/************************************************************************/
+
+void clrdef()
+
+{
+	/*
+	 * subroutine clrdef() -
+	 *
+	 * routine clears the defect list, returning any used heap. no
+	 * value is returned.
+	 *
+	 */
+
+	/* no autos */
+
+	/* only clear if list is not empty */
+	if( (defects.dl_header & 0xffff) != 0 )
+	{
+	 defects.dl_header = 0;
+	 free(defects.dl_data);
+	}
+
+	/* that's all */
+	return;
+}
+
+/************************************************************************/
+
+int alignpart(pstart)
+
+int pstart;
+
+{
+	/*
+	 * subroutine alignpart() -
+	 *
+	 * routine calculates the adjustment for pstart so that
+	 * it lies on a 512 (DEV_BSIZE) byte boundary. returned value is
+	 * the difference between pstart and a properly aligned block
+	 * (>= 0).
+	 *
+	 */
+
+	/* declare autos */
+	unsigned int ratio, align;
+
+	/*
+	 * calculate ratio between DEV_BSIZE & block size,
+	 * watch out for block size > DEV_BSIZE
+	 */
+	if( (ratio = DEV_BSIZE / cdev->d_bloksize) <= 1 )
+	 /* block size >= DEV_BSIZE, no adjustment required */
+	 return(0);
+	else
+	{
+	 /* calculate mis-alignment */
+	 align = pstart % ratio;
+	 
+	 /* return adjustment */
+	 return( align ? ((int)(ratio - align)) : 0);
+	}
+
+	/* all done */
+}
+	
+/************************************************************************/
+
+int scalepart(plength)
+
+int plength;
+
+{
+	/*
+	 * subroutine scalepart() -
+	 *
+	 *  routine scales plength to a multiple of BLKDEV_IOSIZE bytes.
+	 *  this is a requirement of the kernel block I/O routines. returned
+	 *  value is the difference between plength and a properly scaled
+	 *  length.
+	 *
+	 */
+
+	/* declare autos */
+	unsigned int ratio, align;
+
+	/* calculate ratio between BLKDEV_IOSIZE & block size,
+	 * watch out for block size > BLKDEV_IOSIZE.
+	 */
+	if( (ratio = BLKDEV_IOSIZE / cdev->d_bloksize) <= 1)
+	  /* no adjustment required */
+	  return(0);
+	else
+	{
+	 /* calculate no. of excess blocks */
+	 align = plength % ratio;
+
+	 /* return adjustment */
+	 return(align);
+	}
+
+	/* finished */
+}
+
+/************************************************************************/

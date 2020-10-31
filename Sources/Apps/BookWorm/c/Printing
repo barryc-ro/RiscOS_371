@@ -1,0 +1,1034 @@
+/***************************************************/
+/* File   : Printing.c                             */
+/*                                                 */
+/* Purpose: Printing functions for the browser     */
+/*                                                 */
+/* Author : A.D.Hodgkinson, for the new browser.   */
+/*                                                 */
+/*          This code has been 'retro-fitted' to   */
+/*          the old Intertalk browser, and due to  */
+/*          time contraints does not contain the   */
+/*          comment patterns used by Merlyn to     */
+/*          allow his GenH2 program to build the   */
+/*          header files. Therefore, the header    */
+/*          must be maintained manually, as must   */
+/*          any documented Messages file additions */
+/*          and GenH2 should be run with caution - */
+/*          this file should not be passed to it.  */
+/*                                                 */
+/* History: 27-Jan-97: Created                     */
+/*          03-Feb-97: Modified for working under  */
+/*                     RISCOS_Lib in the Intertalk */
+/*                     browser.                    */
+/***************************************************/
+
+#include "signal.h"
+
+#include "stdlib.h"
+#include "stddef.h"
+#include "stdio.h"
+#include "string.h"
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "os.h"
+#include "win.h"
+#include "dbox.h"
+#include "print.h"
+#include "help.h"
+#include "msgs.h"
+#include "flex.h"
+
+#include "PlotSpr.h"
+#include "Browser.h"
+#include "Iconbar.h"
+#include "Images.h"
+#include "Reformat.h"
+#include "Redraw.h"
+#include "ErrorGen.h"
+#include "Main.h"
+#include "Fetch.h"
+#include "Button.h"
+#include "Utils.h"
+#include "Defs.h"
+#include "Printing.h"
+
+/* Local structures */
+
+typedef struct
+{
+  browser * p;           /* Records for whom the print dialogue was opened.                                   */
+  int       copies;      /* Number of copies to print.                                                        */
+  int       start;       /* 1 = whole page, 0 = top of visible area.                                          */
+  int       end;         /* 0 = whole page, -1 = to bottom of visible area, > 0 = number of pages to fill.    */
+  int       pages;       /* Remembers the number of pages set, if 'end' is 0 or -1, to enable Cancel to work. */
+  int       reformat;    /* 1 = reformat to fit page (if start is not 0 and end is not -1), else don't.       */
+  int       orientation; /* 1 = portrait, 0 = landscape.                                                      */
+
+} print_job_info;
+
+/* Globals */
+
+extern int printing            = 0;
+extern int printer_message_ref = 0;
+
+/* Statics */
+
+static int globaljob     = 0;
+static int globalold_job = 0;
+static int mustfree      = 0;
+
+static print_job_info print_current;
+static print_job_info print_old;
+
+static void print_set_settings  (dbox d);
+static void print_initiate      (void);
+static void print_free_memory   (browser * localbrowser);
+
+/* Local macro - swap two signed / unsigned ints / chars. */
+
+#define SWAP(a,b) { (a) ^= (b); (b) ^= (a); (a) ^= (b); }
+
+/* Icon numbers */
+
+#define PI_TOPOFPAGE 4
+#define PI_TOPOFWINDOW 5
+#define PI_BOTTOMOFPAGE 8
+#define PI_BOTTOMOFWINDOW 9
+#define PI_SHEETISFILLED 10
+#define PI_SHEETS 11
+#define PI_REFORMAT 15
+#define PI_UPRIGHT 16
+#define PI_SIDEWAYS 17
+#define PI_COPIES 19
+
+/*************************************************/
+/* print_dbox                                    */
+/*                                               */
+/* Handles the operation of the Print dbox.      */
+/*                                               */
+/* Parameters: Pointer to a browser struct       */
+/*             relevant to the page to print.    */
+/*************************************************/
+
+os_error * print_dbox(browser * b)
+{
+  dbox          d;
+  int           f;
+  print_infostr pinfo;
+  char          pdesc[30];
+  BOOL          driver;
+
+  /* Create the dbox and fill in the title */
+
+  d=dbox_new("PrintSetup");
+  if(!d) return(errorgen(2));
+  dbox_raw_eventhandler(d,help_dboxrawevents,"HdPRINT");
+  button_set_flags(b,B_PRINT,TRUE,FALSE);
+  driver=print_info(&pinfo)==NULL;
+  if(driver)
+  {
+    STRFILL(pdesc,pinfo.description);
+  }
+  else
+  {
+    STRFILL(pdesc,msgs_lookup("NODRIVE:No driver loaded"));
+  }
+  dbox_show(d);
+  win_settitle(dbox_syshandle(d), pdesc);
+
+  print_current.p = b;
+
+  /* Fill in the print_current struct with defaults if it's not initialised yet */
+
+  if (!print_current.copies)
+  {
+    print_current.copies      = 1;
+    print_current.start       = 1;
+    print_current.end         = 0;
+    print_current.pages       = 1;
+    print_current.reformat    = 1;
+    print_current.orientation = 1;
+  }
+
+  print_old = print_current;
+
+  print_set_settings(d);
+
+  /* The main dialogue handling loop */
+
+  do
+  {
+    if (!driver) dbox_fadefield(d,0);
+    f=dbox_fillin(d);
+
+    switch(f)
+    {
+      case 0:
+      {
+        print_current.pages  = dbox_getnumeric(d,PI_SHEETS);
+        print_current.copies = dbox_getnumeric(d,PI_COPIES);
+
+        print_initiate();
+      }
+      break;
+
+      case 1:
+      {
+        print_current = print_old;
+        print_set_settings(d);
+      }
+
+      case PI_TOPOFPAGE:
+      case PI_TOPOFWINDOW:
+      case PI_BOTTOMOFPAGE:
+      case PI_BOTTOMOFWINDOW:
+      case PI_SHEETISFILLED:
+      case PI_UPRIGHT:
+      case PI_SIDEWAYS:
+      {
+        /* Since dbox_getnumeric seems not to work on these fields */
+        /* for some reason (always returns 0, perhaps because the  */
+        /* dbox routines thing the dialogue has been deleted by    */
+        /* the time it gives the OK or Cancel message and you try  */
+        /* to read them), need to keep track of things as they are */
+        /* changed.                                                */
+
+        dbox_setnumeric(d,f,1);
+
+        if (f == PI_TOPOFPAGE)   print_current.start = 1;
+        if (f == PI_TOPOFWINDOW) print_current.start = 0;
+
+        if (f == PI_BOTTOMOFPAGE)   print_current.end = 0;
+        if (f == PI_BOTTOMOFWINDOW) print_current.end = -1;
+        if (f == PI_SHEETISFILLED)  print_current.end = dbox_getnumeric(d,PI_SHEETS);
+
+        if (f == PI_UPRIGHT)  print_current.orientation = 1;
+        if (f == PI_SIDEWAYS) print_current.orientation = 0;
+
+        if (!print_current.start || print_current.end < 0) dbox_fadefield(d, PI_REFORMAT);
+        else dbox_unfadefield(d, PI_REFORMAT);
+      }
+      break;
+
+      case PI_REFORMAT:
+      {
+        /* Keep track of reformat radio as it changes */
+
+        print_current.reformat = !print_current.reformat;
+        dbox_setnumeric(d,PI_REFORMAT,print_current.reformat);
+      }
+      break;
+    }
+
+  } while (f!=dbox_CLOSE && ((f!=0 && f!=1) || dbox_persist()));
+
+  dbox_dispose(&d);
+  button_set_flags(b,B_PRINT,FALSE,FALSE);
+  return(NULL);
+}
+
+/*************************************************/
+/* print_set_settings                            */
+/*                                               */
+/* Sets up a print dialogue box from the local   */
+/* static print_info struct 'print_current'.     */
+/*                                               */
+/* Parameters: dbox handle (pointer to a related */
+/*             dialogue box structure) for the   */
+/*             print dialogue.                   */
+/*************************************************/
+
+static void print_set_settings(dbox d)
+{
+  /* Fill in the dbox with the print_current information */
+
+  dbox_setnumeric(d,PI_COPIES,print_current.copies);
+
+  if (print_current.end > 0) dbox_setnumeric(d,PI_SHEETS,print_current.end);
+  else                       dbox_setnumeric(d,PI_SHEETS,print_current.pages);
+
+  dbox_unfadefield(d, PI_REFORMAT);
+
+  if (print_current.start)
+  {
+    dbox_setnumeric(d,PI_TOPOFPAGE,  1);
+    dbox_setnumeric(d,PI_TOPOFWINDOW,0);
+  }
+  else
+  {
+    dbox_setnumeric(d,PI_TOPOFPAGE,  0);
+    dbox_setnumeric(d,PI_TOPOFWINDOW,1);
+    dbox_fadefield(d, PI_REFORMAT);
+  }
+
+  if (print_current.end == -1)
+  {
+    dbox_setnumeric(d,PI_BOTTOMOFPAGE,  0);
+    dbox_setnumeric(d,PI_BOTTOMOFWINDOW,1);
+    dbox_setnumeric(d,PI_SHEETISFILLED, 0);
+    dbox_fadefield(d, PI_REFORMAT);
+  }
+  else if (!print_current.end)
+  {
+    dbox_setnumeric(d,PI_BOTTOMOFPAGE,  1);
+    dbox_setnumeric(d,PI_BOTTOMOFWINDOW,0);
+    dbox_setnumeric(d,PI_SHEETISFILLED, 0);
+  }
+  else
+  {
+    dbox_setnumeric(d,PI_BOTTOMOFPAGE,  0);
+    dbox_setnumeric(d,PI_BOTTOMOFWINDOW,0);
+    dbox_setnumeric(d,PI_SHEETISFILLED, 1);
+  }
+
+  dbox_setnumeric(d,PI_REFORMAT,print_current.reformat);
+
+  if (print_current.orientation)
+  {
+    dbox_setnumeric(d,PI_UPRIGHT, 1);
+    dbox_setnumeric(d,PI_SIDEWAYS,0);
+  }
+  else
+  {
+    dbox_setnumeric(d,PI_UPRIGHT, 0);
+    dbox_setnumeric(d,PI_SIDEWAYS,1);
+  }
+}
+
+/*************************************************/
+/* print_initiate                                */
+/*                                               */
+/* Starts a print routine by broadcasting a      */
+/* PrintSave message.                            */
+/*************************************************/
+
+static void print_initiate(void)
+{
+  wimp_msgstr m;
+
+  m.hdr.your_ref = 0;
+  m.hdr.action   = (wimp_msgaction) Browser_Message_PrintSave;
+
+  m.data.datasave.w       = 0;
+  m.data.datasave.i       = 0;
+  m.data.datasave.x       = 0;
+  m.data.datasave.y       = 0;
+  m.data.datasave.estsize = -1;
+  m.data.datasave.type    = 0xFAF;
+
+  STRFILL(m.data.datasave.leaf,msgs_lookup("jobname:WebPage"));
+
+  m.hdr.size = (strlen(m.data.datasave.leaf) + 44);
+  if (m.hdr.size % 4) m.hdr.size = (m.hdr.size & ~3) + 4;
+
+  wimp_sendmessage(wimp_ESENDWANTACK, &m, 0);
+
+  printer_message_ref = m.hdr.my_ref;
+
+  return;
+}
+
+/*************************************************/
+/* print_print                                   */
+/*                                               */
+/* Calls the printing engine with parameters     */
+/* specified in the local static print_info      */
+/* structure 'print_current'.                    */
+/*                                               */
+/* Parameters: Pointer to pathname to print to.  */
+/*************************************************/
+
+void print_print(const char * path)
+{
+  os_error * e;
+
+  printing = 1;
+
+  e = print_page(print_current.p,
+                 print_current.copies,
+                 print_current.start,
+                 print_current.end,
+                 print_current.reformat,
+                 print_current.orientation,
+                 path);
+
+  printing = 0;
+
+  if (e) wimpt_complain(e);
+}
+
+/*************************************************/
+/* print_page                                    */
+/*                                               */
+/* Prints out a page, assuming that all the      */
+/* relevant protocol stuff to ensure it's OK to  */
+/* proceed has been done already.                */
+/*                                               */
+/* Parameters: Pointer to a browser struct  */
+/*             relevant to the page to print;    */
+/*             The number of copies to print;    */
+/*             1 to start at the top of the web  */
+/*             page, else start from the top of  */
+/*             the visible area in the window;   */
+/*             0 to end at the bottom of the web */
+/*             page, -1 to end at the bottom of  */
+/*             the visible area, or any >0 value */
+/*             which is taken as the number of   */
+/*             pages to try and fill;            */
+/*             1 to reformat to fit the page     */
+/*             width (orientation is taken into  */
+/*             account), else 0 to keep the      */
+/*             width of the window (if it falls  */
+/*             off the page, tough...!);         */
+/*             1 = portrait, 0 = landscape;      */
+/*             Pointer to pathname to print to.  */
+/*************************************************/
+
+os_error * print_page(browser * b, int copies, int from, int to,
+                      int reformat, int orientation, const char * path)
+{
+  os_error              * e = NULL;
+
+  wimp_redrawstr          redraw;
+  int                     job, old_job;
+  wimp_box                box;
+  int                     more, page, maxpages, top, bottom, temp, next_line;
+  int                     lmarg, bmarg, rmarg, tmarg;
+  unsigned int            features;
+
+  int                     portrait  [2] [2] = { {0x10000,  0}, {0, 0x10000} };
+  int                     landscape [2] [2] = { {0, -0x10000}, {0x10000, 0} };
+
+  browser                 localbrowser;
+
+  void (*old_sigint_handler) (int);
+
+  /* Check to see if there is a printer driver ready */
+
+  e = _swix(PDriver_Info,
+            _OUT(3),
+
+            &features);
+
+  if (e) return e;
+
+  /* Find the current page margins (and therefore, page size, */
+  /* as all margins are expressed as offsets from the bottom  */
+  /* left hand corner of the paper).                          */
+
+  e = _swix(PDriver_PageSize,
+            _OUTR(3,6),
+
+            &lmarg,
+            &bmarg,
+            &rmarg,
+            &tmarg);
+
+  if (e) return e;
+
+  /* If in landscape mode, want to treat the margins */
+  /* in a reversed sense.                            */
+
+  if (!orientation)
+  {
+    SWAP(tmarg,rmarg);
+    SWAP(bmarg,lmarg);
+  }
+
+  localbrowser = *b;
+
+  /* If the user specified printing to or from something that */
+  /* depends upon the visible area, can't then reformat.      */
+
+  if (reformat && (to >= 0) && from)
+  {
+//    int lastchunk, percentage;
+
+    /* Reformat the page ready for printing.                       */
+    /*                                                             */
+    /* First copy over the existing browser structure, and    */
+    /* modify the contents as appropriate.                         */
+
+    localbrowser.next       = NULL;
+    localbrowser.hdata      = NULL;
+    localbrowser.source     = NULL;
+    localbrowser.hsize      = 0;
+    localbrowser.fsize      = 0;
+    localbrowser.usize      = 0;
+    localbrowser.tsize      = 0;
+    localbrowser.dsize      = 0;
+    localbrowser.lsize      = 0;
+    localbrowser.hnum       = 0;
+    localbrowser.hpos       = 0;
+    localbrowser.datasize   = 0;
+    localbrowser.nlines     = 0;
+    localbrowser.lbytes     = 0;
+
+    mustfree = 1;
+
+    localbrowser.display_width = localbrowser.max_width = rmarg - lmarg;
+
+    e = convert_to_os(localbrowser.display_width, &localbrowser.display_width);
+    if (e) return e;
+
+    localbrowser.reformat_width  = localbrowser.display_width;
+    localbrowser.reformat_extent = 0;
+
+    localbrowser.status_fetch    = BS_IDLE;
+    localbrowser.h_fetch         = 0;
+
+    localbrowser.display_request        = 0;
+    localbrowser.display_request_offset = 0;
+    localbrowser.last_reformat_token    = 0;
+
+    localbrowser.savefile = NULL;
+    localbrowser.savetype = 0;
+    localbrowser.savelink = 0;
+
+    /* Now call the reformatter, and loop round until finished. */
+
+    _swix(Hourglass_On,0);
+
+    e = reformat_format_from(&localbrowser, -1);
+    if (e) return e;
+
+    while (reformat_formatting(&localbrowser)) reformat_reformatter(&localbrowser);
+
+    _swix(Hourglass_Off,0);
+  }
+  else mustfree = 0;
+
+//  localbrowser.sourcecolours = 0;
+
+  /* Open up the output stream */
+
+  e = _swix(OS_Find,
+            _INR(0,1) | _OUT(0),
+
+            0x8F,
+            path ? path : "printer:",
+
+            &job);
+
+  if (e) goto out3;
+
+  globaljob = job;
+
+  /* Stop the C library intercepting Escape, since */
+  /* this should be left to the print SWIs.        */
+
+  old_sigint_handler = signal(SIGINT, SIG_IGN);
+
+  /* Start up the printing system */
+
+  e = _swix(PDriver_SelectJob,
+            _INR(0,1) | _OUT(0),
+
+            job,
+            msgs_lookup("PJobName:Web page"),
+
+            &old_job);
+
+  if (e) goto out1;
+
+  globalold_job = old_job;
+
+  /* Hourglass, as this may take some time... */
+
+  _swix(Hourglass_On, 0);
+
+  /* Declare fonts that have been used */
+
+  if (features & Browser_Printer_DeclareFont)
+  {
+    fm_face h;
+
+    /* If using system font, only the system faces will be */
+    /* used; otherwise, need to declare the sans, serif    */
+    /* and fixed faces.                                    */
+
+    if (params.systemfont)
+    {
+      h = fm_find_font("system", 192,192,0,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("system", 192,192,1,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("system", 192,192,0,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("system", 192,192,1,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+    }
+    else
+    {
+      h = fm_find_font("sans",   192,192,0,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("sans",   192,192,1,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("sans",   192,192,0,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("sans",   192,192,1,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+
+      h = fm_find_font("serif",  192,192,0,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("serif",  192,192,1,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("serif",  192,192,0,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("serif",  192,192,1,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+
+      h = fm_find_font("fixed",  192,192,0,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("fixed",  192,192,1,0); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("fixed",  192,192,0,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+      h = fm_find_font("fixed",  192,192,1,1); _swix(PDriver_DeclareFont,_INR(0,2),h,0,2); fm_lose_font(h);
+    }
+
+    /* Finish declaring fonts */
+
+    e = _swix(PDriver_DeclareFont,
+              _INR(0,2),
+
+              0,
+              0,
+              2);
+
+    if (e) goto out2;
+  }
+
+  /* Set the bottom left hand corner of the rectangle to redraw */
+
+  box.x0 = orientation ? lmarg : bmarg;
+  box.y0 = orientation ? bmarg : rmarg;
+
+  /* Set 'top' to the offset from the top of the document to get  */
+  /* to the top of the currently visible portion, and 'bottom'    */
+  /* to the offset to get to the bottom of the currently visible  */
+  /* portion. The positive direction is downwards (so they should */
+  /* both be positive numbers).                                   */
+
+  {
+    wimp_wstate state;
+
+    state.o.w = b->w;
+    e = wimp_get_wind_state(b->w,&state);
+    if (e) goto out2;
+
+    /* Get the basic offsets */
+
+    top    = -state.o.y;
+    bottom = state.o.box.y1 - state.o.box.y0;
+
+    /* Correct for toolbar presence */
+
+    top    += browser_bar_height(b);
+    bottom -= (browser_bar_height(b) + STATUS_HEIGHT - top);
+  }
+
+  /* If 'from' is non-zero, want to print from the top of the whole   */
+  /* page; else from the top of the visible area as worked out above. */
+
+  if (from) top = browser_bar_height(b);
+
+  redraw.scy = -top;
+  redraw.scx = 0;
+
+  /* maxpages will be set either to the user-specified number of */
+  /* sheets of paper to fill ('to' holds that number if greater  */
+  /* than zero), else it holds a very large number - i.e. keep   */
+  /* going until another exit condition occurs within the print  */
+  /* loop (e.g. reaching the end of the web page).               */
+
+  page = 0;
+
+  if (to > 0) maxpages = to;
+  else        maxpages = 0x1000000;
+
+  /* Loop round for all pages. The y scroll position is set */
+  /* initially to be correct for the place we want to print */
+  /* from, and xscroll is set to 0 to mark that no calls    */
+  /* to redraw_draw have happened yet.                      */
+
+  while (page <= maxpages)
+  {
+    page ++;
+
+    /* Set up the Redraw block ready for the calls to redraw_draw */
+
+    redraw.box.x1 = rmarg - lmarg;
+    redraw.box.x0 = 0;
+
+    e = convert_to_os(redraw.box.x1, &redraw.box.x1);
+    if (e) goto out2;
+
+    /* Vertical margins are complicated by the user settings. For printing    */
+    /* down to the bottom of the web page, want to use a full page rectangle; */
+    /* for printing down to the bottom of the visible area, want to use the   */
+    /* 'bottom' variable worked out above. Note the checking to work out      */
+    /* pagination - it *could* be possible that the visible area is taller    */
+    /* than a single sheet of paper for the current printer.                  */
+
+    e = convert_to_os(tmarg - bmarg, &temp);
+    if (e) goto out2;
+
+    if (to >= 0)
+    {
+      redraw.box.y1 = temp,
+      redraw.box.y0 = 0;
+    }
+    else
+    {
+      /* Need to subtract an amount from 'bottom' to mark that a page has been  */
+      /* done, but must do that after the page rendering so the redraw routines */
+      /* have filled in redraw.scx with the last coordinate used - if we    */
+      /* don't do this, we can't tell how much of the web page was actually     */
+      /* used. Remember that xscroll and yscroll are negative; xscroll refers   */
+      /* to the vertical offset to start the next page at, and yscroll was the  */
+      /* offset that this one started at.                                       */
+
+      if (redraw.scx && bottom) bottom -= (redraw.scy - redraw.scx);
+
+      if (bottom - top > temp) /* And *not* '>= temp'! See 'else' code below */
+      {
+        redraw.box.y1 = temp;
+      }
+      else
+      {
+        redraw.box.y1 = bottom - top;
+        bottom = 0;
+
+        /* Since this rectangle is at most a full page in height but probably */
+        /* less, must shift the bottom left hand coordinate of it up an       */
+        /* appropriate amount to print the page fragment at the top of the    */
+        /* paper rather than the bottom.                                      */
+
+        temp -= redraw.box.y1; /* (Page height minus rectangle height in OS units) */
+
+        e = convert_to_points(temp, &temp);
+        if (e) goto out2;
+
+        if (orientation) box.y0 += temp;
+        else             box.x0 += temp;
+
+        /* Signal to redraw_draw that the last line on this page may be split */
+        /* over the bottom of the page, as that's what the user is seeing in  */
+        /* the real window right now.                                         */
+
+        printing = 2;
+      }
+
+      redraw.box.y0 = 0;
+    }
+
+    /* redraw_draw will give the y coordinate of the next line to */
+    /* print when it exits by placing an appropriate coordinate   */
+    /* in the xscroll field of the redraw block that is passed to */
+    /* it during the main printer redraw loop.                    */
+
+    if (redraw.scx) redraw.scy = redraw.scx, redraw.scx = 0;
+
+    /* Start drawing things */
+
+    e = _swix(PDriver_GiveRectangle,
+              _INR(0,4),
+
+              0, /* Rectangle ID word - only 1 per page, so 0 will do */
+              &redraw.box,
+              orientation ? &portrait : &landscape,
+              &box,
+              0xFFFFFF00);
+
+    if (e) goto out2;
+
+/* The parameter to _swix which is commented out below has been removed */
+/* as it provokes a bug in the printer manager (or somewhere) - some    */
+/* rather bizarre register corruption occurs and things go generally    */
+/* pear shaped in a very short space of time. The removal of setting    */
+/* bit 24 is entirely a work around for this and may result in the      */
+/* failure of some JPEGs to print correctly.                            */
+
+    e = _swix(PDriver_DrawPage,
+              _INR(0,3) | _OUT(0),
+
+//              (copies) | ((features & Browser_Printer_ExpectsFlagByte) ? (1<<24) : (0)),
+
+              copies,
+              &redraw.g,
+              0,
+              0,
+
+              &more);
+
+    if (e) goto out2;
+
+//    /* Give an indication of progress */
+//
+//    {
+//      int percent;
+//
+//      percent = (100 * (page - 1)) / estimated_pages;
+//
+//      if (percent > 99) percent = 99;
+//
+//      _swix(Hourglass_Percentage, _IN(0), percent);
+//    }
+//
+//    /* The redraw loop itself. The area stuff is for the */
+//    /* in-page hourglass percentage; see later comments. */
+//
+//    page_area = (redraw.visible_area.x1 - redraw.visible_area.x0) *
+//                (redraw.visible_area.y0 - redraw.visible_area.y0);
+//
+//    last_rect.x0 = last_rect.x1 = last_rect.y0 = last_rect.y0 = 0;
+//
+//    area_completed = 0;
+
+    next_line = 0;
+
+    /* The redraw loop itself */
+
+    while (more)
+    {
+      /* Ensure images are correct for the current mode */
+
+      image_mode_change(b);
+      plotspr_invalidate_cache();
+
+      /* Do the redraw */
+
+      e = redraw_draw(&localbrowser,
+                      &redraw,
+                      TRUE,
+                      TRUE);
+
+      if (e) goto out2;
+
+//      int    this_area;
+//      wimp_box * i;
+
+      if (redraw.scx != 0) next_line = redraw.scx, redraw.scx = 0;
+
+/*{{{
+//      /* Give a percentage completed indicator. This is first based */
+//      /* on the current page being printed, so there's some scaling */
+//      /* of the 100% range to cope with the fact that if you're on  */
+//      /* page 3 of 4, the variation must be between 50% and 75%,    */
+//      /* for example. Since rectangle order cannot be relied upon,  */
+//      /* need to use the area printed so far for the calculation.   */
+//      /* This may fail under unusual circumstances, and certainly   */
+//      /* is not fully accurate as the rectangles always overlap by  */
+//      /* a small amount (the printer driver gives room for rounding */
+//      /* errors by overlapping the rectangles) but in any case      */
+//      /* there will at least be some kind of percentage indication! */
+//      /* With bit image printing, which can be painfully slow, this */
+//      /* is extremely important.                                    */
+//      /*                                                            */
+//      /* There is an attempt to correct for overlapping rectangles, */
+//      /* if this one and the last were overlapping.                 */
+//
+//      i = intersection(&redraw.redraw_area, &last_rect);
+//
+//      if (i)
+//      {
+//        this_area = (redraw.redraw_area.x1 - redraw.redraw_area.x0) *
+//                    (redraw.redraw_area.y0 - redraw.redraw_area.y0)
+//                  - (i->x1                 - i->x0) *
+//                    (i->y0                 - i->y0);
+//      }
+//      else
+//      {
+//        this_area = (redraw.redraw_area.x1 - redraw.redraw_area.x0) *
+//                    (redraw.redraw_area.y0 - redraw.redraw_area.y0);
+//      }
+//
+//      last_rect = redraw.redraw_area;
+//
+//      area_completed += this_area;
+//      if (area_completed > page_area) area_completed = page_area;
+//
+//      {
+//        int percent;
+//
+//        percent = (100 * (page - 1)) / estimated_pages +
+//                  ((100 / estimated_pages) * area_completed) / page_area;
+//
+//        if (percent < 0)  percent = 0;
+//        if (percent > 99) percent = 99;
+//
+//        _swix(Hourglass_Percentage, _IN(0), percent);
+//      }
+/*}}}
+
+      /* Get the next rectangle */
+
+      e = _swix(PDriver_GetRectangle,
+                _IN(1) | _OUT(0),
+
+                &redraw.g,
+                &more);
+
+      if (e) goto out2;
+    }
+
+    if (next_line) redraw.scx = next_line;
+
+    /* If we should print down to the bottom of the visible */
+    /* area of the page, this is flagged with 'to' < 0; if  */
+    /* 'bottom' = 0 as well, there's nothing more to print. */
+
+    if (to < 0 && !bottom) break;
+
+    /* If scxroll is 0, redraw_draw must not have found any */
+    /* lines that fell off the bottom of the page - so      */
+    /* there cannot be any more pages.                      */
+
+    if (!redraw.scx) break;
+
+    /* Otherwise, close the outer while() loop - which */
+    /* may mean we loop for another page.              */
+  }
+
+  /* Finished, so end the job, close the output stream, */
+  /* turn off the hourglass and restore the previous    */
+  /* job.                                               */
+
+  e = _swix(PDriver_EndJob,
+            _IN(0),
+
+            job);
+
+  if (e) goto out2;
+
+  /* Ensure images are restored to the correct mode */
+
+  image_mode_change(b);
+  plotspr_invalidate_cache();
+
+  /* Turn off the hourglass */
+
+  _swix(Hourglass_Off, 0);
+
+  /* Restore the old Escape handler */
+
+  signal(SIGINT, old_sigint_handler);
+
+  /* Close the output stream */
+
+  globaljob = 0;
+
+  e = _swix(OS_Find,
+            _INR(0,1),
+
+            0x00,
+            job);
+
+  if (e) goto out3;
+
+  print_free_memory(&localbrowser);
+
+  /* Restore the previous print job */
+
+  globalold_job = 0;
+
+  e = _swix(PDriver_SelectJob,
+            _INR(0,1),
+
+            old_job,
+            0);
+
+  return e;
+
+out1: /* 'Emergency exit' if PDriver_SelectJob fails */
+
+  signal(SIGINT, old_sigint_handler);
+  globaljob = 0;
+
+  /* Close the output stream */
+
+  _swix(OS_Find,
+        _INR(0,1),
+
+        0x00,
+        job);
+
+  /* Force the hourglass off */
+
+  _swix(Hourglass_Smash, 0);
+
+  /* Free temporarily allocated memory */
+
+  print_free_memory(&localbrowser);
+
+  /* Ensure images are still OK */
+
+  image_mode_change(b);
+  plotspr_invalidate_cache();
+
+  return e;
+
+out2: /* 'Emergency exit' for errors whilst printing */
+
+  signal(SIGINT, old_sigint_handler);
+  print_abort_print();
+  print_free_memory(&localbrowser);
+  image_mode_change(b);
+  plotspr_invalidate_cache();
+
+  return e;
+
+out3: /* 'Emergency exit' for errors outside printing, where memory may be temporarily allocted */
+
+  _swix(Hourglass_Smash, 0);
+  print_free_memory(&localbrowser);
+  image_mode_change(b);
+  plotspr_invalidate_cache();
+
+  return e;
+}
+
+/*************************************************/
+/* print_abort_print                             */
+/*                                               */
+/* Forcibly aborts a print job.                  */
+/*************************************************/
+
+void print_abort_print(void)
+{
+  /* Abort the current print job */
+
+  _swix(PDriver_AbortJob,
+        _IN(0),
+
+        globaljob);
+
+  /* Close the output stream */
+
+  _swix(OS_Find,
+        _INR(0,1),
+
+        0x00,
+        globaljob);
+
+  globaljob = 0;
+
+  /* Restore the previous print job */
+
+  _swix(PDriver_SelectJob,
+        _INR(0,1),
+
+        globalold_job,
+        0);
+
+  globalold_job = 0;
+
+  /* Force the hourglass off */
+
+  _swix(Hourglass_Smash, 0);
+}
+
+/*************************************************/
+/* print_free_memory                             */
+/*                                               */
+/* Frees up browser allocated memory used   */
+/* locally for reformatting a page prior to      */
+/* printing.                                     */
+/*************************************************/
+
+static void print_free_memory(browser * localbrowser)
+{
+  /* mustfree must be set to non-zero for any memory to be freed */
+
+  if (mustfree && localbrowser->hdata) flex_free((flex_ptr) &localbrowser->hdata);
+}

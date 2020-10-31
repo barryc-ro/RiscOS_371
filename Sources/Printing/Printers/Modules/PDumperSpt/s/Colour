@@ -1,0 +1,291 @@
+; > Colour
+
+;------------------------------------------------------------------------------
+;
+; PDumper_SetColour implementation
+;
+;   Entry: r0 ->anchor word
+;          r1 physical RGB
+;          r2 strip information
+;               bits 0..7 => strip type
+;               bits 24..31 => pass number
+; 
+;          r4 halftone information
+;               bits 0..7 => horizontal
+;               bits 8..15 => vertical
+;                     
+;   Exit:  V =1 => r0 ->Error block, r3 corrupt!
+;          else,   r3 colour number to be used  
+;
+; This routine will attempt to process the colour setting required
+; by the PDumper, it attempts to decode the strip type and then
+; setup a suitable colour number.
+;
+;------------------------------------------------------------------------------
+
+SWIPDumper_SetColour ROUT
+
+        Debuga  colset,"(colour set) Anchor word",r0
+        Debuga  colset,", Physical &BBGGRRxx",r1
+        Debuga  colset,", Strip info",r2
+        Debug   colset,", Halftone information",r4
+        Debuga  colset,"(colour set) processed by "
+
+        MOV     r3, r2, LSL #24         ;Is the strip type valid (corrupts r3!)
+        CMP     r3, #((%20-%10)/4)<<24
+        ADDCC   pc, pc, r3, LSR #24-2   ;Despatch correctly if so
+        B       %FT20                   ;Otherwise, give an error
+10
+        B       GetColourMono
+        B       GetColourGrey   
+        B       GetColour8BPP
+        [ fullrgb
+        B       GetColourMulti
+        B       GetColour16Bit
+        B       GetColour24Bit
+        ]
+20
+        Debug   colset,"- bad strip type"
+
+        ADR     r0, ErrorBlock_PDumperBadStrip
+        B       LookupError             ;Report error about strip type being invalid
+
+        MakeInternatErrorBlock PDumperBadStrip,,BadStrp
+
+;..............................................................................
+; 
+; GetColourMono
+;
+; Generate a suitable colour number for a monochrome device.
+;
+; in    as for above
+; out   V =1 => r0 -> error block
+;       else,   r3 contains the colour number
+
+GetColourMono Entry "r2"
+
+        MOV     r11, #&FF
+        AND     r3, r11, r1, LSR #24        ;Source blue
+        AND     r2, r11, r1, LSR #16        ;Source green
+        AND     lr, r11, r1, LSR #8         ;Source red
+
+        ADD     lr, lr, r2                 ;Average red, green and blue
+        ADD     lr, lr, r3
+        MOV     r2, #3
+        DivRem  r10, lr, r2, r3
+
+        RSB     r10, r10, #255              ;Invert
+
+        MOV     r3, r10, LSR #7            ;Get black/white dependent on top bit
+        CMP     r10, #255
+        MOVEQ   r10, #256
+        MOV     r10, r10, LSR #2
+        ORR     r3, r3, r10, LSL #16
+        MOV     r10, r10, LSR #2
+        ORR     r3, r3, r10, LSL #8         ;=Suitable colour number
+
+        Debug   colset,"monochrome",r3
+
+        EXITS
+
+;..............................................................................
+; 
+; GetColourGrey
+;
+; Generate a suitable colour number for a grey-level device.
+;
+; in    as for above
+; out   V =1 => r0 -> error block
+;       else,   r3 contains the colour number
+
+GetColourGrey Entry "r0-r2,r4"
+
+;get R2 -> relevant grey table
+        LDR     R2,=BlockType_Palette
+        SWI     XPDumper_Find
+        BVS     %FT05                    ;Trap the error occuring
+        LDR     R3,[R2,#palette_Calib32] ;offset
+        ADD     R2,R2,R3                 ;R2-> calib32 tables
+        ADD     R2,R2,#4                 ;skip error diffuse word
+        AND     R3,R4,#&FF               ;look at horizontal htone size
+        CMP     R3,#1                    ;1 if its actually error diffused
+        ADDEQ   R2,R2,#14*256            ;R2->error diffuse grey table
+        ADDNE   R2,R2,#15*256            ;R2->halftone grey table
+  Debug colset,"GetColourGrey physcol table@ hhtone ",R1,R2,R3
+
+;now do the usual jazz with accepted lightness function
+        MOV     r3, #&FF                ;Suitable mask for extracting the data
+
+        AND     r10, r3, r1, LSR #16    ;r10 =Green
+        AND     r11, r3, r1, LSR #8     ;r11 =Red
+        MOV     r1, r1, LSR #24         ;r1 =Blue
+
+        MOV     lr, #77
+        MUL     lr, r11, lr             ;lr =77*red
+        MOV     r11, #150
+        MLA     lr, r11, r10, lr        ;lr =77*red +150*green
+        RSB     r1, r1, r1, LSL #3      ;r1 =7*blue
+        ADD     r1, lr, r1, LSL #2      ;r1 =77*red +150*green +28*blue
+        ADD     r3, r1, #&7F
+        ADD     r3, r3, r3, LSL #8
+        ADD     r3, r3, #&100
+        MOV     r3, r3, LSR #16           
+00
+        RSB     r3, r3, #255
+        AND     r3, r3, #255            ;invert and mask to suitable level
+        LDRB    r3,[r2,r3]              ;correct it
+
+        Debug   colset,"grey level",r3
+
+05
+        STRVS   r0, [SP]
+        EXIT
+
+;..............................................................................
+;
+; Generate a suitable colour number for an 8BPP colour device.
+;
+; in    as for above
+; out   V =1 => r0 -> error block
+;       else,   r3 contains the colour number
+; NOTE: NO Calibration is done - this is done later with a precomputed KCMY table
+
+GetColour8BPP Entry "r0-r2,r4-r7"
+
+        LDR     r2, =BlockType_Palette
+        SWI     XPDumper_Find           ;Attempt to locate the palette block
+        BVS     %FT30                   ;...and return any errors
+
+        LDR     r0,[r2,#palette_Palette] ;Load the palette pointer
+        ADD     r0,r2,r0                 ;which is an offset in the file
+05
+        MOV     r5, #&FF
+        AND     r3, r5, r1, LSR #24
+        AND     r2, r5, r1, LSR #16
+        AND     r1, r5, r1, LSR #8      ;Seperate R,G and B components
+
+        MOV     r4, #&FFFFFFFF          ;Worst case colour
+        MOV     lr, #0
+
+        TEQ     r1, r2
+        TEQEQ   r2, r3                  ;Is a grey wanted?
+        MOVEQ   r10, #1
+        MOVNE   r10, #2                 ;Yup so setup a suitable flag
+10
+; r0->next palette table entry to look at
+; r1=B
+; r2=G
+; r3=R
+; r4=best distance so far
+; r5=&ff
+; r10=flag colours not available
+; r12=best colour number so (yes, r12 isn't used from this point onwards)
+; lr=current colour number
+
+; r6 used as distance accumulator
+; r7 used as accumulator
+; r11 used as current palette entry's RRGGBBxx
+
+        LDR     r11, [r0], #4
+        TST     r10, r11                 ;Two bits ab-a =>not allowed as a colour
+        BNE     %FT20
+
+        AND     r7, r5, r11, LSR #16
+        SUBS    r7, r7, r2              ;Get the green distance
+        RSBMI   r7, r7, #0              ;Ensure +VE for faster mul
+        MUL     r6, r7, r7
+
+        AND     r7, r5, r11, LSR #24
+        SUBS    r7, r7, r3              ;Get the blue distance
+        RSBMI   r7, r7, #0              ;...ensure +VE
+        MLA     r6, r7, r7, r6
+
+        AND     r7, r5, r11, LSR #8
+        SUBS    r7, r7, r1              ;Get the red distance
+        RSBMI   r7, r7, #0              ;...ensure +VE
+        MLA     r6, r7, r7, r6
+
+        CMP     r6, r4                  ;Is this the colour we are looking for?
+        MOVLO   r4, r6
+        MOVLO   r12, lr
+20
+        ADD     lr, lr, #1              ;Increase the colour index
+        CMP     lr, #256                ;Have we finished scanning yet?
+        BLT     %BT10
+
+        MOV     r3, r12
+30
+        Debug   colset,"256 colour handler", r3
+ 
+        STRVS   r0, [SP]
+        EXIT
+
+        [ fullrgb
+GetColourMulti Entry "r0-r2,r4"
+;This code transfered from PROdriver Common.24Bit
+     ;;;no longer use 'old' calibration - done by new 32bpp stuff
+     ;;;   BL      CalibrateTheColour
+     ;;;   LDR     R2,[SP,#8]              ;get original strip type back
+        MOV     R2,R2,LSR#24
+;just split the colour into RGB
+        TEQ     R2,#1
+        MOVEQ   R3,R1,LSR#8
+        TEQ     R2,#2
+        MOVEQ   R3,R1,LSR#16
+        TEQ     R2,#3
+        MOVEQ   R3,R1,LSR#24
+        AND     R3,R3,#255
+
+     ;;;   STRVS   R0,[SP]
+        EXIT
+
+GetColour24Bit Entry "r0-r2,r4"
+        ; Don't return a gamma corrected colour since the whole of the output
+        ; buffer is gamma corrected just prior to conversion to CMYK.
+        ; Future version's of SpriteExtend may allow colour translation tables
+        ; that allow the incorporation of gamma correction. Until then it is
+        ; not sensible to return calibrated values from here
+ 
+        ; BL      CalibrateTheColour - gamma correction is current
+
+        MOV     R3,R1,LSR#8             ;We need it down the bottom
+  Debug colset,"  colour in, colour out",R1,R3
+        EXIT
+
+GetColour16Bit Entry "r0-r2,r4"
+        ; Don't gamma correct colour since entire output strip is done just
+        ; prior to rendering - see above
+
+        ;BL      CalibrateTheColour
+        AND     R4,R1,#&F800            ;The red bits
+        AND     R2,R1,#&F80000          ;The green bits
+        AND     R3,R1,#&F8000000        ;The blue bits
+        MOV     R3,R3,LSR#17            ;32-5-10
+        ORR     R3,R3,R2,LSR#14         ;24-5-5
+        ORR     R3,R3,R4,LSR#11         ;16-5
+
+        STRVS   R0,[SP]
+        EXIT
+
+CalibrateTheColour Entry   "r0,r2,r4"
+        LDR     r2, =BlockType_Palette  ;Attempt to locate the palette block
+
+        SWI     XPDumper_Find
+        BVS     %FT05                   ;Trap the error occuring
+
+        LDR     R3,[R2,#palette_Calibration]  ;Load the calibration table offset
+        TEQ     R3,#0
+        ADDNE   R3,R2,R3                ;Which is an offset into the file (or null)
+
+        [ newctrans
+        SWI     XColourTrans_ConvertDeviceColour
+        |
+        BL      ConvertDeviceColour
+        ]
+
+        MOV     R1,R2
+05
+        STRVS   R0, [SP]
+        EXIT
+        ]
+        END

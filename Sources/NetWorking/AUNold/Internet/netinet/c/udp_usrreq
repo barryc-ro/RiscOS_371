@@ -1,0 +1,562 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Internet/netinet/udp_usrreq.c:networking  1.4  $
+ * $Source: /ax/networking:Internet/netinet/udp_usrreq.c: $
+ *
+ * Copyright(c) 1994 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	udp_usrreq.c,v $
+ * Revision 1.4  95/03/31  11:56:40  kwelton
+ * Added some debugs to udp_input().
+ * 
+ * Revision 1.3  95/03/13  16:10:24  aideen
+ * Default is to have UDP checksums disabled.
+ * 
+ * Revision 1.2  95/03/10  17:30:14  kwelton
+ * Default is to have UDP checksums enabled.
+ * 
+ * Revision 1.1  94/12/02  11:24:42  kwelton
+ * Initial revision
+ * 
+ */
+/*
+ * Copyright (c) 1983, 1986 Regents of the University of California.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms are permitted
+ * provided that the above copyright notice and this paragraph are
+ * duplicated in all such forms and that any documentation,
+ * advertising materials, and other materials related to such
+ * distribution and use acknowledge that the software was developed
+ * by the University of California, Berkeley.  The name of the
+ * University may not be used to endorse or promote products derived
+ * from this software without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ */
+#include "sys/param.h"
+#include "sys/dir.h"
+#include "sys/user.h"
+#include "sys/stat.h"
+#include "sys/mbuf.h"
+#include "sys/protosw.h"
+#include "sys/socket.h"
+#include "sys/socketvar.h"
+#include "sys/errno.h"
+#include "sys/dcistructs.h"
+
+#include "net/if.h"
+#include "net/route.h"
+
+#include "netinet/in.h"
+#include "netinet/in_pcb.h"
+#include "netinet/in_systm.h"
+#include "netinet/ip.h"
+#include "netinet/ip_var.h"
+#include "netinet/ip_icmp.h"
+#include "netinet/udp.h"
+#include "netinet/udp_var.h"
+
+#include "svcdebug.h"
+#include "debug.h"
+
+/*
+ * UDP protocol implementation.
+ * Per RFC 768, August, 1980.
+ */
+udp_init()
+{
+
+	udb.inp_next = udb.inp_prev = &udb;
+}
+
+int	udpcksum = 0;		/* XXX */
+int	udp_ttl = UDP_TTL;
+
+struct	sockaddr_in udp_in = { AF_INET };
+
+udp_input(m0, ifp, esrc)
+	struct mbuf *m0;
+	struct ifnet *ifp;
+	char *esrc;
+{
+	register struct udpiphdr *ui;
+	register struct inpcb *inp;
+	register struct mbuf *m;
+	int len;
+	struct ip ip;
+
+	/*
+	 * Get IP and UDP header together in first mbuf.
+	 * Note: IP leaves IP header in first mbuf.
+	 */
+	m = m0;
+	ui = mtod(m, struct udpiphdr *);
+	if (((struct ip *)ui)->ip_hl > (sizeof (struct ip) >> 2))
+		ip_stripoptions((struct ip *)ui, (struct mbuf *)0);
+	if (m->m_len < sizeof (struct udpiphdr)) {
+		udpstat.udps_hdrops++;
+		return;
+	}
+	/*
+	 * Make mbuf data length reflect UDP length.
+	 * If not enough data to reflect UDP length, drop.
+	 */
+	len = ntohs((u_short)ui->ui_ulen);
+	if (((struct ip *)ui)->ip_len != len) {
+		if (len > ((struct ip *)ui)->ip_len) {
+			udpstat.udps_badlen++;
+			goto release;
+		}
+#ifdef OldCode
+		m_adj(m, len - ((struct ip *)ui)->ip_len);
+#else
+		TRIM(m, len - ((struct ip *)ui)->ip_len, NULL);
+#endif
+		/* ((struct ip *)ui)->ip_len = len; */
+	}
+	/*
+	 * Save a copy of the IP header in case we want restore it for ICMP.
+	 */
+	ip = *(struct ip*)ui;
+
+	/*
+	 * Checksum extended UDP header and data.
+	 */
+	if (udpcksum && ui->ui_sum) {
+		ui->ui_next = ui->ui_prev = 0;
+		ui->ui_x1 = 0;
+		ui->ui_len = ui->ui_ulen;
+		if (ui->ui_sum = in_cksum(m, len + sizeof (struct ip))) {
+			udpstat.udps_badsum++;
+#ifdef OldCode
+			m_freem(m);
+#else
+			FREEM(m);
+#endif
+			return;
+		}
+	}
+
+#ifdef DEBUG
+	if( DODEBUG(DBGUDP) )
+	{
+	    Printf("udp_ip: datagram %s %x",
+		   inet_ntoa(ui->ui_src), ntohs(ui->ui_sport));
+	    Printf(", %s %x\n", inet_ntoa(ui->ui_dst), ntohs(ui->ui_dport));
+	}
+#endif
+
+	/*
+	 * Locate pcb for datagram.
+	 */
+	inp = in_pcblookup(&udb,
+	    ui->ui_src, ui->ui_sport, ui->ui_dst, ui->ui_dport,
+		INPLOOKUP_WILDCARD);
+	if (inp == 0) {
+#ifdef DEBUG
+		if( DODEBUG(DBGUDP) )
+		    Printf("udp_ip: no pcb\n");
+#endif
+		if (in_bootpresponse(ntohs(ui->ui_dport))) {
+		/* bootstrap packet response containing config info */
+		    m->m_len -= sizeof(struct udpiphdr);
+		    m->m_off += sizeof(struct udpiphdr);
+		    bootp_udp_input(ifp, m);
+#ifdef OldCode
+		    m_freem(m);
+#else
+		    FREEM(m);
+#endif
+		    return;
+		}
+		goto release;
+	}
+
+	/*
+	 * Construct sockaddr format source address.
+	 * Stuff source address and datagram in user buffer.
+	 */
+	udp_in.sin_port = ui->ui_sport;
+	udp_in.sin_addr = ui->ui_src;
+	m->m_len -= sizeof (struct udpiphdr);
+	m->m_off += sizeof (struct udpiphdr);
+
+#ifdef OldCode
+	if (sorxdirect(inp->inp_socket, m, &udp_in, ui->ui_dst, esrc, ifp->if_unit, ifp->if_swibase + 3))
+	    goto release;
+#else
+	/*
+	 * DCI swibase offset for transmit has changed for DCI 4
+	 */
+	if (sorxdirect(inp->inp_socket, m, &udp_in, ui->ui_dst,
+		       esrc, ifp->if_unit,
+		       ifp->if_swibase + DCI4Transmit))
+	{
+# ifdef DEBUG
+	    if( DODEBUG(DBGUDP) )
+		Printf("udp_ip: rxdirect\n");
+# endif
+	    goto release;
+#endif
+	}
+	if (sbappendaddr(&inp->inp_socket->so_rcv, (struct sockaddr *)&udp_in,
+	    m, (struct mbuf *)0) == 0)
+	{
+#ifdef DEBUG
+	    Printf("udp_ip: sbappendaddr failed\n");
+#endif
+	    goto release;
+	}
+	sorwakeup(inp->inp_socket);
+	return;
+release:
+#ifdef OldCode
+	m_freem(m);
+#else
+	FREEM(m);
+#endif
+}
+
+struct mbuf *
+udp_setup_ack(m0, sin, laddr)
+struct mbuf *m0;
+struct sockaddr_in *sin;
+struct in_addr laddr;
+{
+	register int hlen = sizeof (struct ip);
+	register struct mbuf *m;
+	register struct udpiphdr *ui;
+	register struct ip *ip;
+	register int len = 8;
+	char *p;
+	struct mns_msg {
+	    u_char  mns_opcode;
+	    u_char  mns_port;
+	    u_char  mns_control;
+	    u_char  mns_status;
+	    u_int   mns_handle;
+	} *msg;
+
+#ifdef OldCode
+	MGET(m, M_DONTWAIT, MT_HEADER);
+	if (m == 0)
+		return ((struct mbuf *)0);
+	m->m_off = MMAXOFF(m) - (sizeof (struct udpiphdr) + len);
+#else
+	if( (m = ALLOC_S(MINCONTIG, NULL)) == NULL )
+	{
+#ifdef DEBUG
+	    if( DODEBUG(DBGMMAN) )
+		Printf("udp_setup_ack: ALLOC_S failed\n");
+#endif
+	    return((struct mbuf *)0);
+	}
+
+	m->m_type = MT_HEADER;
+	m->m_off = MAXOFF(m) - (sizeof (struct udpiphdr) + len);
+#endif
+	m->m_len = sizeof (struct udpiphdr) + len;
+	ui = mtod(m, struct udpiphdr *);
+	ui->ui_next = ui->ui_prev = 0;
+	ui->ui_x1 = 0;
+	ui->ui_pr = IPPROTO_UDP;
+	ui->ui_len = htons((u_short)len + sizeof (struct udphdr));
+	ui->ui_src = laddr;
+	ui->ui_dst = sin->sin_addr;
+	ui->ui_sport = sin->sin_port;
+	ui->ui_dport = ui->ui_sport;
+	ui->ui_ulen = ui->ui_len;
+	ui->ui_sum = 0;
+	((struct ip *)ui)->ip_len = sizeof (struct udpiphdr) + len;
+	((struct ip *)ui)->ip_ttl = udp_ttl;
+	ip = mtod(m, struct ip *);
+	ip->ip_v = IPVERSION;
+	ip->ip_off = 0;
+	ip->ip_id = htons(ip_id++);
+	ip->ip_hl = hlen >> 2;
+	ip->ip_len = htons((u_short)ip->ip_len);
+	ip->ip_sum = 0;
+	p = mtod(m, char *) + sizeof(struct udpiphdr);
+	memcpy (p, mtod(m0, char *), 8);
+	msg = (struct mns_msg *)p;
+	msg->mns_opcode = 3; /* ack */
+	msg->mns_status = 0;
+	return (m);
+}
+
+/*
+ * Notify a udp user of an asynchronous error;
+ * just wake up so that he can collect error status.
+ */
+udp_notify(inp)
+	register struct inpcb *inp;
+{
+
+	sorwakeup(inp->inp_socket);
+	sowwakeup(inp->inp_socket);
+}
+
+udp_ctlinput(cmd, sa)
+	int cmd;
+	struct sockaddr *sa;
+{
+	extern u_char inetctlerrmap[];
+	struct sockaddr_in *sin;
+	int in_rtchange();
+
+	if ((unsigned)cmd > PRC_NCMDS)
+		return;
+	if (sa->sa_family != AF_INET && sa->sa_family != AF_IMPLINK)
+		return;
+	sin = (struct sockaddr_in *)sa;
+	if (sin->sin_addr.s_addr == INADDR_ANY)
+		return;
+
+	switch (cmd) {
+
+	case PRC_QUENCH:
+		break;
+
+	case PRC_ROUTEDEAD:
+	case PRC_REDIRECT_NET:
+	case PRC_REDIRECT_HOST:
+	case PRC_REDIRECT_TOSNET:
+	case PRC_REDIRECT_TOSHOST:
+		in_pcbnotify(&udb, &sin->sin_addr, 0, in_rtchange);
+		break;
+
+	default:
+		if (inetctlerrmap[cmd] == 0)
+			return;		/* XXX */
+		in_pcbnotify(&udb, &sin->sin_addr, (int)inetctlerrmap[cmd],
+			udp_notify);
+	}
+}
+
+udp_output(inp, m0)
+	register struct inpcb *inp;
+	struct mbuf *m0;
+{
+	register struct mbuf *m;
+	register struct udpiphdr *ui;
+	register int len = 0;
+
+	/*
+	 * Calculate data length and get a mbuf
+	 * for UDP and IP headers.
+	 */
+	for (m = m0; m; m = m->m_next)
+		len += m->m_len;
+#ifdef OldCode
+	MGET(m, M_DONTWAIT, MT_HEADER);
+	if (m == 0) {
+		m_freem(m0);
+		return (ENOBUFS);
+	}
+#else
+	if( (m = ALLOC_S(MINCONTIG, NULL)) == NULL )
+	{
+#ifdef DEBUG
+	    if( DODEBUG(DBGMMAN) )
+		Printf("udp_output: ALLOC_S failed\n");
+#endif
+	    FREEM(m0);
+	    return(ENOBUFS);
+	}
+	m->m_type = MT_HEADER;
+#endif
+
+	/*
+	 * Fill in mbuf with extended UDP header
+	 * and addresses and length put into network format.
+	 */
+	m->m_off = MAXOFF(m) - sizeof (struct udpiphdr);
+	m->m_len = sizeof (struct udpiphdr);
+	m->m_next = m0;
+	ui = mtod(m, struct udpiphdr *);
+	ui->ui_next = ui->ui_prev = 0;
+	ui->ui_x1 = 0;
+	ui->ui_pr = IPPROTO_UDP;
+	ui->ui_len = htons((u_short)len + sizeof (struct udphdr));
+	ui->ui_src = inp->inp_laddr;
+	ui->ui_dst = inp->inp_faddr;
+	ui->ui_sport = inp->inp_lport;
+	ui->ui_dport = inp->inp_fport;
+	ui->ui_ulen = ui->ui_len;
+
+	/*
+	 * Stuff checksum and output datagram.
+	 */
+	ui->ui_sum = 0;
+	if (udpcksum) {
+	    if ((ui->ui_sum = in_cksum(m, sizeof (struct udpiphdr) + len)) == 0)
+		ui->ui_sum = 0xffff;
+	}
+	((struct ip *)ui)->ip_len = sizeof (struct udpiphdr) + len;
+	((struct ip *)ui)->ip_ttl = udp_ttl;
+	return (ip_output(m, inp->inp_options, &inp->inp_route,
+	    inp->inp_socket->so_options & (SO_DONTROUTE | SO_BROADCAST)));
+}
+
+u_long	udp_sendspace = 20480;
+u_long	udp_recvspace = 20480;
+
+/*ARGSUSED*/
+udp_usrreq(so, req, m, nam, rights)
+	struct socket *so;
+	int req;
+	struct mbuf *m, *nam, *rights;
+{
+	struct inpcb *inp = sotoinpcb(so);
+	int error = 0;
+
+	if (req == PRU_CONTROL)
+		return (in_control(so, (int)m, (caddr_t)nam,
+			(struct ifnet *)rights));
+	if (rights && rights->m_len) {
+		error = EINVAL;
+		goto release;
+	}
+	if (inp == NULL && req != PRU_ATTACH) {
+		error = EINVAL;
+		goto release;
+	}
+	switch (req) {
+
+	case PRU_ATTACH:
+		if (inp != NULL) {
+			error = EINVAL;
+			break;
+		}
+		error = in_pcballoc(so, &udb);
+		if (error)
+			break;
+		error = soreserve(so, udp_sendspace, udp_recvspace);
+		if (error)
+			break;
+		break;
+
+	case PRU_DETACH:
+		in_pcbdetach(inp);
+		break;
+
+	case PRU_BIND:
+		error = in_pcbbind(inp, nam);
+		break;
+
+	case PRU_LISTEN:
+		error = EOPNOTSUPP;
+		break;
+
+	case PRU_CONNECT:
+		if (inp->inp_faddr.s_addr != INADDR_ANY) {
+			error = EISCONN;
+			break;
+		}
+		error = in_pcbconnect(inp, nam);
+		if (error == 0)
+			soisconnected(so);
+		break;
+
+	case PRU_CONNECT2:
+		error = EOPNOTSUPP;
+		break;
+
+	case PRU_ACCEPT:
+		error = EOPNOTSUPP;
+		break;
+
+	case PRU_DISCONNECT:
+		if (inp->inp_faddr.s_addr == INADDR_ANY) {
+			error = ENOTCONN;
+			break;
+		}
+		in_pcbdisconnect(inp);
+		so->so_state &= ~SS_ISCONNECTED;		/* XXX */
+		break;
+
+	case PRU_SHUTDOWN:
+		socantsendmore(so);
+		break;
+
+	case PRU_SEND: {
+		struct in_addr laddr;
+
+		if (nam) {
+			laddr = inp->inp_laddr;
+			if (inp->inp_faddr.s_addr != INADDR_ANY) {
+				error = EISCONN;
+				break;
+			}
+			/*
+			 * Must block input while temporarily connected.
+			 */
+			error = in_pcbconnect(inp, nam);
+			if (error) {
+				break;
+			}
+		} else {
+			if (inp->inp_faddr.s_addr == INADDR_ANY) {
+				error = ENOTCONN;
+				break;
+			}
+		}
+		error = udp_output(inp, m);
+		m = NULL;
+		if (nam) {
+			in_pcbdisconnect(inp);
+			inp->inp_laddr = laddr;
+		}
+		}
+		break;
+
+	case PRU_ABORT:
+		soisdisconnected(so);
+		in_pcbdetach(inp);
+		break;
+
+	case PRU_SOCKADDR:
+		in_setsockaddr(inp, nam);
+		break;
+
+	case PRU_PEERADDR:
+		in_setpeeraddr(inp, nam);
+		break;
+
+	case PRU_SENSE:
+		/*
+		 * stat: don't bother with a blocksize.
+		 */
+		return (0);
+
+	case PRU_SENDOOB:
+	case PRU_FASTTIMO:
+	case PRU_SLOWTIMO:
+	case PRU_PROTORCV:
+	case PRU_PROTOSEND:
+		error =	 EOPNOTSUPP;
+		break;
+
+	case PRU_RCVD:
+	case PRU_RCVOOB:
+		return (EOPNOTSUPP);	/* do not free mbuf's */
+
+	default:
+		panic("udp_usrreq");
+	}
+release:
+	if (m != NULL)
+	{
+#ifdef OldCode
+	    m_freem(m);
+#else
+	    FREEM(m);
+#endif
+	}
+	return (error);
+}
+
+/* EOF udp_usrreq.c */

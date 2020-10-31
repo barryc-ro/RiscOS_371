@@ -1,0 +1,1768 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis.c                                                                            ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA Manager                                                    ***/
+/***  Version:       0.02                                                              ***/
+/***                                                                                   ***/
+/***  By:            William Turner, Acorn Computers Ltd.                              ***/
+/***  Date:          12th July 1994                                                    ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains the code to do Card Information Structure (CIS) access.  ***/
+/***                 and also miscellaneous code that decodes CIS-held information.    ***/
+/***                                                                                   ***/
+/***  History:       0.02 12th July 1994 Updated due to FS review                      ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Variables.h"
+#include "Read.h"
+#include "Driver.h"
+#include "Error.h"
+#include "Debug.h"
+#include "Cis.h"
+#include "Misc.h"
+#include "Swi.h"
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis_Length(registers)                                                            ***/
+/***                                                                                   ***/
+/***  Traverses the CIS to determine its length. The CIS can be either on the card, or ***/
+/***  buffered in main memory.                                                         ***/
+/***                                                                                   ***/
+/***  On Entry:                                                                        ***/
+/***      R0 = 0 normally but...                                                       ***/
+/***           3 if called internally from Cis_ReadTuple                               ***/
+/***           5 if called internally from CIS_FindTuple                               ***/
+/***      R1 = Card Drive                                                              ***/
+/***      R2 = CIS Buffer address (0 if no buffer)                                     ***/
+/***      R4 = CIS Buffer length                                                       ***/
+/***      R6 = Tuple address (only valid if R0 = 3) or (n'th occurrence if R0 = 5)     ***/
+/***      R7 = Tuple buffer (only valid if R0 = 3)                                     ***/
+/***                                                                                   ***/
+/***  On Exit:                                                                         ***/
+/***      R3 = CIS Length                                                              ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode     Cis_Length(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode         error = NO_ERROR;
+    char                                tempbuffer[2];
+    int                                 longdest = 0;
+    BOOL                                primary_chain = TRUE;
+    BOOL                                jumping = FALSE;    /* Are we going to longjump? */
+    char                                attrib_space = 1;     /*Attribute by implication */
+    char                                jump_attrib = 1;      /*Attribute by implication */
+    BOOL                                end_of_cis = FALSE;
+    BOOL                                direct_from_card = TRUE;  /*From PC card default */
+    BOOL                                link_valid = FALSE;        /* Asserted on a jump */
+    int                                 cis_length = 0;
+    int                                 next_step;
+    int                                 next_loc = reg ->r[2];  /* Location to read from */
+    _kernel_swi_regs                    callregs;
+
+    if(next_loc != 0) {
+        direct_from_card = FALSE;
+        attrib_space = 0;
+    }
+
+    #if Debug == TRUE
+        DebugMessage("mK","Entered Cis_Length");
+        if(reg ->r[0]==3) DebugMessage("mK"," from Cis_ReadTuple\n");
+        if(reg ->r[0]==5) DebugMessage("mK"," from Cis_FindTuple\n");
+        else DebugMessage("mK","\n");
+    #endif
+
+    do {
+        if(attrib_space == 0) {
+                next_step = 1;
+        }
+        else
+        {
+                next_step = 2;
+                #if Debug == TRUE
+                        DebugMessage("mK","    Attribute Memory Space\n");
+                #endif
+        }
+
+
+        /**********************************/
+        /*** Code specific to ReadTuple ***/
+        /**********************************/
+        if((reg ->r[0] == 3) && (reg ->r[6] == (cis_length))) {
+            #if Debug == TRUE
+                DebugMessage("mK","    **** Got to the required tuple for fn(3)\n");
+            #endif
+            end_of_cis = TRUE;
+            if(direct_from_card) {
+                #if Debug == TRUE
+                    DebugMessage("mK","         so we'll read it off the card\n");
+                #endif
+                callregs.r[0] = attrib_space << 5;                  /* Physical, no scatter */
+                callregs.r[1] = reg ->r[1];                                   /* Card drive */
+                callregs.r[2] = next_loc;                                           /* From */
+                callregs.r[3] = reg ->r[7];             /* Read them direct to tuple buffer */
+                callregs.r[4] = 2;
+                error = PCMCIA_Read(&callregs); /* Direct call to the SWI routine. Naughty? */
+
+                if(*(MEMORY_PTR)((reg ->r[7]) + 1) > 0) {
+                    callregs.r[0] = attrib_space << 5;              /* Physical, no scatter */
+                    callregs.r[1] = reg ->r[1];                               /* Card drive */
+                    callregs.r[2] = next_loc+(2 * next_step);                       /* From */
+                    callregs.r[3] = (reg ->r[7])+2;     /* Read them direct to tuple buffer */
+                    callregs.r[4] = *(MEMORY_PTR)((reg ->r[7]) + 1);
+                    error = PCMCIA_Read(&callregs);       /* Direct call to the SWI routine */
+                }
+            }
+            else
+            {
+                #if Debug == TRUE
+                    DebugMessage("mK","         so we'll read it out the buffer\n");
+                #endif
+                *(MEMORY_PTR)(reg ->r[7]) = *(MEMORY_PTR)next_loc;
+                *(MEMORY_PTR)((reg ->r[7])+1) = *(MEMORY_PTR)(next_loc+1);
+                cis_length = *(MEMORY_PTR)(next_loc+1);    /* Temporary Re-use of cis_length */
+                reg ->r[7] += 2;
+                next_loc += 2;
+                while(cis_length > 0) {
+                        *(MEMORY_PTR)(reg ->r[7]) = *(MEMORY_PTR)next_loc;
+                        reg ->r[7] ++;
+                        next_loc ++;
+                        cis_length --;
+                }
+            }
+            return(NO_ERROR);
+        }
+        /*****************************/
+        /*** End of specific chunk ***/
+        /*****************************/
+
+
+
+        if(direct_from_card) {
+            callregs.r[0] = (int)attrib_space << 5; /* Physical, no scatter */
+            callregs.r[1] = reg ->r[1]; /* Card drive */
+            callregs.r[2] = next_loc;
+            callregs.r[3] = (int)&tempbuffer;
+            callregs.r[4] = 2;
+
+            #if Debug == TRUE
+                DebugMessage("mK","   Source location = &%08X\n",callregs.r[2]);
+                DebugMessage("mK","   Tempbuffer address = &%08X\n",(int)&tempbuffer);
+            #endif
+            error = PCMCIA_Read(&callregs); /* Direct call to the SWI routine. Naughty! */
+        }
+        else
+        {
+            tempbuffer[0]=*(MEMORY_PTR)next_loc;
+            tempbuffer[1]=*(MEMORY_PTR)(next_loc+1);
+        }
+
+
+        /**********************************/
+        /*** Code specific to FindTuple ***/
+        /**********************************/
+        if((reg ->r[0] == 5) && ((int)tempbuffer[0] == reg ->r[5])) {
+            reg ->r[6] = (reg ->r[6]) - 1;
+            if(reg ->r[6] == 0) {
+                reg ->r[6] = cis_length;
+                #if Debug == TRUE
+                    DebugMessage("mK","    **** Found the required tuple (0x%02X) for fn(5)\n", (int)tempbuffer[0]);
+                #endif
+                return(NO_ERROR);
+            }
+        }
+        /*****************************/
+        /*** End of specific chunk ***/
+        /*****************************/
+
+
+        if((tempbuffer[1]==0xff) && (tempbuffer[0]!=0xff)) {
+             tempbuffer[0]=0xff;
+            cis_length++;
+            #if Debug == TRUE
+                DebugMessage("mK","0xFF Link recognised!\n");
+            #endif
+        }
+
+/******************************************************************************************/
+/** THIS WAS A TEMPORARY FIX FOR MITSUBISHI CARDS (start without a link target in Commmem */
+/******************************************************************************************/
+/*
+        if((link_valid) && (tempbuffer[0] != CISTPL_LINKTARGET)) {
+                        tempbuffer[0] = 0xff;
+                        link_valid = FALSE;
+                        jumping = FALSE;
+        }
+*/
+/******************************************************************************************/
+
+
+        switch((int)tempbuffer[0])
+            {
+                case CISTPL_NULL:
+                    #if Debug == TRUE
+                    DebugMessage("mK","Null tuple recognized\n");
+                    #endif
+                    cis_length++;
+                    next_loc = next_loc + next_step; /* We've read 2 but only wanted 1 */
+                    if(!direct_from_card && (cis_length > reg ->r[4])) end_of_cis = TRUE;
+                    break;
+
+
+
+
+                case CISTPL_LONGLINK_A:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Longlink_A tuple recognized\n");
+                    #endif
+                    next_loc = next_loc + (2 * next_step);
+                    if(direct_from_card) {
+                        callregs.r[0] = attrib_space << 5; /* Physical, no scatter */
+                        callregs.r[1] = reg ->r[1]; /* Card drive */
+                        callregs.r[2] = next_loc;
+                        callregs.r[3] = (int)&longdest;
+                        callregs.r[4] = 4;
+                        /*** Read the next 4 bytes into longdest ***/
+                        error = PCMCIA_Read(&callregs); /* Direct call to SWI. Naughty! */
+                    }
+                    else
+                    {
+                            longdest = (*(MEMORY_PTR)next_loc) +
+                                   (*(MEMORY_PTR)(next_loc+1) << 8) +
+                                   (*(MEMORY_PTR)(next_loc+2) << 16)+
+                                   (*(MEMORY_PTR)(next_loc+3) << 24);
+                    }
+
+                    #if Debug == TRUE
+                        DebugMessage("mK","Longlink dest (attribute) is 0x%8X\n",longdest);
+                    #endif
+                    jumping = TRUE;
+                    jump_attrib = 1; /* This jump is to attribute memory */
+                    cis_length = cis_length + (int)tempbuffer[1] + 2;
+                    next_loc = next_loc + (((int)tempbuffer[1]) * next_step);
+                    if(!direct_from_card && (cis_length > reg ->r[4])) end_of_cis = TRUE;
+                    break;
+
+
+
+
+                case CISTPL_LONGLINK_C:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Longlink_C tuple recognized\n");
+                    #endif
+                    next_loc = next_loc + (2 * next_step);
+                    if(direct_from_card) {
+                        callregs.r[0] = attrib_space << 5; /* Physical, no scatter */
+                        callregs.r[1] = reg ->r[1]; /* Card drive */
+                        callregs.r[2] = next_loc;
+                        callregs.r[3] = (int)&longdest;
+                        callregs.r[4] = 4;
+                        /*** Read the next 4 bytes into longdest ***/
+                        error = PCMCIA_Read(&callregs); /* Direct call to SWI. Naughty! */
+                    }
+                    else
+                    {
+                            longdest = (*(MEMORY_PTR)next_loc) +
+                                   (*(MEMORY_PTR)(next_loc+1) << 8) +
+                                   (*(MEMORY_PTR)(next_loc+2) << 16)+
+                                   (*(MEMORY_PTR)(next_loc+3) << 24);
+                    }
+                    #if Debug == TRUE
+                        DebugMessage("mK","Longlink dest (common) is 0x%8X\n",longdest);
+                    #endif
+                    jumping = TRUE; /* We are jumping */
+                    jump_attrib = 0; /* This jump is to common memory */
+                    cis_length = cis_length + (int)tempbuffer[1] + 2;
+                    next_loc = next_loc + (((int)tempbuffer[1]) * next_step);
+                    if(!direct_from_card && (cis_length > reg ->r[4])) end_of_cis = TRUE;
+                    break;
+
+
+
+
+                case CISTPL_LINKTARGET:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Link target tuple recognized\n");
+                    #endif
+                    if(link_valid) {
+                        next_loc = next_loc + (2 * next_step);
+                        if(direct_from_card) {
+                            callregs.r[3] = (int)&longdest;
+                            callregs.r[4] = 4;
+                            error = PCMCIA_Read(&callregs); /* Direct call SWI. Naughty! */
+                        }
+                        else
+                        {
+                            longdest = (*(MEMORY_PTR)next_loc) +
+                                   (*(MEMORY_PTR)(next_loc+1) << 8) +
+                                   (*(MEMORY_PTR)(next_loc+2) << 16);
+                        }
+
+                        #if Debug == TRUE
+                            DebugMessage("mK","The validation string is 0x%8X\n",longdest);
+                        #endif
+                        if((longdest & 0xffffff) != 0x534943) error = ERROR__INVALID_CIS;
+                        next_loc = next_loc + ((int)tempbuffer[1] * next_step);
+                        link_valid = FALSE;
+                        jumping = FALSE;
+                        cis_length = cis_length + (int)tempbuffer[1] + 2;
+                    }
+                    else error = ERROR__INVALID_CIS;
+                    if(!direct_from_card && (cis_length > reg ->r[4])) end_of_cis = TRUE;
+                    break;
+
+
+
+
+                case CISTPL_NO_LINK:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Nolink tuple recognized\n");
+                    #endif
+                    if(longdest != 0) error = ERROR__INVALID_CIS;
+                    else {
+                        cis_length = cis_length + (int)tempbuffer[1] + 2;
+                        next_loc = next_loc + (((int)tempbuffer[1] + 2) * next_step);
+                        end_of_cis = TRUE; /* We want to end on this chain */
+                    }
+                    if(!direct_from_card && (cis_length > reg ->r[4])) end_of_cis = TRUE;
+                    break;
+
+
+
+
+                case CISTPL_END:
+                    #if Debug == TRUE
+                        DebugMessage("mK","End tuple recognized\n");
+                    #endif
+                    cis_length++;
+                    if(jumping) {
+                        if(direct_from_card)
+                            attrib_space = jump_attrib; /* Set up for the correct type */
+                        else
+                            attrib_space = 0; /* Always common-style in memory */
+                        primary_chain = FALSE;
+                        if(direct_from_card)
+                            next_loc = (int)longdest;
+                        else
+                            next_loc += next_step;
+                        longdest = 0;
+                        link_valid = TRUE;
+                    }
+                    else
+                    {
+                        if(primary_chain & !end_of_cis) {
+                            #if Debug == TRUE
+                                DebugMessage("mK","End of primary chain - implicit jump.");
+                            #endif
+                            attrib_space = 0;
+                            if(direct_from_card)
+                                next_loc = 0;
+                            else
+                                next_loc += next_step;
+                            primary_chain = FALSE;
+                            jumping = TRUE;
+                            link_valid = TRUE;
+                        }
+                        else end_of_cis = TRUE;
+                    }
+                    if(!direct_from_card && (cis_length > reg ->r[4])) end_of_cis = TRUE;
+                    break;
+
+
+
+
+                default:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Tuple %2X unrecognized\n", (int)tempbuffer[0]);
+                    #endif
+                    cis_length = cis_length + (int)tempbuffer[1] + 2;
+                    next_loc = next_loc + (((int)tempbuffer[1] +2) * next_step);
+                    if(!direct_from_card && (cis_length > reg ->r[4])) end_of_cis = TRUE;
+                    break;
+            }
+
+        #if Debug == TRUE
+            DebugMessage("mK","CIS Length so far is &%X\n\n",cis_length);
+        #endif
+
+        if(cis_length > MAX_LEN_CIS_BEFORE_QUIT) error = ERROR__INVALID_CIS;
+
+    } while (!end_of_cis && error == NO_ERROR);
+
+    if(reg ->r[0] == 0) reg ->r[3] = cis_length;
+    if(reg ->r[0] == 3) error = ERROR__INVALID_TUPLE_ADDRESS;
+    if(reg ->r[0] == 5) error = ERROR__TUPLE_NOT_FOUND;
+
+    return (error);
+}
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis_ReadCis(registers)                                                           ***/
+/***                                                                                   ***/
+/***  Loads a block (possibly all) of the CIS into a user buffer in main memory.       ***/
+/***                                                                                   ***/
+/***  On Entry:                                                                        ***/
+/***      R0 = 1                                                                       ***/
+/***      R1 = Card Drive                                                              ***/
+/***      R2 = CIS Buffer address                                                      ***/
+/***      R4 = CIS Buffer length                                                       ***/
+/***                                                                                   ***/
+/***  On Exit:                                                                         ***/
+/***      R3 = CIS Length (or R4 if CIS cannot fit into buffer)                        ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode     Cis_ReadCis(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode             error = NO_ERROR;
+    _kernel_swi_regs                    callregs;
+    int                                 attrib_space = 1;
+    MEMORY_PTR                          buffer_ptr = (MEMORY_PTR)reg ->r[2];
+    BOOL                                end_of_cis = FALSE;
+    BOOL                                jumping = FALSE;
+    BOOL                                nolink = FALSE;
+    BOOL                                link_valid = FALSE;
+    BOOL                                primary_chain = TRUE;
+    int                                 longdest = 0;
+    BOOL                                devicetupleseen = FALSE;
+
+    #if Debug == TRUE
+        DebugMessage("mK","Entered CIS_READCIS routine ************************************************\n");
+    #endif
+
+    /**************************/
+    /** Fill internal buffer **/
+    /**************************/
+    callregs.r[0] = attrib_space << 5;
+    callregs.r[1] = reg ->r[1];          /* Card drive */
+    callregs.r[2] = 0;                   /* Fill from the start of Attribute memory */
+    callregs.r[3] = (int)buffer_ptr;
+    callregs.r[4] = reg ->r[4];          /** Fill the buffer cram-jam full **/
+    error = PCMCIA_Read(&callregs);
+
+    do {
+        if((*(buffer_ptr + 1) == 0xff) && (*buffer_ptr != 0xff)) {
+            #if Debug == TRUE
+                DebugMessage("mK","0xFF Link on the next (valid) tuple...\n");
+            #endif
+        }
+        switch(*buffer_ptr)
+            {
+                case CISTPL_NULL:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Null tuple recognised (and ignored)\n");
+                    #endif
+                    buffer_ptr ++;
+                    break;
+
+
+                case CISTPL_DEVICE:
+                    devicetupleseen = TRUE;
+                    #if Debug == TRUE
+                        DebugMessage("mK","Device description tuple recognized\n");
+                    #endif
+                    if((*(buffer_ptr + 1)) == 0xff) end_of_cis = TRUE; /** This'n had an FF link! **/
+                    buffer_ptr += 2 + *(buffer_ptr + 1);
+                    break;
+
+                case CISTPL_LONGLINK_C:
+                    if(!devicetupleseen) {
+                        end_of_cis = TRUE;
+                        error = ERROR__INVALID_CIS;
+                    }
+                    #if Debug == TRUE
+                        DebugMessage("mK","Longlink_C tuple recognized\n");
+                    #endif
+                    longdest = (*(buffer_ptr+2)) +
+                               (*(buffer_ptr+3) << 8) +
+                               (*(buffer_ptr+4) << 16);
+                    jumping = TRUE;
+                    attrib_space = 0;
+                    if(*(buffer_ptr+1) == 0xff) end_of_cis = TRUE; /** This'n had an FF link! **/
+                    buffer_ptr += 2 + *(buffer_ptr + 1);
+                    break;
+
+
+                case CISTPL_LONGLINK_A:
+                    if(!devicetupleseen) {
+                        end_of_cis = TRUE;
+                        error = ERROR__INVALID_CIS;
+                    }
+                    #if Debug == TRUE
+                        DebugMessage("mK","Longlink_A tuple recognized\n");
+                    #endif
+                    longdest = *(MEMORY_PTR__INT)(buffer_ptr+2);
+                    jumping = TRUE;
+                    attrib_space = 1;
+                    if(*(buffer_ptr+1) == 0xff) end_of_cis = TRUE; /** This'n had an FF link! **/
+                    buffer_ptr += 2 + *(buffer_ptr + 1);
+                    break;
+
+
+                case CISTPL_LINKTARGET:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Link Target tuple recognized\n");
+                    #endif
+                    longdest = (*(buffer_ptr+2)) +
+                               (*(buffer_ptr+3) << 8) +
+                               (*(buffer_ptr+4) << 16);
+                    #if Debug == TRUE
+                        DebugMessage("mK","The validation string is 0x%8X\n",longdest);
+                    #endif
+                    if(!link_valid | (longdest != 0x534943)) {
+                        end_of_cis = TRUE;
+                        #if Debug == TRUE
+                            DebugMessage("mK","Invalid CIS mark on link destination\n");
+                        #endif
+                        error = ERROR__INVALID_CIS;
+                    }
+                    longdest =0;
+                    link_valid = FALSE;
+                    if(*(buffer_ptr+1) == 0xff) end_of_cis = TRUE; /** This'n had an FF link! **/
+                    buffer_ptr += 2 + *(buffer_ptr+1);
+                    break;
+
+
+                case CISTPL_NO_LINK:
+                    if(!devicetupleseen) {
+                        end_of_cis = TRUE;
+                        error = ERROR__INVALID_CIS;
+                    }
+                    #if Debug == TRUE
+                        DebugMessage("mK","No-Link tuple recognized\n");
+                    #endif
+                    if(longdest != 0) error = ERROR__INVALID_CIS;
+                    if(*(buffer_ptr+1) == 0xff) end_of_cis = TRUE; /** This'n had an FF link! **/
+                    buffer_ptr += 2 + *(buffer_ptr + 1);
+                    nolink = TRUE;
+                    break;
+
+
+                case CISTPL_END:
+                    #if Debug == TRUE
+                        DebugMessage("mK","End tuple recognized\n");
+                    #endif
+                    buffer_ptr += 1;
+                    if(primary_chain & (!jumping) & (!nolink)) {
+                        attrib_space = 0;      /* Read from Common */
+                        longdest = 0;      /* Jumping to address 0 */
+                        jumping = TRUE;       /* Set the jump flag */
+                    }
+                    if(jumping) {
+                        callregs.r[0] = attrib_space << 5;
+                        callregs.r[1] = reg ->r[1];          /* Card drive */
+                        callregs.r[2] = longdest;     /* Fill from start of destination */
+                        callregs.r[3] = (int)buffer_ptr;
+                        callregs.r[4] = reg ->r[2] + reg ->r[4] - (int)buffer_ptr;
+                        error = PCMCIA_Read(&callregs);
+                        jumping = FALSE;
+                        primary_chain = FALSE;
+                        link_valid = TRUE;
+                    }
+                    else end_of_cis = TRUE;
+                    break;
+
+
+                default:
+                    #if Debug == TRUE
+                        DebugMessage("mK","Tuple 0x%02X not recognized in Read_CIS\n", *buffer_ptr);
+                    #endif
+                    if(*(buffer_ptr+1) == 0xff) end_of_cis = TRUE; /** This'n had an FF link! **/
+                    buffer_ptr += 2 + *(buffer_ptr+1);
+                    break;
+        }
+        if(!((int)buffer_ptr < (reg ->r[2] + reg ->r[4]))) end_of_cis = TRUE; /** Ie buffer full **/
+    } while(!end_of_cis);
+
+    reg ->r[3] = (int)buffer_ptr - reg ->r[2];
+    if((int)buffer_ptr >= (reg ->r[2] + reg ->r[4])) error = ERROR__NO_ROOM_IN_BUFFER;
+    if(!devicetupleseen) error = ERROR__INVALID_CIS;
+    return (error);
+}
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis_WriteCis(registers)                                                          ***/
+/***                                                                                   ***/
+/***  Dumps a CIS from a user buffer in main memory onto the specified card.           ***/
+/***                                                                                   ***/
+/***  On Entry:                                                                        ***/
+/***      R0 = 2                                                                       ***/
+/***      R1 = Card Drive                                                              ***/
+/***      R2 = CIS Buffer address                                                      ***/
+/***      R3 = CIS length                                                              ***/
+/***                                                                                   ***/
+/***  On Exit:                                                                         ***/
+/***      None                                                                         ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode     Cis_WriteCis(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+    _kernel_swi_regs            callregs;
+    int                         bufferaddr = reg ->r[2];
+    int                         destaddr = 0; /** Start at beginning of memory space **/
+    int                         addr_space = 1; /** Attrib **/
+    char                        tempbuffer[257]; /** Holds the readback tuple **/
+    char                        linktupbuff[5];
+
+    #if Debug == TRUE
+        DebugMessage("gK","Entered CIS_WriteCis ********************************************\n");
+    #endif
+
+    do {
+        /** Write a tuple, then read the tuple to check it has been properly written **/
+        callregs.r[0] = (addr_space << 5); /** Physical, no scatter **/
+        callregs.r[1] = reg ->r[1]; /** Carddrive **/
+
+        /** work out the source of the tuple to write... **/
+        callregs.r[3] = bufferaddr;
+        /** and the destination **/
+        callregs.r[2] = destaddr;
+        /** Find the length of the tuple to write... **/
+        callregs.r[4] = (int)((*(char *)(bufferaddr + 1)) + 2);
+
+        /** And write it directly, via PCMCIA_Write **/
+        error = PCMCIA_Write(&callregs);
+        #if Debug == TRUE
+            DebugMessage("gK","Written the tuple &%02X (it was length %d)\n",(int)(*(char *)(bufferaddr)), (int)((*(char *)(bufferaddr + 1))+2));
+        #endif
+
+        /** Read it back.... **/
+        callregs.r[2] = destaddr;
+        callregs.r[3] = (int)tempbuffer;
+        callregs.r[4] = (int)((*(char *)(bufferaddr + 1)) + 2);
+        error = PCMCIA_Read(&callregs);
+        #if Debug == TRUE
+            DebugMessage("gK","Read the tuple back\n");
+        #endif
+
+        /** Ok, now compare the original & the read-back tuples **/
+        if(memcmp(tempbuffer, (char *)bufferaddr, (*(char *)(bufferaddr + 1))) != 0) {
+            #if Debug == TRUE
+                DebugMessage("gK","Phht, they didn't match - PANIC!!!\n");
+            #endif
+            /** Don't forget special case of attrib, destaddr = 0, FF read back..... **/
+            if((tempbuffer[0] = 0xff) && (addr_space == 1) && (destaddr == 0)) {
+                #if Debug == TRUE
+                    DebugMessage("gK","Phew, it was just that it was trying to write to nonexistant attrib mem\n");
+                #endif
+                /** Dump a link tuple at the start of common memory, followed by the first genuine tuple... **/
+                addr_space = 0; /** Common **/
+                destaddr = 0;
+                callregs.r[0] = 0;
+                callregs.r[2] = destaddr;
+                callregs.r[3] = (int)linktupbuff; /* this is where the link target tuple is built up */
+                callregs.r[4] = 5; /* length of linktarget tuple */
+                linktupbuff[0] = CISTPL_LINKTARGET;
+                linktupbuff[1] = 3;
+                linktupbuff[2] = 'C';
+                linktupbuff[3] = 'I';
+                linktupbuff[4] = 'S';
+                error = PCMCIA_Write(&callregs); /** bung it! **/
+                /** Read it back.... **/
+                callregs.r[2] = destaddr;
+                callregs.r[3] = (int)tempbuffer;
+                callregs.r[4] = 5;
+                error = PCMCIA_Read(&callregs);
+                #if Debug == TRUE
+                    DebugMessage("gK","Error returned from the read was %d\n",(int)error);
+                #endif
+                /** Ok, now compare the original & the read-back tuples **/
+                if((memcmp(tempbuffer, linktupbuff, 5) != 0) || (error!=NO_ERROR)) error=ERROR__BAD_CIS_WRITE;
+                else { /** write the original tuple after the linktarget... **/
+                    #if Debug == TRUE
+                        DebugMessage("gK","Well, at least that wrote OK!\n");
+                    #endif
+                    callregs.r[3] = bufferaddr;
+                    callregs.r[2] = destaddr;
+                    callregs.r[4] = (int)((*(char *)(bufferaddr + 1)) + 2);
+                    error = PCMCIA_Write(&callregs);
+                    callregs.r[2] = destaddr;
+                    callregs.r[3] = (int)tempbuffer;
+                    callregs.r[4] = (int)((*(char *)(bufferaddr + 1)) + 2);
+                    error = PCMCIA_Read(&callregs);
+                    if((memcmp(tempbuffer, (char *)bufferaddr, ((*(char *)(bufferaddr + 1))+2))) || (error != NO_ERROR)) error = ERROR__BAD_CIS_WRITE;
+                    #if Debug == TRUE
+                        if(error == NO_ERROR) DebugMessage("gK","and so did the original tuple...\n");
+                    #endif
+                }
+            }
+            else error = ERROR__BAD_CIS_WRITE;
+        }
+        /** otherwise, they match, so onto the next tuple... **/
+
+        /*** Need to analyse the tuple here, in case it involved a memspace jump ***/
+        switch(*(char *)(bufferaddr)) {
+            case CISTPL_LONGLINK_A:
+                #if Debug == TRUE
+                    DebugMessage("gK","Read a long link to attrib tuple\n");
+                #endif
+                addr_space = 1; /** Attrib **/
+                destaddr = *(MEMORY_PTR__INT)(bufferaddr + 2);
+                break;
+
+            case CISTPL_LONGLINK_C:
+                #if Debug == TRUE
+                    DebugMessage("gK","Read a long link to attrib tuple\n");
+                #endif
+                addr_space = 0; /** Common **/
+                destaddr = *(MEMORY_PTR__INT)(bufferaddr + 2);
+                break;
+
+            default:
+                destaddr = destaddr + 2 + (*(char *)(bufferaddr + 1)); /** point destaddr to after tuple just written **/
+                break;
+        }
+        bufferaddr = bufferaddr + 2 + (*(char *)(bufferaddr + 1)); /** point buffer to next tuple **/
+
+    } while((bufferaddr < (reg ->r[2] + reg ->r[3])) && (error == NO_ERROR));
+
+    return(error);
+}
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis_ReadTuple(registers)                                                         ***/
+/***                                                                                   ***/
+/***  Loads a single tuple from the CIS (either on card or in buffer) into a buffer.   ***/
+/***                                                                                   ***/
+/***  On Entry:                                                                        ***/
+/***      R0 = 3                                                                       ***/
+/***      R1 = Card Drive                                                              ***/
+/***      R2 = CIS Buffer address                                                      ***/
+/***      R3 = CIS Length                                                              ***/
+/***      R4 = CIS Buffer length                                                       ***/
+/***      R6 = Tuple address (offset from start of CIS)                                ***/
+/***      R7 = Tuple buffer address                                                    ***/
+/***                                                                                   ***/
+/***  On Exit:                                                                         ***/
+/***      All registers preserved                                                      ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode     Cis_ReadTuple(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode         error = NO_ERROR;
+    _kernel_swi_regs                    callregs;
+
+    /* If card in I/O mode, return an error */
+
+    if(reg ->r[3] < reg ->r[6]) return(ERROR__INVALID_TUPLE_ADDRESS);
+
+    callregs = *reg;
+    callregs.r[0] = 3;
+
+    error = Cis_Length(&callregs);
+
+    return(error);
+}
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis_InsertTuple(registers)                                                       ***/
+/***                                                                                   ***/
+/***  Inserts the specified tuple into the tuple chain stored in the specified buffer. ***/
+/***                                                                                   ***/
+/***  On Entry:                                                                        ***/
+/***      R0 = 4                                                                       ***/
+/***      R1 = Card Drive                                                              ***/
+/***      R2 = CIS Buffer address                                                      ***/
+/***      R3 = CIS Length (before insertion)                                           ***/
+/***      R4 = CIS Buffer length                                                       ***/
+/***      R6 = Tuple address (ie insert address)                                       ***/
+/***      R7 = Tuple buffer address (where tuple to insert is stored)                  ***/
+/***                                                                                   ***/
+/***  On Exit:                                                                         ***/
+/***      R3 = New CIS Length                                                          ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                    ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode     Cis_InsertTuple(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode         error = NO_ERROR;
+    char                                TuplCode;
+    char                                TuplLink;
+    int                                 LinkValid;
+    int                                 loop;
+    int                                 looplimit;
+    char                                TuplLen = (*(MEMORY_PTR)(reg ->r[7] + 1)) + 2;
+    MEMORY_PTR                          source;
+    MEMORY_PTR                          destination;
+    MEMORY_PTR                          BufferPtr = (MEMORY_PTR)reg ->r[2];
+    int                                 Cis_length = 0;
+
+    #if Debug == TRUE
+        DebugMessage("mK","TuplLen is &%2X\n",TuplLen);
+    #endif
+
+    if(reg ->r[3] + TuplLen > reg ->r[4]) return(ERROR__NO_ROOM_IN_BUFFER);
+
+    do {
+
+        if(Cis_length == reg ->r[6]) {
+            #if Debug == TRUE
+                DebugMessage("mK","Found insertion point at %d\n", Cis_length);
+            #endif
+            source = (MEMORY_PTR)(reg ->r[2] + reg ->r[3]);
+            destination = (MEMORY_PTR)((int)source + (int)TuplLen);
+            looplimit = reg ->r[3] + 1 - Cis_length;
+            #if Debug == TRUE
+                DebugMessage("mK","Source Address is &%8X\n", (int)source);
+                DebugMessage("mK","Destination Address is &%8X\n", (int)destination);
+                DebugMessage("mK","Number of bytes to shift is &8X\n", looplimit);
+            #endif
+
+            for(loop=0; loop < looplimit; loop++) *destination-- = *source--;
+
+            source = (MEMORY_PTR)reg ->r[7];
+            destination = BufferPtr;
+
+            for(loop=0; loop < (TuplLen); loop++) *destination++ = *source++;
+
+            reg ->r[3] = reg ->r[3] + *((MEMORY_PTR)(reg ->r[7]) + 1); /* New length */
+            return(NO_ERROR);
+        }
+
+        TuplCode = *BufferPtr;
+        TuplLink = *(BufferPtr + 1);
+
+        if(((TuplCode == 0xff) || (TuplLink == 0xff)) && ((Cis_length+4) < reg ->r[3])) {
+            if(TuplCode != 0xff) {
+                BufferPtr  += 2;
+                Cis_length += 2;
+            }
+            else
+            {
+                BufferPtr ++;
+                Cis_length ++;
+            }
+            TuplCode = *(BufferPtr);
+            TuplLink = *(BufferPtr+1);
+            LinkValid = *(BufferPtr+2) +
+                        (*(BufferPtr+3) << 8) +
+                        (*(BufferPtr+4) << 16);
+            if((LinkValid != 0x534943) || (TuplCode != CISTPL_LINKTARGET)) error = ERROR__INVALID_CIS;
+            BufferPtr  += TuplLink + 2;
+            Cis_length += TuplLink + 2;
+        }
+        else
+        {
+            BufferPtr  += TuplLink + 2;
+            Cis_length += TuplLink + 2;
+        }
+
+    } while (Cis_length < reg ->r[3]);
+
+    return(ERROR__INVALID_TUPLE_ADDRESS);
+}
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis_FindTuple(registers)                                                         ***/
+/***                                                                                   ***/
+/***  Loads a single tuple from the CIS (either on card or in buffer) into a buffer.   ***/
+/***                                                                                   ***/
+/***  On Entry:                                                                        ***/
+/***      R0 = 5                                                                       ***/
+/***      R1 = Card Drive                                                              ***/
+/***      R2 = CIS Buffer address                                                      ***/
+/***      R3 = CIS Length                                                              ***/
+/***      R4 = CIS Buffer length                                                       ***/
+/***      R5 = Tuple ID (ie TPL_CODE)                                                  ***/
+/***      R6 = n, where we are looking for the n'th occurrence                         ***/
+/***                                                                                   ***/
+/***  On Exit:                                                                         ***/
+/***      R6 = Tuple address (offset from start of CIS) if search was successful.      ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode     Cis_FindTuple(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode         error = NO_ERROR;
+    _kernel_swi_regs                    callregs;
+
+#if Debug == TRUE
+    DebugMessage("mK","*Entered Cis_FindTuple() looking for the %dth tuple 0x%02X\n", reg ->r[6], reg->r[5]);
+#endif
+
+    callregs = *reg;
+    callregs.r[0] = 5;
+
+    error = Cis_Length(&callregs);
+
+    #if Debug == TRUE
+        if(error != NO_ERROR) DebugMessage("mK","Couldn't find it - sorry\n");
+    #endif
+
+    if(error == NO_ERROR) reg ->r[6] = callregs.r[6];
+
+    return(error);
+}
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Cis_DeleteTuple(registers)                                                       ***/
+/***                                                                                   ***/
+/***  Deletes a tuple from a buffered CIS. The tuples following are moved down.        ***/
+/***                                                                                   ***/
+/***  On Entry:                                                                        ***/
+/***      R0 = 6                                                                       ***/
+/***      R1 = Card Drive                                                              ***/
+/***      R2 = CIS Buffer address                                                      ***/
+/***      R3 = CIS Length (before insertion)                                           ***/
+/***      R4 = CIS Buffer length                                                       ***/
+/***      R6 = Tuple address (ie insert address)                                       ***/
+/***                                                                                   ***/
+/***  On Exit:                                                                         ***/
+/***      R3 = New CIS Length                                                          ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode     Cis_DeleteTuple(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode         error = NO_ERROR;
+    char                                TuplCode;
+    char                                TuplLink;
+    int                                 LinkValid;
+    int                                 loop;
+    int                                 looplimit;
+    char                                TuplLen;
+    MEMORY_PTR                          source;
+    MEMORY_PTR                          destination;
+    MEMORY_PTR                          BufferPtr = (MEMORY_PTR)reg ->r[2];
+    int                                 Cis_length = 0;
+
+
+    do {
+
+        if(Cis_length == reg ->r[6]) {
+            #if Debug == TRUE
+                DebugMessage("mK","Found insertion point at %d\n", Cis_length);
+            #endif
+            TuplLen = (*(BufferPtr+1))+2;
+            source = (MEMORY_PTR)((int)BufferPtr + (int)TuplLen);
+            destination = BufferPtr;
+            looplimit = reg ->r[3] + 1 - Cis_length;
+            #if Debug == TRUE
+                DebugMessage("mK","Source Address is &%8X\n", (int)source);
+                DebugMessage("mK","Destination Address is &%8X\n", (int)destination);
+                DebugMessage("mK","Number of bytes to shift is &%8X\n", looplimit);
+            #endif
+
+            for(loop=0; loop < looplimit; loop++) *destination++ = *source++;
+
+            reg ->r[3] = reg ->r[3] - TuplLen; /* New length */
+            return(NO_ERROR);
+        }
+
+        TuplCode = *BufferPtr;
+        TuplLink = *(BufferPtr + 1);
+
+        if(((TuplCode == 0xff) || (TuplLink == 0xff)) && ((Cis_length+4) < reg ->r[3])) {
+            if(TuplCode != 0xff) {
+                BufferPtr  += 2;
+                Cis_length += 2;
+            }
+            else
+            {
+                BufferPtr ++;
+                Cis_length ++;
+            }
+            TuplCode = *(BufferPtr);
+            TuplLink = *(BufferPtr+1);
+            LinkValid = *(BufferPtr+2) +
+                        (*(BufferPtr+3) << 8) +
+                        (*(BufferPtr+4) << 16);
+            if((LinkValid != 0x534943) || (TuplCode != CISTPL_LINKTARGET)) error = ERROR__INVALID_CIS;
+            BufferPtr  += TuplLink + 2;
+            Cis_length += TuplLink + 2;
+        }
+        else
+        {
+            BufferPtr  += TuplLink + 2;
+            Cis_length += TuplLink + 2;
+        }
+
+    } while (Cis_length < reg ->r[3]);
+
+    return(ERROR__INVALID_TUPLE_ADDRESS);
+}
+
+
+
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  DecodeCIStoHardware(CardDrive, buffer pointer, buffer length, cis length)        ***/
+/***                                                                                   ***/
+/***  This routine reads the CIS from the buffer, looking for tuples that affect the   ***/
+/***  hardware for the card, eg access times etc. It then updates the h/w.             ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode     DecodeCIStoHardware(int CardDrv, int Buffer, int BuffLen, int CisLen)
+    {
+    char                        TupleBuffer[257];   /* Reserve a buffer for the read tuple */
+    char                        TempByte;
+    int                         AccessTime;
+    char                        loop;
+    char                        outer;
+    _kernel_swi_regs            kernregs;
+    DRIVER_REGISTERS            drvregs;
+    PCMCIAManager_ErrorCode error = NO_ERROR;
+
+
+    SetUpHWDriver_CallRegs(CardDrive[CardDrv].HardwareDriver, &drvregs);
+    /******************************************************/
+    /*** Initialise the kernel regs to the usual values ***/
+    /******************************************************/
+    kernregs.r[1] = CardDrv;
+    kernregs.r[2] = Buffer;
+    kernregs.r[3] = CisLen;
+    kernregs.r[4] = BuffLen;
+
+    #if Debug == TRUE
+        DebugMessage("mK","\n\n***************** Entered DecodeCIStoHardware ***********************\n");
+    #endif
+
+    /******************************************************************************************/
+    /*** First read the first character of the buffer (tuple code of first tuple) to ensure ***/
+    /*** that the card has a CIS (probably - we already know it's not a DOS pseudo-floppy)  ***/
+    /******************************************************************************************/
+    TempByte = *(MEMORY_PTR)Buffer;
+    if((TempByte != 0x00) && (TempByte != 0x01) && (TempByte != 0xff)) return(ERROR__INVALID_CIS);
+
+    #if Debug == TRUE
+        DebugMessage("mK","    The CIS _appears_ to be valid. No guarantees though, these CIS writers are tricky chaps....\n");
+    #endif
+
+    kernregs.r[0] = 5;
+    kernregs.r[6] = 1;
+    kernregs.r[5] = CISTPL_CONFIG;
+    error = Cis_FindTuple(&kernregs);
+    if(error == NO_ERROR) CardDrive[CardDrv].Status = PARTITION_STATUS__NOPARTITION;
+    else CardDrive[CardDrv].Status = PARTITION_STATUS__NOPARTITION; /** This'll be corrected later if applicable **/
+
+    for(outer = 0; outer < 2; outer++) {
+        /***********************************************************************************/
+        /*** Look for a Device Information Tuple (0x01) to set up the memory info        ***/
+        /***********************************************************************************/
+        kernregs.r[0] = 5;                /* Code for find tuple */
+        kernregs.r[6] = 1;
+        if(outer == 0) kernregs.r[5] = CISTPL_DEVICE_A; /** First, attribute, **/
+        else kernregs.r[5] = CISTPL_DEVICE;             /** then common.  **/
+        error = Cis_FindTuple(&kernregs);
+
+        if(error == NO_ERROR) {           /* Ie there is a Device tuple in the chain */
+            kernregs.r[0] = 3;            /* Code for read tuple */
+            kernregs.r[7] = (int)TupleBuffer;
+            error = Cis_ReadTuple(&kernregs);
+
+            /***************************************************/
+            /**** We've got the tuple, now let's process it! ***/
+            /***************************************************/
+            TempByte = TupleBuffer[2];
+            CardDrive[CardDrv].DeviceType = TempByte >> 4; /** Retain this most fascinating snippet of trivial knowledge **/
+
+            #if Debug == TRUE
+                DebugMessage("mK","    The device information tuple device type is %d\n",CardDrive[CardDrv].DeviceType);
+                DebugMessage("mK","    Found the device information tuple: It says...\n");
+                switch (TempByte >> 4) {
+                    case DTYPE_NULL:
+                        DebugMessage("mK","        No device. Speed should be 0x00.\n");
+                        break;
+
+                    case DTYPE_ROM:
+                        DebugMessage("mK","        ROM device.\n");
+                        break;
+
+                    case DTYPE_OTPROM:
+                        DebugMessage("mK","        OTPROM device.\n");
+                        break;
+
+                    case DTYPE_EPROM:
+                        DebugMessage("mK","        UV EPROM device.\n");
+                        break;
+
+                    case DTYPE_EEPROM:
+                        DebugMessage("mK","        EEPROM device.\n");
+                        break;
+
+                    case DTYPE_FLASH:
+                        DebugMessage("mK","        Flash device.\n");
+                        break;
+
+                    case DTYPE_SRAM:
+                        DebugMessage("mK","        SRAM device.\n");
+                        break;
+
+                    case DTYPE_DRAM:
+                        DebugMessage("mK","        DRAM device.\n");
+                        break;
+
+                    case DTYPE_FUNCSPEC:
+                        DebugMessage("mK","        Function-specific device.\n");
+                        break;
+
+                    case DTYPE_EXTEND:
+                        DebugMessage("mK","        Extended device type.\n");
+                        break;
+
+                    default:
+                        DebugMessage("mK","        Unrecognised device.\n");
+                        break;
+                }
+                if((TempByte && (1<<3)) == 1) DebugMessage("mK","        Write enable switch ignored.\n");
+                    else DebugMessage("mK","        Write enable switch observed.\n");
+
+                switch (TempByte & 7) {
+                    case DSPEED_NULL:
+                        DebugMessage("mK","        Device has null speed.\n");
+                        break;
+
+                    case DSPEED_250NS:
+                        DebugMessage("mK","        Device speed is 250ns.\n");
+                        break;
+
+                    case DSPEED_200NS:
+                        DebugMessage("mK","        Device speed is 200ns.\n");
+                        break;
+
+                    case DSPEED_150NS:
+                        DebugMessage("mK","        Device speed is 150ns.");
+                        break;
+                    case DSPEED_100NS:
+                        DebugMessage("mK","        Device speed is 100ns.\n");
+                        break;
+
+                    case DSPEED_EXT:
+                        DebugMessage("mK","        Extended device speed:");
+                        TempByte = TupleBuffer[3];
+                        DebugMessage("mK","            Speed Mantissa is %d,\n", (TempByte >> 3) & 0x0f);
+                        DebugMessage("mK","            Speed Exponent is %d.\n", TempByte & 7);
+                        if((TempByte && 0x80) != 0) DebugMessage("mK","            EXT bit is set.\n");
+                        break;
+
+                    default:
+                        DebugMessage("mK","        Unrecognised device.\n");
+                        break;
+                }
+                DebugMessage("mK","\n\n");
+            #endif
+
+            TempByte = TupleBuffer[2];
+            switch(TempByte & 7) {
+                case DSPEED_100NS:
+                    AccessTime = 1000;
+                    break;
+
+                case DSPEED_150NS:
+                    AccessTime = 1500;
+                    break;
+
+                case DSPEED_200NS:
+                    AccessTime = 2000;
+                    break;
+
+                case DSPEED_250NS:
+                    AccessTime = 2500;
+                    break;
+
+                case DSPEED_NULL:
+                    AccessTime = 0;
+                    break;
+
+                case DSPEED_EXT:
+                    TempByte = TupleBuffer[3];
+                    AccessTime = 1;
+                    for(loop = 0; loop < (TempByte & 7); loop++) {
+                        AccessTime = AccessTime * 10;
+                    }
+                    switch ((TempByte >> 3) & 0x0f) {
+                        case 0: AccessTime = 0;
+                            break;
+
+                        case 1: break;
+
+                        case 2: AccessTime = AccessTime * 12;
+                            break;
+
+                        case 3: AccessTime = AccessTime * 13;
+                            break;
+
+                        case 4: AccessTime = AccessTime * 15;
+                            break;
+
+                        case 5: AccessTime = AccessTime * 20;
+                            break;
+
+                        case 6: AccessTime = AccessTime * 25;
+                            break;
+
+                        case 7: AccessTime = AccessTime * 30;
+                            break;
+
+                        case 8: AccessTime = AccessTime * 35;
+                            break;
+
+                        case 9: AccessTime = AccessTime * 40;
+                            break;
+
+                        case 0x0a: AccessTime = AccessTime * 45;
+                            break;
+
+                        case 0x0b: AccessTime = AccessTime * 50;
+                            break;
+
+                        case 0x0c: AccessTime = AccessTime * 55;
+                            break;
+
+                        case 0x0d: AccessTime = AccessTime * 60;
+                            break;
+
+                        case 0x0e: AccessTime = AccessTime * 70;
+                            break;
+
+                        case 0x0f: AccessTime = AccessTime * 80;
+                            break;
+                    }
+                    break;
+            }
+            drvregs.r[1] = (AccessTime/10) + 1;  /** The constants above were really 1.2 etc **/
+        }
+        else drvregs.r[1] = 0; /** ie don't change the speed! **/
+
+
+        /*******************************************************************************/
+        /*** Now look for a DEVICE_OC tuple (0x1C) to set up the 3v access time info ***/
+        /*******************************************************************************/
+        #if Debug == TRUE
+            DebugMessage("mK","Now we're looking for the Device 'other' conditions tuple.\n");
+        #endif
+
+        kernregs.r[0] = 5;                   /* Code for find tuple */
+        kernregs.r[6] = 1;
+        if(outer == 0) kernregs.r[5] = CISTPL_DEVICE_OC;
+        else kernregs.r[5] = CISTPL_DEVICE_OA;
+        error = Cis_FindTuple(&kernregs);
+
+        if(error == NO_ERROR) {              /* Ie there is a Device tuple in the chain */
+            kernregs.r[0] = 3;               /* Code for read tuple */
+            kernregs.r[7] = (int)TupleBuffer;
+            error = Cis_ReadTuple(&kernregs);
+
+            /***************************************************/
+            /**** We've got the tuple, now let's process it! ***/
+            /***************************************************/
+            TempByte = TupleBuffer[2];
+            if((TempByte & 0x02) == 2) {     /** 3.3v supported, timing follows... **/
+            TempByte = TupleBuffer[3];
+
+            #if Debug == TRUE
+                DebugMessage("mK","    Found the Device_Ox tuple: It says for 3.3v...\n");
+                switch (TempByte & 7) {
+                    case DSPEED_NULL:
+                        DebugMessage("mK","        Device has null speed.\n");
+                        break;
+
+                    case DSPEED_250NS:
+                        DebugMessage("mK","        Device speed is 250ns.\n");
+                        break;
+
+                    case DSPEED_200NS:
+                        DebugMessage("mK","        Device speed is 200ns.\n");
+                        break;
+
+                    case DSPEED_150NS:
+                        DebugMessage("mK","        Device speed is 150ns.");
+                        break;
+                    case DSPEED_100NS:
+                        DebugMessage("mK","        Device speed is 100ns.\n");
+                        break;
+
+                    case DSPEED_EXT:
+                        DebugMessage("mK","        Extended device speed:");
+                        TempByte = TupleBuffer[3];
+                        DebugMessage("mK","            Speed Mantissa is %d,\n", (TempByte >> 3) & 0x0f);
+                        DebugMessage("mK","            Speed Exponent is %d.\n", TempByte & 7);
+                        if((TempByte && 0x80) != 0) DebugMessage("mK","            EXT bit is set.\n");
+                        break;
+
+                    default:
+                        DebugMessage("mK","        Unrecognised device.\n");
+                        break;
+                }
+                DebugMessage("mK","\n\n");
+            #endif
+
+                TempByte = TupleBuffer[2];
+                switch(TempByte & 7) {
+                    case DSPEED_100NS:
+                        AccessTime = 1000;
+                        break;
+
+                    case DSPEED_150NS:
+                        AccessTime = 1500;
+                        break;
+
+                    case DSPEED_200NS:
+                        AccessTime = 2000;
+                        break;
+
+                    case DSPEED_250NS:
+                        AccessTime = 2500;
+                        break;
+
+                    case DSPEED_NULL:
+                        AccessTime = 0;
+                        break;
+
+                    case DSPEED_EXT:
+                        TempByte = TupleBuffer[3];
+                        AccessTime = 1;
+                        for(loop = 0; loop < (TempByte & 7); loop++) {
+                            AccessTime = AccessTime * 10;
+                        }
+                        switch ((TempByte >> 3) & 0x0f) {
+                            case 0: AccessTime = 0;
+                                break;
+
+                            case 1: break;
+
+                            case 2: AccessTime = AccessTime * 12;
+                                break;
+
+                            case 3: AccessTime = AccessTime * 13;
+                                break;
+
+                            case 4: AccessTime = AccessTime * 15;
+                                break;
+
+                            case 5: AccessTime = AccessTime * 20;
+                                break;
+
+                            case 6: AccessTime = AccessTime * 25;
+                                break;
+
+                            case 7: AccessTime = AccessTime * 30;
+                                break;
+
+                            case 8: AccessTime = AccessTime * 35;
+                                break;
+
+                            case 9: AccessTime = AccessTime * 40;
+                                break;
+
+                            case 0x0a: AccessTime = AccessTime * 45;
+                                break;
+
+                            case 0x0b: AccessTime = AccessTime * 50;
+                                break;
+
+                            case 0x0c: AccessTime = AccessTime * 55;
+                                break;
+
+                            case 0x0d: AccessTime = AccessTime * 60;
+                                break;
+
+                            case 0x0e: AccessTime = AccessTime * 70;
+                                break;
+
+                            case 0x0f: AccessTime = AccessTime * 80;
+                                break;
+                        }
+                        break;
+                }
+            }
+            drvregs.r[2] = (AccessTime/10) + 1;          /** The constants above were really 1.2 etc **/
+        }
+        else drvregs.r[2] = 0;  /** ie don't change! **/
+
+        /** drvregs.r[1] already setup with 5v time **/
+        drvregs.r[3] = 0; /** Don't change setup time **/
+        drvregs.r[4] = 0; /** Don't change hold time either **/
+        drvregs.r[7] = CardDrive[CardDrv].SlotHandle;
+        HardwareFunction(HARDWARE_FUNCTION__SELECT_ACCESS_SPEED, &drvregs, &DRV_Error);
+    }
+    return(error);
+}
+
+
+
+
+
+
+
+
+/***========= THIS FUNCTION IS _NOT_ USED!!!! IT IS A BLAST FROM THE PAST =============***/
+/***========= IT SUPPORTS MULTIPLE PARTITIONS & DYNAMIC DRIVE ALLOCATION  =============***/
+/***========= WHICH WAS DITCHED AT THE SECOND SOFTWARE REVIEW             =============***/
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  DecodeCIStoPartitions(CardDrive, buffer pointer, buffer length, cis length)      ***/
+/***                                                                                   ***/
+/***  This routine reads the CIS from the buffer, looking for tuples that affect the   ***/
+/***  partition info for the card. It then allocates Carddrives as needed.             ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode     DecodeCIStoPartitions(int Buffer, int BuffLen, int CisLen, int CardDrv)
+    {
+    char                        TupleBuffer[257];   /* Reserve a buffer for the read tuple */
+    int                         occurrence = 1;
+    int                         formatposns[MAX_PARTITIONS + 1];
+    int                         drivesused[MAX_PARTITIONS];
+    char                        loop;
+    char                        otherloop;
+    _kernel_swi_regs            kernregs;
+    PCMCIAManager_ErrorCode error = NO_ERROR;
+
+
+    /** first of all, blank the formatposns array **/
+    for(loop = 0; loop < MAX_PARTITIONS; loop++) {
+        formatposns[loop] = 0xffffff; /** Waaay outside the 64Mb PCMCIA address space! **/
+        drivesused[loop] = -1;
+    }
+    formatposns[MAX_PARTITIONS] = 0xffffff; /*quck fix*/
+
+    /******************************************************/
+    /*** Initialise the kernel regs to the usual values ***/
+    /******************************************************/
+    kernregs.r[1] = CardDrv;
+    kernregs.r[2] = Buffer;
+    kernregs.r[3] = CisLen;
+    kernregs.r[4] = BuffLen;
+
+#if Debug == TRUE
+    DebugMessage("mK","\n\n***************** Entered DecodeCIStoPartitions ***********************\n");
+#endif
+
+    /* We know the CIS is OK, as DecodeCIStoHardware has already been called, so off we go! */
+
+    /*************************************************************************************/
+    /*** Find out the partition information & use it.                                  ***/
+    /*************************************************************************************/
+    do {
+        kernregs.r[0] = 5;  /* Code for find tuple */
+        kernregs.r[5] = CISTPL_FORMAT; /* find the format information */
+        kernregs.r[6] = occurrence; /* Find */
+        #if Debug == TRUE
+            DebugMessage("mK","    Looking for CISTPL_FORMAT\n");
+        #endif
+        error = Cis_FindTuple(&kernregs);
+        if(error == NO_ERROR) { /* we found it */
+            formatposns[occurrence - 1] = kernregs.r[6]; /** Store the location it was found in **/
+            kernregs.r[0] = 3;   /* Code for read tuple */
+            kernregs.r[7] = (int)TupleBuffer;
+            error = Cis_ReadTuple(&kernregs);
+            CardDrive[TempCardDrive].PartitionType = TupleBuffer[2];
+            CardDrive[TempCardDrive].PartitionStart = TupleBuffer[4] + (TupleBuffer[5] << 8) +
+                                                      (TupleBuffer[6] << 16) + (TupleBuffer[7] << 24);
+            CardDrive[TempCardDrive].PartitionLength = TupleBuffer[8] + (TupleBuffer[9] << 8) +
+                                                      (TupleBuffer[10] << 16) + (TupleBuffer[11] << 24);
+            #if Debug == TRUE
+                DebugMessage("mK","   **** This is partition %d\n", occurrence);
+                DebugMessage("mK","    Partition Start is &%02X\n", CardDrive[TempCardDrive].PartitionStart);
+                DebugMessage("mK","    Partition Length is &%02X\n", CardDrive[TempCardDrive].PartitionLength);
+                DebugMessage("mK","    Partition type is &%02X\n", CardDrive[TempCardDrive].PartitionType);
+            #endif
+            if((drivesused[occurrence - 1] = CopyTempIntoCardDrive(MEM_CARDDRIVE)) == -1) occurrence = MAX_PARTITIONS; /* ie no carddrives left */
+            occurrence++;
+        }
+    } while((error == NO_ERROR) && (occurrence <= MAX_PARTITIONS)); /** ie loop until no more FORMAT tuples found, or max limit reached **/
+
+
+    /*************************************************************************************/
+    /*** Find out the partition data information & store it.                           ***/
+    /*************************************************************************************/
+    occurrence = 1;
+    do {
+        kernregs.r[0] = 5;             /* Code for find tuple */
+        kernregs.r[5] = CISTPL_ORG;    /* find the data format information */
+        kernregs.r[6] = occurrence;
+
+        error = Cis_FindTuple(&kernregs);
+        if(error == NO_ERROR) {
+            /** Find out where it came from - ie which carddrive does it belong to? **/
+            for(loop = 0; kernregs.r[6] < formatposns[loop]; loop++);
+            if(loop != 0) { /** ie it comes after a format tuple **/
+                kernregs.r[0] = 3;         /* Code for read tuple */
+                kernregs.r[7] = (int)TupleBuffer;
+                error = Cis_ReadTuple(&kernregs);
+                CardDrive[drivesused[formatposns[loop - 1]]].PartitionDataType = TupleBuffer[2];
+                for(otherloop = 0; (TupleBuffer[3+otherloop] != 0) && (otherloop < PARTN_ID_LENGTH); otherloop++) {
+                    CardDrive[drivesused[formatposns[loop - 1]]].PartitionDataId[otherloop] = TupleBuffer[3 + otherloop];
+                    #if Debug == TRUE
+                        DebugMessage("mK","%02X ", TupleBuffer[3 + otherloop]);
+                    #endif
+                }
+
+                if(otherloop < PARTN_ID_LENGTH) CardDrive[drivesused[formatposns[loop - 1]]].PartitionDataId[otherloop] = 0; /* Make sure trminatd */
+
+                #if Debug == TRUE
+                    DebugMessage("mK","\n    Number of characters read was %d", otherloop);
+                    DebugMessage("mK","\n    Data type is &%02X\n", TupleBuffer[2]);
+                #endif
+            }
+        }
+        occurrence++;
+    } while(error == NO_ERROR);
+
+    return(error);
+}
+
+
+
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  DecodeCIStoPartition(CardDrive, buffer pointer, buffer length, cis length)       ***/
+/***                                                                                   ***/
+/***  This routine reads the CIS from the buffer, looking for tuples that affect the   ***/
+/***  partition info for the card. It then decides which partition to actually use.    ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIAManager_ErrorCode                                                        ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode     DecodeCIStoPartition(int Buffer, int BuffLen, int CisLen, int CardDrv)
+    {
+    char                        TupleBuffer[257];   /* Reserve a buffer for the read tuple */
+    int                         fmtoccur = 1;
+    int                         orgoccur = 1;
+    int                         lastformattuple;
+    int                         nextformattuple;
+    char                        tmp;
+    char                        besttype = 0;  /** 0=absolutely bugger all, 1=nowt, 2=unknown partition, 3=dos, 4=pccardfs, 5=driver **/
+    _kernel_swi_regs            kernregs;
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+
+
+    /******************************************************/
+    /*** Initialise the kernel regs to the usual values ***/
+    /******************************************************/
+    kernregs.r[1] = CardDrv;
+    kernregs.r[2] = Buffer;
+    kernregs.r[3] = CisLen;
+    kernregs.r[4] = BuffLen;
+    if((CardDrive[CardDrv].DeviceType==0) || (CardDrive[CardDrv].DeviceType>7)) CardDrive[CardDrv].PartitionLength=0; /** IO card **/
+    else CardDrive[CardDrv].PartitionLength = 1; /** at least say there is something here... **/
+
+#if Debug == TRUE
+    DebugMessage("mK","\n\n***************** Entered DecodeCIStoPartition ***********************\n");
+#endif
+
+    /* We know the CIS is OK, as DecodeCIStoHardware has already been called, so off we go! */
+
+    /*************************************************************************************/
+    /*** Find the first occurrence of the FORMAT tuple                                 ***/
+    /*************************************************************************************/
+    kernregs.r[0] = 5;  /* Code for find tuple */
+    kernregs.r[5] = CISTPL_FORMAT; /* find the format information */
+    kernregs.r[6] = fmtoccur; /* Find */
+    #if Debug == TRUE
+        DebugMessage("mK","    Looking for CISTPL_FORMAT\n");
+    #endif
+    error = Cis_FindTuple(&kernregs);
+    if(error != NO_ERROR) {
+        /** we have no partitions on this card **/
+        if((CardDrive[CardDrv].DeviceType==0) || (CardDrive[CardDrv].DeviceType>7)) CardDrive[CardDrv].Status = PARTITION_STATUS__IO;
+        return(error);
+    }
+    lastformattuple = kernregs.r[6];  /** Remember where we found it **/
+    #if Debug == TRUE
+        DebugMessage("mK"," it's at %d\n",lastformattuple);
+    #endif
+
+    fmtoccur++;
+    do {
+        kernregs.r[6] = fmtoccur; /* Find the next one */
+        #if Debug == TRUE
+            DebugMessage("mK","    Looking for CISTPL_FORMAT (again - it's a hard life...)\n");
+        #endif
+        error = Cis_FindTuple(&kernregs);
+        if(error == NO_ERROR) nextformattuple = kernregs.r[6]; else nextformattuple = 0xffffff;
+        #if Debug == TRUE
+            DebugMessage("mK"," it's at %d\n",nextformattuple);
+        #endif
+
+        /** Right, we know the CIS block for the last format tuple, so lets see if we can find out what sort of partition it is... **/
+        do {
+            kernregs.r[5] = CISTPL_ORG; /** See if we can find out the format type... **/
+            kernregs.r[6] = orgoccur;
+            #if Debug == TRUE
+                DebugMessage("mK","    Looking for CISTPL_ORG\n");
+            #endif
+            error = Cis_FindTuple(&kernregs);
+            #if Debug == TRUE
+                DebugMessage("mK"," found cistpl_org at %d\n",kernregs.r[6]);
+            #endif
+        } while ((error == NO_ERROR) && ((kernregs.r[6] < lastformattuple) || (kernregs.r[6] > nextformattuple)));
+
+        if(error == NO_ERROR) { /** then it's in our space & there is one... **/
+            orgoccur++;
+            kernregs.r[0] = 3;   /* Code for read tuple, cos we want to read it...*/
+            kernregs.r[7] = (int)TupleBuffer;
+            error = Cis_ReadTuple(&kernregs);
+            /** Ok, let's see what sort of partition it is **/
+            if(strcmp((TupleBuffer+3), "DOS") == 0) tmp=3;
+            else if(strcmp((TupleBuffer+3), "PCCARDFS") == 0) tmp=4;
+            else if(strcmp((TupleBuffer+3), "PCCARDFSDRIVER") == 0) tmp=5;
+            else if(strcmp((TupleBuffer+3), "PCCARDFSDRIVERA") == 0) tmp=6;
+            else tmp = 2; /** unkonwn, but it's there... **/
+        }
+        else tmp = 1; /** no org at all so unknown. **/
+
+        /** So, now we know what we've just read, is it better than what we already had? **/
+        /** If so, we'd better overwrite the old one **/
+        if(tmp > besttype) {
+            besttype = tmp;
+            /** Can fill in the .Status bit now then... **/
+            switch(tmp) {
+                case 0: CardDrive[CardDrv].Status = PARTITION_STATUS__NOPARTITION;      /*** no cistpl_org (no cis) ***/
+                        break;
+                case 1: CardDrive[CardDrv].Status = PARTITION_STATUS__NOPARTITION;      /*** ??? ***/
+                        break;
+                case 2: CardDrive[CardDrv].Status = PARTITION_STATUS__NOPARTITION;
+                        break;
+                case 3: CardDrive[CardDrv].Status = PARTITION_STATUS__PCCARDFS;         /** dos **/
+                        break;
+                case 4: CardDrive[CardDrv].Status = PARTITION_STATUS__PCCARDFS;         /** pccardfs **/
+                        break;
+                case 5: CardDrive[CardDrv].Status = PARTITION_STATUS__DRIVER;
+                        break;
+                case 6: CardDrive[CardDrv].Status = PARTITION_STATUS__DRIVERATTR;
+                        break;
+            }
+            /** Stuff the info from the ORG tuple safely away... **/
+            CardDrive[CardDrv].PartitionDataType = TupleBuffer[2];
+            strcpy(CardDrive[CardDrv].PartitionDataId, (TupleBuffer+3));
+            /** Read the info off the format tuple **/
+            kernregs.r[0] = 3;   /* Code for read tuple, cos we want to read it...*/
+            kernregs.r[6] = lastformattuple;
+            kernregs.r[7] = (int)TupleBuffer;
+            error = Cis_ReadTuple(&kernregs);
+            CardDrive[CardDrv].PartitionType = TupleBuffer[2];
+            CardDrive[CardDrv].PartitionStart = TupleBuffer[4] + (TupleBuffer[5] << 8) + (TupleBuffer[6] << 16) + (TupleBuffer[7] << 24);
+            CardDrive[CardDrv].PartitionLength = TupleBuffer[8] + (TupleBuffer[9] << 8) + (TupleBuffer[10] << 16) + (TupleBuffer[11] << 24);
+            #if Debug == TRUE
+                DebugMessage("mK","    Partition Start is &%02X\n", CardDrive[CardDrv].PartitionStart);
+                DebugMessage("mK","    Partition Length is &%02X\n", CardDrive[CardDrv].PartitionLength);
+                DebugMessage("mK","    Partition Data iD string is %s\n", CardDrive[CardDrv].PartitionDataId);
+                DebugMessage("mK","    Partition Status is &%02X\n", CardDrive[CardDrv].Status);
+            #endif
+        }
+
+        /** So, that's this format block dealt with, let's move onto the next... **/
+        lastformattuple = nextformattuple;
+    } while(lastformattuple != 0xffffff);
+
+    return(error);
+}
+

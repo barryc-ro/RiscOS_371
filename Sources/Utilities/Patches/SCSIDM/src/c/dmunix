@@ -1,0 +1,341 @@
+/*
+ * $Header: /ab/bsd:etc/scsidm/dmunix.c:bsd  1.8  $
+ * $Source: /ab/bsd:etc/scsidm/dmunix.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	dmunix.c,v $
+ * Revision 1.8  91/09/11  15:34:46  kwelton
+ * New function disconnect_status() to get/set whether current target
+ * is allowed to disconnect.
+ * 
+ * Revision 1.7  90/08/13  15:23:34  jroach
+ * Bring Risc OS and RISCiX versions in line with each other.
+ * 
+ * Revision 1.6  90/05/25  11:06:02  kwelton
+ * Added support for optical drives to opdev().
+ * 
+ * Revision 1.5  89/06/08  15:59:12  kwelton
+ * Space for identification text moved into struct d_parms. This is to avoid
+ * identification text getting confused when the IDENTIFY on a new device is
+ * OK, but a later command fails & scsidm refuses to open the device.
+ * 
+ * Revision 1.4  89/05/24  17:54:07  kwelton
+ * opdev() now correctly opens device for Read & Write with O_RDWR, instead
+ * of O_RDONLY + O_WRONLY.
+ * 
+ * Revision 1.3  89/04/18  18:33:07  kwelton
+ * Added check for bad device name after return from rdname(). (The first ioctl() performed for a new device).
+ * 
+ * Revision 1.2  89/04/18  17:42:16  kwelton
+ * struct scsiop flags (ps_scsi.h) changed from I_... to SC_...
+ * 
+ * Revision 1.1  89/04/06  11:22:16  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /ab/bsd:etc/scsidm/dmunix.c:bsd  1.8  $";
+#endif
+
+#include <stdio.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "fcntl.h"
+#include "time.h"
+#include "ioctl.h"
+#include "errno.h"
+#include "ps_scsi.h"
+#include "ps_direct.h"
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <fcntl.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <sys/errno.h>
+#include <dev/ps_scsi.h>
+#include <dev/ps_direct.h>
+#endif
+#include "scsidm.h"
+#include "partition.h"
+
+	/* import externals */
+import struct d_parms *cdev;
+import int errno;
+import bool optical;
+
+	/* declare external functions */
+import int getshape();
+import char *rdname();
+
+	/* declare routines defined this segment */
+bool sendcmd(), wrtramptable(), wrtrambsize();
+
+/**********************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, dmunix.c:
+ *
+ * 1) int opdev() - try to open a new device driver
+ *
+ * 2) bool sendcmd() - send a command to the SCSI device
+ *
+ * 3) bool rdramptable() - read RAM copy of partition table
+ *
+ * 4) bool wrtramptable() - write RAM copy of partition table
+ *
+ * 5) bool wrtrambsize() - write RAM copy of block size
+ *
+ * 6) int disconnect_status() - read/write disconnect status
+ *
+ */
+
+/**********************************************************************/
+
+int opdev(dname,newdev)
+
+char *dname;
+struct d_parms *newdev;
+
+{
+	/*
+	 * subroutine opdev() -
+	 *
+	 * routine attempts to open the passed device name. if no
+	 * pathname is given, it assumes that device resides in
+	 * standard directory /dev. returned value is the new file
+	 * descriptor, or -1 if the open failed.
+	 *
+	 */
+
+	/* declare autos */
+	register struct d_parms *devbuf;
+	char *rindex();
+
+	/* set default path if necessary */
+#if defined(SCSIDM_FOR_RISCiX)
+	if( rindex(dname,'/') == NULL )
+	 sprintf(newdev->d_name,"/dev/%s",dname);
+	else
+#endif
+	 strcpy(newdev->d_name,dname);
+
+	/* try to open the file */
+	if( (newdev->d_fd = open(newdev->d_name,O_RDWR)) == -1 )
+	{
+	 /* open failed */
+	 perror(newdev->d_name);
+	 return(-1);
+	}
+
+	/*
+	 * this is a new device, load parameters into cdev before
+	 * calling rdname() etc., which expect cdev to address the
+	 * new device.
+	 */
+	devbuf = cdev;
+	cdev = newdev;
+
+	/* read the disk's identification text */
+	{ char *name = rdname(&cdev->d_type);
+	  if (name == NULL)
+	    {
+	      cdev->d_ident[0] = '\0';
+	    }
+	  else
+	    { strncpy(cdev->d_ident,name,MAX_ID-1);
+	      cdev->d_ident[MAX_ID-1]='\0';
+	    }
+	}
+
+	/* check for a `bad' device type */
+	if( cdev->d_type == NOPTYPE )
+	{
+	 /* close the device & signal an error */
+	 close(cdev->d_fd);
+	 cdev->d_fd = -1;
+	}
+
+	/*
+	 * test whether this device is an explicitly
+	 * supported optical drive - only need to set
+	 * optical flag for the time being.
+	 */
+	optical = isoptical(cdev->d_ident) ? TRUE : FALSE;
+
+	/* read the disk shape if it is a direct access device */
+	if( cdev->d_fd >= 0 &&
+	   (cdev->d_type == DAPTYPE || cdev->d_type == OMPTYPE) )
+	 if( rdshape(cdev) != GOOD )
+	 {
+	  /* close the device & signal an error */
+	  close(cdev->d_fd);
+	  cdev->d_fd = -1;
+	 }
+
+	/* unbuffer device & return status */
+	cdev = devbuf;
+	return(newdev->d_fd);
+}
+
+/************************************************************************/
+
+bool sendcmd(cmdptr)
+
+struct scsiop *cmdptr;
+
+{
+	/*
+	 * subroutine sendcmd() -
+	 *
+	 * routine sends a command to the current SCSI device. returned
+	 * value is TRUE if the command was accepted, else FALSE.
+	 *
+	 */
+
+	/* no autos */
+
+	/* if no sense required, clear the status area of the cdb */
+	if( (cmdptr->flags & SC_NO_SENSE) )
+	{
+	 bzero(cmdptr->sense,SCSI_SENSE);
+	 cmdptr->flags &= ~SC_SENSE_VALID;
+	}
+
+	/* use the appropriate ioctl() */
+	if( ioctl(cdev->d_fd,SCSIDO,(char *)cmdptr) < 0 )
+	{
+	 if( errno == ENODEV || errno == ENOTTY )
+	 {
+	  perror(cdev->d_name);
+	  return(FALSE);
+	 }
+	 else
+	  return(TRUE);
+	}
+	else
+	 return(TRUE);
+
+}
+
+/************************************************************************/
+
+bool rdramptable(ptable)
+
+Table *ptable;
+
+{
+	/*
+	 * subroutine rdramptable() -
+	 *
+	 * routine reads a new copy of the passed partition table from RAM.
+	 * returned value is TRUE if all OK, else FALSE.
+	 *
+	 */
+
+	/* no autos */
+
+	/* call the appropriate ioctl */
+	if( ioctl(cdev->d_fd,READPART,&ptable) < 0 )
+	{
+	 perror(cdev->d_name);
+	 return(FALSE);
+	}
+	else
+	 return(TRUE);
+
+}
+
+/************************************************************************/
+
+bool wrtramptable(ptable)
+
+Table *ptable;
+
+{
+	/*
+	 * subroutine wrtramptable() -
+	 *
+	 * routine writes a new RAM copy of the passed partition table.
+	 * returned value is TRUE if all OK, else FALSE.
+	 *
+	 */
+
+	/* no autos */
+
+	/* call the appropriate ioctl */
+	if( ioctl(cdev->d_fd,WRITEPART,&ptable) < 0 )
+	{
+	 perror(cdev->d_name);
+	 return(FALSE);
+	}
+	else
+	 return(TRUE);
+
+}
+
+/************************************************************************/
+
+bool wrtrambsize(blocksize)
+
+int blocksize;
+
+{
+	/*
+	 * subroutine wrtrambsize() -
+	 *
+	 * routine writes a new RAM copy of the passed block size.
+	 * returned value is TRUE if all OK, else FALSE.
+	 *
+	 */
+
+	/* no autos */
+
+	/* call the appropriate ioctl */
+	if( ioctl(cdev->d_fd,WRITEBLOCK,&blocksize) < 0 )
+	{
+	 perror(cdev->d_name);
+	 return(FALSE);
+	}
+	else
+	 return(TRUE);
+
+}
+
+/************************************************************************/
+
+#if defined(SCSIDM_FOR_RISCiX)
+int disconnect_status(status, set_it)
+
+int *status;
+bool set_it;
+
+{
+	/*
+	 * subroutine disconnect_status() -
+	 *
+	 * routine reads / writes disconnect status. returned
+	 * value is 1 if command OK, else 0.
+	 *
+	 */
+
+	/* declare autos */
+	int retc, command;
+
+	command = (set_it) ? SCSISDISCONNECT : SCSIGDISCONNECT;
+
+	if( (retc = ioctl(cdev->d_fd, command, status)) < 0 )
+	{
+	    fprintf(stderr, "ioctl(SCSI%sDISCONNECT): ",
+		    (set_it) ? "S" : "G");
+	    perror("");
+	}
+
+	/* finished */
+	return((retc == 0) ? 1 : 0 );
+}
+#endif
+
+/************************************************************************/

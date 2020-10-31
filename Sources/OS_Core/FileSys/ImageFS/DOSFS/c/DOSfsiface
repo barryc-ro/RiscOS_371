@@ -1,0 +1,4439 @@
+/***************************************************************************/
+/***************************************************************************/
+/** THIS FILE IS NO LONGER USED                                           **/
+/***************************************************************************/
+/***************************************************************************/
+/*> c.DOSfsiface <*/
+/*-------------------------------------------------------------------------*/
+/* MSDOS Filing System interface                         (c) 1990, JGSmith */
+/*-------------------------------------------------------------------------*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <kernel.h>
+#include <swis.h>
+
+#include "h.types"
+#include "h.debug"
+#include "h.system"
+#include "h.ADFSshape"
+#include "h.DOSshape"
+#include "h.cache"
+#include "h.ADFS"
+#include "h.MSDOS"
+#include "h.DOSdisc"
+#include "h.fsiface"
+#include "h.FSerrors"
+#include "h.naming"
+#include "h.wcompare"
+#include "h.TIMEconv"
+#include "h.Csupport"
+#include "h.mapping"
+#include "h.namecache"
+#include "h.BBCdisc"
+
+/*-------------------------------------------------------------------------*/
+/* The following are used for parameter returns to the RISC OS world. They
+ * are provided as static structures to ensure they are not de-allocated
+ * when we leave the C world (since normal variables are allocated from the
+ * stack).
+ */
+
+static fs_open_block   fblock ;
+static fs_datestamp    tstamp ;
+static fs_load_block   lblock ;
+static fs_cat_entry    fcat ;
+static fs_dir_block    dblock ;
+#if 0  /* NOT USED at the moment */
+static fs_entry_info   einfo ;
+static fs_dir_contexts dcontext ;
+#endif /* NOT USED */
+
+/*-------------------------------------------------------------------------*/
+/*- INTERNAL functions ----------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/* CheckDiscAndName:
+ * Perform as much processing on the given filename as possible. This is
+ * called whenever we are given a filename/pathname from RISC OS.
+ * Returns:
+ *      0 = information in "out" variables valid
+ *     -1 = name contained wildcards
+ * The negative return codes will have defined the error to be returned.
+ */
+static int CheckDiscAndName(/* in */
+                            int          lDIR,     /* load directory? */
+                            int          wcard,    /* wildcards allowed */
+                            char        *fname,    /* RISC OS filename */
+                            /* out */
+                            objecttype  *type,     /* object type */
+                            DIR_info   **cdir,     /* current directory */
+                            char       **DOSname,  /* FULL DOS name */
+                            char       **leafname, /* leafname */
+#ifdef BBCDFS
+                            int         *drive,    /* drive */
+                            int         *BDTflag,  /* type of disc */
+                            int         *BBCside   /* if "BDTflag" == TRUE */
+#else
+                            int         *drive     /* drive */
+#endif /* BBCDFS */
+                           )
+{
+ char      *filename = fname ;
+#ifdef BBCDFS
+ int        loop ;
+ transinfo  ntinfo ;
+#endif /* BBCDFS */
+
+ tracef0("CheckDiscAndName: entered\n") ;
+
+ *type = isFILE ;               /* by default */
+ *leafname = NULL ;             /* default is no leafname */
+ *cdir = NULL ;                 /* default is no current directory */
+#ifdef BBCDFS
+ *BDTflag = FALSE ;             /* DOS by default */
+#endif /* BBCDFS */
+
+ /* release all cached disc information (directories and CLUSTERs) */
+ /**** TODO ****/
+
+ tracef1("CheckDiscAndName: MaxString = %d\n",MaxString) ;
+
+ /* allocate the memory for the translated path */
+ if ((*DOSname = (char *)my_malloc(MaxString)) == NULL)
+  return_error0(int,err_heapexhausted) ;
+
+ **DOSname = '\0' ;     /* NULL name */
+
+ if ((fname == NULL) || (*fname == NULL))
+  {
+   DIR_info *newdir = NULL ;
+   *cdir = get_current_dir() ;         /* current directory */
+
+   tracef1("CheckDiscAndName: *cdir = &%08X\n",(word)*cdir) ;
+   if (*cdir != NULL)
+    {
+     tracef2("CheckDiscAndName: sizeof(DIR_info) = %d, (*cdir)->dir_size = %d\n",sizeof(DIR_info),(*cdir)->dir_size) ;
+
+     newdir = (DIR_info *)my_malloc(sizeof(DIR_info) + (*cdir)->dir_size) ;
+     if (newdir == NULL)
+      {
+       my_free(*DOSname) ;
+       return_error0(int,err_heapexhausted) ;
+      }
+     /* copy the directory data */
+     memmove((char *)newdir,(char *)(*cdir),(sizeof(DIR_info) + (*cdir)->dir_size)) ;
+     *cdir = newdir ;                    /* and return the new copy */
+
+     *drive = get_current_drive() ;      /* and current drive */
+     *leafname = NULL ;                  /* or leafname */
+#ifdef BBCDFS
+     *BDTflag = FALSE ;                  /* must be a DOS disc */
+#endif /* BBCDFS */
+     *type = isDIR ;                     /* current directory referenced */
+     tracef2("CheckDiscAndName: filename is NULL (drive = %d, cdir = &%08X)\n",*drive,(word)*cdir) ;
+     return(0) ;
+    }
+   else
+    {
+     tracef0("CheckDiscAndName: no current directory\n") ;
+#if 0
+     /* we should use the root on the default drive */
+     fname = filename = "$\0" ;         /* static string */
+#endif
+    }
+  }
+
+ /* check if wildcarded objects are allowed */
+ if (!wcard && (checknotwildcarded(fname) != NULL))
+  {
+   my_free(*DOSname) ;
+   return_error1(int,err_wildcardedname,fname) ;
+  }
+
+ /* and discover which drive the path references */
+ *drive = getDRIVE(&filename) ;
+ if (*drive == -1)
+  {
+   my_free(*DOSname) ;
+   *DOSname = NULL ;
+   return((int)-1) ;  /* error already defined */
+  }
+
+ tracef1("CheckDiscAndName: drive = %d\n",*drive) ;
+ /* This will have cached the disc information and referenced it
+  * with "dinfo". Release all the other (old) cached information. **TODO**
+  */
+ release_CLUSTER_cache(*drive) ;
+
+#ifdef BBCDFS
+ if (dinfo->dtype == fBBC)
+  {
+   *BDTflag = TRUE ;
+   if ((loop = RISCOStoBBC(filename,*DOSname,BBCside)) < 0)
+    {
+     /* failed to translate the filename */
+     my_free(*DOSname) ;
+     *DOSname = NULL ;
+     return_error1(int,err_notranslation,fname) ;
+    }
+   *leafname = *DOSname ;
+   return(0) ;
+  }
+ else
+  *BDTflag = FALSE ;            /* NOT a BBC disc */
+#endif /* BBCDFS */
+
+ /* convert the MS-DOS path to a RISC OS one */
+#ifdef ECOLINK
+ if (ecolink_naming)
+  {
+   /* ECOLINK style naming */
+   if ((ntinfo = convertRISCOStoDOS(filename,*DOSname)) < 0)
+    {
+     my_free(*DOSname) ;
+     *DOSname = NULL ;
+     return(-1) ;         /* error already defined */
+    }
+
+   if (ntinfo == noName)
+    {
+     my_free(*DOSname) ;
+     *DOSname = NULL ;
+     return_error1(int,err_notranslation,fname) ;
+    }
+
+   if (ntinfo == extTrans)
+    {
+     tracef0("CheckDiscAndName: pseudo-directory reference\n") ;
+     *type = isPSEUDODIR ;
+     *leafname = NULL ;
+     *cdir = NULL ;       /* no current directory */
+     return(0) ;
+    }
+  }
+ else /* Acorn style naming */
+  (void)convertRISCOStoDOS(filename,*DOSname) ;
+#else  /* ECOLINK */
+ (void)convertRISCOStoDOS(filename,*DOSname) ;
+#endif /* ECOLINK */
+
+ /* load the desired directory if required (also returns the leafname) */
+ if (lDIR)
+  {
+   tracef0("CheckDiscAndName: about to attempt to load directory\n") ;
+   resolvePATH(*DOSname,cdir,leafname,(DOSdisc *)dinfo->discdesc) ;
+   tracef1("CheckDiscAndName: cdir = &%08X\n",(word)*cdir) ;
+  }
+ else
+  {
+   /* we do NOT return these components */
+   *cdir = NULL ;
+   *leafname = NULL ;
+  }
+
+ tracef0("CheckDiscAndName: completed (returning 0)\n") ;
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+static void fs_update_loadexec(word ld,word ex,DOS_direntry *dentry)
+{
+ time5byte    updateTIME ;
+ int cROStype = ((ld & ADFStypemask) >> ADFStypeshift) ;
+
+ tracef1("fs_update_loadexec: cROStype = &%03X\n",cROStype) ;
+
+ if ((cROStype==DOStype) || (cROStype==ATARItype) || (cROStype==AMIGAtype))
+  {
+   erase_ROStype(dentry) ; /* remove any possible RISC OS file-type */
+  }
+ else
+  {
+   put_FILE_ROStype(dentry,cROStype) ;
+  }
+
+ /* update the timestamp */
+ updateTIME.lo = ex ;
+ updateTIME.hi = (ld & 0xFF) ;
+ put_FILE_time(dentry,RISCOStoTIME(&updateTIME)) ;
+ put_FILE_date(dentry,RISCOStoDATE(&updateTIME)) ;
+
+ return ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+static void fs_update_load(word ld,DOS_direntry *dentry)
+{
+ /* The load address under RISC OS forms part of the timestamp, and contains
+  * the file type information. Note: The rest of the timestamp is provided in
+  * the "exec" address, which we have NOT been given. It is therefore NOT
+  * possible for us to update just the "load" address part of the MSDOS
+  * timestamp.
+  */
+ /* However, if we are providing the RISC OS extensions, we can support the
+  * update of the file type information contained in the "load" address.
+  */
+ int cROStype = ((ld & ADFStypemask) >> ADFStypeshift) ;
+
+ tracef1("fs_update_load: cROStype = &%03X\n",cROStype) ;
+
+ if ((cROStype!=DOStype) && (cROStype!=ATARItype) && (cROStype!=AMIGAtype))
+  put_FILE_ROStype(dentry,cROStype) ;
+
+ return ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+static void fs_update_exec(word ex,DOS_direntry *dentry)
+{
+ /* The exec address under RISC OS forms part of the timestamp. Note: The
+  * rest of the timestamp is provided in the "load" address, which we have NOT
+  * been given. It is therefore NOT possible for us to update just the "exec"
+  * address part of the MSDOS timestamp.
+  */
+
+ /**** NULL operation ****/
+
+ return ;
+ UNUSED(ex) ;
+ UNUSED(dentry) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+static void fs_update_attr(word attr,DOS_direntry *dentry)
+{
+ if ((dentry->FILE_attribute & FILE_subdir) == 0)
+  dentry->FILE_attribute = RISCOStoDOSattributes(attr) ;
+ return ;
+}
+
+/*-------------------------------------------------------------------------*/
+/* write_loadexec: write the file load and exec addresses */
+
+static int write_loadexec(char *fname,word ld,word ex,char *SIF)
+{
+ objecttype    otype ;
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ int           drive ;
+ DOS_direntry *dentry ;
+ int           loop ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef3("write_loadexec: \"%s\" %08X %08X\n",((fname==NULL)?"":fname),ld,ex) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag == TRUE)
+  {
+   tracef0("write_loadexec: BBC format to be done\n") ;
+   return(0) ;
+  }
+
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  {
+   tracef0("write_loadexec: CheckDiscAndName failed\n") ;
+   return(-1) ;
+  }
+#endif /* BBCDFS */
+
+ /* search the directory for the named object */
+ loop = 0 ;
+ tracef1("write_loadexec: looking for leafname \"%s\"\n",leafname) ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   fs_update_loadexec(ld,ex,dentry) ;
+   cdir->dir_modified = -1 ; /* directory entry updated */
+
+   /* and then ensure the information back to the disc */
+   if (MakeConsistent(cdir) != 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     /* the error message should already be defined */
+     return(-1) ;
+    }
+  }
+ else
+  {
+   /* file not found in this directory */
+   tracef0("write_loadexec: file not found\n") ;
+
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return_error1(int,err_filenotfound,fname) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ tracef0("write_loadexec: completed\n") ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+static int display_directory_banner(DIR_info *cdir)
+{
+ /* display a suitable directory banner */
+ char ddrive = ((dinfo->drive != -1) ? (char)(dinfo->drive + '0') : '?') ;
+
+ tracef3("display_directory_banner: drive = %d, SIN = &%x, Size = &%x\n",cdir->dir_drive,cdir->dir_sector,cdir->dir_size) ;
+ /* The directory name field should be filled in. This will mean storing the
+  * leafname of the directory in the "DIR_info" structure. Also the names
+  * should be padded out to "DOSnamesize" and "discnamesize" width.
+  */
+ printf("Disc %s :%c  Dir. <Unset> :%d\n\n",dinfo->disc_name,ddrive,cdir->dir_drive) ;
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- EXPORTED functions ----------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/*- file operations (sequential and random access) ------------------------*/
+/*-------------------------------------------------------------------------*/
+
+fs_open_block *DOS_fs_open_file(word op,char *fname,int fshand,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ int           createfile = 0 ;
+ DOS_direntry *dentry ;
+ FILEdesc     *finfo = NULL ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef3("\n\nDOS_fs_open_file: op %d \"%s\" (fshand = &%08X)\n",op,fname,fshand) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return((fs_open_block *)-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return_error0(fs_open_block *,err_invalidopBBC) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_open_file: leafname = \"%s\"\n",leafname) ;
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+     tracef2("DOS_fs_open_file: loop %d = \"%s\"\n",loop,ROname) ;
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       if ((finfo = (FILEdesc *)my_malloc(sizeof(FILEdesc))) == NULL)
+        return_error0(fs_open_block *,err_heapexhausted) ;
+
+       finfo->nextfile = FILE_list ;
+       FILE_list = finfo ;
+       finfo->dtype = fBBC ;
+       finfo->optype = op ;
+       finfo->fs_handle = fshand ;
+       finfo->drive = drive ;
+       memmove((char *)finfo->discname,(char *)dinfo->disc_name,discnamesize) ;
+       finfo->bdisc = bdisc ;
+       {
+        char *namebuff = (char *)my_malloc(strlen(leafname) + 1) ;
+        if (namebuff != NULL)
+         bcopy(namebuff,leafname,(strlen(leafname) + 1)) ;
+        finfo->fname = namebuff ;
+       }
+       finfo->startCLUSTER = BBC_get_start(bdir,loop) ;
+       finfo->filelen = BBC_get_length(bdir,loop) ;
+       finfo->indexptr = 0 ;
+       finfo->currentCLUSTER = -1 ;
+       finfo->modified = 0 ;
+       finfo->filebuff = NULL ;
+       finfo->BBCside = BBCside ;
+
+       /* "dentry" references the directory entry */
+       fblock.inhand = (int)finfo ;
+       fblock.buffsize = 0x00000100 ;         /* 256bytes of buffer */
+       fblock.fileext = BBC_get_length(bdir,loop) ;
+       fblock.falloc = BBC_get_length(bdir,loop) ;
+       fblock.information = ((1 << 30) | ((op != 0) ? (1 << 31) : 0)) ;
+       break ;
+      }
+    }
+   return(&fblock) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return((fs_open_block *)-1) ;
+#endif /* BBCDFS */
+
+ if (otype == isPSEUDODIR)
+  {
+   if ((finfo = (FILEdesc *)my_malloc(sizeof(FILEdesc))) == NULL)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     return_error0(fs_open_block *,err_heapexhausted) ;
+    }
+
+   finfo->nextfile = FILE_list ;
+   FILE_list = finfo ;
+#ifdef BBCDFS
+   finfo->dtype = fDOS ;
+#endif
+   finfo->optype = op ;
+   finfo->fs_handle = fshand ;
+   finfo->drive = drive ;
+   memmove((char *)finfo->discname,(char *)dinfo->disc_name,discnamesize) ;
+   finfo->ddisc = (DOSdisc *)dinfo->discdesc ;
+   finfo->fname = NULL ;
+   finfo->startCLUSTER = -1 ;
+   finfo->filelen = 0 ;
+   finfo->indexptr = 0 ;
+   finfo->currentCLUSTER = -1 ;
+   finfo->modified = 0 ;
+   finfo->filebuff = NULL ;
+
+   fblock.inhand = (int)finfo ;
+   fblock.information = ((1 << 30) | (1 << 29)) ;
+   fblock.buffsize = 0 ;
+   fblock.fileext = 0 ;
+   fblock.falloc = 0 ;
+
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+
+   return(&fblock) ;
+  }
+
+ /* search the directory */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   tracef0("DOS_fs_open_file: object exists\n") ;
+
+   /* if "op == 1" then we must delete any old copy of the file first */
+   if (op == 1)
+    {
+     tracef0("DOS_fs_open_file: delete existing file to be done\n") ;
+
+     if ((dentry->FILE_attribute & FILE_subdir) != 0)
+      {
+       tracef0("DOS_fs_open_file: attempt to delete directory\n") ;
+       return_error1(fs_open_block *,err_notfile,fname) ;
+      }
+
+     dentry->FILE_status = FILE_deleted ;
+     cdir->dir_modified = -1 ; /* directory entry updated */
+     freeclusters(get_FILE_cluster(dentry),(DOSdisc *)dinfo->discdesc) ;
+    }
+  }
+ else
+  {
+   tracef0("DOS_fs_open_file: object doesn't exist\n") ;
+   if (op != 1)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     return_error1(fs_open_block *,err_filenotfound,fname) ;
+    }
+
+   tracef0("DOS_fs_open_file: create operation specified\n") ;
+   createfile = -1 ;
+  }
+
+ if (createfile != 0)
+  {
+   /* generate a directory entry for the file */
+   if (saveFILE(leafname,NULL,NULL,&cdir,1) < 0)
+    {
+     tracef0("DOS_fs_open_file: failed to save empty file\n") ;
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+     /* the error message should already be defined */
+     return((fs_open_block *)-1) ;
+    }
+  }
+
+ if ((dentry->FILE_attribute & FILE_subdir) == 1)
+  {
+   tracef0("DOS_fs_open_file: object is a directory\n") ;
+   fblock.information = ((1 << 30) | (1 << 29)) ;
+  }
+ else
+  fblock.information = ((1 << 30) | ((op != 0) ? (1 << 31) : 0)) ;
+
+ if ((finfo = (FILEdesc *)my_malloc(sizeof(FILEdesc))) == NULL)
+  return_error0(fs_open_block *,err_heapexhausted) ;
+
+ finfo->nextfile = FILE_list ;
+ FILE_list = finfo ;
+#ifdef BBCDFS
+ finfo->dtype = fDOS ;
+#endif
+ finfo->optype = op ;
+ finfo->fs_handle = fshand ;
+ finfo->drive = drive ;
+ finfo->ddisc = (DOSdisc *)dinfo->discdesc ;
+ {
+  char *namebuff = (char *)my_malloc(strlen(fname) + 1) ;
+  if (namebuff != NULL)
+   bcopy(namebuff,fname,(strlen(fname) + 1)) ;
+  finfo->fname = namebuff ;
+ }
+ finfo->startCLUSTER = get_FILE_cluster(dentry) ;
+ finfo->filelen = dentry->FILE_size ;
+ finfo->indexptr = 0 ;
+ finfo->currentCLUSTER = -1 ;
+ finfo->modified = 0 ;
+ finfo->filebuff = NULL ;
+
+ /* "dentry" references the directory entry */
+ fblock.inhand = (int)finfo ;
+ fblock.buffsize = 0x00000100 ;         /* 256bytes of buffer */
+ fblock.fileext = dentry->FILE_size ;
+ fblock.falloc = dentry->FILE_size ;
+
+ if (op != 0)   /* only need to update if we were creating */
+  {
+   if (MakeConsistent(cdir) < 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+     return_error0(fs_open_block *,err_updatefailed) ;
+    }
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(&fblock) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_get_bytes(int fhand,char *memaddr,word bytes,word foff)
+{
+ FILEdesc *finfo = (FILEdesc *)fhand ;
+ DOSdisc  *ddisc = NULL ;
+#ifdef BBCDFS
+ BBCdisc  *bdisc = NULL ;
+ int       BBCsidesize = 0 ;
+#endif /* BBCDFS */
+ word      allocsize ;
+ int       nextcluster ;
+ word      loop ;
+
+ tracef4("\n\nDOS_fs_get_bytes: &%08X (&%08X bytes to &%08X from &%08X)\n",fhand,bytes,memaddr,foff) ;
+
+ /* we should ensure that the correct disc is present in the drive */
+ /**** TODO ****/
+ /* this will lead to slow file updating/interrogation, since we will have
+  * to ascertain the format and load the boot block and root directory
+  * every time this function is called.
+  */
+
+#ifdef BBCDFS
+ if (finfo->dtype == fBBC)
+  {
+   tracef0("DOS_fs_get_bytes: BBC file\n") ;
+   bdisc = (finfo->bdisc) ;
+   BBCsidesize = (BBC_get_sechi(bdisc->side0) | bdisc->side0->dinfo2) ;
+   allocsize = bytespersec(bdisc->dr) ;
+  }
+ else
+  {
+   tracef0("DOS_fs_get_bytes: DOS file\n") ;
+   ddisc = (finfo->ddisc) ;
+   allocsize = secsalloc(ddisc) * bytespersec((&(ddisc->disc_record))) ;
+  }
+#else
+ tracef0("DOS_fs_get_bytes: DOS file\n") ;
+ ddisc = (finfo->ddisc) ;
+ allocsize = secsalloc(ddisc) * bytespersec((&(ddisc->disc_record))) ;
+#endif /* BBCDFS */
+
+ tracef1("DOS_fs_get_bytes: allocsize = &%08X\n",allocsize) ;
+
+ /* calculate the base cluster for the required data */
+ nextcluster = finfo->startCLUSTER ;
+#ifdef BBCDFS
+ if (finfo->dtype == fBBC)
+  {
+   if (foff >= finfo->filelen)
+    {
+     tracef0("DOS_fs_get_bytes: request is outside the file\n") ;
+     return_error0(int,err_EOF) ;
+    }
+   nextcluster = (nextcluster + (foff / allocsize)) ;   /* number of sectors */
+   loop = (foff % allocsize) ;  /* remainder */
+  }
+ else
+  {
+   loop = foff ;
+   while (loop >= allocsize)
+    {
+     if ((nextcluster = getnextCLUSTER(nextcluster,ddisc))>=CLUSTER_end(ddisc))
+      {
+       tracef1("DOS_fs_get_bytes: request is outside the file (nextcluster = &%03X)\n",nextcluster) ;
+       return_error0(int,err_EOF) ;       /* request outside file */
+      }
+     loop -= allocsize ;
+    }
+  }
+#else /* BBCDFS */
+ loop = foff ;
+ while (loop >= allocsize)
+  {
+   if ((nextcluster = getnextCLUSTER(nextcluster,ddisc))>=CLUSTER_end(ddisc))
+    {
+     tracef1("DOS_fs_get_bytes: request is outside the file (nextcluster = &%03X)\n",nextcluster) ;
+     return_error0(int,err_EOF) ;       /* request outside file */
+    }
+   loop -= allocsize ;
+  }
+#endif /* BBCDFS */
+
+ /* "loop" is the index into the "nextcluster" loaded */
+ tracef2("DOS_fs_get_bytes: nextcluster = &%03X (loop = &%08X)\n",nextcluster,loop) ;
+
+ /* check if request can be satisfied by the current buffer */
+ if (nextcluster != finfo->currentCLUSTER)
+  {
+   tracef0("DOS_fs_get_bytes: releasing the old buffer\n") ;
+   if (finfo->modified != 0)
+    {
+     tracef0("DOS_fs_get_bytes: ensure current buffer to the file\n") ;
+#ifdef BBCDFS
+     if (finfo->dtype == fBBC)
+      {
+       int BBCsector = finfo->currentCLUSTER + (BBCsidesize * finfo->BBCside) ;
+       if (BBC_RW(Wdata,bdisc->drive,BBCsector,(byte *)finfo->filebuff,allocsize,bdisc->dr) != 0)
+        return_error0(int,err_writefailed) ;
+      }
+     else
+      saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,ddisc) ;
+#else
+     saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,ddisc) ;
+#endif /* BBCDFS */
+    }
+
+   finfo->currentCLUSTER = -1 ;
+   finfo->modified = 0 ;
+   if (finfo->filebuff != NULL)
+    my_free(finfo->filebuff) ;
+   finfo->filebuff = NULL ;
+  }
+
+ while ((bytes != 0) && (nextcluster > 0))
+  {
+   /* calculate the number of bytes to read offset into this buffer */
+   int dbytes = (allocsize - loop) ;
+
+   tracef2("DOS_fs_get_bytes: dbytes = &%08X (bytes = &%08X)\n",dbytes,bytes) ;
+
+   if ((bytes < allocsize) || (dbytes < allocsize))
+    {
+     if (finfo->filebuff == NULL)
+      {
+       tracef0("DOS_fs_get_bytes: no buffer, allocating and loading\n") ;
+       if ((finfo->filebuff = (char *)my_malloc(allocsize)) == NULL)
+        return_error0(int,err_heapexhausted) ;
+       finfo->currentCLUSTER = nextcluster ;
+#ifdef BBCDFS
+       if (finfo->dtype == fBBC)
+        {
+         int BBCsector = nextcluster + (BBCsidesize * finfo->BBCside) ;
+         tracef0("DOS_fs_get_bytes: load next DFS sector\n") ;
+         if (BBC_RW(Rdata,bdisc->drive,BBCsector,(byte *)finfo->filebuff,allocsize,bdisc->dr) != 0)
+          return_error0(int,err_readfailed) ;
+         nextcluster++ ;
+        }
+       else
+        nextcluster = loadCLUSTER(nextcluster,finfo->filebuff,ddisc) ;
+#else
+       nextcluster = loadCLUSTER(nextcluster,finfo->filebuff,ddisc) ;
+#endif /* BBCDFS */
+       finfo->modified = 0 ;
+      }
+
+     if (bytes < dbytes)
+      dbytes = bytes ;
+
+     /* copy out of the buffer */
+     bcopy(memaddr,(char *)((int)finfo->filebuff + loop),bytes) ;
+    }
+   else
+    {
+     tracef0("DOS_fs_get_bytes: load directly to memory\n") ;
+     if (finfo->filebuff == NULL)
+      {
+#ifdef BBCDFS
+       if (finfo->dtype == fBBC)
+        {
+         int BBCsector = nextcluster + (BBCsidesize * finfo->BBCside) ;
+         tracef0("DOS_fs_get_bytes: load BBC sector\n") ;
+         if (BBC_RW(Rdata,bdisc->drive,BBCsector,(byte *)memaddr,allocsize,bdisc->dr) != 0)
+          return_error0(int,err_readfailed) ;
+         nextcluster++ ;
+        }
+       else
+        nextcluster = loadCLUSTERs(nextcluster,memaddr,(int)((bytes / allocsize) * allocsize),(word *)&dbytes,ddisc) ;
+#else
+       nextcluster = loadCLUSTERs(nextcluster,memaddr,(int)((bytes / allocsize) * allocsize),(word *)&dbytes,ddisc) ;
+#endif /* BBCDFS */
+      }
+     else
+      bcopy(memaddr,finfo->filebuff,allocsize) ;
+    }
+
+   if (nextcluster == -1)               /* CLUSTER load failed */
+    return_error0(int,err_readfailed) ;
+
+   tracef1("DOS_fs_get_bytes: data transferred (nextcluster = &%03X)\n",nextcluster) ;
+
+   bytes -= dbytes ;
+   memaddr += dbytes ;
+   finfo->indexptr += dbytes ;
+   loop = 0 ;                      /* after the first cluster we are aligned */
+  }
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_put_bytes(int fhand,char *memaddr,word bytes,word foff,char dbyte)
+{
+ FILEdesc *finfo = (FILEdesc *)fhand ;
+ DOSdisc  *ddisc = NULL ;
+#ifdef BBCDFS
+ BBCdisc  *bdisc = NULL ;
+ int       BBCsidesize = 0 ;
+#endif /* BBCDFS */
+ word      allocsize ;
+ int       nextcluster ;
+ word      loop ;
+
+ tracef4("\n\nDOS_fs_put_bytes: &%08X (&%08X bytes from &%08X at &%08X)\n",fhand,bytes,memaddr,foff) ;
+
+ /* we should ensure that the correct disc is in the drive */
+ /**** TODO ****/
+
+#ifdef BBCDFS
+ if (finfo->dtype == fBBC)
+  {
+   tracef0("DOS_fs_put_bytes: BBC file\n") ;
+   bdisc = (finfo->bdisc) ;
+   BBCsidesize = (BBC_get_sechi(bdisc->side0) | bdisc->side0->dinfo2) ;
+   allocsize = bytespersec(bdisc->dr) ;
+   tracef1("DOS_fs_put_bytes: bdisc = &%08X\n",(word)bdisc) ;
+   tracef1("DOS_fs_put_bytes: allocsize = &%08X\n",allocsize) ;
+  }
+ else
+  {
+   tracef0("DOS_fs_put_bytes: DOS file\n") ;
+   ddisc = (finfo->ddisc) ;
+   tracef1("DOS_fs_put_bytes: secsalloc(ddisc) = %d\n",secsalloc(ddisc)) ;
+   tracef1("DOS_fs_put_bytes: bytespersec(dr) = %d\n",bytespersec((&(ddisc->disc_record)))) ;
+   allocsize = secsalloc(ddisc) * bytespersec((&(ddisc->disc_record))) ;
+  }
+#else
+ tracef0("DOS_fs_put_bytes: DOS file\n") ;
+ ddisc = (finfo->ddisc) ;
+ tracef1("DOS_fs_put_bytes: secsalloc(ddisc) = %d\n",secsalloc(ddisc)) ;
+ tracef1("DOS_fs_put_bytes: bytespersec(dr) = %d\n",bytespersec((&(ddisc->disc_record)))) ;
+ allocsize = secsalloc(ddisc) * bytespersec((&(ddisc->disc_record))) ;
+#endif /* BBCDFS */
+
+ tracef1("DOS_fs_put_bytes: allocsize = &%08X\n",allocsize) ;
+
+ /* calculate the base cluster for the required data */
+ nextcluster = finfo->startCLUSTER ;
+#ifdef BBCDFS
+ if (finfo->dtype == fBBC)
+  {
+   if (foff >= finfo->filelen)
+    {
+     tracef0("DOS_fs_put_bytes: request is outside the file\n") ;
+     tracef0("DOS_fs_put_bytes: we are writing ... so extend the file\n") ;
+     return_error0(int,err_EOF) ;
+    }
+   nextcluster = (nextcluster + (foff / allocsize)) ;   /* number of sectors */
+   loop = (foff % allocsize) ;  /* remainder */
+  }
+ else
+  {
+   loop = foff ;
+   while (loop >= allocsize)
+    {
+     if ((nextcluster = getnextCLUSTER(nextcluster,ddisc))>=CLUSTER_end(ddisc))
+      {
+       tracef1("DOS_fs_put_bytes: request is outside the file (nextcluster = &%03X)\n",nextcluster) ;
+       return_error0(int,err_EOF) ;       /* request outside file */
+      }
+     loop -= allocsize ;
+    }
+  }
+#else
+ loop = foff ;
+ while (loop >= allocsize)
+  {
+   if ((nextcluster = getnextCLUSTER(nextcluster,ddisc))>=CLUSTER_end(ddisc))
+    {
+     tracef1("DOS_fs_put_bytes: request is outside the file (nextcluster = &%03X)\n",nextcluster) ;
+     return_error0(int,err_EOF) ;       /* request outside file */
+    }
+   loop -= allocsize ;
+  }
+#endif /* BBCDFS */
+
+ /* "loop" is the index into the "nextcluster" loaded */
+ tracef2("DOS_fs_put_bytes: nextcluster = &%03X (loop = &%08X)\n",nextcluster,loop) ;
+
+ while ((bytes != 0) && (nextcluster > 0))
+  {
+   /* calculate the number of bytes to write offset into this buffer */
+   int dbytes = (allocsize - loop) ;
+   tracef2("DOS_fs_put_bytes: dbytes = &%08X (bytes = &%08X)\n",dbytes,bytes) ;
+   if ((bytes < allocsize) || (dbytes < allocsize))
+    {
+     /* check if the request can be satisfied by the current buffer */
+     if ((nextcluster != finfo->currentCLUSTER) || (finfo->filebuff == NULL))
+      {
+       tracef0("DOS_fs_put_bytes: releasing the old buffer\n") ;
+       if ((finfo->modified != 0) && (finfo->filebuff != NULL))
+        {
+         tracef0("DOS_fs_put_bytes: ensure current buffer to the file\n") ;
+#ifdef BBCDFS
+         if (finfo->dtype == fBBC)
+          {
+           int BBCsector = finfo->currentCLUSTER+(BBCsidesize*finfo->BBCside);
+           if (BBC_RW(Wdata,bdisc->drive,BBCsector,(byte *)finfo->filebuff,allocsize,bdisc->dr) != 0)
+            return_error0(int,err_writefailed) ;
+          }
+         else
+          saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,ddisc) ;
+#else
+         saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,ddisc) ;
+#endif /* BBCDFS */
+        }
+       if (finfo->filebuff != NULL)
+        my_free(finfo->filebuff) ;
+       if ((finfo->filebuff = (char *)my_malloc(allocsize)) == NULL)
+        return_error0(int,err_heapexhausted) ;
+       finfo->currentCLUSTER = nextcluster ;
+       finfo->modified = 0 ;
+#ifdef BBCDFS
+       if (finfo->dtype == fBBC)
+        {
+         int BBCsector = nextcluster + (BBCsidesize * finfo->BBCside) ;
+         if (BBC_RW(Rdata,bdisc->drive,BBCsector,(byte *)finfo->filebuff,allocsize,bdisc->dr) != 0)
+           return_error0(int,err_readfailed) ;
+        }
+       else
+        loadCLUSTER(nextcluster,finfo->filebuff,ddisc) ;
+#else
+       loadCLUSTER(nextcluster,finfo->filebuff,ddisc) ;
+#endif /* BBCDFS */
+      }
+     if (bytes < dbytes)
+      dbytes = bytes ;
+     /* copy the data into the buffer */
+     bcopy((char *)((int)finfo->filebuff + loop),memaddr,bytes) ;
+     finfo->modified = -1 ;
+    }
+   else
+    {
+     tracef0("DOS_fs_put_bytes: write directly to the file\n") ;
+#ifdef BBCDFS
+     if (finfo->dtype == fBBC)
+      {
+       int BBCsector = nextcluster + (BBCsidesize * finfo->BBCside) ;
+       if (BBC_RW(Wdata,bdisc->drive,BBCsector,(byte *)memaddr,allocsize,bdisc->dr)!=0)
+        return_error0(int,err_writefailed) ;
+       nextcluster++ ;
+      }
+     else
+      nextcluster = saveCLUSTER(nextcluster,memaddr,ddisc) ;
+#else
+     nextcluster = saveCLUSTER(nextcluster,memaddr,ddisc) ;
+#endif /* BBCDFS */
+     finfo->modified = 0 ;
+     finfo->currentCLUSTER = -1 ;
+     if (finfo->filebuff != NULL)
+      my_free(finfo->filebuff) ;
+     finfo->filebuff = NULL ;
+    }
+
+   if (nextcluster == -1)       /* CLUSTER load failed */
+    return_error0(int,err_readfailed) ;
+
+   bytes -= dbytes ;
+   memaddr += dbytes ;
+   finfo->indexptr += dbytes ;
+   loop = 0 ;                   /* after first cluster we are aligned */
+  }
+
+ return(0) ;
+ UNUSED(dbyte) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOS_fs_read_ptr(int fhand)
+{
+ tracef1("\n\nDOS_fs_read_ptr: &%08X\n",fhand) ;
+ /* this should NOT be required for buffered files */
+ /* but highlight any use for the moment */
+ return_error0(word,err_opnotsupported) ;
+ UNUSED(fhand) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_write_ptr(int fhand,word sptr)
+{
+ tracef2("\n\nDOS_fs_write_ptr: &%08X (fileptr &%08X)\n",fhand,sptr) ;
+ /* this should NOT be required for buffered files */
+ /* but highlight any use for the moment */
+
+ /* If we do provide the functionality... this may possibly extend the
+  * file.
+  */
+
+ return_error0(int,err_opnotsupported) ;
+ UNUSED(fhand) ;
+ UNUSED(sptr) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOS_fs_read_extent(int fhand)
+{
+ tracef1("\n\nDOS_fs_read_extent: &%08X\n",fhand) ; 
+ /* this should NOT be required for buffered files */
+ /* but highlight any use for the moment */
+
+ /* returns where the furthest file pointer has reached (not necessarily the
+  * complete (CLUSTER multiple) allocation, nor the current indexptr).
+  */
+
+ return_error0(word,err_opnotsupported) ;
+ UNUSED(fhand) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_write_extent(int fhand,word fext)
+{
+ FILEdesc *finfo = (FILEdesc *)fhand ;
+
+ tracef2("\n\nDOS_fs_write_extent: &%08X (extent = &%08X)\n",fhand,fext) ;
+ /* This should NOT be required for buffered files */
+ /* Unfortunately Draw manages to call it (along with fs_ensure). */
+ /* We should really just update the file handle information, and not
+  * perform any real disc updates until the file is closed.
+  * Note: we may get called multiple times for a single "open" session.
+  *
+  * However, we should set the allocated file length to be required extent
+  * rounded up to the nearest cluster. We should set the file length in the
+  * directory entry to be exactly the required extent.
+  */
+ finfo->indexptr = fext ;
+
+ return(0) ;
+ UNUSED(fhand) ;
+ UNUSED(fext) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOS_fs_alloc(int fhand)
+{
+ tracef1("\n\nDOS_fs_alloc: &%08X\n",fhand) ;
+ return_error0(word,err_opnotsupported) ;
+ UNUSED(fhand) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_EOF(int fhand)
+{
+ tracef0("\n\nDOS_fs_EOF:\n") ;
+ /* this should NOT be required for buffered files */
+ /* but highlight any use for the moment */
+ return_error0(int,err_opnotsupported) ;
+ UNUSED(fhand) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_flush(int fhand)
+{
+ tracef1("\n\nDOS_fs_flush: &%08X\n",fhand) ;
+ /* this should NOT be required for buffered files */
+ /* but highlight any calls for the moment */
+ return_error0(int,err_opnotsupported) ;
+ UNUSED(fhand) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOS_fs_ensure(int fhand,word ensure)
+{
+ FILEdesc     *finfo = (FILEdesc *)fhand ;
+ DOSdisc      *ddisc = NULL ;       /* description of the disc */
+ int           num_clusters ;       /* number of clusters allocated to file */
+ int           free_clusters ;      /* number of free clusters in FAT */
+ int          *carray ;             /* array of FAT entries */
+ int           FATarraysize ;       /* size of the complete FAT */
+ int           FATentries ;         /* number of entries in a FAT */
+ int           CLUSTERsize ;        /* size of a CLUSTER */
+ int           CLUSTERs_required ;  /* size we need to ensure in CLUSTERs */
+ int           startCLUSTER ;       /* where the file starts */
+ int           loop ;               /* general loop counter */
+ DIR_info     *cdir ;               /* directory where file is held */
+ char         *leafname ;           /* used in updating the directory entry */
+ DOS_direntry *dentry ;             /* referenced directory entry */
+ int           drive ;              /* temporary drive reference */
+ char         *DOSname ;            /* temporary name translation space */
+#ifdef ECOLINK
+ transinfo  ntinfo ;                /* type of translated filename */
+#endif /* ECOLINK */
+
+ tracef2("\n\nDOS_fs_ensure: fh = &%08X, ensure size &%08X\n",fhand,ensure) ;
+
+#ifdef BBCDFS
+ if (finfo->dtype == fBBC)
+  return_error0(word,err_opnotsupported) ;
+#endif /* BBCDFS */
+
+ /* Ensure the file of the passed handle is at least "ensure" bytes long.
+  * We should return the number of bytes we did ensure.
+  */
+ tracef1("DOS_fs_ensure: file is currently &%08X bytes long\n",finfo->filelen);
+
+ if (finfo->filelen >= ensure)
+  {
+   tracef0("DOS_fs_ensure: file is already large enough\n") ;
+   return(0) ;
+  }
+
+ ddisc = finfo->ddisc ;
+ FATentries = ddisc->disc_FATentries ;
+ CLUSTERsize = cluster_size(&(ddisc->disc_boot.b.b)) ;
+ CLUSTERs_required = ((ensure + (CLUSTERsize - 1)) / CLUSTERsize) ;
+
+ tracef1("DOS_fs_ensure: CLUSTERs_required = %d\n",CLUSTERs_required) ;
+
+ /* calculate the number of FAT entries and create an array large enough to
+  * hold all the entries.
+  */
+ FATarraysize = ((FATentries + 1) * sizeof(int)) ;
+ if ((carray = (int *)my_malloc(FATarraysize)) == NULL)
+  {
+   tracef0("DOS_fs_ensure: unable to allocate memory for cluster chain\n") ;
+   return_error0(int,err_heapexhausted) ;
+  }
+
+ startCLUSTER = finfo->startCLUSTER ;
+ tracef1("DOS_fs_ensure: startCLUSTER = &%03X\n",startCLUSTER) ;
+
+ num_clusters = 0 ;
+ if (startCLUSTER < CLUSTER_end(ddisc))
+  {
+   /* get the number of CLUSTERs used */
+   num_clusters = buildusedchain(startCLUSTER,ddisc,carray) ;
+   tracef1("DOS_fs_ensure: number of CLUSTERs used = %d\n",num_clusters) ;
+  }
+
+ if (CLUSTERs_required > num_clusters)
+  {
+   tracef0("DOS_fs_ensure: more clusters required\n") ;
+   /* attach the free list to the used list */
+   if (num_clusters == 0)
+    free_clusters = buildfreechain(ddisc,&(carray[0]),FATentries) ;
+   else
+    free_clusters = buildfreechain(ddisc,&(carray[num_clusters-1]),FATentries);
+   if ((num_clusters + free_clusters) < CLUSTERs_required)
+    {
+     my_free(carray) ;
+     return_error0(int,err_discfull) ;
+    }
+  }
+   
+ /* terminate this free list at the point we need */
+ carray[CLUSTERs_required] = NULL ;
+ startCLUSTER = carray[0] ; /* the first chain entry */
+
+ if (startCLUSTER == NULL) /* zero length file */
+  startCLUSTER = CLUSTER_end(ddisc) ;
+
+ finfo->startCLUSTER = startCLUSTER ;
+ tracef1("DOS_fs_ensure: startCLUSTER = &%03X\n",startCLUSTER) ;
+ finfo->filelen = ensure ; /* new file size */
+ tracef2("DOS_fs_ensure: file \"%s\" directory entry size to be set to &%08X\n",finfo->fname,finfo->filelen) ;
+ tracef0("**** directory update should occur in the file close code ****\n") ;
+ drive = getDRIVE(&(finfo->fname)) ;
+ if (drive == -1)
+  {
+   my_free(carray) ;
+   return((int)-1) ;  /* error already defined */
+  }
+ /* convert the MS-DOS path to a RISC OS one */
+ if ((DOSname = (char *)my_malloc(MaxString)) == NULL)
+  {
+   my_free(carray) ;
+   return_error0(int,err_heapexhausted) ;
+  }
+#ifdef ECOLINK
+ if (ecolink_naming)
+  {
+   /* ECOLINK style naming */
+   if ((ntinfo = convertRISCOStoDOS(finfo->fname,DOSname)) < 0)
+    {
+     my_free(DOSname) ;
+     my_free(carray) ;
+     return(-1) ;         /* error already defined */
+    }
+   if (ntinfo == noName)
+    {
+     my_free(DOSname) ;
+     return_error1(int,err_notranslation,finfo->fname) ;
+    }
+   if (ntinfo == extTrans)
+    {
+     tracef0("CheckDiscAndName: pseudo-directory reference\n") ;
+     return(0) ;
+    }
+  }
+ else /* Acorn style naming */
+  (void)convertRISCOStoDOS(finfo->fname,DOSname) ;
+#else  /* ECOLINK */
+ (void)convertRISCOStoDOS(finfo->fname,DOSname) ;
+#endif /* ECOLINK */
+ resolvePATH(DOSname,&cdir,&leafname,ddisc) ;
+ /* update the directory entry */
+ loop = 0 ;
+ if ((dentry=findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   put_FILE_cluster(dentry,startCLUSTER) ;
+   dentry->FILE_size = finfo->filelen ;
+   cdir->dir_modified = -1 ; /* directory entry updated */
+  }
+ else
+  {
+   tracef0("DOS_fs_ensure: failed to find directory entry\n") ;
+   my_free(DOSname) ;
+   my_free(carray) ;
+   return_error1(int,err_filenotfound,finfo->fname) ;
+  }
+ my_free(DOSname) ;
+
+ /* claim the "carray" clusters from the FAT and build into a chain */
+ for (loop=0; (carray[loop] != NULL); loop++)
+  if (carray[loop + 1] == NULL)
+   writenextCLUSTER(carray[loop],CLUSTER_end(ddisc),ddisc) ;
+  else
+   writenextCLUSTER(carray[loop],carray[loop + 1],ddisc) ;
+
+ my_free(carray) ;
+ (void)MakeConsistent(cdir) ;
+ tracef0("DOS_fs_ensure: completed\n") ;
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_write_zeros(int fhand,word fptr,word bytes)
+{
+ FILEdesc *finfo = (FILEdesc *)fhand ;
+ DOSdisc  *ddisc = NULL ;
+#ifdef BBCDFS
+ BBCdisc  *bdisc = NULL ;
+ int       BBCsidesize = 0 ;
+#endif /* BBCDFS */
+ word      allocsize ;
+ int       nextcluster ;
+ word      loop ;
+ char     *memaddr ;
+
+ /* Write the required number of zeroes to the file */
+ tracef3("\n\nDOS_fs_write_zeros: &%08X (fptr &%08X bytes &%08X)\n",fhand,fptr,bytes) ;
+
+ /* NOTE: This bears a striking similarity to the put_bytes function. They
+  *       should be merged.
+  */
+
+ /* create a buffer of zeroes */
+ if ((memaddr = my_malloc(allocsize)) == NULL)
+  return_error0(int,err_heapexhausted) ;
+ bzero(memaddr,allocsize) ;
+
+#ifdef BBCDFS
+ if (finfo->dtype == fBBC)
+  {
+   tracef0("DOS_fs_write_zeros: BBC file\n") ;
+   bdisc = (finfo->bdisc) ;
+   BBCsidesize = (BBC_get_sechi(bdisc->side0) | bdisc->side0->dinfo2) ;
+   allocsize = bytespersec(bdisc->dr) ;
+   tracef1("DOS_fs_write_zeros: bdisc = &%08X\n",(word)bdisc) ;
+   tracef1("DOS_fs_write_zeros: allocsize = &%08X\n",allocsize) ;
+  }
+ else
+  {
+   tracef0("DOS_fs_write_zeros: DOS file\n") ;
+   ddisc = (finfo->ddisc) ;
+   tracef1("DOS_fs_write_zeros: secsalloc(ddisc) = %d\n",secsalloc(ddisc)) ;
+   tracef1("DOS_fs_write_zeros: bytespersec(dr) = %d\n",bytespersec((&(ddisc->disc_record)))) ;
+   allocsize = secsalloc(ddisc) * bytespersec((&(ddisc->disc_record))) ;
+  }
+#else
+ tracef0("DOS_fs_write_zeros: DOS file\n") ;
+ ddisc = (finfo->ddisc) ;
+ tracef1("DOS_fs_write_zeros: secsalloc(ddisc) = %d\n",secsalloc(ddisc)) ;
+ tracef1("DOS_fs_write_zeros: bytespersec(dr) = %d\n",bytespersec((&(ddisc->disc_record)))) ;
+ allocsize = secsalloc(ddisc) * bytespersec((&(ddisc->disc_record))) ;
+#endif /* BBCDFS */
+
+ tracef1("DOS_fs_write_zeros: allocsize = &%08X\n",allocsize) ;
+
+ /* calculate the base cluster for the required data */
+ nextcluster = finfo->startCLUSTER ;
+#ifdef BBCDFS
+ if (finfo->dtype == fBBC)
+  {
+   if (fptr >= finfo->filelen)
+    {
+     tracef0("DOS_fs_write_zeros: request is outside the file\n") ;
+     my_free(memaddr) ;
+     return_error0(int,err_EOF) ;
+    }
+   nextcluster = (nextcluster + (fptr / allocsize)) ;   /* number of sectors */
+   loop = (fptr % allocsize) ;  /* remainder */
+  }
+ else
+  {
+   loop = fptr ;
+   while (loop >= allocsize)
+    {
+     if ((nextcluster = getnextCLUSTER(nextcluster,ddisc))>=CLUSTER_end(ddisc))
+      {
+       tracef1("DOS_fs_write_zeros: request is outside the file (nextcluster = &%03X)\n",nextcluster) ;
+       my_free(memaddr) ;
+       return_error0(int,err_EOF) ;       /* request outside file */
+      }
+     loop -= allocsize ;
+    }
+  }
+#else
+ loop = fptr ;
+ while (loop >= allocsize)
+  {
+   if ((nextcluster = getnextCLUSTER(nextcluster,ddisc))>=CLUSTER_end(ddisc))
+    {
+     tracef1("DOS_fs_write_zeros: request is outside the file (nextcluster = &%03X)\n",nextcluster) ;
+     my_free(memaddr) ;
+     return_error0(int,err_EOF) ;       /* request outside file */
+    }
+   loop -= allocsize ;
+  }
+#endif /* BBCDFS */
+
+ /* "loop" is the index into the "nextcluster" loaded */
+ tracef2("DOS_fs_write_zeros: nextcluster = &%03X (loop = &%08X)\n",nextcluster,loop) ;
+
+ while ((bytes != 0) && (nextcluster > 0))
+  {
+   /* calculate the number of bytes to write offset into this buffer */
+   int dbytes = (allocsize - loop) ;
+   tracef2("DOS_fs_write_zeros: dbytes = &%08X (bytes = &%08X)\n",dbytes,bytes) ;
+   if ((bytes < allocsize) || (dbytes < allocsize))
+    {
+     /* check if the request can be satisfied by the current buffer */
+     if ((nextcluster != finfo->currentCLUSTER) || (finfo->filebuff == NULL))
+      {
+       tracef0("DOS_fs_write_zeros: releasing the old buffer\n") ;
+       if ((finfo->modified != 0) && (finfo->filebuff != NULL))
+        {
+         tracef0("DOS_fs_write_zeros: ensure current buffer to the file\n") ;
+#ifdef BBCDFS
+         if (finfo->dtype == fBBC)
+          {
+           int BBCsector = finfo->currentCLUSTER+(BBCsidesize*finfo->BBCside);
+           if (BBC_RW(Wdata,bdisc->drive,BBCsector,(byte *)finfo->filebuff,allocsize,bdisc->dr) != 0)
+            {
+             my_free(memaddr) ;
+             return_error0(int,err_writefailed) ;
+            }
+          }
+         else
+          saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,ddisc) ;
+#else
+         saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,ddisc) ;
+#endif /* BBCDFS */
+        }
+       if (finfo->filebuff != NULL)
+        my_free(finfo->filebuff) ;
+       if ((finfo->filebuff = (char *)my_malloc(allocsize)) == NULL)
+        {
+         my_free(memaddr) ;
+         return_error0(int,err_heapexhausted) ;
+        }
+       finfo->currentCLUSTER = nextcluster ;
+       finfo->modified = 0 ;
+#ifdef BBCDFS
+       if (finfo->dtype == fBBC)
+        {
+         int BBCsector = nextcluster + (BBCsidesize * finfo->BBCside) ;
+         if (BBC_RW(Rdata,bdisc->drive,BBCsector,(byte *)finfo->filebuff,allocsize,bdisc->dr) != 0)
+          {
+           my_free(memaddr) ;
+           return_error0(int,err_readfailed) ;
+          }
+        }
+       else
+        loadCLUSTER(nextcluster,finfo->filebuff,ddisc) ;
+#else
+       loadCLUSTER(nextcluster,finfo->filebuff,ddisc) ;
+#endif /* BBCDFS */
+      }
+     if (bytes < dbytes)
+      dbytes = bytes ;
+     /* copy the data into the buffer */
+     bzero((char *)((int)finfo->filebuff + loop),bytes) ;
+     finfo->modified = -1 ;
+    }
+   else
+    {
+     tracef0("DOS_fs_write_zeros: write directly to the file\n") ;
+#ifdef BBCDFS
+     if (finfo->dtype == fBBC)
+      {
+       int BBCsector = nextcluster + (BBCsidesize * finfo->BBCside) ;
+       if (BBC_RW(Wdata,bdisc->drive,BBCsector,(byte *)memaddr,allocsize,bdisc->dr)!=0)
+        {
+         my_free(memaddr) ;
+         return_error0(int,err_writefailed) ;
+        }
+       nextcluster++ ;
+      }
+     else
+      nextcluster = saveCLUSTER(nextcluster,memaddr,ddisc) ;
+#else
+     nextcluster = saveCLUSTER(nextcluster,memaddr,ddisc) ;
+#endif /* BBCDFS */
+     finfo->modified = 0 ;
+     finfo->currentCLUSTER = -1 ;
+     if (finfo->filebuff != NULL)
+      my_free(finfo->filebuff) ;
+     finfo->filebuff = NULL ;
+    }
+
+   if (nextcluster == -1)       /* CLUSTER load failed */
+    {
+     my_free(memaddr) ;
+     return_error0(int,err_readfailed) ;
+    }
+
+   bytes -= dbytes ;
+   finfo->indexptr += dbytes ;
+   loop = 0 ;                   /* after first cluster we are aligned */
+  }
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+fs_datestamp *DOS_fs_read_datestamp(int fhand)
+{
+ FILEdesc     *finfo = (FILEdesc *)fhand ;
+ fs_cat_entry *catinfo ;
+
+ tracef1("\n\nDOS_fs_read_datestamp: &%08X\n",fhand) ;
+
+ catinfo = DOS_fs_read_cat(finfo->fname,NULL) ;
+ if (catinfo != NULL)
+  {
+   tstamp.loadaddr = catinfo->loadaddr ;
+   tstamp.execaddr = catinfo->execaddr ;
+  }
+ else
+  {
+   tstamp.loadaddr = 0x00000000 ;
+   tstamp.execaddr = 0x00000000 ; /* this should possibly be "DEADDEAD" */
+  }
+
+ return(&tstamp) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_close_file(int fhand,word loadaddr,word execaddr)
+{
+ FILEdesc *finfo = NULL ;
+ FILEdesc *cptr = NULL ;
+
+ tracef3("\n\nDOS_fs_close_file: &%08X (ld = &%08X ex = &%08X)\n",fhand,loadaddr,execaddr) ;
+
+ /* NOTEs
+  * -----
+  * If this file was opened with a create operation (OPENOUT) then we should
+  * set the closed length to that of the current file pointer. This may
+  * involve releasing allocated CLUSTERs aswell as updating the directory
+  * information.
+  */
+
+ /* Search for the file descriptor that we are going to remove */
+ cptr = NULL ;
+ for (finfo = FILE_list; (finfo != NULL); finfo = finfo->nextfile)
+  {
+   if (finfo == (FILEdesc *)fhand)
+    {
+     tracef2("DOS_fs_close_file: handle found (filebuff = &%08X, modified = %d)\n",finfo->filebuff,finfo->modified) ;
+     tracef1("DOS_fs_close_file: open type = &%08X\n",finfo->optype) ;
+     if ((finfo->filebuff != NULL) && (finfo->modified != 0))
+      {
+       tracef0("DOS_fs_close_file: buffer needs to be written to the file\n") ;
+#ifdef BBCDFS
+       if (finfo->dtype == fBBC)
+        {
+         int BBCsidesize = (BBC_get_sechi(finfo->bdisc->side0) | finfo->bdisc->side0->dinfo2) ;
+         int BBCsector = finfo->currentCLUSTER + (BBCsidesize*finfo->BBCside) ;
+         if (BBC_RW(Wdata,finfo->bdisc->drive,BBCsector,(byte *)finfo->filebuff,bytespersec(finfo->bdisc->dr),finfo->bdisc->dr) != 0)
+          return_error0(int,err_writefailed) ;
+        }
+       else
+        saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,finfo->ddisc) ;
+#else
+       saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,finfo->ddisc) ;
+#endif /* BBCDFS */
+
+       finfo->modified = 0 ;
+       my_free(finfo->filebuff) ;
+       finfo->filebuff = NULL ;
+      }
+
+     {
+      int           CLUSTERsize ;
+      int           CLUSTERs_required ;
+      int          *carray ;
+      int           FATarraysize ;
+      int           FATentries = finfo->ddisc->disc_FATentries ;
+      DIR_info     *cdir = NULL ;
+      objecttype    otype ;
+      char         *DOSname ;
+      char         *leafname ;
+      int           drive ;
+      DOS_direntry *dentry ;
+      int           loop ;
+      int           startCLUSTER ;
+      int           num_clusters ;
+      int           free_clusters ;
+
+      tracef1("DOS_fs_close_file: indexptr = &%08X\n",finfo->indexptr) ;
+      /* update the directory entry file length ... if file opened with
+       * OPENOUT then we should truncate the file to the next cluster up
+       * from the indexptr (ie. release CLUSTERs no longer used)
+       */
+
+      if (CheckDiscAndName(TRUE,TRUE,finfo->fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+       {
+        tracef0("DOS_fs_close_file: failed CheckDiscAndName\n") ;
+        return((int)-1) ; /* error already defined */
+       }
+
+      /* consistency checks */
+      if (drive != finfo->drive)
+       {
+        tracef0("DOS_fs_close_file: drive numbers do not match\n") ;
+        /* we should generate a proper error number for this */
+        return_error0(int,err_discerror) ;
+       }
+
+      tracef1("DOS_fs_close_file: ddisc = &%08X\n",(int)(finfo->ddisc)) ;
+
+      CLUSTERsize = cluster_size(&(finfo->ddisc->disc_boot.b.b)) ;
+
+      tracef1("DOS_fs_close_file: CLUSTERsize = &%08X\n",CLUSTERsize) ;
+
+      CLUSTERs_required = ((finfo->indexptr + (CLUSTERsize-1)) / CLUSTERsize) ;
+
+      tracef1("DOS_fs_close_file: CLUSTERs_required = %d\n",CLUSTERs_required);
+      tracef1("DOS_fs_close_file: FATentries = %d\n",FATentries) ;
+
+      FATarraysize = ((FATentries + 1) * sizeof(int)) ;
+
+      tracef1("DOS_fs_close_file: attempt to malloc &%08X\n",FATarraysize) ;
+
+      if ((carray = (int *)my_malloc(FATarraysize)) == NULL)
+       {
+        tracef0("DOS_fs_close_file: no memory for cluster chain\n") ;
+        if (cdir != NULL)
+         my_free(cdir) ;
+        if (DOSname != NULL)
+         my_free(DOSname) ;
+        return_error0(int,err_heapexhausted) ;
+       }
+
+      loop = 0 ;
+      if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) == NULL)
+       {
+        tracef1("DOS_fs_close_file: \"%s\" not found\n",leafname) ;
+        if (cdir != NULL)
+         my_free(cdir) ;
+        if (DOSname != NULL)
+         my_free(DOSname) ;
+        return_error1(int,err_filenotfound,finfo->fname) ;
+       }
+
+      startCLUSTER = get_FILE_cluster(dentry) ;
+      /* construct a copy of the files cluster chain */
+      num_clusters = buildusedchain(startCLUSTER,finfo->ddisc,carray) ;
+
+      if (CLUSTERs_required > num_clusters)
+       {
+        tracef0("DOS_fs_close_file: more clusters required\n") ;
+        /* attach the free list to the used list */
+        free_clusters = buildfreechain(finfo->ddisc,&(carray[num_clusters - 1]),FATentries) ;
+
+        if ((num_clusters + free_clusters) < CLUSTERs_required)
+         {
+          my_free(carray) ;
+          if (cdir != NULL)
+           my_free(cdir) ;
+          if (DOSname != NULL)
+           my_free(DOSname) ;
+          return_error0(int,err_discfull) ;
+         }
+       }
+      else
+       {
+        tracef0("DOS_fs_close_file: clusters can be released\n") ;
+        /* free the excess CLUSTERs */
+        freeclusters(carray[CLUSTERs_required - 1],finfo->ddisc) ;
+       }
+
+      /* NOTE the new file length */
+      dentry->FILE_size = finfo->indexptr ;
+      cdir->dir_modified = -1 ; /* directory has been updated */
+
+      /* ensure the FATs and directory are updated onto the disc */
+      (void)MakeConsistent(cdir) ;
+
+      if (cdir != NULL)
+       my_free(cdir) ;
+      if (DOSname != NULL)
+       my_free(DOSname) ;
+     }
+
+     /* release other internal allocations */
+#ifdef BBCDFS
+     if ((finfo->fname != NULL) && (finfo->dtype == fDOS))
+#else
+     if (finfo->fname != NULL)
+#endif
+      {
+       tracef1("DOS_fs_close_file: filename \"%s\"\n",finfo->fname) ;
+       if ((loadaddr & ADFStimestamp) == ADFStimestamp)
+        write_loadexec(finfo->fname,loadaddr,execaddr,NULL) ;
+       /* NO action taken if we failed to update the load and exec addresses */
+       my_free(finfo->fname) ;
+      }
+
+     /* keep the list upto date */
+     if (cptr == NULL)
+      FILE_list = finfo->nextfile ;
+     else
+      cptr->nextfile = finfo->nextfile ;
+
+     my_free(finfo) ;
+     return(0) ;
+    }
+   cptr = finfo ;
+  }
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- Catalogue entry updating ----------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_write_cat(char *fname,word ld,word ex,word attr,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef4("\n\nDOS_fs_write_cat: \"%s\" (ld = &%08X, ex = &%08X, attr = &%08X)\n",fname,ld,ex,attr) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return(0) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_write_cat: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_write_cat: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       BBC_set_load(bdir,loop,ld) ;
+       BBC_set_exec(bdir,loop,ex) ;
+       if (attr & objectlocked)
+        bdir->fname[loop][7] |= BBC_lockbit ;
+       else
+        bdir->fname[loop][7] &= ~BBC_lockbit ;
+       /* and write the directory back to the disc */
+       ensureBBCdisc(bdisc,BBCside) ;
+       break ;
+      }
+    }
+   return(0) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return(-1) ;
+#endif /* BBCDFS */
+
+ if (otype == isPSEUDODIR)
+  {
+   tracef0("DOS_fs_write_cat: referenced object is a PSEUDO directory\n") ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return(0) ;
+  }
+
+ /* search the directory for the named object */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   fs_update_loadexec(ld,ex,dentry) ;
+   cdir->dir_modified = -1 ; /* directory entry updated */
+
+   /* and then ensure the information back to the disc */
+   if (MakeConsistent(cdir) != 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     /* the error message should already be defined */
+     return(-1) ;
+    }
+  }
+ else
+  {
+   /* file not found in this directory */
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error1(int,err_filenotfound,fname) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+ UNUSED(attr) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_write_load(char *fname,word ld,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef1("\n\nDOS_fs_write_load: \"%s\"\n",fname) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return(0) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_write_load: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_write_load: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       BBC_set_load(bdir,loop,ld) ;
+       /* and write the directory back to the disc */
+       ensureBBCdisc(bdisc,BBCside) ;
+       break ;
+      }
+    }
+   return(0) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return(-1) ;
+#endif
+
+ if (otype == isPSEUDODIR)
+  {
+   tracef0("DOS_fs_write_load: referenced object is a PSEUDO directory\n") ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return(0) ;
+  }
+
+ /* search the directory for the named object */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   fs_update_load(ld,dentry) ;
+   cdir->dir_modified = -1 ; /* directory entry updated */
+
+   /* and then ensure the information back to the disc */
+   if (MakeConsistent(cdir) != 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     /* the error message should already be defined */
+     return(-1) ;
+    }
+  }
+ else
+  {
+   /* file not found in this directory */
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error1(int,err_filenotfound,fname) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_write_exec(char *fname,word ex,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef1("\n\nDOS_fs_write_exec: \"%s\"\n",fname) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return(0) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_write_exec: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_write_exec: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       BBC_set_exec(bdir,loop,ex) ;
+       /* and write the directory back to the disc */
+       ensureBBCdisc(bdisc,BBCside) ;
+       break ;
+      }
+    }
+   return(0) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return(-1) ;
+#endif /* BBCDFS */
+
+ if (otype == isPSEUDODIR)
+  {
+   tracef0("DOS_fs_write_exec: referenced object is a PSEUDO directory\n") ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return(0) ;
+  }
+
+ /* search the directory for the named object */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   fs_update_exec(ex,dentry) ;
+   cdir->dir_modified = -1 ; /* directory entry updated */
+
+   /* and then ensure the information back to the disc */
+   if (MakeConsistent(cdir) != 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     /* the error message should already be defined */
+     return(-1) ;
+    }
+  }
+ else
+  {
+   /* file not found in this directory */
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error1(int,err_filenotfound,fname) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_write_attr(char *fname,word attr,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef1("\n\nDOS_fs_write_attr: \"%s\"\n",fname) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return(0) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_write_attr: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_write_attr: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       if (attr & objectlocked)
+        bdir->fname[loop][7] |= BBC_lockbit ;
+       else
+        bdir->fname[loop][7] &= ~BBC_lockbit ;
+       /* and write the directory back to the disc */
+       ensureBBCdisc(bdisc,BBCside) ;
+       break ;
+      }
+    }
+   return(0) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return(-1) ;
+#endif /* BBCDFS */
+
+ if (otype == isPSEUDODIR)
+  {
+   tracef0("DOS_fs_write_attr: referenced object is a PSEUDO directory\n") ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return(0) ;
+  }
+
+ /* search the directory for the named object */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   fs_update_attr(attr,dentry) ;
+   cdir->dir_modified = -1 ; /* directory entry updated */
+
+   /* and then ensure the information back to the disc */
+   if (MakeConsistent(cdir) != 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     /* the error message should already be defined */
+     return(-1) ;
+    }
+  }
+ else
+  {
+   /* file not found in this directory */
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error1(int,err_filenotfound,fname) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- Catalogue entry interrogation -----------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+fs_cat_entry *DOS_fs_read_cat(char *fname,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef1("\n\nDOS_fs_read_cat: \"%s\"\n",((fname == NULL) ? "" : fname)) ;
+
+ fcat.type = no_object ;
+ fcat.loadaddr = 0x00000000 ;
+ fcat.execaddr = 0x00000000 ;
+ fcat.filelen  = 0x00000000 ;
+ fcat.fileattr = 0x00000000 ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return((fs_cat_entry *)-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    {
+     /* pseudo-directory */
+     tracef0("DOS_fs_read_cat: BBC pseudo directory specified\n") ;
+     fcat.type = object_dir ;
+     fcat.fileattr = (ownerread|ownerwrite|publicread|publicwrite) ;
+     return(&fcat) ;
+    }
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_read_cat: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_read_cat: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       fcat.type     = object_file ;
+       fcat.loadaddr = BBC_get_load(bdir,loop) ;
+       fcat.execaddr = BBC_get_exec(bdir,loop) ;
+       fcat.filelen  = BBC_get_length(bdir,loop) ;
+       fcat.fileattr = (ownerread|ownerwrite|publicread|publicwrite) ;
+       if (bdir->fname[loop][7] & BBC_lockbit)
+        fcat.fileattr |= objectlocked ;
+       break ;
+      }
+    }
+
+   return(&fcat) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return((fs_cat_entry *)-1) ;
+#endif /* BBCDFS */
+
+ if (otype == isPSEUDODIR)
+  {
+   fcat.type = object_dir ;
+   fcat.fileattr = (ownerread | ownerwrite) ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return(&fcat) ;
+  }
+
+ /* search the directory */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   time5byte le ;
+   word      dosext = 0x00000000 ;
+
+   tracef0("DOS_fs_read_cat: file found\n") ;
+   tracef0("DOS_fs_read_cat: ECOLINK style naming to be done here\n") ;
+
+   if (buildFILEname(dentry,DOSname) != NULL)
+    (void)after((char *)&dosext,DOSname,file_sep,1) ;
+
+   MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+   {
+    int value = get_FILE_ROStype(dentry) ;
+    if (value != 0)
+     le.hi = (le.hi & ~ADFStypemask) | (value << 8) ;
+    else
+     {
+      mapentry *cmap ;
+      for (cmap = maplist; (cmap); cmap = cmap->next)
+       if (cmap->dosext == dosext)
+        {
+         le.hi = (le.hi & ~ADFStypemask) | (cmap->ROtype << 8) ;
+         break ;
+        }
+     }
+   }
+  
+   fcat.type = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+  
+   /* construct suitable RISC OS fields */
+   fcat.loadaddr = le.hi ;
+   fcat.execaddr = le.lo ;
+   fcat.filelen  = dentry->FILE_size ;
+   fcat.fileattr = DOStoRISCOSattributes(dentry) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ tracef1("DOS_fs_read_cat: %s\n",((fcat.type == no_object) ? "NOT FOUND" : "FOUND")) ;
+ tracef1("DOS_fs_read_cat: load = &%08X\n",fcat.loadaddr) ;
+ tracef1("DOS_fs_read_cat: exec = &%08X\n",fcat.execaddr) ;
+ tracef1("DOS_fs_read_cat: attr = &%08X\n",fcat.fileattr) ;
+ tracef1("DOS_fs_read_cat: size = &%08X\n",fcat.filelen) ;
+
+ return(&fcat) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- complete object operations --------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+fs_load_block *DOS_fs_load_file(char *fname,word maddr,word loadi,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef2("\n\nDOS_fs_load_file: filename = \"%s\" &%08X\n",fname,maddr) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return((fs_load_block *)-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return_error0(fs_load_block *,err_invalidopBBC) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_load_file: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_load_file: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       int   BBCsidesize = (BBC_get_sechi(bdisc->side0)|bdisc->side0->dinfo2);
+       int   secsize = bytespersec(bdisc->dr) ;
+       int   BBCsector = BBC_get_start(bdir,loop) + (BBCsidesize * BBCside) ;
+       int   whole = (BBC_get_length(bdir,loop) / secsize) ;
+       int   left = (BBC_get_length(bdir,loop) % secsize) ;
+       byte *buffer = (byte *)my_malloc(secsize) ;
+
+       tracef0("DOS_fs_load_file: file exists\n") ;
+       tracef0("DOS_fs_load_file: check that existing file is not open\n") ;
+
+       if (buffer == NULL)
+        return_error0(fs_load_block *,err_heapexhausted) ;
+
+       if (BBC_RW(Rdata,bdisc->drive,BBCsector,(byte *)maddr,(whole * secsize),bdisc->dr) != 0)
+        return_error0(fs_load_block *,err_readfailed) ;
+
+       if (left != 0)
+        {
+         if (BBC_RW(Rdata,bdisc->drive,BBCsector + whole,buffer,secsize,bdisc->dr) != 0)
+          return_error0(fs_load_block *,err_readfailed) ;
+         memcpy((char *)(maddr + (whole * secsize)),(char *)buffer,left) ;
+        }
+
+       my_free(buffer) ;
+
+       /* construct return information */
+       lblock.loadaddr   = BBC_get_load(bdir,loop) ;
+       lblock.execaddr   = BBC_get_exec(bdir,loop) ;
+       lblock.flength    = BBC_get_length(bdir,loop) ;
+       lblock.attributes = (ownerread|ownerwrite|publicread|publicwrite) ;
+       if (bdir->fname[loop][7] & BBC_lockbit)
+        lblock.attributes |= objectlocked ;
+
+       strcpy(tline,leafname) ;
+       lblock.fname = tline ;
+       return(&lblock) ;
+      }
+    }
+
+   return_error1(fs_load_block *,err_filenotfound,fname) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return((fs_load_block *)-1) ;
+#endif
+
+ tracef1("DOS_fs_load_file: we should not ignore the load flags (&%08X)\n",loadi) ;
+
+ tracef1("DOS_fs_load_file: leafname = \"%s\"\n",leafname) ;
+
+ /* start at the beginning of the directory */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   time5byte  le ;
+   char      *cfile = buildFILEname(dentry,NULL) ;
+   word       dosext = 0x00000000 ;
+
+   tracef0("DOS_fs_load_file: file found\n") ;
+
+   (void)after((char *)&dosext,cfile,file_sep,1) ;
+
+   if (loadOBJECT(get_FILE_cluster(dentry),(char *)maddr,dentry->FILE_size,(DOSdisc *)dinfo->discdesc) < 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     /* error message should already be defined */
+     return((fs_load_block *)-1) ;
+    }
+
+   convertDOStoRISCOS(cfile,DOSname) ;
+   my_free(cfile) ;
+   strcpy(tline,DOSname) ;
+
+   MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+   {
+    int value = get_FILE_ROStype(dentry) ;
+    if (value != 0)
+     le.hi = (le.hi & ~ADFStypemask) | (value << 8) ;
+    else
+     {
+      mapentry *cmap ;
+      for (cmap = maplist; (cmap); cmap = cmap->next)
+       if (cmap->dosext == dosext)
+        {
+         le.hi = (le.hi & ~ADFStypemask) | (cmap->ROtype << 8) ;
+         break ;
+        }
+     }
+   }
+  
+   /* construct return information */
+   lblock.loadaddr   = le.hi ;
+   lblock.execaddr   = le.lo ;
+   lblock.flength    = dentry->FILE_size ;
+   lblock.attributes = DOStoRISCOSattributes(dentry) ;
+   lblock.fname      = tline ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(&lblock) ;
+
+ UNUSED(loadi) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+char *DOS_fs_save_file(char *fn,word ld,word ex,word start,word end,char *SIF)
+{
+ DIR_info   *cdir ;
+ char       *DOSname ;
+ char       *leafname ;
+ objecttype  otype ;
+ int         drive ;
+#ifdef BBCDFS
+ int         loop ;
+ int         BDTflag = FALSE ;
+ int         BBCside ;
+#endif /* BBCDFS */
+
+ tracef1("\n\nDOS_fs_save_file: \"%s\"\n",fn) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fn,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return((char *)-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+   int          startsector ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return_error0(char *,err_invalidopBBC) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_save_file: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_save_file: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       tracef0("DOS_fs_save_file: file exists\n") ;
+       /* we cheat by deleting this file from the directory. NOTE:
+        * we are not writing this intermediate copy back, so if we fail
+        * later due to lack of disc space, the directory is preserved.
+        */
+       tracef0("DOS_fs_save_file: check that existing file is not open\n") ;
+       BBCdeleteentry(bdir,loop) ;
+       break ;
+      }
+    }
+
+   if ((bdir->centries >> 3) == 31)
+    return_error0(char *,err_dirfull) ;
+
+   if ((startsector = findBBCspace(bdisc,BBCside,(end - start))) == -1)
+    return_error0(char *,err_discfull) ;
+
+   tracef1("DOS_fs_save_file: space starts at sector %d\n",startsector) ;
+   /* save the data to the file */
+   {
+    int   BBCsidesize = (BBC_get_sechi(bdisc->side0) | bdisc->side0->dinfo2) ;
+    int   secsize = bytespersec(bdisc->dr) ;
+    int   BBCsector = startsector + (BBCsidesize * BBCside) ;
+    int   whole = ((end - start) / secsize) ;    /* whole number of sectors */
+    int   left = ((end - start) % secsize) ;
+    byte *buffer = (byte *)my_malloc(secsize) ;
+
+    if (buffer == NULL)
+     return_error0(char *,err_heapexhausted) ;
+
+    if (BBC_RW(Wdata,bdisc->drive,BBCsector,(byte *)start,(whole * secsize),bdisc->dr) != 0)
+     return_error0(char *,err_writefailed) ;
+
+    if (left != 0)
+     {
+      memcpy((char *)buffer,(char *)(start + (whole * secsize)),left) ;
+      if (BBC_RW(Wdata,bdisc->drive,BBCsector + whole,buffer,secsize,bdisc->dr) != 0)
+       return_error0(char *,err_writefailed) ;
+     }
+
+    my_free(buffer) ;
+   }
+
+   /* create a new directory entry at the end of the directory */
+   bdir->fname[(bdir->centries >> 3)][7] = leafname[0] ;
+   for (loop = 0; (loop < 7); loop++)
+    {
+     if (leafname[loop + 1] == NULL)
+      break ;
+     bdir->fname[(bdir->centries >> 3)][loop] = leafname[loop + 1] ;
+    }
+   for (; (loop < 7); loop++)
+    bdir->fname[(bdir->centries >> 3)][loop] = ' ' ;
+
+   BBC_set_load(bdir,(bdir->centries >> 3),ld) ;
+   BBC_set_exec(bdir,(bdir->centries >> 3),ex) ;
+   BBC_set_length(bdir,(bdir->centries >> 3),(end - start)) ;
+   BBC_set_start(bdir,(bdir->centries >> 3),startsector) ;
+
+   bdir->centries += 8 ;
+
+   /* and write the directory back to the disc */
+   ensureBBCdisc(bdisc,BBCside) ;
+
+   sprintf(tline,"%s",leafname) ;
+   return(tline) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fn,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return((char *)-1) ;
+#endif /* BBCDFS */
+
+ tracef1("DOS_fs_save_file: leafname = \"%s\"\n",leafname) ;
+
+ /* call the "saveFILE" primitive to perform the save operation */
+ if (saveFILE(leafname,(char *)start,(end - start),&cdir,0) < 0)
+  {
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   /* the error message should already be defined */
+   return((char *)-1) ;
+  }
+
+ /* NOTE: the "saveFILE" primitive used above will automatically have set
+  *       the files datestamp to the current date, plus also set the
+  *       archive bit.
+  */
+
+ /* if save successful then update the FILEs directory information */
+ /* If the filetype is NOT one of "DOStype" "ATARItype" or "AMIGAtype" then
+  * preserve the value in the directory entry
+  */
+ if ((ld & ADFStimestamp) == ADFStimestamp)
+  if (write_loadexec(fn,ld,ex,SIF) != 0)
+   {
+    if (cdir != NULL)
+     my_free(cdir) ;
+    if (DOSname != NULL)
+     my_free(DOSname) ;
+
+    return_error1(char *,err_savefailed,fn) ;
+   }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ /* this information is dependant on the "OPT 1 x" setting */
+ sprintf(tline,"%s",leafname) ;
+
+ return(tline) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+char *DOS_fs_create(char *fname,word ld,word ex,word start,word end,char *SIF)
+{
+ DIR_info   *cdir ;
+ char       *DOSname ;
+ char       *leafname ;
+ objecttype  otype ;
+ int         drive ;
+#ifdef BBCDFS
+ int         loop ;
+ int         BDTflag = FALSE ;
+ int         BBCside ;
+#endif /* BBCDFS */
+
+ tracef2("\n\nDOS_fs_create: \"%s\" (length = &%08X)\n",fname,(end - start)) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return((char *)-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+   int          startsector ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return_error0(char *,err_invalidopBBC) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_create: leafname = \"%s\"\n",leafname) ;
+
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_create: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       tracef0("DOS_fs_create: file exists\n") ;
+       /* we cheat by deleting this file from the directory. NOTE:
+        * we are not writing this intermediate copy back, so if we fail
+        * later due to lack of disc space, the directory is preserved.
+        */
+       tracef0("DOS_fs_create: check that existing file is not open\n") ;
+       BBCdeleteentry(bdir,loop) ;
+       break ;
+      }
+    }
+
+   if ((bdir->centries >> 3) == 31)
+    return_error0(char *,err_dirfull) ;
+
+   if ((startsector = findBBCspace(bdisc,BBCside,(end - start))) == -1)
+    return_error0(char *,err_discfull) ;
+
+   tracef1("DOS_fs_create: space starts at sector %d\n",startsector) ;
+
+   /* create a new directory entry at the end of the directory */
+   bdir->fname[(bdir->centries >> 3)][7] = leafname[0] ;
+   for (loop = 0; (loop < 7); loop++)
+    {
+     if (leafname[loop + 1] == NULL)
+      break ;
+     bdir->fname[(bdir->centries >> 3)][loop] = leafname[loop + 1] ;
+    }
+   for (; (loop < 7); loop++)
+    bdir->fname[(bdir->centries >> 3)][loop] = ' ' ;
+
+   BBC_set_load(bdir,(bdir->centries >> 3),ld) ;
+   BBC_set_exec(bdir,(bdir->centries >> 3),ex) ;
+   BBC_set_length(bdir,(bdir->centries >> 3),(end - start)) ;
+   BBC_set_start(bdir,(bdir->centries >> 3),startsector) ;
+
+   bdir->centries += 8 ;
+
+   /* and write the directory back to the disc */
+   ensureBBCdisc(bdisc,BBCside) ;
+
+   sprintf(tline,"%s",leafname) ;
+   return(tline) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return((char *)-1) ;
+#endif /* BBCDFS */
+
+ tracef1("DOS_fs_create: leafname = \"%s\"\n",leafname) ;
+
+ /* call the "saveFILE" primitive to perform the create operation */
+ if (saveFILE(leafname,(char *)start,(end - start),&cdir,1) < 0)
+  {
+   tracef0("DOS_fs_create: failed to save empty file\n") ;
+
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   /* the error message should already be defined */
+   return((char *)-1) ;
+  }
+
+ /* NOTE: the "saveFILE" primitive used above will automatically have set
+  *       the files datestamp to the current date, plus also set the
+  *       archive bit.
+  */
+
+ /* If save successful then update the FILEs directory information. */
+ /* If the filetype is NOT one of "DOStype" "ATARItype" or "AMIGAtype" then
+  * preserve the value in the directory entry.
+  */
+ if ((ld & ADFStimestamp) == ADFStimestamp)
+  {
+   tracef0("DOS_fs_create: about to write load and exec addresses\n") ;
+   if (write_loadexec(fname,ld,ex,SIF) != 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+
+     return_error1(char *,err_savefailed,fname) ;
+    }
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ /* this information is dependant on the "OPT 1 x" setting */
+ sprintf(tline,"%s",leafname) ;
+ tracef1("DOS_fs_create: tline = \"%s\"\n",tline) ;
+ return(tline) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_create_dir(char *fname,word size,char *SIF)
+{
+ DIR_info   *cdir ;
+ char       *DOSname ;
+ char       *leafname ;
+ objecttype  otype ;
+ int         drive ;
+#ifdef BBCDFS
+ int         BDTflag = FALSE ;
+ int         BBCside ;
+#endif /* BBCDFS */
+
+ tracef1("\n\nDOS_fs_create_dir: \"%s\"\n",fname) ;
+
+ /* Adding a directory consists of finding a free directory entry in the
+  * parent directory, and then attaching a couple of clusters to the created
+  * entry.
+  * If a file exists with the same name this is an error.
+  * If a directory already exists with the same name, no error is generated.
+  */
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag)
+  {
+   tracef0("DOS_fs_create_dir: not provided on BBC discs\n") ;
+   return_error0(int,err_notsupportedBBC) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return(-1) ;
+#endif /* BBCDFS */
+
+ tracef1("DOS_fs_create_dir: leafname = \"%s\"\n",leafname) ;
+
+ if (makeDIR(leafname,cdir,(DOSdisc *)dinfo->discdesc) != 0)
+  {
+   tracef0("DOS_fs_create_dir: failed to create directory\n") ;
+
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return(-1) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(size) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- directory update ------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+fs_cat_entry *DOS_fs_delete(char *fname,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif
+
+ tracef1("\n\nDOS_fs_delete: \"%s\"\n",fname) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return((fs_cat_entry *)-1) ;
+#else
+ if (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return((fs_cat_entry *)-1) ;
+#endif /* BBCDFS */
+
+ /* default */
+ fcat.type = no_object ;
+
+#ifdef BBCDFS
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return_error0(fs_cat_entry *,err_invalidopBBC) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_delete: leafname = \"%s\"\n",leafname) ;
+
+   /* Check that the directory entry exists */
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_delete: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       /*** TODO *** Check that the file is NOT opened */
+       tracef0("DOS_fs_delete: check file is not already opened\n") ;
+
+       fcat.type     = object_file ;
+       fcat.loadaddr = BBC_get_load(bdir,loop) ;
+       fcat.execaddr = BBC_get_exec(bdir,loop) ;
+       fcat.filelen  = BBC_get_length(bdir,loop) ;
+       fcat.fileattr = (ownerread|ownerwrite|publicread|publicwrite) ;
+       if (bdir->fname[loop][7] & BBC_lockbit)
+        return_error1(fs_cat_entry *,err_locked,fname) ;
+
+       BBCdeleteentry(bdir,loop) ;
+       ensureBBCdisc(bdisc,BBCside) ;
+       break ;
+      }
+    }
+
+   return(&fcat) ;
+  }
+#endif /* BBCDFS */
+
+ if (otype == isPSEUDODIR)
+  {
+   tracef0("DOS_fs_delete: attempt to delete pseudo-directory\n") ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   /* default information */
+   fcat.type     = object_dir ;
+   fcat.loadaddr = 0x00000000 ;
+   fcat.execaddr = 0x00000000 ;
+   fcat.filelen  = 0x00000000 ;
+   fcat.fileattr = 0x00000000 ;
+
+   return(&fcat) ;
+  }
+
+ tracef1("DOS_fs_delete: leafname = \"%s\"\n",leafname) ;
+
+ /* search the directory */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) != NULL)
+  {
+   time5byte le ;
+   word      dosext = 0x00000000 ;
+
+   tracef0("DOS_fs_delete: file found\n") ;
+
+   if ((dentry->FILE_attribute & FILE_subdir) != 0)
+    {
+     /* check that the directory is empty */
+     DIR_info *subdir ;
+     char     *subleafname ;
+
+     tracef0("DOS_fs_delete: attempt to delete directory\n") ;
+     tracef1("DOS_fs_delete: DOSname  = \"%s\"\n",DOSname) ;
+     tracef1("DOS_fs_delete: leafname = \"%s\"\n",leafname) ;
+
+     /* At the moment "resolvePATH" has special code to deal with the
+      * single entry in ROOT. We need to simulate that here.
+      */
+     if (my_strcmp(&DOSname[1],leafname) == 0) /* special bodge */
+      sprintf(DOSname,"%s\\*.*",DOSname) ;
+     else
+      sprintf(DOSname,"%s\\%s\\*.*",DOSname,leafname) ;
+
+     /* load the desired directory, returning the leafname "*.*" */
+     resolvePATH(DOSname,&subdir,&subleafname,(DOSdisc *)dinfo->discdesc) ;
+     loop = 0 ;
+     tracef1("DOS_fs_delete: subleafname = \"%s\"\n",subleafname) ;
+     if (findDIRentry(subleafname,&(subdir->dir_entries[0]),&loop) != NULL)
+      {
+       tracef0("DOS_fs_delete: attempt to delete non-empty directory\n") ;
+
+       if (subdir != NULL)
+        my_free(subdir) ;
+       if (subleafname != NULL)
+        my_free(subleafname) ;
+       if (cdir != NULL)
+        my_free(cdir) ;
+       if (DOSname != NULL)
+        my_free(DOSname) ;
+
+       return_error1(fs_cat_entry *,err_notempty,fname) ;
+      }
+     if (subdir != NULL)
+      my_free(subdir) ;
+     if (subleafname != NULL)
+      my_free(subleafname) ;
+    }
+
+   /* We have found the file directory entry, so remove the directory entry
+    * and then release the cluster chain associated with the object.
+    * RISC OS expects a description of the object deleted to be returned.
+    */
+   (void)buildFILEname(dentry,DOSname) ;
+   (void)after((char *)&dosext,DOSname,file_sep,1) ;
+
+   /* construct return information */
+   MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+   {
+    int value = get_FILE_ROStype(dentry) ;
+    if (value != 0)
+     le.hi = (le.hi & ~ADFStypemask) | (value << 8) ;
+    else
+     {
+      mapentry *cmap ;
+      for (cmap = maplist; (cmap); cmap = cmap->next)
+       if (cmap->dosext == dosext)
+        {
+         le.hi = (le.hi & ~ADFStypemask) | (cmap->ROtype << 8) ;
+         break ;
+        }
+     }
+   }
+
+   fcat.type     = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+   fcat.loadaddr = le.hi ;
+   fcat.execaddr = le.lo ;
+   fcat.filelen  = dentry->FILE_size ;
+   fcat.fileattr = DOStoRISCOSattributes(dentry) ;
+
+   dentry->FILE_status = FILE_deleted ;
+   freeclusters(get_FILE_cluster(dentry),(DOSdisc *)dinfo->discdesc) ;
+   cdir->dir_modified = -1 ; /* directory entry updated */
+
+   if (MakeConsistent(cdir) < 0)
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+     return_error0(fs_cat_entry *,err_updatefailed) ;
+    }
+
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return(&fcat) ;
+  }
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return_error1(fs_cat_entry *,err_filenotfound,fname) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOS_fs_rename(char *oldname,char *newname,char *oldSIF,char *newSIF)
+{
+ DIR_info     *cdir ;
+ DIR_info     *ndir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           newdrive ;
+ int           loop ;
+ DOS_direntry *dentry ;
+ DOS_direntry *found ;
+ char         *cfile ;
+ FILEdesc     *cfhand = FILE_list ;
+ int           diffdir = FALSE ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef2("\n\nDOS_fs_rename: \"%s\" to \"%s\"\n",oldname,newname) ;
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,oldname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag)
+  {
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   if ((BBCside == -1) || ((leafname == NULL) || (*leafname == NULL)))
+    return_error0(word,err_invalidopBBC) ;
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef1("DOS_fs_rename: leafname = \"%s\"\n",leafname) ;
+
+   /* Check to see if a file of the destination name already exists */
+   for (loop = 0; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+
+     tracef2("DOS_fs_rename: loop %d = \"%s\"\n",loop,ROname) ;
+
+     if (wild_card_compare(leafname,ROname) == TRUE)
+      {
+       /*** TODO *** Check that the file is NOT opened */
+       tracef0("DOS_fs_rename: check file is not already opened\n") ;
+
+       /* Check if we are allowed to rename the object */
+       if (bdir->fname[loop][7] & BBC_lockbit)
+        return_error1(word,err_locked,oldname) ;
+
+       /* update the directory entry */
+       RISCOStoBBC(newname,ROname,&BBCside) ;
+
+       /* copy the name over the directory entry (padding with NULLs) */
+       tracef1("DOS_fs_rename: write \"%s\" into directory\n",ROname) ;
+       {
+        int iloop ;
+        bdir->fname[loop][7] = ROname[0] ;  /* directory */
+        for (iloop = 0; ((iloop < 7) && (ROname[iloop + 1] != '\0')); iloop++)
+         bdir->fname[loop][iloop] = ROname[iloop + 1] ;
+        for (;(iloop < 7); iloop++)
+         bdir->fname[loop][iloop] = ' ' ;
+       }
+
+       /* and ensure the disc is upto date */
+       ensureBBCdisc(bdisc,BBCside) ;
+       break ; /* for loop */
+      }
+    }
+   if (loop == (bdir->centries >> 3))
+    return_error1(word,err_filenotfound,oldname) ;
+   return(0) ;
+  }
+#else
+ if (CheckDiscAndName(TRUE,TRUE,oldname,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return(-1) ;
+#endif /* BBCDFS */
+
+ tracef1("DOS_fs_rename: leafname = \"%s\"\n",leafname) ;
+
+ /* start at the beginning of the directory */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(cdir->dir_entries[0]),&loop)) == NULL)
+  {
+   tracef0("fs_rename: file not found\n") ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error1(word,err_filenotfound,oldname) ;
+  }
+
+ found = dentry ;
+
+#if 0 /* not required */
+ if ((cfile = buildFILEname(found,NULL)) == NULL)
+  {
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error0(word,err_heapexhausted) ;
+  }
+
+ tracef1("fs_rename: found directory entry \"%s\"\n",cfile) ;
+#endif
+
+ /* check that no wildcard characters exist in either leafname */
+ if (checknotwildcarded(leafname) != 0)     /* original name */
+  {
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error1(word,err_wildcardedname,oldname) ;
+  }
+
+ /* check if source file is open ("found" describes the file) */
+ for (cfhand = FILE_list; (cfhand != NULL); cfhand = cfhand->nextfile)
+  {
+   if ((cfhand->drive == drive) && (cfhand->startCLUSTER == get_FILE_cluster(found)))
+    {
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+     return_error1(word,err_alreadyopen,oldname) ;
+    }
+  }
+
+ tracef0("fs_rename: file is NOT currently open\n") ;
+
+ /* This code assumes that the new name does NOT contain a drive specifier.
+  * We should possibly call "getDRIVE" to remove the drive specifier and to
+  * ensure that the requested disc and pathname is the same as the original.
+  */
+ tracef0("DOS_fs_rename: *** TODO *** check disc is the same\n") ;
+
+ cfile = newname ;
+ if ((newdrive = getDRIVE(&cfile)) == -1)
+  {
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return((word)-1) ;  /* error already defined */
+  }
+
+ (void)convertRISCOStoDOS(cfile,DOSname) ;
+
+ if (checknotwildcarded(DOSname) != 0)  /* new name */
+  {
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error1(word,err_wildcardedname,newname) ;
+  }
+
+ /* check to see if we already have a file with the destination name */
+ /* load the desired directory, and return the leafname */
+ resolvePATH(DOSname,&ndir,&leafname,(DOSdisc *)dinfo->discdesc) ;
+
+ tracef1("fs_rename: new leafname \"%s\"\n",leafname) ;
+
+ /* start at the beginning of the directory */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,&(ndir->dir_entries[0]),&loop)) != NULL)
+  {
+   /* new name already exists in the destination directory */
+
+   if (ndir != NULL)
+    my_free(ndir) ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+
+   return_error0(word,err_alreadyexists) ;
+  }
+
+ /* check for the objects being on different drives or discs */
+ if ((drive != newdrive) || (strcmp((char *)cdir->dir_discname,(char *)ndir->dir_discname) != 0))
+  {
+   tracef0("DOS_fs_rename: directories are on different discs\n") ;
+   if (ndir != NULL)
+    my_free(ndir) ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   return_error0(word,err_badrename) ;
+  }
+
+ /* we should deal with the case where the objects are in different dirs */
+ if ((cdir->dir_root!=ndir->dir_root) || (cdir->dir_sector!=ndir->dir_sector))
+  {
+   int cattr = found->FILE_attribute ;
+
+   tracef0("DOS_fs_rename: different directories\n") ;
+   tracef3("old directory info: root %d, drive %d, sector %d\n",cdir->dir_root,cdir->dir_drive,cdir->dir_sector) ;
+   tracef3("new directory info: root %d, drive %d, sector %d\n",ndir->dir_root,ndir->dir_drive,ndir->dir_sector) ;
+
+   /* found = original name entry */
+   found->FILE_status = FILE_deleted ;
+
+   if ((dentry = findemptyDIRentry(&(ndir->dir_entries[0]),ndir->dir_size)) == NULL)
+    {
+     if (ndir != NULL)
+      my_free(ndir) ;
+     if (cdir != NULL)
+      my_free(cdir) ;
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+     return_error0(word,err_dirfull) ;
+    }
+
+   /* place filename and attributes */
+   sprintf((char *)&(dentry->FILE_status),"           ") ;
+   before((char *)&(dentry->FILE_status),leafname,file_sep,1) ;
+   after((char *)&(dentry->FILE_extension),leafname,file_sep,1) ;
+   /* copy spare bytes (either JGS info or DRDOS5.0 info) */
+   for (loop = 0; (loop < spare1); loop++)
+    dentry->FILE_reserved[loop] = found->FILE_reserved[loop] ;
+   /* copy file description */
+   dentry->FILE_attribute = cattr ;
+   dentry->FILE_time = found->FILE_time ;
+   dentry->FILE_timeHI = found->FILE_timeHI ;
+   dentry->FILE_date = found->FILE_date ;
+   dentry->FILE_dateHI = found->FILE_dateHI ;
+   dentry->FILE_cluster = found->FILE_cluster ;
+   dentry->FILE_clusterHI = found->FILE_clusterHI ;
+   dentry->FILE_size = found->FILE_size ;
+   ndir->dir_modified = -1 ; /* directory updated */
+   diffdir = TRUE ;     /* object placed in different directory */
+  }
+ else
+  {
+   /* replace the characters in the directory entry */
+   /* This is necessary due to sprintf NULL terminating strings */
+   int cattr = found->FILE_attribute ;
+   sprintf((char *)&(found->FILE_status),"           ") ;
+   before((char *)&(found->FILE_status),leafname,file_sep,1) ;
+   after((char *)&(found->FILE_extension),leafname,file_sep,1) ;
+   found->FILE_attribute = cattr ;
+   cdir->dir_modified = -1 ; /* directory updated */
+  }
+
+ tracef1("DOS_fs_rename: directory entrie%s updated\n",(diffdir ? "s" : "")) ;
+
+ /* make original directory consistent */
+ if (MakeConsistent(cdir) < 0)
+  {
+   if (ndir != NULL)
+    my_free(ndir) ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   /* error message should already be defined */
+   return(-1) ;
+  }
+
+ /* make new directory consistent (if different) */
+ if (diffdir && (MakeConsistent(ndir) < 0))
+  {
+   if (ndir != NULL)
+    my_free(ndir) ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   /* error message should already be defined */
+   return(-1) ;
+  }
+
+ tracef0("DOS_fs_rename: consistent (exiting OK)\n") ;
+
+ if (ndir != NULL)
+  my_free(ndir) ;
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(oldSIF) ;
+ UNUSED(newSIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_access(char *fname,char *access)
+{
+ tracef2("\n\nDOS_fs_access: \"%s\" %s\n",fname,access) ;
+
+ return_error0(int,err_opnotsupported) ;
+ UNUSED(fname) ;
+ UNUSED(access) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- directory manipulation ------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_set_dir(char *fname,char *SIF)
+{
+ char         *filename = fname ;
+ objecttype    otype ;
+ DIR_info     *cdir = NULL ;
+ DIR_info     *odir = NULL ;
+ char         *DOSname ;
+ char         *leafname ;
+ int           drive = -1 ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+
+ tracef1("\n\nDOS_fs_set_dir: \"%s\"\n",((fname == NULL) ? "" : fname)) ;
+
+ if ((fname == NULL) || (*fname == '\0'))
+  {
+   /* NULL filename given : treat this as being a request for "$" */
+   tracef0("DOS_fs_set_dir: NULL name (using $)\n") ;
+   filename = "$\0" ;     /* standard RISC OS ROOT directory */
+  }
+
+#ifdef BBCDFS
+ if (CheckDiscAndName(TRUE,TRUE,filename,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0)
+  return(-1) ;
+
+ if (BDTflag)
+  {
+   if (DOSname != NULL)
+    my_free(DOSname) ;
+   if (cdir != NULL)
+    my_free(cdir) ;
+   return_error0(int,err_opnotsupported) ;
+  }
+
+#else /* BBCDFS */
+ if (CheckDiscAndName(TRUE,TRUE,filename,&otype,&cdir,&DOSname,&leafname,&drive) < 0)
+  return(-1) ;
+#endif /* BBCDFS */
+
+ /* comments:
+  *     drive = -1        : error returned from "getDrive" (we shouldn't see)
+  *     drive = -2        : drive number not given in command (dir only)
+  *     leafname != NULL  : sub-dir to be loaded as "cdir"
+  */
+
+ tracef1("DOS_fs_set_dir: drive = %d\n",drive) ;
+ set_current_drive(drive) ;     /* change to the new drive */
+
+ tracef1("DOS_fs_set_dir: DOSname = \"%s\"\n",DOSname) ;
+ if ((leafname != NULL) && (*leafname != '\0'))
+  {
+   DOS_direntry *dentry ;
+   int           index ;
+
+   tracef1("DOS_fs_set_dir: leafname = \"%s\"\n",leafname) ;
+
+   /* we should also load the "leafname" using "cdir" as the parent */
+   index = 0 ;
+   if ((dentry = findSUBDIR(leafname,&(cdir->dir_entries[0]),&index)) != NULL)
+    {
+     DIR_info     *newdir = NULL ;
+     DOSdisc      *ddisc = (DOSdisc *)dinfo->discdesc ;
+     ADFS_drecord *dr = &(ddisc->disc_record) ;
+     word          sizedir = 0 ;        /* calculated directory size */
+     int           next = get_FILE_cluster(dentry) ;
+     word          allocsize = secsalloc(ddisc) * bytespersec(dr) ;
+
+     if (next != 0)
+      {
+       sizedir = allocsize ;
+       for (; ((next = getnextCLUSTER(next,ddisc)) < CLUSTER_end(ddisc)); sizedir += allocsize) ;
+      }
+
+     tracef0("DOS_fs_set_dir: directory found\n") ;
+     tracef1("DOS_fs_set_dir: start cluster = %d\n",get_FILE_cluster(dentry)) ;
+     tracef1("DOS_fs_set_dir: directory size = &%x\n",sizedir) ;
+     tracef0("DOS_fs_set_dir: we need to load the directory\n") ;
+
+     /* allocate a new "dirstruct" large enough to hold the directory */
+     if ((newdir = (DIR_info *)my_malloc(sizedir + sizeof(DIR_info))) == NULL)
+      {
+       if (DOSname != NULL)
+        my_free(DOSname) ;
+       if (cdir != NULL)
+        my_free(cdir) ;
+       return_error0(int,err_heapexhausted) ;
+      }
+
+     /* load the directory into memory */
+     newdir->dir_root = 0 ; /* NOT the ROOT directory */
+     newdir->dir_drive = drive ;
+
+     sprintf((char *)&newdir->dir_name[0],"%s",leafname) ;
+
+     memmove((char *)&newdir->dir_discname[0],&dinfo->disc_name[0],discnamesize) ;
+     newdir->dir_disctstamp = ddisc->disc_tstamp;
+     newdir->dir_sector = CLUSTERtoSECTOR(get_FILE_cluster(dentry),ddisc) ;
+     newdir->dir_size = sizedir ;
+
+     /* We need to remember this information so that we can update the
+      * directory entry when the directory contents are modified.
+      */
+     newdir->dir_parentsec = cdir->dir_sector ;
+     newdir->dir_parentindex = (index - 1) ;
+     newdir->dir_parentsize = cdir->dir_size ;
+     newdir->dir_modified = 0 ; /* directory entries not updated */
+     tracef3("DOS_fs_get_dir: parent sec = %d, parent index = %d, size &%08X\n",cdir->dir_sector,(index - 1),cdir->dir_size) ;
+     newdir->next = NULL ;
+     newdir->last = NULL ;
+
+     if (loadOBJECT(get_FILE_cluster(dentry),(char *)&(newdir->dir_entries[0]),sizedir,ddisc) < 0)
+      {
+       tracef0("DOS_fs_set_dir: failed to load directory into memory\n") ;
+
+       my_free(newdir) ;
+       if (DOSname != NULL)
+        my_free(DOSname) ;
+       if (cdir != NULL)
+        my_free(cdir) ;
+
+       return(-1) ;     /* error already defined */
+      }
+
+     my_free(cdir) ;        /* release the old directory */
+     cdir = newdir ;        /* and make this the "cdir" */
+    }
+   else
+    {
+     /* directory does not exist */
+     if (DOSname != NULL)
+      my_free(DOSname) ;
+     if (cdir != NULL)
+      my_free(cdir) ;
+     return_error1(int,err_dirnotfound,fname) ;
+    }
+  }
+
+ /* set the current directory to the specified directory */
+ tracef1("DOS_fs_set_dir: cdir = &%08X\n",(word)cdir) ;
+ odir = set_current_dir(cdir) ;
+ if (odir != NULL)
+  my_free(odir) ;       /* release the old directory */
+ tracef1("DOS_fs_set_dir: old dir = &%08X\n",(word)odir) ;
+
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_read_CSD(word dataaddr)
+{
+ DIR_info *cdir = get_current_dir() ;
+ char     *buffer = (char *)dataaddr ;
+
+ tracef1("\n\nDOS_fs_read_CSD: dataaddr = &%08X\n",dataaddr) ;
+
+ /* write data about current directory into passed buffer:
+  *   <zero byte><name length byte><current directory name><priviledge byte>
+  * The directory name has no terminating character. The priviledge byte
+  * should be zero.
+  */
+ *buffer++ = 0x00 ; /* leading NULL byte */
+ if (cdir == NULL) /* no current directory */
+  {
+   /* return "Unset" if no current directory */
+   *buffer++ = strlen("Unset") ;
+   sprintf(buffer,"Unset") ;
+   /* This cheats, by relying on the "sprintf" placing a terminating NULL
+    * (which we assume to be &00) at the end of the string.
+    */
+  }
+ else
+  {
+   /* return "Unset" if no current directory */
+   *buffer++ = strlen((char *)cdir->dir_name) ;
+   sprintf(buffer,"%s",(char *)cdir->dir_name) ;
+   /* This cheats, by relying on the "sprintf" placing a terminating NULL
+    * (which we assume to be &00) at the end of the string.
+    */
+  }
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_read_LIB(word dataaddr)
+{
+ tracef0("\n\nDOS_fs_read_LIB:\n") ;
+ return_error0(int,err_badlibrary) ;
+ UNUSED(dataaddr) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_set_lib(char *fname,char *SIF)
+{
+ tracef0("\n\nDOS_fs_set_lib:\n") ;
+ return_error0(int,err_badlibrary) ;
+ UNUSED(fname) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+fs_dir_contexts *DOS_fs_context(int newCSD,int newURD,int newLIB)
+{
+ tracef0("\n\nDOS_fs_context:\n") ;
+ return_error0(fs_dir_contexts *,err_opnotsupported) ;
+ UNUSED(newCSD) ;
+ UNUSED(newURD) ;
+ UNUSED(newLIB) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_name(word dataaddr)
+{
+ char *cptr = (char *)dataaddr ;
+
+ tracef1("\n\nDOS_fs_name: dataaddr = &%08X\n",dataaddr) ;
+
+ /* Return the following information in the passed data area:
+  *        <name length><disc name><boot option>
+  * The <name length> field is a byte.
+  * The <disc name> is a ASCII string (is it NULL terminated?).
+  * The <boot option> field is a byte ("*OPT 4" setting).
+  *
+  * If we do not have a CSD then "Unset" should be returned as the <disc name>
+  * and &00 as the <boot option>.
+  */
+
+ if (dinfo == NULL)
+  {
+   *cptr++ = strlen("Unset") ;
+   sprintf(cptr,"Unset") ;
+   /* This cheats, by relying on the "sprintf" placing a terminating NULL
+    * (which we assume to be &00) at the end of the string.
+    */
+  }
+ else
+  {
+   *cptr++ = strlen((char *)dinfo->disc_name) ;
+   sprintf(cptr,"%s",(char *)dinfo->disc_name) ;
+   /* This cheats, by relying on the "sprintf" placing a terminating NULL
+    * (which we assume to be &00) at the end of the string.
+    */
+  }
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- directory display -----------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_cat_dir(char *fname,char *SIF)
+{
+ DIR_info         *cdir ;
+ char             *DOSname ;
+ char             *leafname ;
+ objecttype        otype ;
+ int               drive ;
+ int               loop ;
+ DOS_direntry     *dentry ;
+ int               namelen = (namsize + 1 + extsize + 1) ;
+ int               dwidth = 80 ;  /* default display width */
+ int               cpos = 0 ;     /* current character position */
+ char             *nbuff = (char *)my_malloc(namsize + 1 + extsize + 1 + 1) ;
+ int               maxn = 0 ;     /* maximum number of horizontal entries */
+ int               remn = 0 ;     /* number of overflow columns */
+ word              inblock[3] ;   /* temporary parameter block */
+ _kernel_swi_regs  rset ;
+#ifdef BBCDFS
+ int               BDTflag = FALSE ;
+ int               BBCside ;
+#endif /* BBCDFS */
+#ifdef FORCESTYLE
+ int               oldnamingstyle = ecolink_naming ;
+#endif /* FORCESTYLE */
+ 
+ tracef1("\n\nDOS_fs_cat_dir: \"%s\"\n",((fname == NULL) ? "" : fname)) ;
+
+#ifdef BBCDFS
+ if ((nbuff == NULL) || (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0))
+  return(-1) ;
+
+ if (BDTflag)
+  return_error0(int,err_notsupportedBBC) ;
+#else
+ if ((nbuff == NULL) || (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0))
+  return(-1) ;
+#endif /* BBCDFS */
+
+ /* read the current mode width and tailor the display suitably */
+ inblock[0] = 132 ; /* left-hand window column */
+ inblock[1] = 134 ; /* right-hand window column */
+ inblock[2] = -1 ;  /* terminator */
+ rset.r[0] = (word)inblock ;
+ rset.r[1] = (word)inblock ;
+ _kernel_swi((XOS_Bit | OS_ReadVduVariables),&rset,&rset) ;
+ dwidth = ((inblock[1] - inblock[0]) + 1) ;
+ tracef1("DOS_fs_cat_dir: display width = %d\n",dwidth) ;
+
+#ifdef FORCESTYLE
+ ecolink_naming = FALSE ;       /* force Acorn style naming */
+#endif /* FORCESTYLE */
+
+ do
+  {
+   namelen++ ;  /* increment the name length */
+   maxn = (dwidth / namelen) ;
+   remn = (dwidth % namelen) ;
+  } while (remn >= maxn) ;
+ 
+ display_directory_banner(cdir) ;
+ loop = 0 ;
+ cpos = 0 ;
+ do
+  {
+   if ((dentry = getnextDIRentry(&(cdir->dir_entries[0]),&loop)) != NULL)
+    {
+     /* NOTE: we should NOT display the FILE volume entry.
+      *       This should be extended to hidden and system files also.
+      */
+     if ((dentry->FILE_attribute & FILE_volume) == 0)
+      {
+       char *cfile ;
+       if ((cfile = buildFILEname(dentry,nbuff)) != NULL)
+        {
+         convertDOStoRISCOS(cfile,DOSname) ;
+         cfile = DOSname ;
+         tab(cpos) ;
+         printf("%s",cfile) ;
+         if ((cpos + namelen) > (dwidth - namelen))
+          {
+           printf("\n") ;
+           cpos = 0 ;
+          }
+         else
+          cpos += namelen ;
+        }
+      }
+    }
+  } while ((dentry != NULL) && (loop >= 0)) ;
+
+ if (cpos != 0)
+  printf("\n") ;
+
+#ifdef FORCESTYLE
+ ecolink_naming = oldnamingstyle ;      /* back to previous style */
+#endif /* FORCESTYLE */
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_examine_dir(char *fname,char *SIF)
+{
+ DIR_info     *cdir ;
+ char         *DOSname ;
+ char         *leafname ;
+ objecttype    otype ;
+ int           drive ;
+ int           loop ;
+ int           cpos = 0 ;
+ int           mdatelen = longestTIMEstring() ;
+ DOS_direntry *dentry ;
+ char         *nbuff = (char *)my_malloc(namsize + 1 + extsize + 1 + 1) ;
+#ifdef BBCDFS
+ int           BDTflag = FALSE ;
+ int           BBCside ;
+#endif /* BBCDFS */
+#ifdef FORCESTYLE
+ int           oldnamingstyle = ecolink_naming ;
+#endif /* FORCESTYLE */
+ 
+ tracef1("\n\nDOS_fs_examine_dir: \"%s\"\n",((fname == NULL) ? "" : fname)) ;
+
+#ifdef BBCDFS
+ if ((nbuff == NULL) || (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0))
+  return(-1) ;
+
+ if (BDTflag)
+  return_error0(int,err_notsupportedBBC) ;
+#else
+ if ((nbuff == NULL) || (CheckDiscAndName(TRUE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0))
+  return(-1) ;
+#endif /* BBCDFS */
+
+#ifdef FORCESTYLE
+ ecolink_naming = FALSE ;       /* force Acorn style naming */
+#endif /* FORCESTYLE */
+
+ tracef1("DOS_fs_examine_dir: cdir = &%08X\n",(word)cdir) ;
+ display_directory_banner(cdir) ;
+ loop = 0 ;
+ do
+  {
+   if ((dentry = getnextDIRentry(&(cdir->dir_entries[0]),&loop)) != NULL)
+    {
+     tracef2("DOS_fs_examine_dir: %d dentry = &%08X\n",loop,(word)dentry) ;
+
+     /* NOTE: we should NOT display the FILE volume entry.
+      *       This should be extended to hidden and system files also.
+      */
+     if ((dentry->FILE_attribute & FILE_volume) == 0)
+      {
+       char *cfile ;
+       if ((cfile = buildFILEname(dentry,nbuff)) != NULL)
+        {
+         word dosext = 0x00000000 ;
+
+         /* check to see if we have an ".ext" -> RISC OS filetype mapping */
+         (void)after((char *)&dosext,cfile,file_sep,1) ;
+         tracef2("File \"%s\" dosext = &%08X\n",cfile,dosext) ;
+
+         convertDOStoRISCOS(cfile,DOSname) ;
+         cfile = DOSname ;
+         cpos = 0 ;
+         printf("%s",cfile) ;
+         tab(cpos += (namsize + 1 + extsize + 1 + 1)) ;
+         cfile = attrstring((dentry->FILE_attribute & FILE_subdir),DOStoRISCOSattributes(dentry)) ;
+         printf("%s",cfile) ;
+         my_free(cfile) ;
+         tab(cpos += 4) ;
+
+         {
+          _kernel_swi_regs  rset ;
+          _kernel_oserror  *rerror = NULL ;
+          int               loop ;
+          mapentry         *cmap ;
+
+          rset.r[2] = 0x000 ;
+
+          for (cmap = maplist; (cmap); cmap = cmap->next)
+           if (cmap->dosext == dosext)
+            {
+             rset.r[2] = cmap->ROtype ;
+             break ; /* the for loop */
+            }
+
+          rset.r[0] = FSControl_ReadFileType ;
+          if ((rerror = _kernel_swi((XOS_Bit | OS_FSControl),&rset,&rset)) != NULL)
+           {
+            if (cdir != NULL)
+             my_free(cdir) ;
+            if (DOSname != NULL)
+             my_free(DOSname) ;
+            return_errorX(int,rerror) ;
+           }
+          for (loop = 0; (loop < 4); loop++)
+           printf("%c",(rset.r[2] >> (loop * 8)) & 0xFF) ;
+          for (loop = 0; (loop < 4); loop++)
+           printf("%c",(rset.r[3] >> (loop * 8)) & 0xFF) ;
+         }
+
+         tab(cpos += 10) ;    /* 9character type + 1padding space */
+
+         cfile = MSDOStoSTRING(get_FILE_time(dentry),get_FILE_date(dentry)) ;
+         printf("%s ",cfile) ;
+         my_free(cfile) ;    /* release area malloc'ed in "MSDOStoSTRING" */
+
+         tab(cpos += (mdatelen + 1)) ;
+         cfile = filesize(dentry->FILE_size) ;
+         printf("%s\n",cfile) ;
+         my_free(cfile) ;
+        }
+      }
+    }
+  } while ((dentry != NULL) && (loop >= 0)) ;
+
+#ifdef FORCESTYLE
+ ecolink_naming = oldnamingstyle ;      /* restore previous style */
+#endif /* FORCESTYLE */
+
+ if (cdir != NULL)
+  my_free(cdir) ;
+ if (DOSname != NULL)
+  my_free(DOSname) ;
+
+ return(0) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_cat_library(char *fname,char *SIF)
+{
+ tracef1("\n\nDOS_fs_cat_library: \"%s\"\n",fname) ;
+ /* Libraries are not supported... files are located on search paths */
+ return_error0(int,err_badlibrary) ;
+ UNUSED(fname) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_examine_library(char *fname,char *SIF)
+{
+ tracef1("\n\nDOS_fs_examine_library: \"%s\"\n",fname) ;
+ /* Libraries not supported... files are located on search paths */
+ return_error0(int,err_badlibrary) ;
+ UNUSED(fname) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- file/directory information --------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_examine(char *fname,char *SIF)
+{
+ tracef1("\n\nDOS_fs_examine: \"%s\"\n",((fname == NULL) ? "" : fname)) ;
+
+ /**** TODO ****/
+
+ return_error0(int,err_opnotsupported) ;
+ UNUSED(fname) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+fs_dir_block *DOS_fs_read_dir(char *fname,word dest,word num,word off,word blen,char *SIF)
+{
+ tracef1("\n\nDOS_fs_read_dir: \"%s\"\n",((fname == NULL) ? "" : fname)) ;
+ return_error0(fs_dir_block *,err_opnotsupported) ;
+ UNUSED(fname) ;
+ UNUSED(dest) ;
+ UNUSED(num) ;
+ UNUSED(off) ;
+ UNUSED(blen) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+fs_dir_block *DOS_fs_read_dir_info(char *fname,
+                                   word  dest,
+                                   word  num,
+                                   word  off,
+                                   word  blen,
+                                   char *SIF
+                                  )
+{
+#ifdef ECOLINK
+ static name_cache *ncache = NULL ;  /* active over multiple calls */
+ int                adding ;
+#endif /* ECOLINK */
+ DIR_info          *cdir ;
+ char              *DOSname ;
+ char              *leafname ;
+ objecttype         otype ;
+ int                drive ;
+ int                loop ;
+ fs_entry_info     *entries = (fs_entry_info *)dest ;
+ int                numread = 0 ;
+ DOS_direntry      *dentry ;
+ int                infostate = FALSE ;
+ char              *nbuff = (char *)my_malloc(namsize + 1 + extsize + 1) ;
+#ifdef BBCDFS
+ int                BDTflag = FALSE ;
+ int                BBCside ;
+#endif /* BBCDFS */
+
+ tracef2("\n\nDOS_fs_read_dir_info: \"%s\" (%d)\n",((fname==NULL)?"":fname),num) ;
+
+ /* default return state */
+ dblock.objects_read = 0 ;      /* no records read */
+ dblock.next_offset = -1 ;      /* next entry is end of directory */
+
+ /* Note: This call does NOT load the directory
+  *       "cdir" and "leafname" should both be left as NULL pointers
+  */
+#ifdef BBCDFS
+ if ((nbuff == NULL) || (CheckDiscAndName(FALSE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive,&BDTflag,&BBCside) < 0))
+  {
+   if (nbuff != NULL)
+    my_free(nbuff) ;
+   return((fs_dir_block *)-1) ;
+  }
+
+ if (BDTflag)
+  {
+   int          entrysize ;
+   BBCdisc     *bdisc = (BBCdisc *)(DOSdisc *)dinfo->discdesc ;
+   BBC_dirinfo *bdir ;
+
+   tracef0("DOS_fs_read_dir_info: return BBC directory information\n") ;
+
+   if (BBCside == -1)
+    {
+     tracef0("DOS_fs_read_dir_info: returning pseudo drive directories\n") ;
+
+     /* return the pseudo drive directories */
+     /* side 0 */
+     entries->loadaddr   = 0x00000000 ;
+     entries->execaddr   = 0x00000000 ;
+     entries->flength    = 0x00000000 ;
+     entries->attributes = (ownerread|ownerwrite|publicread|publicwrite) ;
+     entries->type       = object_dir ;
+     /* copy the filename into the destination structure */
+     strcpy(entries->fname,(((drive == 0) || (drive == 2)) ? "0" : "1")) ;
+     /* and update the reference information */
+     entrysize = strlen("0") + (sizeof(fs_entry_info) - 3) ;
+     entrysize = wordalign(entrysize) ;
+     entries = (fs_entry_info *)((word)entries + entrysize) ;
+     dblock.objects_read++ ;
+
+     /* possible side 1 */
+     if (bdisc->dsided != 0)
+      {
+       entries->loadaddr   = 0x00000000 ;
+       entries->execaddr   = 0x00000000 ;
+       entries->flength    = 0x00000000 ;
+       entries->attributes = (ownerread|ownerwrite|publicread|publicwrite) ;
+       entries->type       = object_dir ;
+       /* copy the filename into the destination structure */
+       strcpy(entries->fname,(((drive == 0) || (drive == 2)) ? "2" : "3")) ;
+       /* and update the reference information */
+       entrysize = strlen("0") + (sizeof(fs_entry_info) - 3) ;
+       entrysize = wordalign(entrysize) ;
+       entries = (fs_entry_info *)((word)entries + entrysize) ;
+       dblock.objects_read++ ;
+      }
+     return(&dblock) ;
+    }
+
+   bdir = ((BBCside == 0) ? bdisc->side0 : bdisc->side1) ;
+   tracef2("DOS_fs_read_dir_info: off = %d, (bdir->centries >> 3) = %d\n",off,(bdir->centries >> 3)) ;
+   for (loop = off; (loop < (bdir->centries >> 3)); loop++)
+    {
+     char ROname[9] ;
+     BBCentrytoRISCOS((char *)&(bdir->fname[loop][0]),&ROname[0]) ;
+     entrysize = strlen(ROname) + (sizeof(fs_entry_info) - 3) ;
+     entrysize = wordalign(entrysize) ;
+     if (((word)entries + entrysize) <= ((word)dest + blen))
+      {
+       tracef1("DOS_fs_read_dir_info: copied ROname = \"%s\"\n",ROname) ;
+       entries->loadaddr   = BBC_get_load(bdir,loop) ;
+       entries->execaddr   = BBC_get_exec(bdir,loop) ;
+       entries->flength    = BBC_get_length(bdir,loop) ;
+       entries->attributes = (ownerread|ownerwrite|publicread|publicwrite) ;
+       if (bdir->fname[loop][7] & BBC_lockbit)
+        entries->attributes |= objectlocked ;
+       entries->type       = object_file ;
+       /* copy the filename into the destination structure */
+       strcpy(entries->fname,ROname) ;
+       /* and update the reference information */
+       entries = (fs_entry_info *)((word)entries + entrysize) ;
+       numread++ ;        /* count this entry */
+      }
+     else
+      {
+#if 0 
+       loop-- ;   /* we need to re-do this entry on the next call */
+#endif
+       break ;
+      }
+    }
+
+   dblock.objects_read = numread ;
+   if (loop == (bdir->centries >> 3))
+    dblock.next_offset = -1 ; /* next entry is end of directory */
+   else
+    dblock.next_offset = loop ;
+
+   return(&dblock) ;
+  }
+#else
+ if ((nbuff == NULL) || (CheckDiscAndName(FALSE,TRUE,fname,&otype,&cdir,&DOSname,&leafname,&drive) < 0))
+  {
+   if (nbuff != NULL)
+    my_free(nbuff) ;
+   return((fs_dir_block *)-1) ;
+  }
+#endif /* BBCDFS */
+
+ /* wildcarded names mean return the directory level files */
+ if (checknotwildcarded(DOSname) < 0)
+  infostate = TRUE ;
+
+ tracef2("DOS_fs_read_dir_info: dinfo->discdesc = &%08X, ((DOSdisc *)dinfo->discdesc)->disc_record = &%08X\n",(int)dinfo->discdesc,(int)&((DOSdisc *)dinfo->discdesc)->disc_record) ;
+
+ if ((cdir = loadDIR(DOSname,drive,(DOSdisc *)dinfo->discdesc,infostate)) == NULL)
+  {
+#ifdef ECOLINK
+   if (ncache != NULL)
+    {
+     /* ensure that we do not use this name cache for the next directory */
+     my_free(ncache) ;
+     ncache = NULL ;
+    }
+#endif /* ECOLINK */
+   my_free(DOSname) ;
+   my_free(nbuff) ;
+   return_error1(fs_dir_block *,err_dirnotfound,fname) ;
+  }
+
+ if ((int)cdir == -1)
+  {
+   tracef0("DOS_fs_read_dir_info: no current directory\n") ;
+#ifdef ECOLINK
+   if (ncache != NULL)
+    {
+     my_free(ncache) ;
+     ncache = NULL ;
+    }
+#endif /* ECOLINK */
+   my_free(DOSname) ;
+   my_free(nbuff) ;
+   /* the error message should already be defined */
+   return((fs_dir_block *)-1) ;
+  }
+
+#ifdef ECOLINK
+ /* If we are at the beginning of a directory, then we should create a new
+  * extension name cache.
+  */
+ if (off == 0)
+  {
+   tracef0("DOS_fs_read_dir_info: at the beginning of the directory\n") ;
+   if (ncache != NULL)
+    {
+     my_free(ncache) ;
+     ncache = NULL ;
+    }
+
+   if ((ncache = create_cache(cdir->dir_size / sizeof(DOS_direntry))) == NULL)
+    {
+     my_free(DOSname) ;
+     my_free(cdir) ;
+     my_free(nbuff) ;
+     return_error0(fs_dir_block *,err_heapexhausted) ;
+    }
+  }
+#endif /* ECOLINK */
+
+ /* start reading entries from the requested offset */
+ loop = off ;
+ do
+  {
+   if ((dentry = getnextDIRentry(&(cdir->dir_entries[0]),&loop)) != NULL)
+    {
+     /* "getnextDIRentry" returns all FILE types:
+      * This includes volume labels and hidden and system files. At the
+      * moment we only stop volume labels from being returned.
+      */
+     if ((dentry->FILE_attribute & FILE_volume) == 0)
+      {
+       /* we have a listable directory entry */
+       char *cfile ;
+       word  entrysize ;
+
+       if ((cfile = buildFILEname(dentry,nbuff)) != NULL)
+        {
+#ifdef ECOLINK
+         word dosext = 0x00000000 ; /* ensure zero start */
+
+         if (!ecolink_naming)
+          {
+           /* check to see if we have an ".ext" -> RISC OS filetype mapping */
+           (void)after((char *)&dosext,cfile,file_sep,1) ;
+           tracef2("File \"%s\" dosext = &%08X\n",cfile,dosext) ;
+          }
+#else  /* ECOLINK */
+         word dosext = 0x00000000 ; /* ensure zero start */
+
+         /* check to see if we have an ".ext" -> RISC OS filetype mapping */
+         (void)after((char *)&dosext,cfile,file_sep,1) ;
+         tracef2("File \"%s\" dosext = &%08X\n",cfile,dosext) ;
+#endif /* ECOLINK */
+
+         convertDOStoRISCOS(cfile,DOSname) ;
+         cfile = DOSname ;
+
+#ifdef ECOLINK
+         if (ecolink_naming)
+          {
+           adding = TRUE ;
+           {
+            char *cptr = cfile ;
+
+            tracef1("DOS_fs_read_dir_info: cptr = \"%s\"\n",cptr) ;
+
+            for (; (*cptr && (*cptr != '.')); cptr++) ;
+            if (*cptr)
+             {
+              /* we have a RISC OS directory seperator */
+              if (infostate)
+               {
+                /* We need to return the names, NOT the extensions */
+                bcopy(cfile,++cptr,(strlen(cptr) + 1)) ;
+               }
+             else
+               {
+                /* terminate the name at the extension */
+                *cptr = NULL ;
+
+                /* we should check to see if we have already given this name at
+                 * this directory level.
+                 */
+                if (check_cache(ncache,cfile) >= 0)
+                 adding = FALSE ;
+                else
+                 if (add_to_cache(ncache,cfile) < 0)
+                  {
+                   my_free(ncache) ;
+                   ncache = NULL ;
+                   my_free(DOSname) ;
+                   my_free(cdir) ;
+                   my_free(nbuff) ;
+                   return_error0(fs_dir_block *,err_namereadfailed) ;
+                 }
+
+                /* Ensure the object is viewed as a directory */
+                dentry->FILE_attribute |= FILE_subdir ;
+               }
+             }
+           }
+
+           if (adding)
+            {
+             /* calculate the size of this entry (word-aligned) */
+             entrysize = strlen(cfile) + (sizeof(fs_entry_info) - 3) ;
+             entrysize = wordalign(entrysize) ;
+
+             tracef1("DOS_fs_read_dir_info: adding entry size %d\n",entrysize);
+
+             if (((word)entries + entrysize) <= ((word)dest + blen))
+              {
+               time5byte le ;
+               MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+               /* check if the file has RISC OS info in its spare bytes */
+               {
+                int value = get_FILE_ROStype(dentry) ;
+                if (value != 0)
+                 le.hi = (le.hi & ~ADFStypemask) | (value << 8) ;
+               }
+
+               /* RISC OS required information */
+               entries->loadaddr = le.hi ;
+               entries->execaddr = le.lo ;
+               entries->flength = dentry->FILE_size ;
+               entries->attributes = DOStoRISCOSattributes(dentry) ;
+               entries->type = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+
+               /* copy the filename into the destination structure */
+               strcpy(entries->fname,cfile) ;
+
+               /* and update the reference information */
+               entries = (fs_entry_info *)((word)entries + entrysize) ;
+               numread++ ;        /* count this entry */
+              }
+             else
+              {
+               loop-- ;   /* we need to re-do this entry on the next call */
+               break ;
+              }
+            }
+          }
+         else /* Acorn style naming */
+          {
+           /* calculate the size of this entry (word-aligned) */
+           entrysize = strlen(cfile) + (sizeof(fs_entry_info) - 3) ;
+           entrysize = wordalign(entrysize) ;
+
+           tracef1("DOS_fs_read_dir_info: adding entry, size %d\n",entrysize) ;
+
+           if (((word)entries + entrysize) <= ((word)dest + blen))
+            {
+             time5byte le ;
+             MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+             /* check if the file has RISC OS information in its spare bytes */
+             {
+              int value = get_FILE_ROStype(dentry) ;
+              if (value != 0) /* non-NULL then this is the RISC OS filetype */
+               le.hi = (le.hi & ~ADFStypemask) | (value << 8) ;
+              else
+               {
+                mapentry *cmap ;
+                /* NO so use the calculated DOS extension */
+                for (cmap = maplist; (cmap); cmap = cmap->next)
+                 if (cmap->dosext == dosext)
+                  {
+                   le.hi = (le.hi & ~ADFStypemask) | (cmap->ROtype << 8) ;
+                   break ; /* the for loop */
+                  }
+               }
+             }
+
+             /* RISC OS required information */
+             entries->loadaddr = le.hi ;
+             entries->execaddr = le.lo ;
+             entries->flength = dentry->FILE_size ;
+             entries->attributes = DOStoRISCOSattributes(dentry) ;
+             entries->type = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+
+             /* copy the filename into the destination structure */
+             strcpy(entries->fname,cfile) ;
+
+             /* and update the reference information */
+             entries = (fs_entry_info *)((word)entries + entrysize) ;
+             numread++ ;        /* count this entry */
+            }
+           else
+            {
+             loop-- ; /* we need to re-do this entry on the next call */
+             break ;
+            }
+          }
+#else
+         /* calculate the size of this entry (word-aligned) */
+         entrysize = strlen(cfile) + (sizeof(fs_entry_info) - 3) ;
+         entrysize = wordalign(entrysize) ;
+
+         tracef1("DOS_fs_read_dir_info: adding entry, size %d\n",entrysize) ;
+
+         if (((word)entries + entrysize) <= ((word)dest + blen))
+          {
+           time5byte le ;
+           MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+           /* check if the file has RISC OS information in its spare bytes */
+           {
+            int value = get_FILE_ROStype(dentry) ;
+            if (value != 0) /* non-NULL then this is the RISC OS filetype */
+             le.hi = (le.hi & ~ADFStypemask) | (value << 8) ;
+            else
+             {
+              mapentry *cmap ;
+              /* NO so use the calculated DOS extension */
+              for (cmap = maplist; (cmap); cmap = cmap->next)
+               if (cmap->dosext == dosext)
+                {
+                 le.hi = (le.hi & ~ADFStypemask) | (cmap->ROtype << 8) ;
+                 break ; /* the for loop */
+                }
+             }
+           }
+
+           /* RISC OS required information */
+           entries->loadaddr = le.hi ;
+           entries->execaddr = le.lo ;
+           entries->flength = dentry->FILE_size ;
+           entries->attributes = DOStoRISCOSattributes(dentry) ;
+           entries->type = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+
+           /* copy the filename into the destination structure */
+           strcpy(entries->fname,cfile) ;
+
+           /* and update the reference information */
+           entries = (fs_entry_info *)((word)entries + entrysize) ;
+           numread++ ;        /* count this entry */
+          }
+         else
+          {
+           loop-- ; /* we need to re-do this entry on the next call */
+           break ;
+          }
+#endif /* ECOLINK */
+        }
+       else
+        {
+#ifdef ECOLINK
+         if (ncache != NULL)
+          my_free(ncache) ;
+         ncache = NULL ;
+#endif /* ECOLINK */
+         my_free(DOSname) ;
+         my_free(cdir) ;
+         my_free(nbuff) ;
+         return_error0(fs_dir_block *,err_namereadfailed) ;
+        }
+      }
+    }
+  } while ((numread < num) && ((dentry != NULL) && (loop >= 0))) ;
+
+ dblock.objects_read = numread ;
+ dblock.next_offset = loop ;
+
+#ifdef ECOLINK
+ if ((loop == -1) && (ncache != NULL))
+  {
+   /* we are at the end of the directory, so release the cache */
+   my_free(ncache) ;
+   ncache = NULL ;
+  }
+#endif /* ECOLINK */
+
+ my_free(cdir) ;
+ my_free(DOSname) ;
+ my_free(nbuff) ;
+
+ return(&dblock) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+fs_dir_block *DOS_fs_read_dir_extra(char *fname,word dest,word num,word off,word blen,char *SIF)
+{
+ tracef0("\n\nDOS_fs_read_dir_extra:\n") ;
+ return_error0(fs_dir_block *,err_opnotsupported) ;
+ UNUSED(fname) ;
+ UNUSED(dest) ;
+ UNUSED(num) ;
+ UNUSED(off) ;
+ UNUSED(blen) ;
+ UNUSED(SIF) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*- media information -----------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_opt(word option,word parameter)
+{
+ tracef0("\n\nDOS_fs_opt:\n") ;
+ return_error0(int,err_opnotsupported) ;
+ UNUSED(option) ;
+ UNUSED(parameter) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+#define autobootfile    "$.bat/.autoexec"
+
+int DOS_fs_boot(void)
+{
+ fs_cat_entry *fptr ;
+ char          txtline[32] ;      /* small text buffer */
+
+ tracef0("\n\nDOS_fs_boot:\n") ;
+
+ if ((int)(fptr = DOS_fs_read_cat(autobootfile,"")) == -1)
+  return(-1) ;  /* return any error state to the caller */
+
+ sprintf(&txtline[0],"%%exec %s\0",autobootfile) ;
+ if (_kernel_oscli(txtline))
+  {
+   return_error1(int,err_failedexec,autobootfile) ;
+  }
+ else
+  return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_shutdown(void)
+{
+ FILEdesc *finfo = FILE_list ;
+ FILEdesc *optr = NULL ;
+
+ tracef1("\n\nDOS_fs_shutdown: FILE_list = &%08X\n",(word)FILE_list) ;
+
+ /* should close all open files and ensure all disc/drive buffers */
+ for (;(finfo != NULL);)
+  {
+   tracef1("DOS_fs_shutdown: handle = &%08X\n",finfo->fs_handle) ;
+   if ((finfo->filebuff != NULL) && (finfo->modified != 0))
+    {
+     tracef0("DOS_fs_shutdown: buffer needs to be written to the file\n") ;
+#ifdef BBCDFS
+     if (finfo->dtype == fBBC)
+      {
+       int BBCsidesize = (BBC_get_sechi(finfo->bdisc->side0) | finfo->bdisc->side0->dinfo2) ;
+       int BBCsector = finfo->currentCLUSTER + (BBCsidesize*finfo->BBCside) ;
+       if (BBC_RW(Wdata,finfo->bdisc->drive,BBCsector,(byte *)finfo->filebuff,bytespersec(finfo->bdisc->dr),finfo->bdisc->dr) != 0)
+        return_error0(int,err_writefailed) ;
+      }
+     else
+      saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,finfo->ddisc) ;
+#else
+     saveCLUSTER(finfo->currentCLUSTER,finfo->filebuff,finfo->ddisc) ;
+#endif /* BBCDFS */
+     finfo->modified = 0 ;
+     my_free(finfo->filebuff) ;
+     finfo->filebuff = NULL ;
+    }
+
+   /* release all associated buffers */
+   if (finfo->fname != NULL)
+    {
+     my_free(finfo->fname) ;
+     finfo->fname = NULL ;
+    }
+
+   /* keep the list upto date */
+   optr = finfo ;
+   FILE_list = finfo = finfo->nextfile ;
+   my_free(optr) ;
+  }
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOS_fs_banner(void)
+{
+ tracef0("\n\nDOS_fs_banner:\n") ;
+ printf("%s\n",moduleName()) ;  /* Run-Time generated filing system banner */
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/*> EOF c.DOSfsiface <*/

@@ -1,0 +1,413 @@
+; > IOC
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; call: IOCdevice
+;
+; in:   r0  = reason code
+;       r8  = private word
+;       wp -> workspace
+;
+; out:  V clear, registers setup correctly
+;       V set, r0 -> error block
+;
+; This entry point is provided to allow the IOC device to do what it needs to
+; do, this is called by DeviceFS to pass events and control operations to the
+; device driver.
+;
+
+IOCdevice       ROUT
+
+                BIC     lr, lr, #V_bit+ C_bit                   ; just ensure that all is OK
+                CMP     r0, #(%10-%00)/4
+                ADDCC   pc, pc, r0, LSL #2                      ; despatch the event
+                B       %10                                     ; if not valid then give an error
+00
+                B       ioc_open                                ; open a stream
+                B       ioc_close                               ; close the stream
+                B       ioc_wakeup                              ; wake up because someone's transferring
+                MOVS    pc, lr
+                MOVS    pc, lr
+                MOVS    pc, lr
+                B       common_createTX
+                MOVS    pc, lr
+                MOVS    pc, lr
+                MOVS    pc, lr
+                MOVS    pc, lr
+                B       ioc_created                             ; stream created
+10
+                ADRL    r0, ErrorBlock_Parallel_BadCall         ; if not within valid range
+                DoError                                         ; then generate an error
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; call: ioc_open
+;
+; in:   r0  = reason code
+;       r2  = external handle (used for calling DeviceFS)
+;       r3  = flags for opening the file
+;       r6 -> special field that has been decoded
+;
+; out:  r1  = internal handle (used in communication from DeviceFS)
+;
+; This call is made to allow the parallel device driver to initialise itself, ie.
+; claiming any vectors it may need.
+;
+
+ioc_open        ENTRY   "r0,r1"
+                Debug   open,"ioc_open"
+ [ StorkPower
+                BL      SetPower_On             ;Should be powered down, so power up
+ ]
+                MOV     r0, #PrinterAck_DevNo
+                ADR     r1, ioc_irq
+                BL      common_open
+ [ StorkPower
+                BLVS    SetPower_Off            ;If openning failed, try powering down. If failure occurred
+                                                ;because port was in use, the service call will be faulted
+                                                ;and the port will remain powered (as it should be).
+ ]
+                EXIT
+
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; call: ioc_close
+;
+; in:   r0  = reason code
+;       r2  = internal handle
+;
+; out:  -
+;
+; This call is made to allow the device to close down the routines associated
+; with printing characters.
+;
+
+ioc_close       ENTRY   "r0-r2"
+                Debug   close,"ioc_close"
+                MOV     r0, #PrinterAck_DevNo
+                ADR     r1, ioc_irq
+                ADR     r2, ioc_busy_check_callafter
+                BL      common_close
+ [ StorkPower
+                BL      SetPower_Off            ;Will be powered up, so power down
+ ]
+                EXIT
+
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; call: ioc_wakeup
+;
+; in:   r0  = reason code
+;       r2  = internal handle
+;
+; out:  r0 = 0 if staying dormant, otherwise preserved
+;
+; This call is made when the device driver should wake itself up because there is
+; data in the buffer to be sent.
+;
+
+ioc_wakeup      ENTRY   "r0-r3"
+
+                Debug   out,"ioc_wakeup"
+
+                ORR     lr, lr, #I_bit          ; disable IRQs round this bit
+                TEQP    lr, #0
+                MOV     r3, #IOC
+                BL      ioc_busy                ; returns EQ if not busy
+                BLEQ    ioc_strobe              ; if not busy, strobe char
+                EXITS   EQ
+
+                MOV     r0, #0                  ; indicate we wish to remain dormant
+                STR     r0, [sp]
+                LDRB    r3, IRQFlags
+                TST     r3, #if_PendingCallAfter ; if we've already asked for a callafter
+                EXITS   NE                      ; then exit
+
+                LDR     r0, =BusyCheckInterval
+                ADR     r1, ioc_busy_check_callafter
+                MOV     r2, wp
+                SWI     XOS_CallAfter
+                ORRVC   r3, r3, #if_PendingCallAfter
+                STRVCB  r3, IRQFlags
+
+                EXITS
+
+ioc_busy_check_callafter ENTRY "r0"
+                MOV     r0, pc
+                ORR     lr, r0, #SVC_mode :OR: I_bit
+                TEQP    lr, #0                          ; switch to SVC mode, IRQs off
+                NOP
+                Push    "r0, lr"                        ; save old flags, r14_svc
+                LDRB    r0, IRQFlags
+                BIC     r0, r0, #if_PendingCallAfter    ; indicate no pending callafter any more
+                STRB    r0, IRQFlags
+                BL      ioc_wakeup                      ; and call wakeup routine
+                Pull    "r0, lr"
+                TEQP    r0, #0                          ; restore old mode
+                NOP
+                EXITS                                   ; and exit
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; call: ioc_created
+;
+; in:   r0 = reason code (11)
+;       r2 = internal handle
+;       r3 = buffer handle
+;
+; out:  -
+;
+; This routine is called when an input or output stream has been created.
+;
+
+ioc_created     ENTRY   "r0-r2"
+
+                Debug   open,"ioc_created, buffer handle =",r3
+
+                STR     r3, BufferHandle        ; store buffer handle, so we know which
+                                                ; buffer to make dormant if busy is active after ack
+ [ FastBufferMan
+                MOV     r0, r3
+                SWI     XBuffer_InternalInfo
+                STRVS   r0, [sp]
+                EXIT    VS
+                STR     r0, BufferId
+                STR     r1, BuffManService
+                STR     r2, BuffManWkSpace
+ ]
+                EXITS
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; call: ioc_busy
+;
+; in:   r3 -> IOC
+;
+; out:  Z =0 => port is busy
+;       Z =1 => port is idle
+;
+; This code simply returns the state of the A1 printer port, if it
+; is busy.  When busy the device should not be restrobed as this will
+; scrap the current character.
+;
+; In the routine will simply read the IOC masks to see what is should do.
+;
+
+ioc_busy        ENTRY   "r0"
+                LDR     lr, [r3, #IOCIRQSTAA]
+                TST     lr, #pbusy_bit                          ; 0 => busy
+                PullEnv NE
+                ORRNES  pc, lr, #Z_bit                          ; indicate not busy, Z=1.
+
+                Debug   out,"busy"
+
+                MOV     lr, #F_bit                              ; disable FIQs round updates
+                TST     lr, pc                                  ; to IOCIRQMSKA
+                TEQEQP  lr, pc
+
+                LDRB    r0, [r3, #IOCIRQMSKA]
+                ORR     r0, r0, #pack_bit                       ; is busy, so enable pack IRQ
+                STRB    r0, [r3, #IOCIRQMSKA]
+
+                TEQEQP  lr, pc                                  ; restore FIQ status
+
+                PullEnv
+                BICS    pc, lr, #Z_bit                          ; and Z=0 on exit, busy
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; call: ioc_irq
+;
+; in:   wp -> workspace
+;       r3 -> IOC
+;
+; out:  r0-r3, wp may be corrupted
+;
+; This code handles IRQ from the printer device, the process is as follows:
+;
+; a) Clear IRQ within IOC;
+; b) Wait for PACK to go high again;
+; c) Extract a character by calling CallAVector;
+; d) Enable/Disable printer IRQ within IOC space (with FIQs disabled);
+; e) If character (C=0 on return from vector) then strobe character;
+; f) Return.
+;
+
+ioc_irq         ROUT
+
+; The acknowledge interrupt is triggered on the falling (leading) edge of PACK, and some printers'
+; manuals indicate that the printer is only ready when the pulse is completed (ie when PACK has gone high again).
+; So now we should wait for PACK to go high
+
+                MOV     r2, #40                                 ; loop until PACK is high (time out after >=20탎)
+10
+                LDRB    r0, [r3, #IOCControl]                   ; loop until the state of PACK is high
+                TST     r0, #pack_state_bit
+                BNE     %FT15
+                SUBS    r2, r2, #1
+                BNE     %BT10
+
+                MOV     r0, #pack_bit                           ; PACK not gone high (probably printer off)
+                STRB    r0, [r3, #IOCIRQCLRA]                   ; so clear interrupt and wait for printer on
+                MOVS    pc, lr
+
+15
+ [ CheckBusyAfterAck
+                MOV     r2, #20                                 ; loop 20 times (at least 20*0.5탎)
+20
+                LDRB    r0, [r3, #IOCIRQSTAA]
+                TST     r0, #pbusy_bit                          ; 0 => busy
+                BNE     ioc_strobe                              ; not busy, so carry on
+                SUBS    r2, r2, #1
+                BNE     %BT20
+
+                MOV     r0, #pack_bit                           ; clear interrupt anyway
+                STRB    r0, [r3, #IOCIRQCLRA]
+
+                LDRB    r2, IRQFlags                            ; if we already have a pending callafter
+                TST     r2, #if_PendingCallAfter
+                MOVNES  pc, lr                                  ; then exit
+
+                MOV     r3, pc
+                ORR     r0, r3, #SVC_mode                       ; go into SVC_mode to issue SWI call
+                TEQP    r0, #0
+                NOP
+
+                Push    "r2, lr"
+                LDR     r0, =BusyCheckInterval
+                ADR     r1, ioc_busy_check_callafter
+                MOV     r2, wp
+                SWI     XOS_CallAfter
+                Pull    "r2, lr"
+                ORRVC   r2, r2, #if_PendingCallAfter
+                STRVCB  r2, IRQFlags
+
+                TEQP    r3, #0                                  ; restore IRQ mode
+                NOP
+                MOVS    pc, lr                                  ; and exit
+
+ ]
+
+; and drop thru to...
+
+; in: r3 -> IOC
+;     SVC_mode or IRQ_mode
+;     IRQs disabled (this is needed (a) because may enable pack IRQ (b) mustn't have F=1 and I=0
+;
+; out: r0-r2 corrupted
+;
+
+ioc_strobe      ENTRY
+                MOV     r0, #pack_bit                           ; clear interrupt - note this is done inside the strobe
+                STRB    r0, [r3, #IOCIRQCLRA]                   ; routine in order to clear any fake acknowledges
+                                                                ; generated on printer power-on
+
+                Debug   out,"sending byte"
+
+ [ FastBufferMan
+                MOV     r0, #BufferReason_RemoveByte
+                LDR     r1, BufferId
+                CallBuffMan
+ |
+                MOV     r2, pc
+                BIC     r2, r2, #C_bit + V_bit                  ; clear C&V for entering mode
+                ORR     lr, r2, #SVC_mode                       ; derive SVC mode (NB if entered in SVC mode, then
+                                                                ; we've already saved lr_svc, so we can junk it now)
+                TEQP    lr, #0                                  ; change to SVC mode with C and V clear
+                NOP
+
+                Push    "lr"
+                LDR     r1, StreamHandle
+                SWI     XDeviceFS_TransmitCharacter             ; attempt to get byte to send
+                Pull    "lr"                                    ; preserve link register
+
+                ORRCS   r2, r2, #C_bit                          ; ensure C flag reflected correctly
+                TEQP    r2, #0
+                NOP                                             ; back to original mode (IRQ or SVC)
+ ]
+
+                MOV     lr, #F_bit
+                TST     lr, pc
+                TEQEQP  lr, pc                                  ; FIQs now disabled!
+
+                LDRB    tmp, [r3, #IOCIRQMSKA]                  ; get IRQ mask A
+                ORRCC   tmp, tmp, #pack_bit
+                BICCS   tmp, tmp, #pack_bit                     ; if char enable printer IRQ, else disable!
+                STRB    tmp, [r3, #IOCIRQMSKA]
+
+                TEQEQP  lr, pc                                  ; restore FIQ status (IRQs still disabled)
+
+                EXITS   CS                                      ; if no character then exit
+
+                LDR     r1, =PrinterData                        ; r1 -> printer data byte
+                STRB    byte, [r1]                              ; write character
+
+; now need set up time of 0.5탎, so read latch B soft copy and write to latch B (at least 5 ticks)
+
+                MOV     r2, #0
+                LDRB    r2, [r2, #LatchBSoftCopy]               ; r2 = Latch B value without strobe
+                STRB    r2, [r1, #LatchB - PrinterData]
+
+                ORR     r0, r2, #pstrobe_bit                    ; enable strobing
+
+; strobe must be held high for at least 1탎, so write it high twice, then write low
+; each write is at least 5 ticks (@8MHz), so high time >= 10/8 탎
+
+                STRB    r0, [r1, #LatchB - PrinterData]
+                STRB    r0, [r1, #LatchB - PrinterData]
+                STRB    r2, [r1, #LatchB - PrinterData]         ; disable strobing
+
+; no need to explicitly wait for 1탎 with data valid, there's no way we can send another character within 1탎
+; since we have to call SWI XDeviceFS_TransmitChar to get each char.
+
+; now cancel any pending callafter, since we've just transmitted a char
+
+                LDRB    r0, IRQFlags
+                TST     r0, #if_PendingCallAfter
+                EXITS   EQ
+
+                MOV     r2, pc
+                ORR     lr, r2, #SVC_mode                       ; force SVC mode
+                TEQP    lr, #0
+                NOP
+
+                Push    "r0,lr"
+                ADR     r0, ioc_busy_check_callafter
+                MOV     r1, wp
+                SWI     XOS_RemoveTickerEvent
+                Pull    "r0,lr"
+
+                TEQP    r2, #0                                  ; switch back
+                NOP
+
+                BIC     r0, r0, #if_PendingCallAfter
+                STRB    r0, IRQFlags
+
+                EXITS                                           ; and return home
+
+                LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+                END
+

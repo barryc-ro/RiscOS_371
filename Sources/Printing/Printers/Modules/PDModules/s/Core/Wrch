@@ -1,0 +1,1058 @@
+; > Core.Wrch
+
+;----------------------------------------------------------------------------
+;
+; The WrchV interception routine
+;
+;----------------------------------------------------------------------------
+
+interceptwrch
+        Push    "R0-R6,R10,R11,LR"
+
+; Is this VDU output we're not interested in?
+        LDRB    R1,passthrough
+        TST     R1,#passthrough_wrch
+        Pull    "R0-R6,R10,R11,PC",NE
+
+; intercept but do precisely nothing if it is a counting pass
+        LDR     R1, counting_pass
+; Debug   PageBox, "wrch counting_pass = ",R1
+        CMP     R1, #0
+        Pull    "R0-R6,R10,R11,LR,PC",NE
+
+; Remember R10,R11,LR values for calling previous owner - used when we pass
+; control sequences down to the real VDU code.
+
+        ADR     R1,vdupassdownparams
+        STMIA   R1,{R10,R11,LR}
+
+; Pick up current job's workspace, check for persistent errors, enable
+; ESCAPEs and pass through recursive OS_WriteC's
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+
+        BL      checkpersistenterror
+        BVS     interceptwrch_persistentreturn
+
+        BL      enableescapes
+
+        [       DoFontSpriteVdu
+
+; Are we in the middle of a PLOT &D0-&D7 or VDU 23,26,... sequence? Branch
+; if so.
+
+        LDRB    R2,doingfontplot
+        CMP     R2,#0                           ;NB clears V
+        BNE     interceptwrch_fontplot
+
+        ]
+
+; Are we queueing VDU characters?
+
+        LDRB    R1,wrchqueuepos
+        TEQ     R1,#0
+        BEQ     interceptwrch_notqueueing
+
+; Yes. Add it to the queue, then deal with the complete sequence if it's
+; finished.
+
+        ADR     LR,wrchqueueend
+        STRB    R0,[LR,-R1]
+        SUBS    R1,R1,#1
+        STRB    R1,wrchqueuepos
+        LDREQB  R1,wrchinitchar
+        B       interceptwrch_dealwithcontrolseqifEQ
+
+; No. Start by separating out control characters and DELETEs.
+
+interceptwrch_notqueueing
+        CMP     R0,#32
+        BLO     interceptwrch_control
+        TEQ     R0,#127
+        MOVEQ   R1,#32                  ;Give DELETE an index of 32 below
+        BEQ     interceptwrch_dealwithcontrolseqifEQ
+
+; This is a text character. First set the correct colour.
+
+        MOV     R1,#0
+        BL      gcol_lookupfg
+        BNE     interceptwrch_charplotted
+        BL      colour_setrealrgb
+
+; Then calculate the top left corner of the character - one screen pixel up
+; from the indicated position, and adjusted by graphics origin and user's
+; box origin.
+
+        LDRVC   R1,curryeig
+        MOVVC   LR,#1
+        MOVVC   LR,LR,LSL R1
+
+        ADRVC   R1,oldpoint
+        LDMVCIA R1,{R1,R2}
+        ADDVC   R2,R2,LR
+
+        ADRVC   LR,origin
+        LDMVCIA LR,{R3,LR}
+        ADDVC   R1,R1,R3
+        ADDVC   R2,R2,LR
+
+        ADRVC   LR,usersoffset
+        LDMVCIA LR,{R3,LR}
+        SUBVC   R1,R1,R3
+        SUBVC   R2,R2,LR
+
+; And get the printer dependent code to deal with the character.
+
+        BLVC    vdu5_char
+        BVS     interceptwrch_return
+
+; After successful plotting, do whatever automatic movement of the current
+; graphics position is required. Note that this does NOT affect older
+; graphics positions.
+
+interceptwrch_charplotted
+        ADR     LR,vdu5autoadvance
+        LDMIA   LR,{R2,R10}
+        ADR     LR,oldpoint
+        LDMIA   LR,{R0,R1}
+        ADD     R0,R0,R2
+        ADD     R1,R1,R10
+        STMIA   LR,{R0,R1}
+        CLRV
+        B       interceptwrch_return
+
+        [       DoFontSpriteVdu
+
+; Deal with a character encountered during a PLOT &D0-&D7 or VDU 23,26,...
+; string. R2 contains the value of 'doingfontplot' - i.e. the correct value
+; of R2 for the Font_Paint call or &80 for the VDU 23,26,... call
+
+interceptwrch_fontplot                          ;NB V is clear on arrival
+        LDRB    LR,textbufferpos                ;Discard NULs at start of
+        ORRS    LR,LR,R0                        ;  string (so that fixed part
+        BEQ     interceptwrch_return            ;  of VDU sequence can be
+                                                ;  terminated by nine NULs)
+        LDRB    LR,fontplotseqlen               ;In a sequence?
+        TEQ     LR,#0                           ;Branch if so
+        BNE     interceptwrch_fontplot_insequence
+        CMP     R0,#32                          ;A control character?
+        BHS     interceptwrch_fontplot_addchar  ;Add to string if not
+        ADR     LR,fontsequencelengths          ;Get number of characters
+        LDRB    LR,[LR,R0]                      ;  remaining in sequence
+        STRB    LR,fontplotseqlen               ;  and store it
+        TEQ     LR,#0                           ;End of string?
+        BNE     interceptwrch_fontplot_addchar  ;Add to string if not
+
+; We've found a control character that isn't in a Font_Paint control
+; sequence - i.e. one that terminates the string.
+
+        ADR     R1,textbuffer                   ;Store the character
+        LDRB    R3,textbufferpos
+        STRB    R0,[R1,R3]
+        MOV     LR,#0                           ;Terminate PLOT &D0-&D7
+        STRB    LR,doingfontplot                ;  or VDU 23,26,... sequence
+        TST     R2,#&10                         ;Which is it?
+        BEQ     interceptwrch_VDU23_26          ;Branch if VDU 23,26,...
+
+        ADR     R3,thispoint                    ;Get the point concerned
+        LDMIA   R3,{R3,R4}
+        SWI     XFont_Paint                     ;Call the font manager
+        ADRVC   LR,thispoint                    ;Shuffle points up at end
+        LDMVCIA LR,{R1-R6}                      ;  of PLOT call
+        ADRVC   LR,oldpoint
+        STMVCIA LR,{R1-R6}
+        ASSERT  oldpoint = thispoint+8
+        ASSERT  olderpoint = oldpoint+8
+        ASSERT  oldestpoint = olderpoint+8
+        B       interceptwrch_return
+
+interceptwrch_VDU23_26
+        MOV     R1,#23
+        BL      wrch_passcontrolseq
+        ADRVC   R1,textbuffer
+        ADDVC   R2,R3,#1                        ;NB R3 is Len(textbuffer) - 1
+        BLVC    wrch_passdownstring
+        B       interceptwrch_return
+
+fontsequencelengths
+        DCB     0,  0,  0,  0,  0,  0,  0,  0
+        DCB     0,  3,  0,  3,  0,  0,  0,  0
+        DCB     0,  1,  3,  7,  0,&FF,  0,  0
+        DCB     0,  2,  1,  0,  0,  0,  0,  0
+        ALIGN
+
+interceptwrch_fontplot_insequence
+        TEQ     LR,#&FF                         ;If an ordinary sequence,
+        SUBNE   LR,LR,#1                        ;  decrement remaining
+        STRNEB  LR,fontplotseqlen               ;  length and add character
+        BNE     interceptwrch_fontplot_addchar  ;  to buffer
+        CMP     R0,#32                          ;Is this a control character?
+        MOVLO   LR,#0                           ;If so, we can exit the
+        STRLOB  LR,fontplotseqlen               ;  control sequence
+
+interceptwrch_fontplot_addchar
+        ADR     R1,textbuffer                   ;Store the character
+        LDRB    R3,textbufferpos
+        STRB    R0,[R1,R3]
+        ADD     R3,R3,#1
+        STRB    R3,textbufferpos
+        CMP     R3,#256                         ;Clears V if 0-255
+        ADRHS   R0,ErrorBlock_FontTooLong
+        BLHS    LookupSingle                    ; Sets V
+        B       interceptwrch_return
+
+; OSS This error is not in PDriveShare.Messages as this code is conditionally
+; assembled out.
+
+        MakeInternatErrorBlock  FontTooLong
+
+        ]
+
+; This is a control character. Check the length of its sequence. If zero,
+; deal with it immediately. Otherwise, start queueing.
+
+interceptwrch_control
+        ADR     LR,wrch_lengths
+        LDRB    R1,[LR,R0]
+        TEQ     R1,#0
+        STRNEB  R0,wrchinitchar
+        STRNEB  R1,wrchqueuepos
+        MOVEQ   R1,R0
+
+interceptwrch_dealwithcontrolseqifEQ
+        BLEQ    wrch_controlsequence
+
+interceptwrch_return
+        BL      disableandcheckescapes
+        BLVS    makepersistenterror
+interceptwrch_persistentreturn
+        STRVS   R0,[R13]
+        Pull    "R0-R6,R10,R11,LR,PC"
+
+; The lengths of VDU control sequences
+
+wrch_lengths
+        DCB     0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        DCB     0,1,2,5,0,0,1,9,8,5,0,0,4,4,0,2
+
+; Subroutine to deal with a complete VDU sequence. R1 holds the initial
+; character of the sequence, except that R1=32 for the delete character. The
+; rest of the sequence is in the 'wrchqueue' variable. Also, R0 holds the
+; last character of the sequence.
+;   Preserves all registers except R0 - R6.
+
+wrch_controlsequence
+        Push    "LR"
+        BL      vdu5_flush              ;This sequence is likely to plot or
+        Pull    "PC",VS                 ;  otherwise disrupt a sequence of
+                                        ;  VDU 5 characters. Play it safe!
+        LDRB    LR,disabled             ;Fall through if VDU drivers disabled
+        TST     LR,#disabled_vdu        ;  and this is not VDU 6
+        TEQNE   R1,#6
+        MOVEQ   LR,PC                   ;Table-driven subroutine call
+        ADDEQ   PC,PC,R1,LSL #2
+        Pull    "PC"                    ;And return
+
+        Return                          ;VDU 0 - do nothing
+        B       wrch_noprintercontrol   ;VDU 1,... - error (printer control)
+        B       wrch_noprintercontrol   ;VDU 2 - error (printer control)
+        Return                          ;VDU 3 - do nothing (as not printing)
+        B       wrch_noVDU4chars        ;VDU 4 - error (text mode)
+        Return                          ;VDU 5 - does nothing for VDU 5
+        B       wrch_enable             ;VDU 6 - enable driver
+        B       wrch_passcontrolseq     ;VDU 7 - bell - pass to VDU driver
+        B       wrch_backspace          ;VDU 8 - back space
+        B       wrch_forwardspace       ;VDU 9 - forward space
+        B       wrch_linefeed           ;VDU 10 - line feed
+        B       wrch_lineback           ;VDU 11 - reverse line feed
+        B       wrch_clearbox           ;VDU 12 - clear graphics clip box
+        B       wrch_carriagereturn     ;VDU 13 - carriage return
+        Return                          ;VDU 14 - does nothing for VDU 5
+        Return                          ;VDU 15 - does nothing for VDU 5
+        B       wrch_clearbox           ;VDU 16 - clear graphics clip box
+        Return                          ;VDU 17,... - does nothing for VDU 5
+        B       wrch_setgcol            ;VDU 18,... - set GCOL
+        B       wrch_passcontrolseq     ;VDU 19,... - pass to VDU driver
+        B       wrch_passcontrolseq     ;VDU 20 - pass to VDU driver
+        B       wrch_disable            ;VDU 21 - disable driver
+        B       wrch_nomodechanges      ;VDU 22,... - error (mode change)
+        B       wrch_vdu23              ;VDU 23,... - miscellaneous calls
+        B       wrch_setclipbox         ;VDU 24,... - set clipping box
+        B       wrch_plot               ;VDU 25,... - plot calls
+        B       wrch_defaultbox         ;VDU 26 - set default box & cursors
+        Return                          ;VDU 27 - do nothing
+        Return                          ;VDU 28,... - does nothing for VDU 5
+        B       wrch_setorigin          ;VDU 29,... - set graphics origin
+        B       wrch_homecursor         ;VDU 30 - home cursor
+        B       wrch_tabcursor          ;VDU 31,... - tab
+                                        ;VDU 127 - delete
+
+; Deal with a VDU 127 sequence.
+
+wrch_delete
+        Push    "LR"
+
+; First set the background colour.
+
+        MOV     R1,#0
+        BL      gcol_lookupbg
+        BEQ     wrch_delete_notdisabled
+        CLRV
+        B       wrch_delete_return
+
+wrch_delete_notdisabled
+        BL      colour_setrealrgb
+
+; Then back off by the automatic character advance.
+
+        ADRVC   LR,vdu5autoadvance
+        LDMVCIA LR,{R0,R3}
+        ADRVC   LR,oldpoint
+        LDMVCIA LR,{R1,R2}
+        SUBVC   R1,R1,R0
+        SUBVC   R2,R2,R3
+        STMVCIA LR,{R1,R2}
+
+; Then calculate the top left corner of the DELETE block - one screen pixel
+; up from the indicated position, and adjusted by graphics origin and user's
+; box origin.
+
+        LDRVC   R0,curryeig
+        MOVVC   LR,#1
+        ADDVC   R2,R2,LR,LSL R0
+
+        ADRVC   LR,origin
+        LDMVCIA LR,{R3,LR}
+        ADDVC   R1,R1,R3
+        ADDVC   R2,R2,LR
+
+        ADRVC   LR,usersoffset
+        LDMVCIA LR,{R3,LR}
+        SUBVC   R1,R1,R3
+        SUBVC   R2,R2,LR
+
+; And get the printer dependent code to deal with the character.
+
+        BLVC    vdu5_delete
+wrch_delete_return
+        Pull    "PC"
+
+; Subroutines to deal with various specific VDU sequences.
+;   Each has R1 = first character of sequence, rest of sequence in
+; 'wrchqueue', R0 = last character of sequence on entry, and should
+; preserve all registers except R0 - R6.
+
+; Deal with various control sequences by passing them on to the previous
+; owner of the WrchV vector.
+;   R0 is not relevant on entry to this routine, and it preserves all
+; registers.
+
+wrch_passcontrolseq
+        Push    "R0-R2,LR"
+        MOV     R0,R1
+        BL      wrch_passdownchar
+        ADRVC   LR,wrch_lengths
+        LDRVCB  R2,[LR,R1]
+        ADRVC   R1,wrchqueueend
+        SUBVC   R1,R1,R2
+        BLVC    wrch_passdownstring
+        STRVS   R0,[R13]
+        Pull    "R0-R2,PC"
+
+; Subroutine to pass the string whose starting address is in R1 and whose
+; length is in R2 to the previous owner of the WrchV vector.
+
+wrch_passdownstring
+        Push    "R0-R2,LR"
+wrch_passdownstring_loop
+        SUBS    R2,R2,#1                ;NB clears V if return will happen
+        Pull    "R0-R2,PC",LT
+        LDRB    R0,[R1],#1
+        BL      wrch_passdownchar
+        BVC     wrch_passdownstring_loop
+        STRVS   R0,[R13]
+        Pull    "R0-R2,PC"
+
+; Subroutine to pass the character in R0 to the previous owner of the WrchV
+; vector.
+
+wrch_passdownchar
+        Push    "R10-R12,LR"
+        ADR     LR,wrch_passdownchar_continue + SVC_mode
+        Push    "LR"
+        ADR     LR,vdupassdownparams
+        LDMIA   LR,{R10,R11,PC}
+wrch_passdownchar_continue
+        Pull    "R10-R12,PC"
+
+; Error for VDU 1,c or VDU 2 or VDU 3 sequence.
+
+wrch_noprintercontrol
+        ADR     r0, ErrorBlock_PrintCantPrinterVDU
+        B       LookupSingle            ; Will set V and return to LR
+
+        MakeInternatErrorBlock PrintCantPrinterVDU,,NoVDU
+
+
+; Error for VDU 4 sequence.
+
+wrch_noVDU4chars
+        ADR     r0, ErrorBlock_PrintCantVDU4
+        B       LookupSingle            ; Will set V and return to LR
+
+        MakeInternatErrorBlock PrintCantVDU4,,NoVDU4
+
+
+; Deal with a VDU 6 sequence.
+
+wrch_enable
+        LDRB    R1,disabled
+        BIC     R1,R1,#disabled_vdu
+        STRB    R1,disabled
+        Return
+
+; Deal with a VDU 8 sequence.
+
+wrch_backspace
+        ADR     R4,vdu5charadvance
+        LDMIA   R4,{R2,R3}
+wrch_reverseupdatecursor
+        RSB     R2,R2,#0
+        RSB     R3,R3,#0
+wrch_updatecursor
+        ADR     R4,oldpoint
+        LDMIA   R4,{R0,R1}
+        ADD     R0,R0,R2
+        ADD     R1,R1,R3
+        STMIA   R4,{R0,R1}
+        Return
+
+; Deal with a VDU 9 sequence.
+
+wrch_forwardspace
+        ADR     R4,vdu5charadvance
+        LDMIA   R4,{R2,R3}
+        B       wrch_updatecursor
+
+; Deal with a VDU 10 sequence.
+
+wrch_linefeed
+        ADR     R4,vdu5lineadvance
+        LDMIA   R4,{R2,R3}
+        B       wrch_updatecursor
+
+; Deal with a VDU 11 sequence.
+
+wrch_lineback
+        ADR     R4,vdu5lineadvance
+        LDMIA   R4,{R2,R3}
+        B       wrch_reverseupdatecursor
+
+; Deal with a VDU 12 or VDU 16 sequence.
+
+wrch_clearbox
+        Push    "LR"
+        MOV     R1,#0
+        BL      gcol_lookupbg
+        Pull    "PC",NE
+        BL      colour_setrealrgb
+        BLVC    plot_fillclipbox
+        Pull    "PC"
+
+; Deal with a VDU 13 sequence.
+
+wrch_carriagereturn
+        Push    "LR"
+        LDRB    R1,cursorcontrol
+        TST     R1,#&08
+        BEQ     wrch_carriagereturn_horizontal
+wrch_carriagereturn_vertical
+        BL      wrch_verticalcharorg
+        STR     R3,oldpoint+4
+        Pull    "PC"
+wrch_carriagereturn_horizontal
+        BL      wrch_horizontalcharorg
+        STR     R2,oldpoint
+        Pull    "PC"
+
+; Subroutines to find the horizontal and vertical character origins.
+; Entry: R1 = 'cursorcontrol'.
+; Exit:  R2 = character X origin for 'wrch_horizontalcharorg'.
+;        R3 = character Y origin for 'wrch_verticalcharorg'.
+;        R0 corrupt.
+
+wrch_horizontalcharorg
+        TST     R1,#&02
+        LDREQ   R2,graphicswindow
+        LDRNE   R2,graphicswindow+8
+        LDRNE   R0,vdu5charsize
+        SUBNE   R2,R2,R0
+        Return
+
+wrch_verticalcharorg
+        LDR     R3,curryeig
+        MOV     R0,#1
+        MOV     R0,R0,LSL R3
+        TST     R1,#&04
+        LDREQ   R3,graphicswindow+12
+        LDRNE   R3,graphicswindow+4
+        SUB     R3,R3,R0
+        LDRNE   R0,vdu5charsize+4
+        ADDNE   R3,R3,R0
+        Return
+
+; Deal with a VDU 18,k,c sequence.
+
+wrch_setgcol
+        LDRB    R1,wrchqueueend-1       ;Get the colour
+        TST     R1,#&80                 ;Select foreground or background
+        ADRNE   R2,bgmode
+        BICNE   R1,R1,#&80
+        ADREQ   R2,fgmode
+        ASSERT  fggcol-fgmode = bggcol-bgmode
+        STRB    R1,[R2,#fggcol-fgmode+1]        ;Store the colour
+        LDRB    R1,wrchqueueend-2       ;Get the GCOL action
+        STR     R1,[R2]                 ;Store the GCOL action
+        MOV     R1,#0
+        STRB    R1,[R2,#fggcol-fgmode+3]        ;And indicate this is a GCOL
+        Return
+
+; Deal with a VDU 21 sequence.
+
+wrch_disable
+        LDRB    R1,disabled
+        ORR     R1,R1,#disabled_vdu
+        STRB    R1,disabled
+        Return
+
+; Error for VDU 22,m sequence.
+
+wrch_nomodechanges
+        ADR     r0, ErrorBlock_PrintCantModeChange
+        B       LookupSingle            ; Will set V and return to LR
+
+        MakeInternatErrorBlock PrintCantModeChange,,NoModCh
+
+
+; Deal with a VDU 23,... sequence.
+
+wrch_vdu23
+        Push    "LR"
+        LDRB    R2,wrchqueueend-9
+        CMP     R2,#32                  ;Redefining a character?
+        BHS     wrch_vdu23_chardefn     ;Branch if so
+        MOV     LR,PC                   ;Otherwise do table-driven
+        ADD     PC,PC,R2,LSL #2         ;  subroutine call
+        Pull    "PC"
+
+        B       wrch_passcontrolseq     ;VDU 23,0,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,1,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,2,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,3,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,4,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,5,... - pass down
+        B       wrch_setdotpattern      ;VDU 23,6,... - set dot-dash pattern
+        B       wrch_cannothandlevdu23  ;VDU 23,7,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,8,... - error
+        B       wrch_passcontrolseq     ;VDU 23,9,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,10,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,11,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,12,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,13,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,14,... - pass down
+        B       wrch_passcontrolseq     ;VDU 23,15,... - pass down
+        B       wrch_setcursorcontrol   ;VDU 23,16,... - set cursor control
+        B       wrch_vdu23_17           ;VDU 23,17,... - miscellaneous calls
+        B       wrch_cannothandlevdu23  ;VDU 23,18,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,19,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,20,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,21,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,22,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,23,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,24,... - error
+        [       DoFontSpriteVdu
+        B       wrch_setfontparams      ;VDU 23,25,... - set font parameters
+        B       wrch_setfont            ;VDU 23,26,... - set fancy font
+        B       wrch_vduselectsprite    ;VDU 23,27,... - select/get sprite
+        |
+        B       wrch_nofontspritevdu    ;VDU 23,25,... - not done
+        B       wrch_nofontspritevdu    ;VDU 23,26,... - not done
+        B       wrch_nofontspritevdu    ;VDU 23,27,... - not done
+        ]
+        B       wrch_cannothandlevdu23  ;VDU 23,28,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,29,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,30,... - error
+        B       wrch_cannothandlevdu23  ;VDU 23,31,... - error
+
+wrch_vdu23_chardefn
+        MOV     R1,R2
+        BL      broadcast_vdu5_changed
+        MOV     R1,#23
+        BL      wrch_passcontrolseq
+        Pull    "PC"
+
+wrch_cannothandlevdu23
+        ADR     r0, ErrorBlock_PrintCantThisVDU23
+        B       LookupSingle            ; Will set V and return to LR
+
+        MakeInternatErrorBlock PrintCantThisVDU23,,NoVDU23
+
+
+; Deal with VDU 23,6,...
+
+wrch_setdotpattern
+        ADR     R2,wrchqueueend-8
+        LDMIA   R2,{R0,R1}
+        ADR     R2,dottedpattern
+        STMIA   R2,{R0,R1}
+        Return
+
+; Deal with VDU 23,16,...
+
+wrch_setcursorcontrol
+        Push    "LR"
+        BL      vdu5_flush
+        LDRVCB  R0,cursorcontrol
+        LDRVCB  R1,wrchqueueend-7
+        ANDVC   R0,R0,R1
+        LDRVCB  R1,wrchqueueend-8
+        EORVC   R0,R0,R1
+        ORRVC   R0,R0,#&40
+        STRVCB  R0,cursorcontrol
+        BLVC    adjustvdu5advances
+        Pull    "PC"
+
+; Deal with VDU 23,17,...
+
+wrch_vdu23_17
+        Push    "LR"
+        LDRB    R2,wrchqueueend-8
+        CMP     R2,#(wrch_vdu23_17_tableend - wrch_vdu23_17_table):SHR:2
+                                        ;NB clears V
+        BLHS    wrch_cannothandlevdu23  ;NB sets V if taken
+        MOVVC   LR,PC                   ;Otherwise do table-driven
+        ADDVC   PC,PC,R2,LSL #2         ;  subroutine call
+        Pull    "PC"
+
+wrch_vdu23_17_table
+        Return                          ;VDU 23,17,0,... - do nothing
+        Return                          ;VDU 23,17,1,... - do nothing
+        B       wrch_setfgtint          ;VDU 23,17,2,... - set fg tint
+        B       wrch_setbgtint          ;VDU 23,17,3,... - set bg tint
+        B       wrch_passcontrolseq     ;VDU 23,17,4,... - pass down
+        Return                          ;VDU 23,17,5,... - do nothing
+        B       wrch_passcontrolseq     ;VDU 23,17,6,... - pass down
+        B       wrch_changecharsize     ;VDU 23,17,7,... - change char. sizes
+wrch_vdu23_17_tableend
+
+; Deal with VDU 23,17,2-3,tint,0,0,0,0,0,0.
+
+wrch_setfgtint
+        LDRB    R0,wrchqueueend-7
+        STRB    R0,fggcol
+        Return
+
+wrch_setbgtint
+        LDRB    R0,wrchqueueend-7
+        STRB    R0,bggcol
+        Return
+
+; Deal with VDU 23,17,7,flags,x;y;0,0.
+
+wrch_changecharsize
+        Push    "LR"
+        BL      vdu5_flush
+        Pull    "PC",VS
+        ADR     R0,wrchqueueend-8
+        LDMIA   R0,{R0,R1}
+        MOV     R0,R0,LSR #16
+        MOV     R1,R1,LSL #16
+        MOV     R1,R1,LSR #16
+        ADR     R2,currxeig
+        LDMIA   R2,{R2,R3}
+        ASSERT  curryeig = currxeig+4
+        MOV     R0,R0,LSL R2
+        MOV     R1,R1,LSL R3
+        LDRB    R2,wrchqueueend-7
+        TST     R2,#2_10
+        ADRNE   R3,vdu5charsize
+        STMNEIA R3,{R0,R1}
+        TST     R2,#2_100
+        ADRNE   R3,vdu5charspace
+        STMNEIA R3,{R0,R1}
+        BL      adjustvdu5advances
+        Pull    "PC"
+
+        [       DoFontSpriteVdu
+
+; Deal with VDU 23,25,... sequence.
+
+wrch_setfontparams
+********** STILL TO BE IMPLEMENTED **********
+
+; Deal with VDU 23,26,... sequence. This is done by starting the collection
+; of a font name and then leaving the rest of the work until later.
+
+wrch_setfont
+        Push    "LR"
+        MOV     LR,#&80                 ;Store fact that we're doing a VDU
+        STRB    LR,doingfontplot        ;  23,26,... sequence
+        MOV     LR,#0                   ;Also record no control sequence
+        STRB    LR,fontplotseqlen       ;  in progress
+        Pull    "PC"
+
+; Deal with VDU 23,27,... sequence.
+
+wrch_vduselectsprite
+********** STILL TO BE IMPLEMENTED **********
+
+; Deal with OS_SpriteOp with reason code &018 (select sprite for VDU code)
+wrch_selectsprite
+********** STILL TO BE IMPLEMENTED **********
+
+        ]
+
+; Deal with a VDU 24,l;b;r;t; sequence.
+
+wrch_setclipbox
+        Push    "LR"
+
+        LDR     R1,wrchqueueend-8               ;Get lower left point
+        MOV     R2,R1,ASR #16
+        MOV     R1,R1,LSL #16
+        MOV     R1,R1,ASR #16
+
+        LDR     R3,wrchqueueend-4               ;Get upper right point
+        MOV     R4,R3,ASR #16
+        MOV     R3,R3,LSL #16
+        MOV     R3,R3,ASR #16
+
+        ADR     LR,origin                       ;Adjust for graphics origin
+        LDMIA   LR,{R5,R6}
+        ADD     R1,R1,R5
+        ADD     R2,R2,R6
+        ADD     R3,R3,R5
+        ADD     R4,R4,R6
+
+        ADD     R3,R3,#1
+        ADD     R4,R4,#1
+
+        ADR     LR,graphicswindow               ;Record clip box for benefit
+        STMIA   LR,{R1-R4}                      ;  of graphics home position
+
+        ADR     LR,usersoffset                  ;Offset to user's box origin
+        LDMIA   LR,{R5,R6}
+        SUB     R1,R1,R5
+        SUB     R2,R2,R6
+        SUB     R3,R3,R5
+        SUB     R4,R4,R6
+
+        BL      pagebox_setnewbox               ;And report to printer
+                                                ;  specific code
+        Pull    "PC"
+
+; Deal with a VDU 25,k,xl,xh,yl,yh sequence.
+
+wrch_plot
+        Push    "R7-R9,LR"
+
+        LDRB    LR,wrchqueueend-5       ;Get the plot type
+        TEQ     LR,#&B8                 ;Treat the "move to/by" code in the
+        TEQNE   LR,#&BC                 ;  block copy/move group specially
+        BICEQ   LR,LR,#&F8              ;  (for old cwimp libraries)
+        MOV     R1,LR,LSR #3            ;Get the plot group
+        LDR     R1,[PC,R1,LSL #2]       ;Get the routine or message offset
+        B       wrch_plot_continue
+
+        DCD     plot_linebothends-wrch_plot     ;Solid line, both ends
+        DCD     plot_linestartonly-wrch_plot    ;Solid line, no end point
+        [       RealDottedLines
+        DCD     plot_dottedbothends-wrch_plot   ;Dotted line, both ends
+        DCD     plot_dottedstartonly-wrch_plot  ;Dotted line, no end point
+        |
+        DCD     plot_linebothends-wrch_plot     ;Solid line, both ends
+        DCD     plot_linestartonly-wrch_plot    ;Solid line, no end point
+        ]
+        DCD     plot_lineendonly-wrch_plot      ;Solid line, no start point
+        DCD     plot_linenoends-wrch_plot       ;Solid line, no ends
+        [       RealDottedLines
+        DCD     plot_dottedendonly-wrch_plot    ;Dotted line, no start point
+        DCD     plot_dottednoends-wrch_plot     ;Dotted line, no ends
+        |
+        DCD     plot_lineendonly-wrch_plot      ;Solid line, no start point
+        DCD     plot_linenoends-wrch_plot       ;Solid line, no ends
+        ]
+        DCD     plot_point-wrch_plot            ;Point
+        DCD     (nohorizfillsmessage-wrch_plot):OR:TopBit
+        DCD     plot_triangle-wrch_plot         ;Triangle
+        DCD     (nohorizfillsmessage-wrch_plot):OR:TopBit
+        DCD     plot_rectangle-wrch_plot        ;Axis-aligned rectangle
+        DCD     (nohorizfillsmessage-wrch_plot):OR:TopBit
+        DCD     plot_parallelogram-wrch_plot    ;Parallelogram
+        DCD     (nohorizfillsmessage-wrch_plot):OR:TopBit
+        DCD     (nofloodfillsmessage-wrch_plot):OR:TopBit
+        DCD     (nofloodfillsmessage-wrch_plot):OR:TopBit
+        DCD     plot_strokecircle-wrch_plot     ;Circle outline
+        DCD     plot_fillcircle-wrch_plot       ;Circle fill
+        DCD     plot_strokearc-wrch_plot        ;Circular arc
+        DCD     plot_fillchord-wrch_plot        ;Circular chord segment fill
+        DCD     plot_fillsector-wrch_plot       ;Circular pie sector fill
+        DCD     (nocopymovesmessage-wrch_plot):OR:TopBit
+        DCD     plot_strokeellipse-wrch_plot    ;Ellipse outline
+        DCD     plot_fillellipse-wrch_plot      ;Ellipse fill
+        [       DoFontSpriteVdu
+        DCD     wrch_plot_fontcall-wrch_plot    ;Font PLOT
+        |
+        DCD     (nofontspritevdumessage-wrch_plot):OR:TopBit
+        ]
+        DCD     (noundefinedplotsmessage-wrch_plot):OR:TopBit
+        DCD     (noundefinedplotsmessage-wrch_plot):OR:TopBit
+        [       DoFontSpriteVdu
+        DCD     wrch_plot_spritecall-wrch_plot  ;Sprite PLOT
+        |
+        DCD     (nofontspritevdumessage-wrch_plot):OR:TopBit
+        ]
+        DCD     (noundefinedplotsmessage-wrch_plot):OR:TopBit
+        DCD     (noundefinedplotsmessage-wrch_plot):OR:TopBit
+
+wrch_plot_continue
+        ADR     R3,wrch_plot
+        ADDS    R1,R1,R3
+        BMI     wrch_plot_cannothandle
+
+        LDR     R3,wrchqueueend-4       ;Get the co-ordinate pair
+        MOV     R2,R3,LSL #16           ;  and sign-extend it
+        MOV     R2,R2,ASR #16
+        MOV     R3,R3,ASR #16
+
+        TST     LR,#4
+        ADREQ   R4,oldpoint             ;Address appropriate origin
+        ADRNE   R4,origin
+        LDMIA   R4,{R4,R5}              ;Get the origin
+        ADD     R2,R2,R4                ;  and add it to the specified point
+        ADD     R3,R3,R5
+
+        ADR     R8,thispoint
+        STMIA   R8!,{R2-R3}             ;Store new cursor position
+        LDMIA   R8,{R4-R7}              ;And load old cursor positions
+        ASSERT  oldpoint = thispoint+8
+        ASSERT  olderpoint = oldpoint+8
+
+        ADR     R8,usersoffset          ;Offset positions from being relative
+        LDMIA   R8,{R8,R9}              ;  to the user's origin to being
+        SUB     R2,R2,R8                ;  relative to the bottom left corner
+        SUB     R3,R3,R9                ;  of the box being printed
+        SUB     R4,R4,R8
+        SUB     R5,R5,R9
+        SUB     R6,R6,R8
+        SUB     R7,R7,R9
+
+        ANDS    LR,LR,#3                ;Find colour type and act according
+        CMPNE   LR,#2                   ;  to it - return if it's just a move
+        BEQ     wrch_plot_normalreturn
+        MOV     R8,R1
+        MOV     R1,#0
+        BL      gcol_lookupfgorbg
+        BNE     wrch_plot_normalreturn
+        BL      colour_setrealrgb
+
+        MOVVC   LR,PC                   ;Table-driven subroutine call to the
+        MOVVC   PC,R8                   ;  correct routine to handle this
+        BVS     wrch_plot_return        ;  call, then return
+
+wrch_plot_normalreturn
+        [       DoFontSpriteVdu
+
+        LDRB    LR,doingfontplot        ;Provided we've not just started a
+        TEQ     LR,#0                   ;  font plot, shift graphics
+        ADREQ   LR,thispoint            ;  positions up
+        LDMEQIA LR,{R3-R8}
+        ADREQ   LR,oldpoint
+        STMEQIA LR,{R3-R8}
+        ASSERT  oldpoint = thispoint+8
+        ASSERT  olderpoint = oldpoint+8
+        ASSERT  oldestpoint = olderpoint+8
+
+        |
+
+        ADR     LR,thispoint            ;Shift graphics positions up
+        LDMIA   LR,{R3-R8}
+        ADR     LR,oldpoint
+        STMIA   LR,{R3-R8}
+        ASSERT  oldpoint = thispoint+8
+        ASSERT  olderpoint = oldpoint+8
+        ASSERT  oldestpoint = olderpoint+8
+
+        ]
+
+        CLRV
+wrch_plot_return
+        Pull    "R7-R9,PC"
+
+; OSS On entry R1 contains the address of the error block, but with the top
+; bit set.
+
+wrch_plot_cannothandle
+        BIC     R0,R1,#TopBit
+        BL      LookupSingle                    ; Always sets the V bit
+        Pull    "R7-R9,PC"
+
+nohorizfillsmessage
+        MakeInternatErrorBlock PrintCantHorizFill,,NoHFill
+
+nofloodfillsmessage
+        MakeInternatErrorBlock PrintCantFloodFill,,NoFFill
+
+nocopymovesmessage
+        MakeInternatErrorBlock PrintCantCopyMove,,NoBlkOp
+
+noundefinedplotsmessage
+        MakeInternatErrorBlock PrintCantUndefPlot,,NoUPlot
+
+        [ :LNOT:DoFontSpriteVdu
+
+nofontspritevdumessage
+        MakeInternatErrorBlock PrintCantFontSpriteVDU,,NoFSVDU
+
+wrch_selectsprite
+wrch_nofontspritevdu
+        ADR     R0, ErrorBlock_PrintCantFontSpriteVDU
+        B       LookupSingle                    ; Will set V and return to LR
+
+        |
+
+wrch_plot_fontcall
+        Push    "LR"
+        LDRB    LR,wrchqueueend-5       ;Store appropriate plot type, and
+        ORR     LR,LR,#&10              ;  record fact that we're doing a
+        STRB    LR,doingfontplot        ;  font plot.
+        MOV     LR,#0                   ;Also record no control sequence
+        STRB    LR,fontplotseqlen       ;  in progress
+        Pull    "PC"
+
+wrch_plot_spritecall
+        Push    "R0-R2,R5,LR"
+        CLRV
+        LDRB    LR,wrchqueueend-5
+        ANDS    LR,LR,#3
+        BEQ     wrch_plot_spritecall_return
+        ADR     R0,currentsprite
+        LDMIA   R0,{R0-R2}
+        TEQ     R0,#0
+        ADRMI   R0,ErrorBlock_PrintNoCurrentSprite
+        BLMI    LookupSingle                    ; Sets V
+        BVS     wrch_plot_spritecall_return
+        CMP     LR,#2                           ;If EQ, do nothing, like
+        ADDGT   R0,R0,#SpriteReason_PlotMask    ;  other things with invert
+        LDRGT   R5,bgmode                       ;  actions
+        ADDLT   R0,R0,#SpriteReason_PutSprite
+        LDRLT   R5,fgmode
+        SWINE   XOS_SpriteOp
+wrch_plot_spritecall_return
+        STRVS   R0,[R13]
+        Pull    "R0-R2,R5,PC"
+
+; OSS This error is not in PDriveShare.Messages because the code is
+; conditionally assembled out.
+
+        MakeInterantErrorBlock  PrintNoCurrentSprite
+
+        ]
+
+
+; Deal with a VDU 26 sequence - note this one preserves all registers because
+; it is called from other places besides 'wrch_controlsequence'.
+
+wrch_defaultbox
+        Push    "R1-R6,LR"
+
+; Set origin and cursors to (0,0)
+
+        MOV     R1,#0
+        MOV     R2,#0
+        ADR     LR,origin
+        STMIA   LR!,{R1,R2}
+        ASSERT  thispoint = origin+8
+        STMIA   LR!,{R1,R2}
+        ASSERT  oldpoint = thispoint+8
+        STMIA   LR!,{R1,R2}
+        ASSERT  olderpoint = oldpoint+8
+        STMIA   LR!,{R1,R2}
+        ASSERT  oldestpoint = olderpoint+8
+        STMIA   LR!,{R1,R2}
+
+; Set 'graphicswindow' from user's box.
+
+        ADR     LR,usersoffset
+        LDMIA   LR,{R1-R4}
+        ASSERT  usersbox = usersoffset+8
+        ADD     R3,R3,R1
+        ADD     R4,R4,R2
+
+        ADR     LR,currxeig                     ;Adjust to pixel boundaries
+        LDMIA   LR,{R5,R6}                      ;  to ensure clip boxes have
+        ASSERT  curryeig = currxeig+4           ;  the tiling properties an
+        MOV     R1,R1,ASR R5                    ;  application might expect
+        MOV     R2,R2,ASR R6
+        MOV     R3,R3,ASR R5
+        MOV     R4,R4,ASR R6
+        MOV     R1,R1,LSL R5
+        MOV     R2,R2,LSL R6
+        MOV     R3,R3,LSL R5
+        MOV     R4,R4,LSL R6
+
+        ADR     LR,graphicswindow               ;Record clip box for benefit
+        STMIA   LR,{R1-R4}                      ;  of graphics home position
+
+; Set up the maximum box to be plotted
+
+        BL      pagebox_setmaxbox
+
+; And return
+
+        Pull    "R1-R6,PC"
+
+; Deal with a VDU 29,xlo,xhi,ylo,yhi sequence.
+
+wrch_setorigin
+        LDR     R1,wrchqueueend-4
+        MOV     R2,R1,ASR #16
+        MOV     R1,R1,LSL #16
+        MOV     R1,R1,ASR #16
+        STR     R1,origin               ;Cheaper not to use an STM in this
+        STR     R2,origin+4             ;  particular case
+        Return
+
+; Deal with VDU 30 and VDU 31,x,y sequences.
+
+wrch_homecursor
+        Push    "LR"
+        MOV     R4,#0
+        MOV     R5,#0
+        B       wrch_tabcursor_common
+
+wrch_tabcursor
+        Push    "LR"
+        LDRB    R4,wrchqueueend-2
+        LDRB    R5,wrchqueueend-1
+
+wrch_tabcursor_common
+        BL      wrch_horizontalcharorg
+        BL      wrch_verticalcharorg
+        ADR     LR,vdu5charadvance
+        LDMIA   LR,{R0,R1}
+        MLA     R2,R0,R4,R2
+        MLA     R3,R1,R4,R3
+        ADR     LR,vdu5lineadvance
+        LDMIA   LR,{R0,R1}
+        MLA     R2,R0,R5,R2
+        MLA     R3,R1,R5,R3
+        ADR     LR,oldpoint
+        STMIA   LR,{R2,R3}
+        CLRV
+        Pull    "PC"
+
+        END

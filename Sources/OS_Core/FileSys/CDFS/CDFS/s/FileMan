@@ -1,0 +1,917 @@
+; -> FileMan
+
+;***************************************************************************
+
+;***************************************************************************
+;        This handles all of the file manipulating parts
+;***************************************************************************
+
+;***************************************************************************
+
+; procedures in here:
+
+; CloseFile
+; ControlOpenFile
+; FSOperations
+; GetByte
+; MultiOperations
+; OpenFile
+; SelectFilingSystem               ( *CDFS )
+; WholeFile
+
+;***************************************************************************
+SelectFilingSystem ROUT
+;        Selects filing system when *CDFS is typed
+;***************************************************************************
+
+ ALIGN
+
+ ;R0 - R6 corruptible
+ ;R7 - R11 must be preserved
+
+ ; R12 = pointer to latest version of module
+ ; R13 = pointer to full descending stack
+ ; R14 = return address
+
+ log_on
+
+ STASH R14
+
+ MOV R0, #14                ; Reason code
+
+ ADR R1, FilingSystemName   ; Select CDFS
+
+ SWI XOS_FSControl
+
+ GRAB PC
+
+StartUpText = "Next Technology "     ; let it run on !
+title                                ; identical strings
+FilingSystemName = "CDFS", 0         ;
+
+ [ RISC_OS = 2
+SpriteDataPathName = ":29.$.SPRITES", 0
+ ]
+
+ ALIGN
+
+;*************************************************************************
+OpenFile ROUT      ;  see page 973
+;*************************************************************************
+
+; on entry:
+; R0 = 0 for read, 1 for create and update, 2 for update
+; R1 -> filename
+; R3 = file switch handle for the file
+; R6 -> special field, else 0
+
+; on exit:
+; R0 = file information word ( see page 974 )
+; R1 = file handle used by me
+; R2 = buffer size for FS to use
+; R3 = file extent ( buffered files only )
+; R4 = space currently allocated to file ( buffered files )
+
+; If a directory is opened, THEN it will NOT have bytes requested from it !
+; this means that the object type is not needed
+
+; R8 -> disc buffer
+ log_on
+
+
+ STASHALL
+ [ demoversion=ON
+ LDR R14, demotries                   ;For demo version
+ ADD R14, R14, #1                       ; Lock up if done enough
+ STR R14, demotries                   ;
+ CMP R14, #NUMBEROFDEMOTRIES  ;
+ MOVGE R14, #0                          ;
+ MOVGE PC, R14                          ;
+ ]
+
+ Debug " Open "
+
+;**************
+; Trying to write to CDROM ?
+;**************
+
+ TEQ R0, #READONLY              ; Open for read only
+ TEQNE R0, #UPDATEONLY          ; Or updating, but no actual writing
+
+ [ RISC_OS=2
+ addr R0, CannotWriteYouTwat, NE  ; Cannot write to cdrom
+ BNE Error                      ;
+ |
+          MOVNE       r0, #ERROR_WRITETOCD
+          BNE         Error
+ ]
+
+
+ [ RISC_OS = 2
+
+;**************
+; Is CDFSFiler requesting sprite data ?
+;**************
+
+ ADR R0, SpriteDataPathName
+
+ MOV R2, #?SpriteDataPathName
+
+ BL CompareStrings    ; returns 'eq' or 'ne'
+
+ BEQ %FT01                      ; [ yes ]
+
+;**************
+ ]
+
+
+ MOV R0, R1
+
+;*********************************
+; Dir: ( pathname$, RETURN pointer to block of object info, 0 if not found,
+;                   RETURN R2 = 1 if a file, 2 if a directory )
+;                   RETURN R3 -> start of disc buffer
+;                   RETURN R4 = drive number
+ MOV R1, #2
+ BL Dir
+;*********************************
+
+ TEQ R2, #NOTFOUND              ; File not found
+ GRABALL EQ
+ MOVEQ R1, #0
+ BICEQS PC, R14, #Overflow_Flag
+
+ MOV R8, R3
+
+                                ; see 'Open' for below proc
+ BL NumberOfNextFreeFileHandle  ; Returns R0 = FileHandle ( 1 - 256 )
+
+; TEQ R0, #0                     ; could not find a free place
+; ADREQL R0, InternalError       ; FS or me screwed up
+; BEQ Error                      ;
+
+ STR R0, verytemporary          ;
+
+
+ MOV R0, #6                     ; claim some memory for my little buffer
+ MOV R3, #SizeOfOpenBuffer      ; 45 bytes claimed
+
+ SWI XOS_Module
+
+ GRABALL VS                     ; if cannot get it, then cry to FS
+ LDRVS R0, temp1                ;
+ MOVVS R1, #0                   ;
+ BICVSS PC, R14, #Overflow_Flag ;
+
+;***************
+; Put details into my small buffer
+;***************
+
+ STASH R1                         ; add drive number to details
+ MOV R0, R4                       ;
+ STASH R2
+; MOV R2, #0
+ BL PreGetUniqueNumber            ; R0=drive number, RETURNS R1, R2
+ GRAB R2
+ STR R1, [ R2, #DISCNUMBEROPEN ]  ;
+
+ ADD R1, R2, #DISCNAMEOPENOFFSET  ; add disc name to details
+ STASH R2
+ MOV R2, R8
+ BL GetDiscName                   ; R0 = drive, R1 -> where to put
+ MOV R0, R1                       ; R2 -> disc buffer
+ BL CutSpace                      ;
+ GRAB R2
+ GRAB R1                          ;
+
+ STRB R4, [ R2, #DRIVENUMBEROPEN ]; add drive number to details
+
+ LDRB R3, [ R8, #DISCMODEOFFSETINABUFFER ]  ; disc mode details
+ STRB R3, [ R2, #DISCMODEOPEN ]             ;
+
+ LDR R3, [ R8, #BLOCKSIZEOFFSETINABUFFER ]; add size of block to details
+ STR R3, [ R2, #SIZEOFBLOCKOPEN ] ;
+
+
+; Work out actual LBA start
+
+
+; STASH R7 - R8
+
+ MOV R7, #myblocksize
+
+ DivRem R8, R7, R3, R14
+
+ LDR R3, [ R1, #LBASTARTOFFSET ]  ; add start block to details
+ MOV R3, R3, LSR #8
+
+ DivRem R7, R3, R8, R14
+
+ STR R7, [ R2, #STARTLBAOPEN ]    ;
+
+
+; GRAB R7 - R8
+
+;         ************
+
+ LDR R3, [ R1, #LENGTHOFFSET ]    ; add length of file to details
+ STR R3, [ R2, #SIZEOFFILEOPEN ]  ;
+ STR R3, temp1                    ; tell FS the size of the file
+
+;*****************
+
+
+ LDR R4, =:INDEX:OpenFileList-4 ; Put pointer to claimed memory in list
+ ADD R4, R4, R12                ;
+ LDR R0, verytemporary          ;
+ STR R2, [ R4, R0, ASL #2 ]     ; R2 -> my small buffer
+
+
+ MOV R3, #0                     ; obj is a dir, so set info word for FS
+
+ LDRB R2, [ R1, #OBJECTTYPEOFFSET ]
+ TEQ R2, #DIRECTORY             ;
+ ORREQ R3, R3, #1:SHL:29        ;
+
+
+ LDRB R2, [ R1, #FILEATTRIBUTESOFFSET ]; read is permitted from this entry
+ TST R2, #2_10001          ;
+ ORRNE R3, R3, #1:SHL:30        ;   ORREQ
+ STR R3, temp2                  ;
+
+ GRABALL
+
+ LDR R0, temp2                   ; info word for FileSwitch about entry
+
+ LDR R1, verytemporary           ; file handle
+
+ MOV R2, #FSBUFFERSIZE           ; size of buffer that FileSwitch should use
+
+ LDR R3, temp1                   ; file extent
+
+ MOV R4, R3                      ; space currently allocated to file
+
+ BICS PC, R14, #Overflow_Flag
+
+
+ [ RISC_OS = 2
+;********************
+; Give CDFSFiler requested spritedata
+;********************
+
+01
+                                ; see 'Open' for below proc
+ BL NumberOfNextFreeFileHandle  ; Returns R0 = FileHandle ( 1 - 256 )
+
+ STR R0, handleforspritedata
+
+ GRABALL
+
+ MOV R0, #1:SHL:30              ; read is permitted from this file (ofcourse)
+ LDR R1, handleforspritedata
+ MOV R2, #FSBUFFERSIZE
+ LDR R3, =EndOfSpriteData - StartOfSpriteData    ;
+; LDR R4, =EndOfSpriteData - StartOfSpriteData    ; space currently allocated
+ MOV R4, R3
+
+ BICS PC, R14, #Overflow_Flag
+
+ ]
+
+;***************************************************************************
+GetByte ROUT      ; see page 975
+;***************************************************************************
+
+; on entry:
+;          R1 = my file handle
+;          R2 = memory address to put data
+;          R3 = number of bytes to read
+;          R4 = file offset to get data from
+
+; on exit:
+;         nothing
+
+
+; strategy:
+;          . work out which block to start from
+;          . work out which block to end at
+;          . work out which byte to start from in the block
+;          . work out which byte to end at in the block
+;          . If the byte to start from is not 0 THEN
+;          .                                    {
+;          .                                     load a block into my buffer
+;          .                                     copy out whats needed
+;          .                                     add 1 to start block
+;          .                                    }
+;          . if (start block != end block)
+;          .    {
+;          .     if (end byte ==0 (or blocksize ?) )
+;          .        number_to_load=end block-start block
+;          .    else
+;          .        number_to_load=(end block-start block)-1
+;          .
+;          .     if (number_to_load > 0)
+;          .         load number_to_load blocks into users area
+;          .    }
+;          .
+;          . if (end_byte !=0 )
+;          .    {
+;          .     load a block into my buffer
+;          .     copy out whatevers needed
+;          .    }
+
+; temp1 = disc number
+; bufferedblockdiscnumber
+; bufferedblocknumber
+
+; R7 = blocksize, R10 = blocksize ( in loop )
+; R8 = block
+; R11 = memory address to put data at    SEE IN LOOP FOR MORE FIXS !
+ log_on
+
+
+ STASHALL
+ [ demoversion=ON
+ LDR R14, demotries                   ;For demo version
+ ADD R14, R14, #1                       ; Lock up if done enough
+ STR R14, demotries                   ;
+ CMP R14, #NUMBEROFDEMOTRIES  ;
+ MOVGE R14, #0                          ;
+ MOVGE PC, R14                          ;
+ ]
+
+ Debug " Get byte "
+
+ [ debug=ON
+ MOV R5, R3
+ DebugDisplay R5
+ ]
+
+ [ RISC_OS = 2
+;**************
+; Quicky to give sprite data to filer
+;**************
+
+ LDR R5, handleforspritedata          ; Did filer request sprite data ?
+ TEQ R5, R1                           ;
+ BEQ %FT05                            ;
+
+;**************
+
+ ]
+
+
+ MOV R11, R2
+
+ LDR R5, =:INDEX:OpenFileList - 4 ; R6 -> my little buffer of entry details
+ ADD R5, R5, R12                  ;
+ LDR R6, [ R5, R1, LSL #2 ]       ;
+; TEQ R6, #0                       ;
+; ADREQL R0, InternalError         ;
+; BEQ Error                        ;
+
+;******************
+; Make sure that correct disc is in drive
+;******************
+
+ LDR R5, [ R6, #DISCNUMBEROPEN ]
+
+
+ LDRB R0, [ R6, #DRIVENUMBEROPEN ]
+
+ MOV R2, #1
+
+ BL GetUniqueNumber               ; R0 = drive number, RETURNS R1 = number
+                                  ; R2 = 1 no error
+
+ STR R1, temp1
+                                  ; R2 = 0 if error, else RETURNS R1=0
+ TEQ R1, R5
+
+ MOV R1, R0
+ ADDNE R0, R6, #DISCNAMEOPEN
+ BLNE PromptForDisc               ; R0 -> disc name, R1 = drive number
+
+
+;******************
+
+
+
+ LDR R5, [ R6, #STARTLBAOPEN ]   ; R4 = start LBA of load
+
+
+ ADD R7, R12, #:INDEX:sparecontrolblock
+
+; Will already be done because of uniquenumber
+; LDRB R0, [ R6, #DRIVENUMBEROPEN ]
+; BL ConvertDriveNumberToDeviceID          ; r0 = drive, R7 -> control block
+; BVS Error
+
+ LDRB R0, [ R6, #DISCMODEOPEN ]
+
+ BL ChangeDiscMode                        ; R0 = mode, R7 -> control block
+
+
+ MOV R0, #1
+
+
+; LDR R7, [ R6, #SIZEOFBLOCKOPEN ]
+ LDR R10, [ R6, #SIZEOFBLOCKOPEN ]
+
+; LDRB R1, [ R6, #DRIVENUMBEROPEN ]        ; R1 = drive number
+                                 ; work out where to start from:
+                                 ; R4 = offset to get data from
+
+
+ ADD R6, R4, R3                  ; R9 = file offset + number of bytes to read
+
+; MOV R10, R7
+
+ DivRem R0, R4, R10, R14         ; R0 = block to read from
+ ADD R0, R0, R5                  ; R4 = bytes offset in a block to read from
+
+
+ DivRem R2, R6, R10, R14         ; R2 = block to end at
+ ADD R2, R2, R5                  ; R6 = bytes offset in a block to end at
+
+ ADD R7, R12, #:INDEX:sparecontrolblock
+
+; R0 = start block
+; R1 = drive number
+; R2 = end block
+; R3 
+; R4 = start byte
+; R5 =    number to load
+; R6 = endbyte
+; R7 -> controlblock
+; R8 =
+; R9 =
+; R10 = blocksize
+; R11 -> where to put data
+; R14 =
+
+;          . If the byte to start from is not 0 THEN
+;          .                                    {
+;          .                                     load a block into my buffer
+;          .                                     copy out whats needed
+;          .                                     add 1 to start block
+;          .                                    }
+
+ TEQ R4, #0
+ BEQ %FT01
+
+ STASH R0-R3
+
+ MOV R3, R1
+
+ MOV R2, #1
+
+ BL PreLoadBlockFromDrive ; r1->buffer
+
+; This assumes that I am not asked for 0 bytes
+
+; if (end byte==0) THEN
+;     Copy from r1+start byte, r11, length (blocksize-start byte)
+; else
+;     IF (end block==start block)
+;         Copy from r1+start byte, r11, length (end byte-start byte)
+;     else
+;         Copy from r1+start byte, r11, length (blocksize-start byte)
+
+ ADD R1, R1, R4
+ MOV R2, R11
+
+ TEQ R6, #0
+ SUBEQ R3, R10, R4
+ BEQ %FT11
+
+ TEQ R2, R0
+ SUBNE R3, R10, R4
+ SUBEQ R3, R6, R4
+
+11
+ ADD R11, R11, R3  ; Move to further along the buffer
+
+ SWI     XCD_ByteCopy
+
+ GRAB R0-R3
+
+ ADD R0, R0, #1    ; start block++
+
+ MOV R4, #0        ; start byte=0
+
+01
+
+;          . if (start block < end block)
+;          .    {
+
+ CMP R0, R2
+ BGE %FT02
+
+;          .     if (end byte ==0 (or blocksize ?) )
+
+; TEQ R6, #0
+
+;          .        number_to_load=end block-start block
+
+ SUB R5, R2, R0
+
+; ADDEQ R5, R5, #1
+
+;          .    else
+;          .        number_to_load=(end block-start block)-1
+
+; SUBNE R5, R5, #1
+
+;          .
+;          .     if (number_to_load > 0)
+
+ CMP R5, #0
+
+;          .         load number_to_load blocks into users area
+
+
+ STASH R1-R3, GT
+
+ MOVGT R3, R1
+
+ MOVGT R1, R11
+
+ MOVGT R2, R5
+
+ BLGT LoadBlockFromDrive
+
+ GRAB R1-R3, GT
+
+ ADDGT R0, R0, R5
+
+ [ myblocksize<>2048
+ ! 0, "AAAAAAAAa see fileman"
+ ]
+ ADDGT R11, R11, R5, LSL #11
+
+;          .    }
+
+02
+
+;          . if (end_byte !=0 )
+
+ TEQ R6, #0
+
+ BEQ %FT04
+
+;          .    {
+;          .     load a block into my buffer
+
+ MOV R2, #1
+
+ MOV R3, R1
+
+ BL PreLoadBlockFromDrive
+
+;          .     copy out whatevers needed
+;          .    }
+
+ MOV R2, R11
+
+ MOV R3, R6
+
+ SWI    XCD_ByteCopy
+
+04
+
+ GRABALL
+ BICS PC, R14, #Overflow_Flag
+
+ [ RISC_OS = 2
+;**********************
+; Give the sprite data to the filer
+;**********************
+05
+; on entry:
+; R2 -> put here
+; R3 = length of data
+; R4 = offset
+
+ Debug " Give the sprite data to the filer "
+
+;*******************
+; Give sprite data                ; R2 -> place to put data
+;*******************
+
+
+ ADRL r1, StartOfSpriteData
+ ADD R1, R1, R4
+
+ [ debug=ON
+ MOV R5, R1
+ Debug " Copy from :"
+ DebugDisplay R5
+
+ MOV R5, R2
+ Debug " Copy to :"
+ DebugDisplay R5
+
+ MOV R5, R3
+ Debug " Length :"
+ DebugDisplay R5
+ Debug ": "
+ ]
+
+; R1 -> copy from
+; R2 -> copy to
+; R3 = length of copy
+
+ SWI        XCD_ByteCopy
+
+ GRABALL
+
+ BICS PC, R14, #Overflow_Flag
+
+ ]
+
+;***************************************************************************
+ControlOpenFile ROUT   ; see page 979 ( FSEntry_Args )
+;***************************************************************************
+
+ STASHALL
+ log_on
+
+
+ Debug " Control open file "
+
+ CMP R0, #(EndOfJumpTableForFSEntry_Args-StartOfJumpTableForFSEntry_Args)/4
+
+ GRABALL GT
+ BICGTS PC, R14, #Overflow_Flag
+
+
+ LDR     r14, [ pc, r0, LSL #2 ]
+ ADD     pc, pc, r14
+
+
+StartOfJumpTableForFSEntry_Args
+
+; 0. Read sequential pointer for unbuffered file
+ DCD Nothing                 - StartOfJumpTableForFSEntry_Args - 4
+
+; 1. Write sequential pointer
+ DCD SaveFile                - StartOfJumpTableForFSEntry_Args - 4
+
+; 2. Reads the size of the file of unbuffered
+ DCD Nothing                 - StartOfJumpTableForFSEntry_Args - 4
+
+; 3. Writes the size of the file
+ DCD SaveFile                - StartOfJumpTableForFSEntry_Args - 4
+
+; 4. Reads the size of the file (all types)
+ DCD ReadSizeAllocatedToFile - StartOfJumpTableForFSEntry_Args - 4
+
+; 5. EOF check for unbuffered files
+ DCD Nothing - StartOfJumpTableForFSEntry_Args - 4
+
+; 6. Flush buffers, if bit 27 was set
+ DCD Nothing                 - StartOfJumpTableForFSEntry_Args - 4
+
+; 7. Ensure the size of the file (all types)
+ DCD ReadSizeAllocatedToFile - StartOfJumpTableForFSEntry_Args - 4
+
+; 8. Write zeros to a file
+ DCD SaveFile                - StartOfJumpTableForFSEntry_Args - 4
+
+; 9. Read the date stamp of the file
+ DCD ReadFileDateStamp       - StartOfJumpTableForFSEntry_Args - 4
+
+EndOfJumpTableForFSEntry_Args
+
+
+;----------------------------------------------------------------------------------------------
+CloseFile ROUT
+;
+; see page 983   DONE
+; on entry:
+;          R1 = my file handle
+;          R2 = new load address
+;          R3 = new execution address
+;----------------------------------------------------------------------------------------------
+
+ STASHALL
+
+ Debug " Close "
+
+ [ RISC_OS = 2
+;******************
+; Is Fileswitch trying to close the CDFSFiler icon sprite ?
+;******************
+
+ LDR R5, handleforspritedata         ;
+ TEQ R5, R1                          ; [ yes  - then tidy up ]
+ MOVEQ R5, #0                        ;
+ STREQ R5, handleforspritedata       ;
+ GRABALL EQ                          ;
+ BICEQS PC, R14, #Overflow_Flag      ;
+ ]
+
+;******************
+; Free the claimed buffer used for the open file details
+;******************
+
+ LDR R3, =:INDEX:OpenFileList - 4
+ ADD R3, R3, R12
+ LDR R2, [ r3, r1, LSL #2 ]!
+
+ MOV R0, #7                          ; Free memory
+ SWI XOS_Module                      ;
+
+;******************
+; Remove the buffer from the list
+;******************
+
+ MOV R0, #0
+ STR R0, [ R3 ]
+
+;******************
+; Home James
+;******************
+
+ GRABALL
+
+ BICS PC, R14, #Overflow_Flag
+
+
+
+
+;----------------------------------------------------------------------------------------------
+WholeFile ROUT
+; on entry:
+;          r0 = reason code
+; on exit:
+;          
+;
+; see PRM2 page 983 ( FSEntry_File )  see 'EntryFile'
+;----------------------------------------------------------------------------------------------
+
+ log_on
+
+
+ STASHALL
+
+ [ demoversion=ON
+ LDR R14, demotries                   ;For demo version
+ ADD R14, R14, #1                       ; Lock up if done enough
+ STR R14, demotries                   ;
+ CMP R14, #NUMBEROFDEMOTRIES  ;
+ MOVGE R14, #0                          ;
+ MOVGE PC, R14                          ;
+ ]
+ Debug " Whole files "
+
+ TEQ R0, #255    ; MUST BE HERE BEFORE ENDOFTABLECHECK !!!!!
+ BEQ LoadFile                                ; DONE
+
+
+           ; Make sure that the reason code is supported by me
+
+
+ CMP R0, #( EndOfJumpTableForFSEntry_File - JumpTableForFSEntry_File ) / 4
+ GRABALL GE
+ MOVGES PC, R14
+
+ LDR     r14, [ pc, r0, LSL #2 ]
+ ADD     pc, pc, r14
+
+
+JumpTableForFSEntry_File
+
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 0  n / a       DONE
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 1  n / a       DONE
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 2  n / a       DONE
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 3  n / a       DONE
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 4  n / a       DONE
+ DCD ReadCatalogue - JumpTableForFSEntry_File - 4 ; 5  used to find an object
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 6  n / a       DONE
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 7  n / a       DONE
+ DCD SaveFile - JumpTableForFSEntry_File - 4 ; 8  n / a       DONE
+ DCD Nothing - JumpTableForFSEntry_File - 4  ; 9  only called if bit 26 set ( not supported )
+
+ [ RISC_OS > 2
+ DCD ReadBlockSize - JumpTableForFSEntry_File - 4 ; 10        DONE natural block size
+ ]
+
+EndOfJumpTableForFSEntry_File
+
+;----------------------------------------------------------------------------------------------
+FSOperations ROUT
+;
+; on entry:
+;          r0 = reason code
+;          r1 - r6 depends on reason code
+; on exit:
+;
+;  see page 988 ( FSEntry_Func )
+; 
+;      These are to be found in 'Filer'
+;----------------------------------------------------------------------------------------------
+
+ log_on
+
+
+ STASHALL
+
+ [ demoversion=ON
+ LDR R14, demotries                   ;For demo version
+ ADD R14, R14, #1                       ; Lock up if done enough
+ STR R14, demotries                   ;
+ CMP R14, #NUMBEROFDEMOTRIES  ;
+ MOVGE R14, #0                          ;
+ MOVGE PC, R14                          ;
+ ]
+
+ Debug " FSOperations "
+
+;-------------------------------------------------------------------------
+; Make sure that the reason code is supported by me
+;-------------------------------------------------------------------------
+ CMP R0, #( EndOfJumpTableForFSEntry_Func - JumpTableForFSEntry_Func ) / 4
+ GRABALL GT
+ BICGTS PC, R14, #Overflow_Flag
+
+ LDR     r14, [ pc, r0, LSL #2 ]
+ ADD     pc, pc, r14
+
+JumpTableForFSEntry_Func
+
+ [ RISC_OS = 2
+ DCD SetDIR - JumpTableForFSEntry_Func - 4            ; 0  *DIR
+ DCD SetLIB - JumpTableForFSEntry_Func - 4            ; 1  *LIB
+ DCD Catalogue - JumpTableForFSEntry_Func - 4         ; 2  *CAT
+ DCD EX - JumpTableForFSEntry_Func - 4                ; 3  *EX
+ DCD LCAT - JumpTableForFSEntry_Func - 4              ; 4  *LCAT
+ DCD LEX - JumpTableForFSEntry_Func - 4               ; 5  *LEX
+ DCD Info - JumpTableForFSEntry_Func - 4              ; 6  *INFO
+ |
+
+; Under RISC OS 3 this is done for me
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 0  *DIR
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 1  *LIB
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 2  *CAT
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 3  *EX
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 4  *LCAT
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 5  *LEX
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 6  *INFO
+ ]
+
+ DCD SaveFile - JumpTableForFSEntry_Func - 4          ; 7  *OPT
+ DCD SaveFile - JumpTableForFSEntry_Func - 4          ; 8  *RENAME
+ DCD SaveFile - JumpTableForFSEntry_Func - 4          ; 9  *ACCESS
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 10  attempt to boot from CD - ignore
+
+ [ RISC_OS = 2
+ DCD ReadBoot_OS2 - JumpTableForFSEntry_Func - 4      ; 11 Get disc name
+ DCD CurrentDirectory - JumpTableForFSEntry_Func - 4  ; 12 
+ DCD ReadLIBName - JumpTableForFSEntry_Func - 4       ; 13 READ LIB NAME
+ |
+; Under RISC OS 3 this is done for me
+ DCD ReadBoot_OS3 - JumpTableForFSEntry_Func - 4      ; 11 Get disc name
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 12 Read dir name
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 13 Read lib name
+ ]
+
+ DCD CurrentDirObjects - JumpTableForFSEntry_Func - 4 ; 14
+ DCD ObjectInfo - JumpTableForFSEntry_Func - 4        ; 15
+ DCD Shutdown - JumpTableForFSEntry_Func - 4          ; 16 *SHUTDOWN
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 17 not used -see 'Information Block'
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 18 SET DIR CONTEXTS not used (bit 24)
+ DCD ReadEntriesAndLength - JumpTableForFSEntry_Func - 4; 19 READ DIR ENTRIES
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 20 *FileInfo not used (bit 25)
+
+ [ RISC_OS <> 2
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 21 notification of new image (RISC OS3)
+ DCD Nothing - JumpTableForFSEntry_Func - 4           ; 22 image about to be closed (RISC OS3)
+ DCD CanonicaliseName - JumpTableForFSEntry_Func - 4  ; 23 Canoncalise name (RISC OS3)
+ DCD ResolveWildcard - JumpTableForFSEntry_Func - 4   ; 24 Get a complete file name
+; DCD ReadDefectlist - JumpTableForFSEntry_Func - 4    ; 25 Read defect list
+; DCD SaveFile - JumpTableForFSEntry_Func - 4          ; 26 Add a defect to the list
+; DCD ReadBoot2 - JumpTableForFSEntry_Func - 4         ; 27 Read boot option 2
+; DCD SaveFile - JumpTableForFSEntry_Func - 4          ; 28 Write boot option
+; DCD ReadUsedSpace - JumpTableForFSEntry_Func - 4     ; 29 Read used space map
+; DCD ReadFreeSpace - JumpTableForFSEntry_Func - 4     ; 30 Read free space
+; DCD SaveFile - JumpTableForFSEntry_Func - 4          ; 31 Name image
+; DCD SaveFile - JumpTableForFSEntry_Func - 4          ; 31 Stamp image
+ ]
+
+EndOfJumpTableForFSEntry_Func
+
+
+;************* End of jump table
+
+;****************
+;MultiOperations    ; see page 998 ( FSEntry_GBPB ) not used ( bit 28 in Open)
+;****************
+
+
+
+
+ LTORG
+
+ END

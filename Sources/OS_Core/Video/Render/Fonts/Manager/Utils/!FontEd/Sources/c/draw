@@ -1,0 +1,303 @@
+/*  Title: > c.draw
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.drag"
+#include "h.draw"
+#include "h.editchar"
+#include "h.loadsave"
+#include "h.scaffold"
+#include "h.sprites"
+#include "h.suspend"
+
+int xscale, yscale;  /* global parameters to buildpath */
+
+os_error * buildp(Char_Block *charptr,
+                  int **fillpp, int **strokepp,
+                  scaffoldstr *scaffold, int xoffset, int yoffset);
+os_error *dopath(Pt_Block *firstpt, scaffoldstr *scaffold);
+
+
+/* Build up the Draw path for a given char
+ * This includes any composite pasts of the character (recursion to a depth of 1 only)
+ * Performs scaffold calculations on each part of the composite char in turn (if required)
+ * Decide whether to use skeleton lines, assuming pixel size = 2x2 OS units
+ * (the interesting cases all occur when writing to a mode 18 sprite)
+ * On exit: buildoutptr -> terminating zero of path (used by drag_exportchar())
+ */
+
+os_error * buildpath(Char_Block *charptr, int *fillpath, int *strokepath, BOOL doscaffold)
+{
+  scaffoldstr myscaffold, *scaffold;
+
+  if (heaptrace) mytracef("unsuspendpathdata()\n");
+
+  e(return(e), unsuspendpathdata(charptr));      /* expand now so composites are present */
+
+  if (doscaffold) scaffold = &myscaffold; else scaffold = NULL;
+
+  if (strokepath != NULL && strokepath != (int *)-1)
+  {
+    register Font_Block *font = charptr->parent;
+    register int t = font->skeleton_threshold;
+    if (t) {
+      register int designsize = font->filedata->designsize;
+      if ((((designsize * yscale)+(1<<15))>>16) >= (t << 1) &&
+          (((designsize * xscale)+(1<<15))>>16) >= (t << 1)) {
+        buildoutptr = strokepath; endpath();
+        strokepath = (int *)-1;     /* don't produce strokepath if too big to need it */
+      }
+    }
+  }
+
+  if (heaptrace) mytracef("buildp(%p,%p,%p,%p)\n",charptr,fillpath,strokepath,scaffold);
+
+  e(return(e), buildp(charptr, &fillpath, &strokepath, scaffold, 0, 0));
+
+  if (heaptrace) mytracef("do composites\n");
+
+  { Comp_Block *comp = charptr->composites;
+    while (comp) {
+      Char_Block *chr;
+      mytracef("buildpath: char %d composite %d (%d,%d)\n",charptr->charno,
+                                                           comp->charno,comp->xorigin,comp->yorigin);
+      if (comp->charno < charptr->parent->nchars) {
+        chr = charptr->parent->chars[comp->charno];
+        if (chr) {
+          if (heaptrace) mytracef("unsuspendpathdata(%p) ...",chr);
+          e(return(e), unsuspendpathdata(chr));
+          e(return(e), buildp(chr, &fillpath, &strokepath, scaffold, comp->xorigin, comp->yorigin));
+          e(return(e), suspendpathdata(chr));
+          if (heaptrace) mytracef("done\n");
+        }
+      }
+      comp = comp->next;
+    }
+  }
+
+  if (heaptrace) mytracef("suspendpathdata ...");
+  e(return(e), suspendpathdata(charptr));            /* don't suspend until composite bits done */
+  if (heaptrace) mytracef("done.\n");
+
+  return(NULL);
+}
+
+
+/* Construct path for char, given x0,y0,x1,y1,xscale,yscale
+ * Also calculate scaffold offsets, if required.
+ */
+
+os_error * buildp(Char_Block *charptr,
+                  int **fillpp, int **strokepp,
+                  scaffoldstr *scaffold, int xoffset, int yoffset)
+{
+  Path_Block *subpath;
+  int *fillpath = *fillpp;
+  int *strokepath = *strokepp;
+
+  if (scaffold) e(return(e), getscaffold(charptr, scaffold, xoffset, yoffset));
+
+  x0 -= xoffset;                /* offset is in design units */
+  y1 -= yoffset;
+
+  buildoutptr = fillpath;             /* buildoutptr is a global variable */
+
+  subpath = charptr->nextpath;
+
+  while (subpath != NULL)
+  {
+    register Pt_Block *pt = subpath->firstpoint;
+    if (strokepath != NULL && (pt->nextpt[0] == NULL || pt->nextpt[1] == NULL)) {
+      if (strokepath != (int *)-1) {   /* ignore strokepath if -1 */
+        buildoutptr = strokepath;
+        e(return(e), dopath(pt, scaffold));
+        strokepath = buildoutptr;
+      }
+    } else {
+      buildoutptr = fillpath;
+      e(return(e), dopath(pt,scaffold));
+      fillpath = buildoutptr;
+    }
+    subpath = subpath->nextpath;
+  }
+  buildoutptr = fillpath; endpath();
+  if (strokepath != NULL && strokepath != (int *)-1) { buildoutptr = strokepath; endpath(); }
+
+  x0 += xoffset;                   /* reset for next time */
+  y1 += yoffset;
+
+  *fillpp = fillpath;
+  *strokepp = strokepath;
+
+  return(NULL);
+}
+
+
+os_error *dopath(Pt_Block *firstpt, scaffoldstr *scaffold)
+{
+  Pt_Block *endp1, *ctrl1, *ctrl2, *endp2;
+
+  ctrl2 = NULL;
+  endp1 = firstpt;
+
+  while (endp1 != NULL)
+  {
+    if ((ctrl1=endp1->nextpt[0])==ctrl2) ctrl1 = endp1->nextpt[1];
+    if (ctrl1==NULL) break;
+
+    if (ctrl2 == NULL) e(return(e), moveto(endp1,scaffold));
+
+    ctrl2 = ctrl1->nextpt[0];
+    endp2 = ctrl2->nextpt[1];
+
+    switch(ctrl1->type)
+    {
+      case PT_STRAIGHT:
+      case PT_STRAIGHT+PT_INVISIBLE:
+           e(return(e), lineto(endp2,scaffold));
+           break;
+      case PT_CONTROL:
+      case PT_CONTROL+PT_INVISIBLE:
+           e(return(e), curveto(ctrl1,ctrl2,endp2,scaffold));
+           break;
+    }
+
+    if ((endp1=endp2)==firstpt) break;  /* avoid looping */
+  }
+  return(NULL);
+}
+
+
+os_error * drawfill(int *fillpath, int *matrix, int flatness)
+{
+  os_regset r;
+  r.r[0] = (int) fillpath;
+  r.r[1] = 0x32;                /* 0x32  = even-odd fill to 1/2 way */
+  r.r[2] = (int)matrix;         /* 0 => no matrix */
+  r.r[3] = flatness;            /* 0 => default flatness */
+  return(os_swix(Draw_Fill,&r));
+}
+
+
+os_error * drawfill_winding(int *fillpath, int *matrix, int flatness)
+{
+  os_regset r;
+  r.r[0] = (int) fillpath;
+  r.r[1] = 0x30;                /* 0x30  = non-zero winding number fill to 1/2 way */
+  r.r[2] = (int)matrix;         /* 0 => no matrix */
+  r.r[3] = flatness;            /* 0 => default flatness */
+  return(os_swix(Draw_Fill,&r));
+}
+
+
+os_error * drawstroke(int *strokepath, int *matrix, int flatness)
+{
+  os_regset r;
+  r.r[0] = (int) strokepath;
+  r.r[1] = 0x18;                /* 0x18  = fill boundary only */
+  r.r[2] = (int)matrix;         /* 0 => no matrix */
+  r.r[3] = flatness;            /* 0 => default flatness */
+  r.r[4] = 0;                   /* 0 => 1 pixel thick */
+  r.r[5] = 0;                   /* no special line joins */
+  r.r[6] = 0;                   /* not dotted */
+  return(os_swix(Draw_Stroke,&r));
+}
+
+#define ErrorNumber_PathFull 0x987
+static os_error err_bufferoverflow = { ErrorNumber_PathFull, "Too many path elements" };
+
+os_error *moveto(Pt_Block *pt, scaffoldstr *scaffold)
+{
+  register int sizeleft = buildoutptr[1];
+  if (sizeleft < 12) return(&err_bufferoverflow);
+  *buildoutptr++ = DRAW_MOVE;
+  *buildoutptr++ = scaleptx(pt,scaffold);        /* OS units << 8 */
+  *buildoutptr++ = scalepty(pt,scaffold);
+  buildoutptr[0] = DRAW_TERM;
+  buildoutptr[1] = sizeleft - 12;
+  return(NULL);
+}
+
+os_error *lineto(Pt_Block *pt, scaffoldstr *scaffold)
+{
+  register int sizeleft = buildoutptr[1];
+  if (sizeleft < 12) return(&err_bufferoverflow);
+  *buildoutptr++ = DRAW_LINE;
+  *buildoutptr++ = scaleptx(pt,scaffold);        /* OS units << 8 */
+  *buildoutptr++ = scalepty(pt,scaffold);
+  buildoutptr[0] = DRAW_TERM;
+  buildoutptr[1] = sizeleft - 12;
+  return(NULL);
+}
+
+os_error *curveto(pt1,pt2,pt3,scaffold)
+Pt_Block *pt1,*pt2,*pt3;
+scaffoldstr *scaffold;
+{
+  register int sizeleft = buildoutptr[1];
+  if (sizeleft < 28) return(&err_bufferoverflow);
+  *buildoutptr++ = DRAW_CURV;
+  *buildoutptr++ = scaleptx(pt1,scaffold);       /* OS units << 8 */
+  *buildoutptr++ = scalepty(pt1,scaffold);
+  *buildoutptr++ = scaleptx(pt2,scaffold);
+  *buildoutptr++ = scalepty(pt2,scaffold);
+  *buildoutptr++ = scaleptx(pt3,scaffold);
+  *buildoutptr++ = scalepty(pt3,scaffold);
+  buildoutptr[0] = DRAW_TERM;
+  buildoutptr[1] = sizeleft - 28;
+  return(NULL);
+}
+
+os_error *closepath(void)
+{
+  register int sizeleft = buildoutptr[1];
+  if (sizeleft < 4) return(&err_bufferoverflow);
+  *buildoutptr++ = DRAW_CLOS;
+  buildoutptr[0] = DRAW_TERM;
+  buildoutptr[1] = sizeleft - 4;
+  return(NULL);
+}
+
+void endpath(void)
+{
+  *buildoutptr = DRAW_TERM;          /* don't move on, in case more is added later */
+}
+
+
+void bezier(bx0,by0,bx1,by1,bx2,by2,bx3,by3)
+int bx0,by0,bx1,by1,bx2,by2,bx3,by3;
+{
+  int path[11];
+
+  path[0] = DRAW_MOVE;
+  path[1] = scalex8(bx0);
+  path[2] = scaley8(by0);
+  path[3] = DRAW_CURV;
+  path[4] = scalex8(bx1);
+  path[5] = scaley8(by1);
+  path[6] = scalex8(bx2);
+  path[7] = scaley8(by2);
+  path[8] = scalex8(bx3);
+  path[9] = scaley8(by3);
+  path[10] = DRAW_TERM;
+
+  drawstroke(path, NULL, 0);
+}
+
+
+int scaleptx(Pt_Block *pt, scaffoldstr *scaffold)
+{
+  register int x = (((pt->x-x0)*xscale) >> 8) + (bx<<8) + (dx<<7);
+  if (scaffold==NULL) return(x);
+  else return (x+scaffold->x[pt->scaffoldx]);
+}
+
+int scalepty(Pt_Block *pt, scaffoldstr *scaffold)
+{
+  register int y = (((pt->y-y1)*yscale) >> 8) + (by<<8) + (dy<<7);
+  if (scaffold==NULL) return(y);
+  else return (y+scaffold->y[pt->scaffoldy]);
+}

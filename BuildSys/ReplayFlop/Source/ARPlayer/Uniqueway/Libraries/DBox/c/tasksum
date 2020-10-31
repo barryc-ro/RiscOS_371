@@ -1,0 +1,576 @@
+/* > tasksum.c
+
+ * © SJ Middleton, 1993
+
+ * Simplified summary window for use with taskwindows.
+ * Has three summary lines giving latest returned from taskwindow.
+
+ */
+
+#include "dbox.h"
+#include "dboxquery.h"
+#include "draw/font.h"
+#include "msgs.h"
+#include "swis.h"
+#include "template.h"
+#include "werr.h"
+#include "wimpx.h"
+#include "win.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "macros.h"
+
+#include "tasksum.h"
+#include "wmisc.h"
+
+#define MAX_NLINES      16
+
+typedef struct tasksum__str
+{
+/*  struct tasksum__str *link; */
+
+    taskwindow      task;
+    const char      *title;
+    dbox            d;
+    wimp_w          w;
+    tasksum_state   state;
+
+    tasksum_eventfn eventfn;
+    void            *eventhandle;
+    int             eventdepth;
+    BOOL            dispose_pending;
+
+    char            *data;
+    int             data_size;
+
+    int             nlines,
+                    max_line_length;
+
+    char            *status[MAX_NLINES];
+
+    int             current_line,
+                    line_length;
+
+    int             nextrafields;
+
+    int             box_width,
+                    box_height;
+};
+
+#define RUNNING_STATE   msgs_lookup("Stsum0:Running")
+#define PAUSED_STATE    msgs_lookup("Stsum1:Paused")
+#define ABORTED_STATE   msgs_lookup("Stsum2:Aborted")
+#define COMPLETED_STATE msgs_lookup("Stsum3:Completed")
+
+#define PAUSE_STRING    msgs_lookup("Stsum4:Pause")
+#define CONTINUE_STRING msgs_lookup("Stsum5:Continue")
+
+#define REALLY_CLOSE    msgs_lookup("Dtsum0:Task running, do you wish to abort?")
+
+#define ABORT_FIELD     2
+#define PAUSE_FIELD     3
+#define ACTION_FIELD    5
+#define SAVE_FIELD      6
+#define STATUS_1_FIELD  7
+
+static mem_allocfn  alloc_fn = 0;
+static mem_freefn   free_fn = 0;
+static int          tasksum__opened = 0;
+static int          wimp_font = 0;
+/*
+static tasksum  tasksum__base = NULL;
+ */
+
+/* ---------------------------------------------------------------------------------- */
+
+static const char *state_string(tasksum ts)
+{
+    switch (ts->state)
+    {
+        case tasksum_Running:       return RUNNING_STATE;
+        case tasksum_Paused:        return PAUSED_STATE;
+        case tasksum_Aborted:       return ABORTED_STATE;
+        case tasksum_Completed:     return COMPLETED_STATE;
+    }
+    return "";
+}
+
+static void set_title(tasksum ts)
+{
+    win_settitlef(ts->w, "%s - %s", ts->title, state_string(ts));
+}
+
+static void set_actions(tasksum ts)
+{
+    dbox d = ts->d;
+    switch (ts->state)
+    {
+        case tasksum_Running:
+            dbox_setfield(d, PAUSE_FIELD, PAUSE_STRING);
+            break;
+
+        case tasksum_Paused:
+            dbox_setfield(d, PAUSE_FIELD, CONTINUE_STRING);
+            break;
+
+        case tasksum_Aborted:
+        case tasksum_Completed:
+            dbox_setfield(d, PAUSE_FIELD, PAUSE_STRING);
+
+            dbox_fadefield(d, ABORT_FIELD);
+            dbox_fadefield(d, PAUSE_FIELD);
+
+            {
+                int i;
+                for (i = 0; i < ts->nextrafields; i++)
+                    dbox_fadefield(d, (STATUS_1_FIELD + ts->nlines) + i);
+            }
+            break;
+    }
+}
+
+static void set_state(tasksum ts, tasksum_state newstate)
+{
+    if (ts->state != newstate)
+    {
+        ts->state = newstate;
+        set_actions(ts);
+        set_title(ts);
+    }
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+static BOOL send_state(tasksum ts, tasksum_state state)
+{
+    BOOL disposed = FALSE;
+    if (ts->eventfn)
+    {
+        ts->eventdepth ++;
+        ts->eventfn(ts, state, ts->eventhandle);
+        ts->eventdepth --;
+
+        if (ts->dispose_pending)
+        {
+            tasksum_dispose(&ts);
+            disposed = TRUE;
+        }
+    }
+    return disposed;
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+static BOOL check_abort(tasksum ts)
+{
+    BOOL dispose = TRUE;
+    if (ts->state == tasksum_Running || ts->state == tasksum_Paused)
+    {
+        dispose = FALSE;
+        if (dboxquery(REALLY_CLOSE) == dboxquery_YES)
+        {
+            taskwindow_dispose(&ts->task);
+            ts->state = tasksum_Aborted;
+            dispose = !send_state(ts, ts->state);
+        }
+    }
+    return dispose;
+}
+
+static void summary_events(dbox d, void *handle)
+{
+    tasksum     ts = handle;
+    dbox_field  action = dbox_get(d);
+    switch (action)
+    {
+        case dbox_CLOSE:
+            if (check_abort(ts))
+            {
+                ts->state = tasksum_Closed;
+                send_state(ts, ts->state);
+                tasksum_dispose(&ts);
+            }
+            break;
+
+        case ABORT_FIELD:
+            check_abort(ts);
+            break;
+
+        case PAUSE_FIELD:
+            switch (ts->state)
+            {
+                case tasksum_Running:
+                    set_state(ts, tasksum_Paused);
+                    taskwindow_suspend(ts->task);
+                    break;
+
+                case tasksum_Paused:
+                    set_state(ts, tasksum_Running);
+                    taskwindow_resume(ts->task);
+                    break;
+            }
+            break;
+
+        case SAVE_FIELD:
+            send_state(ts, tasksum_SaveButton);
+            break;
+
+        default:
+            send_state(ts, tasksum_UserButton + action);
+            break;
+    }
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+static void set_statusfields(tasksum ts)
+{
+    int i;
+    for (i = 0; i < ts->nlines; i++)
+/*      no_err(wimp_set_icon_state(dbox_syshandle(ts->d), STATUS_1_FIELD + i, 0, 0)); */
+        dbox_setfield(ts->d, STATUS_1_FIELD + i, ts->status[(i + ts->current_line + 1) % ts->nlines]);
+}
+
+static void build_statusfields(tasksum ts)
+{
+    int i;
+    for (i = 0; i < MAX_NLINES; i++)
+    {
+        wimp_icon   icon;
+        no_err(wimp_get_icon_info(dbox_syshandle(ts->d), STATUS_1_FIELD + i, &icon));
+        if ((icon.flags & (wimp_IBTYPE*15 | wimp_IDELETED)) != wimp_BIGNORE)
+            break;
+
+        if (ts->max_line_length == 0)
+        {
+            ts->max_line_length = icon.data.indirecttext.bufflen - 1;
+            ts->box_width = icon.box.x1 - icon.box.x0;
+            ts->box_height = icon.box.y1 - icon.box.y0;
+        }
+
+        ts->status[i] = calloc(ts->max_line_length + 1, 1); /* icon.data.indirecttext.buffer; */
+        ts->nlines++;
+    }
+
+/* if gives error then wimp_font will stay at 0 */
+    _swix(Wimp_ReadSysInfo, _IN(0) | _OUT(0), 8, &wimp_font);
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+#if 1
+
+static int get_splitchar(tasksum ts)
+{
+    int available = ts->box_width/(8*2);
+    if (wimp_font)
+    {
+        char *start = ts->status[ts->current_line];
+        char *split;
+        os_error *e = _swix(Font_ScanString, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4) | _OUT(1),
+            wimp_font,
+            start,
+            font_KERN,
+            ts->box_width*400,
+            ts->box_height*400,
+            &split);
+
+        if (e == NULL)
+            available = split - start;
+    }
+
+    return ts->line_length <= available ? -1 : available;
+}
+
+static void check_split(tasksum ts, BOOL must_increment)
+{
+    int split;
+    do
+    {
+        int next_line = (ts->current_line + 1) % ts->nlines;
+
+        split = get_splitchar(ts);
+
+        if (split != -1)
+        {
+            strcpy(&ts->status[next_line][0], &ts->status[ts->current_line][split]);
+            ts->status[ts->current_line][split] = '\0';
+
+            ts->current_line = next_line;
+            ts->line_length = strlen(ts->status[ts->current_line]);
+        }
+        else if (must_increment)
+        {
+            ts->current_line = next_line;
+            ts->line_length = 0;
+        }
+    }
+    while (split != -1);
+}
+
+static void setup_fields(tasksum ts, const char *data, int nbytes)
+{
+    int i;
+    for (i = 0; i < nbytes; i++)
+    {
+        int c = data[i];
+        if (c == '\n')
+        {
+            ts->status[ts->current_line][ts->line_length] = '\0';
+            check_split(ts, TRUE);
+        }
+        else
+        {
+            if (ts->line_length == ts->max_line_length)
+                check_split(ts, TRUE);
+
+            if (c >= ' ')
+                ts->status[ts->current_line][ts->line_length++] = c;
+        }
+    }
+    ts->status[ts->current_line][ts->line_length] = '\0';
+    check_split(ts, FALSE);
+}
+
+#else
+
+static void setup_fields(tasksum ts, const char *data, int nbytes)
+{
+    int i;
+    for (i = 0; i < nbytes; i++)
+    {
+        int c = data[i];
+        if (c == '\n')
+        {
+            ts->status[ts->current_line][ts->line_length] = '\0';
+            ts->line_length = ts->max_line_length;
+        }
+        else
+        {
+            if (ts->line_length == ts->max_line_length)
+            {
+                ts->current_line = (ts->current_line + 1) % ts->nlines;
+                ts->line_length = 0;
+            }
+            if (c >= ' ')
+                ts->status[ts->current_line][ts->line_length++] = c;
+        }
+    }
+    ts->status[ts->current_line][ts->line_length] = '\0';
+}
+
+#endif
+
+static void task_events(taskwindow t, const char *data, int nbytes, void *handle)
+{
+    tasksum ts = handle;
+    if (nbytes == -1)
+    {
+        set_state(ts, tasksum_Completed);
+        send_state(ts, ts->state);
+    }
+    else
+    {
+        if (alloc_fn)
+        {
+            if (ts->data == NULL)
+                dbox_unfadefield(ts->d, SAVE_FIELD);
+
+            alloc_nextiscalled("tasksum");
+            if (alloc_fn((void **)&ts->data, ts->data_size + nbytes))
+            {
+                memcpy(ts->data + ts->data_size, data, nbytes);
+                ts->data_size += nbytes;
+            }
+        }
+
+        setup_fields(ts, data, nbytes);
+
+        set_statusfields(ts);
+    }
+    UNUSED(t);
+}
+
+
+/* ---------------------------------------------------------------------------------- */
+
+void tasksum_pause(tasksum ts)
+{
+    if (ts->state == tasksum_Running)
+    {
+        set_state(ts, tasksum_Paused);
+        taskwindow_suspend(ts->task);
+    }
+}
+
+void tasksum_continue(tasksum ts)
+{
+    if (ts->state == tasksum_Paused)
+    {
+        set_state(ts, tasksum_Running);
+        taskwindow_resume(ts->task);
+    }
+}
+
+void tasksum_abort(tasksum ts)
+{
+    if (ts->state == tasksum_Running || ts->state == tasksum_Paused)
+    {
+        set_state(ts, tasksum_Aborted);
+        taskwindow_dispose(&ts->task);
+    }
+}
+
+void tasksum_dispose(tasksum *pts)
+{
+    tasksum ts = *pts;
+    if (ts)
+    {
+        if (ts->eventdepth > 0)
+            ts->dispose_pending = TRUE;
+        else
+        {
+            int i;
+
+            for (i = 0; i < ts->nlines; i++)
+                free(ts->status[i]);
+
+            if (free_fn)
+                free_fn((void **)&ts->data);
+    
+            if (ts->task)
+                taskwindow_dispose(&ts->task);
+    
+            if (ts->d)
+                dbox_dispose(&ts->d);
+
+/* detach from linked list
+            if (tasksum__base == ts)
+                tasksum__base = ts->link;
+            else
+            {
+                tasksum t = tasksum__base;
+                while (t->link != ts && t->link != NULL)
+                    t = t->link;
+                if (t->link)
+                    t->link = ts->link;
+            }
+ */
+            free(ts);
+        }
+        *pts = NULL;
+    }
+}
+
+tasksum tasksum_attach(taskwindow t, const char *sum_ident, const char *title, const char *action, ...)
+{
+    tasksum ts = calloc(sizeof(struct tasksum__str), 1);
+    if (ts)
+    {
+        ts->task = t;
+        ts->title = title;
+        ts->state = tasksum_Running;
+        taskwindow_eventhandler(t, task_events, ts);
+
+        if ((ts->d = dbox_new((char *)sum_ident)) != NULL)
+        {
+            char    buffer[256];
+            va_list ap;
+
+            va_start(ap, action);
+            vsprintf(buffer, action, ap);
+            va_end(ap);
+            dbox_setfield(ts->d, ACTION_FIELD, buffer);
+            dbox_setfield(ts->d, PAUSE_FIELD, PAUSE_STRING);
+            dbox_fadefield(ts->d, SAVE_FIELD);
+
+            build_statusfields(ts);
+            set_statusfields(ts);
+
+            ts->w = dbox_syshandle(ts->d);
+            dbox_eventhandler(ts->d, summary_events, ts);
+    
+            dbox_showstatic(ts->d);
+            wmisc_openshifted(ts->w, &tasksum__opened);
+
+            set_title(ts);
+
+
+            {
+                wimp_wind *wp = template_syshandle((char *)sum_ident);
+                ts->nextrafields = wp->nicons - (STATUS_1_FIELD + ts->nlines);
+            }
+
+/* add to linked list
+            ts->link = tasksum__base;
+            tasksum__base = ts;
+ */
+        }
+        else
+            tasksum_dispose(&ts);
+    }
+    return ts;
+}
+
+void tasksum_reattach(tasksum ts, taskwindow t, const char *action, ...)
+{
+    if (ts && t)
+    {
+        char    buffer[256];
+        va_list ap;
+
+        va_start(ap, action);
+        vsprintf(buffer, action, ap);
+        va_end(ap);
+
+        ts->task = t;
+        taskwindow_eventhandler(t, task_events, ts);
+
+        set_state(ts, tasksum_Running);
+        dbox_setfield(ts->d, ACTION_FIELD, buffer);
+        dbox_unfadefield(ts->d, ABORT_FIELD);
+        dbox_unfadefield(ts->d, PAUSE_FIELD);
+    }
+}
+
+void tasksum_setaction(tasksum ts, const char *action, ...)
+{
+    char    buffer[256];
+    va_list ap;
+
+    va_start(ap, action);
+    vsprintf(buffer, action, ap);
+    va_end(ap);
+
+    dbox_setfield(ts->d, ACTION_FIELD, buffer);
+}
+
+void tasksum_eventhandler(tasksum ts, tasksum_eventfn fn, void *handle)
+{
+    ts->eventfn = fn;
+    ts->eventhandle = handle;
+}
+
+void tasksum_registermemfns(mem_allocfn allocfn, mem_freefn freefn)
+{
+    alloc_fn = allocfn;
+    free_fn = freefn;
+}
+
+const char *tasksum_data(tasksum ts, int *size)
+{
+    if (size)
+        *size = ts->data_size;
+    return ts->data;
+}
+
+int tasksum_syshandle(tasksum ts)
+{
+    return (int)ts->d;
+}
+
+/* eof tasksum.c */

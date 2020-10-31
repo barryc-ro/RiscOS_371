@@ -1,0 +1,337 @@
+
+/* prtablegen.c - extended version, with:
+     - ink-depletion parameter
+     - ink minimum-non-zero parameter */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#define Debug 1
+
+typedef unsigned char uint8;
+
+typedef struct
+{
+  float csaturate;    /* precentage */
+  int   r_adj_my;     /* colour near red: magenta-yellow adjust */
+  int   g_adj_cy;     /* colour near green: cyan-yellow adjust */
+  int   b_adj_cm;     /* colour near blue: cyan-magenta adjust */
+  float bright;
+  float contrast;
+  float gamma[3];     /* r,g,b - final gamma, for inks */
+  float depletion;
+  int   min_non_zero;
+} calib_t;
+
+typedef struct
+{
+  int   r_adj_my;
+  int   g_adj_cy;
+  int   b_adj_cm;
+  int   saturate;
+  uint8 luts[256*3];
+} tables_t;
+
+/* ------------------------------------------------------------------------ */
+
+static calib_t default_ca = { 0, 0,0,0, 1, 1, {1,1,1}, 0, 1 };
+
+/* ------------------------------------------------------------------------ */
+
+static FILE *do_fopen(char *name, char *mode)
+{
+  FILE *fp = fopen(name,mode);
+
+  if (fp == NULL)
+  {
+    fprintf(stderr,"failed to open '%s'\n",name);
+    exit(1);
+  }
+  return fp;
+}
+
+/* ------------------------------------------------------------------------ */
+
+void *do_malloc(int size)
+{
+  /* allocate size bytes; abort on failure */
+
+  void *ptr = malloc(size);
+
+  if (ptr == NULL)
+  {
+    fprintf(stderr,"Sorry! not enough memory (malloc failed)\n");
+    exit(1);
+  }
+
+  return(ptr);
+}
+
+/* ------------------------------------------------------------------------ */
+
+#if 0
+void gamma_table(float gamma, uint8 *gamLUT, int start, int stop, int size)
+{
+  int    i;
+  double range = size-1.0, scale = (double)stop - (double)start;
+
+/*
+  if (gamma < 0.1F) gamma = 0.1F;
+  if (gamma > 10.0F) gamma = 10.0F;
+*/
+
+  gamma = 1/gamma;
+
+  for (i=0; i<size; i++)
+    gamLUT[i] = start + (int)(scale*pow(i/range,gamma) + 0.5);
+}
+#endif
+
+double gamma(double x, double inv_gamma)
+{
+  /* inv_gamma = 1/gamma; x = 0..1, gamma(x) = 0..1 */
+
+  return pow(x,inv_gamma);
+}
+
+/* ------------------------------------------------------------------------ */
+
+#if 0
+static void contrast_table256(float con, uint8 *cLUT)
+{
+  int x;
+
+  /* 1st half */
+  gamma_table(1/con,cLUT,0,127,128);
+  /* 2nd half; reflect about y=x */
+  for (x=0; x<128; x++) cLUT[255-x] = 255 - cLUT[x];
+}
+#endif
+
+double contrast(double x, double contr)
+{
+  /* x = 0..1; contrast(x) = 0..1 */
+
+  if (x > 0.5)
+    return 1.0 - 0.5*pow(2.0*(1.0-x),contr);
+  else
+    return 0.5*pow(2.0*x,contr);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void validate_calib(calib_t *ca)
+{
+  int i;
+
+  for (i=0; i<3; i++)
+  {
+    if (ca->gamma[i] > 10.0F) ca->gamma[i] = 10.0F;
+    if (ca->gamma[i] <  0.1F) ca->gamma[i] =  0.1F;
+  }
+  if (ca->bright > 10.0F) ca->bright = 10.0F;
+  if (ca->bright <  0.1F) ca->bright =  0.1F;
+  if (ca->contrast > 10.0F) ca->contrast = 10.0F;
+  if (ca->contrast <  0.1F) ca->contrast =  0.1F;
+
+  if (ca->r_adj_my < -255) ca->r_adj_my = -255;
+  if (ca->r_adj_my >  255) ca->r_adj_my =  255;
+  if (ca->g_adj_cy < -255) ca->g_adj_cy = -255;
+  if (ca->g_adj_cy >  255) ca->g_adj_cy =  255;
+  if (ca->b_adj_cm < -255) ca->b_adj_cm = -255;
+  if (ca->b_adj_cm >  255) ca->b_adj_cm =  255;
+
+  if (ca->csaturate <  0.0F) ca->csaturate =  0.0F;
+  if (ca->csaturate > 25.0F) ca->csaturate = 25.0F;
+  /* saturate only held in 1/64'ths in tables */
+  i = (int)(64.0F*ca->csaturate/100.0F + 0.5F);
+  ca->csaturate = i/0.64F;
+
+  if (ca->depletion <  0.0F) ca->depletion =  0.0F;
+  if (ca->depletion > 90.0F) ca->depletion = 90.0F;
+
+  if (ca->min_non_zero <  1) ca->min_non_zero =  1;
+  if (ca->min_non_zero > 15) ca->min_non_zero = 15;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void read_calib(calib_t *ca, char *fname)
+{
+  FILE *fp = do_fopen(fname,"r");
+  char line[256];
+  int  i;
+
+  *ca = default_ca;
+
+  do fgets(line,255,fp); while (line[0] == '#');
+  i = sscanf(line,"bright = %f",&ca->bright);
+  fgets(line,255,fp);
+  sscanf(line,"contrast = %f",&ca->contrast);
+  fgets(line,255,fp);
+  sscanf(line,"red adjust M-Y = %d",&ca->r_adj_my);
+  fgets(line,255,fp);
+  sscanf(line,"green adjust C-Y = %d",&ca->g_adj_cy);
+  fgets(line,255,fp);
+  sscanf(line,"blue adjust C-M = %d",&ca->b_adj_cm);
+  fgets(line,255,fp);
+  sscanf(line,"colour saturate = %f",&ca->csaturate);
+  fgets(line,255,fp);
+  i = sscanf(line,"ink gamma(s) = %f %f %f",
+             ca->gamma,ca->gamma+1,ca->gamma+2);
+  if (i == 1) ca->gamma[1] = ca->gamma[2] = ca->gamma[0];
+  fgets(line,255,fp);
+  sscanf(line,"ink depletion = %f",&ca->depletion);
+  fgets(line,255,fp);
+  sscanf(line,"ink min non-zero = %d",&ca->min_non_zero);
+  fclose(fp);
+
+  validate_calib(ca);
+
+#if Debug
+  fprintf(stderr,"bright           = %5.1f\n"
+                 "contrast         = %5.1f\n"
+                 "red adjust M-Y   = %4d\n"
+                 "green adjust C-Y = %4d\n"
+                 "blue adjust C-M  = %4d\n"
+                 "colour saturate  = %7.2f %%\n"
+                 "ink gamma(s)     = %5.1f %5.1f %5.1f\n"
+                 "ink depletion    = %7.2f %%\n"
+                 "ink min non-zero = %2d\n",
+                 ca->bright,ca->contrast,
+                 ca->r_adj_my,ca->g_adj_cy,ca->b_adj_cm,ca->csaturate,
+                 ca->gamma[0],ca->gamma[1],ca->gamma[2],
+                 ca->depletion,ca->min_non_zero );
+#endif
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void set_tables(calib_t *ca, tables_t *ta)
+{
+  int    i, ic,im,iy;
+  double b,c,s,x,d,bcon,inkc,inkm,inky, gam[3];
+
+  ta->r_adj_my = ca->r_adj_my;
+  ta->g_adj_cy = ca->g_adj_cy;
+  ta->b_adj_cm = ca->b_adj_cm;
+  ta->saturate = (int)(64.0F*ca->csaturate/100.0F + 0.5F);
+
+  b = 1.0/ca->bright;
+  c = ca->contrast;
+  s = 100.0/(100.0-ca->csaturate);       /* colour saturate multiplier */
+  s = s/255.0;                           /* now scaled to give x in range 0..1 */
+  d = 255.0*(100.0-ca->depletion)/100.0; /* max ink value, from depletion */
+  for (i=0; i<3; i++) gam[i] = 1.0/ca->gamma[i];
+
+  for (i=0; i<256; i++)
+  {
+    /* quantities, q are replaced by 1-q because of rgb -> cmy */
+    x  = s*(double)i;
+    if (x > 1.0) x = 1.0;
+    bcon = contrast(gamma(1.0-x,b),c);
+    inkc = 1.0 - gamma(bcon,gam[0]);
+    inkm = 1.0 - gamma(bcon,gam[1]);
+    inky = 1.0 - gamma(bcon,gam[2]);
+    ic = (int)(d*inkc + 0.5); if (ic < ca->min_non_zero) ic = 0;
+    im = (int)(d*inkm + 0.5); if (im < ca->min_non_zero) im = 0; 
+    iy = (int)(d*inky + 0.5); if (iy < ca->min_non_zero) iy = 0;
+    ta->luts[i]     = ic;
+    ta->luts[i+256] = im;
+    ta->luts[i+512] = iy;
+  }
+
+}
+
+/* ------------------------------------------------------------------------ */
+
+#if Debug
+static void print_table(FILE *fp, uint8 *table, char *name)
+{
+  int i,j;
+
+  fprintf(fp,";%s\n",name);
+  for (i=0; i<16; i++)
+  {
+    fprintf(fp,"  DCB ");
+    for (j=i*16; j<i*16+16; j++)
+    {
+      fprintf(fp,"%3d",table[j]);
+      if ((j&15) == 15) fprintf(fp,"\n"); else fprintf(fp,",");
+    }
+  }
+}
+#endif
+
+/* ------------------------------------------------------------------------ */
+
+#if 0
+/* old version - creates text file for AASM to GET */
+static void write_tables(calib_t *ca, tables_t *ta, char *fname)
+{
+  FILE *fp;
+
+fprintf(stderr,"writing %s...\n",fname);
+
+  fp = do_fopen(fname,"w");
+  fprintf(fp,"; b=%1.1f c=%1.1f cc=%1d,%1d,%1d cs=%1.1f g=%1.1f,%1.1f,%1.1f\n",
+          ca->bright,ca->contrast,
+          ca->r_adj_my,ca->g_adj_cy,ca->b_adj_cm,ca->csaturate,
+          ca->gamma[0],ca->gamma[1],ca->gamma[2]);
+  fprintf(fp,"CorrectionTables32\n"
+             "  DCD %1d,%1d,%1d ;colour adjusts\n"
+             "  DCD %1d ;saturation\n",
+             ta->r_adj_my,ta->g_adj_cy,ta->b_adj_cm,ta->saturate );
+  print_table(fp,ta->luts,"red");
+  print_table(fp,ta->luts+256,"green");
+  print_table(fp,ta->luts+512,"blue");
+
+  fprintf(fp,"\n   END\n");
+  fclose(fp);
+}
+#endif
+
+/* new version - outputs binary file for PDumper_mjsLoadCalibration SWI */
+static void write_tables(calib_t *ca, tables_t *ta, char *fname)
+{
+  FILE *fp;
+
+fprintf(stderr,"writing %s...\n",fname);
+
+  fp = do_fopen(fname,"wb");
+
+  fwrite(&ta->r_adj_my,4,1,fp);
+  fwrite(&ta->g_adj_cy,4,1,fp);
+  fwrite(&ta->b_adj_cm,4,1,fp);
+  fwrite(&ta->saturate,4,1,fp);
+  fwrite(ta->luts,768,1,fp);
+
+  fclose(fp);
+
+#if Debug
+  print_table(stderr,ta->luts,"red");
+  print_table(stderr,ta->luts+256,"green");
+  print_table(stderr,ta->luts+512,"blue");
+#endif
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+  calib_t  calib;
+  tables_t tables;
+
+  if (argc != 3)
+  {
+    fprintf(stderr,"usage: prtablegen <calib in> <table out>\n");
+    exit(1);
+  }
+
+  read_calib(&calib,argv[1]);
+  set_tables(&calib,&tables);
+  write_tables(&calib,&tables,argv[2]);
+
+  return 0;
+}

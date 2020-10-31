@@ -1,0 +1,245 @@
+; > Sources.ModHead
+        LEADR   Module_LoadAddr
+
+        ASSERT  (.=Module_BaseAddr)
+
+        DCD     0                               ; Start
+        DCD     Init           - Module_BaseAddr
+        DCD     Die            - Module_BaseAddr
+        DCD     Service        - Module_BaseAddr
+        DCD     Title          - Module_BaseAddr
+        DCD     Helpstr        - Module_BaseAddr
+        DCD     0                               ; Helptable
+
+;---------------------------------------------------------------------------
+Title   DCB     "Keyboard",0
+Helpstr DCB     "Keyboard",9,"$VString ($Date)",0
+                ALIGN
+
+;---------------------------------------------------------------------------
+;       Module initialisation point.
+;
+Init
+        ENTRY
+
+        Debug   mod,"Init"
+
+        LDR     r2, [r12]                       ; Have we already got a workspace ?
+        CMP     r2, #0
+        BNE     %FT01
+
+        MOV     r0, #6
+        LDR     r3, =max_running_work
+        SWI     XOS_Module                      ; Claim workspace.
+        EXIT    VS
+
+        STR     r2, [r12]                       ; Store workspace pointer.
+01
+        MOV     r12, r2
+
+        MOV     r0, #0
+        STRB    r0, KBState
+        STRB    r0, LEDState
+
+ [ debugtable
+        DebugTabInit r0,r1,r2
+        ADR     r0, DebugTable
+        Debug   table,"memory B",r0
+ ]
+
+        BL      ClaimVectors
+        BLVC    KeyInit
+
+        BLVS    ShutDown
+
+        Debug   mod," module initialised"
+
+        EXIT
+
+;---------------------------------------------------------------------------
+; ClaimVectors
+;       Out:    corrupts r0
+;
+;       Claim vectors for keyboard input.
+;
+ClaimVectors
+        ENTRY   "r1-r4"
+
+        Debug   mod,"ClaimVectors"
+
+ [ IO_Type = "IOMD"
+        IRQOff  r0                              ; Disable keyboard IRQs.
+        RxOffTxOff r1,r2
+        SetPSR  r0
+
+        MOV     r0, #14
+        ADRL    r1, TXIRQHandler
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector
+
+        MOVVC   r0, #15
+        ADRVCL  r1, RXIRQHandler
+        SWIVC   XOS_ClaimDeviceVector
+ |
+        MOV     r0, #13
+        ADRL    r1, RXIRQHandler
+        MOV     r2, r12
+        IOMDBase r3
+        ADD     r3, r3, #IOMD_KBDCR
+        MOV     r4, #IOMD_KBDCR_RxF
+        SWI     XOS_ClaimDeviceVector
+
+        MOVVC   r0, #IOC
+        LDRVCB  r1, [r0, #IOCIRQMSKB]
+        ORRVC   r1, r1, #podule_IRQ_bit
+        STRVCB  r1, [r0, #IOCIRQMSKB]
+ ]
+
+        MOVVC   r0, #KEYV
+        ADRVC   r1, KeyVec
+        SWIVC   XOS_Claim
+
+        Debug   mod," vectors claimed"
+
+        EXIT
+
+;---------------------------------------------------------------------------
+; ReleaseVectors
+;       Out:    corrupts r0
+;
+;       Release vectors for keyboard input.
+;
+ReleaseVectors
+        ENTRY   "r1-r4"
+
+        Debug   mod,"ReleaseVectors"
+
+ [ IO_Type = "IOMD"
+        MOV     r0, #14
+        ADRL    r1, TXIRQHandler
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+
+        MOV     r0, #15
+        ADRL    r1, RXIRQHandler
+        SWI     XOS_ReleaseDeviceVector
+ |
+        MOV     r0, #13
+        ADRL    r1, RXIRQHandler
+        MOV     r2, r12
+        IOMDBase r3
+        ADD     r3, r3, #IOMD_KBDCR
+        MOV     r4, #IOMD_KBDCR_RxF
+        SWI     XOS_ReleaseDeviceVector
+ ]
+
+        MOV     r0, #KEYV
+        ADR     r1, KeyVec
+        SWI     XOS_Release
+
+        Debug   mod," vectors released"
+
+        EXITS
+
+;---------------------------------------------------------------------------
+;       Service handler.
+;
+Service
+        TEQ     r1, #Service_Reset
+        MOVNES  pc, lr
+
+        LDR     r12, [r12]
+
+        ENTRY   "r0-r2"
+
+        MOV     r0, #&FD                ; Read last reset type.
+        MOV     r1, #0
+        MOV     r2, #&FF
+        SWI     XOS_Byte
+        TEQ     r1, #0                  ; If hard reset then
+        EXITS   NE                      ;   do nothing.
+
+        BL      ClaimVectors
+        BLVC    KeyInit
+
+        EXITS
+
+;---------------------------------------------------------------------------
+;       Sit on KEYV for enable call and so that LEDs can be set.
+;
+KeyVec
+        TEQ     r0, #3
+        BEQ     keyv_setleds            
+
+        TEQ     r0, #4
+        MOVNES  pc, lr
+
+keyv_init
+ [ debugtable
+        ENTRY   "r0"
+        DebugTab r0,lr,#&81
+ |
+        ENTRY
+ ]
+        IRQOff  lr
+ [ KillAutoRepeat
+        BL      ClearKbd
+ ]
+        LDRB    lr, KBState             ; Safe to start sending keys.
+        BIC     lr, lr, #state_RESET
+        STRB    lr, KBState
+        EXITS
+
+keyv_setleds
+ [ debugtable
+        ENTRY   "r1,r2"
+        DebugTab r2,lr,#&82
+ |
+        ENTRY   "r1"
+ ]
+        MOV     lr, r1
+        TST     lr, #4                  ; Swap bits 0 and 2.
+        BICEQ   r1, r1, #1
+        ORRNE   r1, r1, #1
+        TST     lr, #1
+        BICEQ   r1, r1, #4
+        ORRNE   r1, r1, #4
+        STRB    r1, LEDState
+        BL      SetLEDs
+        EXITS
+
+;---------------------------------------------------------------------------
+;       Killing the module.
+;
+Die
+        ENTRY
+
+        LDR     r12, [r12]
+        CMP     r12, #0
+        Pull    "pc",EQ,^
+
+        BL      ShutDown
+
+        EXITS
+
+;---------------------------------------------------------------------------
+;       Tidy up before dying.
+;       out:  preserves all registers and flags.
+;
+ShutDown
+        ENTRY   "r0-r2"
+
+        Debug   mod,"Shutdown"
+
+        BL      ReleaseVectors                  ; Don't want to be enabled/get LEDs any more.
+
+        KbdDisable r0,r1
+
+        MOV     r0, #0
+        SWI     XOS_InstallKeyHandler
+        SWI     XOS_InstallKeyHandler           ; Reinstall current key handler to clear keys down.
+
+        EXITS                                   ; Ignore errors, preserve flags.
+
+
+        END

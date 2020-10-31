@@ -1,0 +1,928 @@
+/*
+
+  Merlyn Kline, 1995
+
+:NOTES
+
+The reformatter for the browser window
+
+This uses a list of browser_line structures in the browser data space.
+There are browser->nlines of these, numbered from 1 to nlines.
+Each is followed by 1 or more browser_line_chunk structures (numberd 0-(n-1))
+which represent the contents of the line.
+When the last entry in the list points at the last part of the last token
+in the token list, reformatting is complete.
+
+:END
+
+:MESSAGES
+:END
+
+:HISTORY
+:END
+
+*/
+
+#define LEADING 4
+
+#include "stdlib.h"
+#include "stddef.h"
+#include "string.h"
+
+/*----------------------------------------------------------------------*/
+#include "os.h"
+#include "font.h"
+#include "wimpt.h"
+/*----------------------------------------------------------------------*/
+#include "wimp.h"
+/*----------------------------------------------------------------------*/
+#include "win.h"
+#include "sprite.h"
+#include "bbc.h"
+#include "resspr.h"
+#include "msgs.h"
+
+#include "Main.h"
+/*----------------------------------------------------------------------*/
+#include "Browser.h"
+#include "FontManage.h"
+#include "Redraw.h"
+#include "ErrorGen.h"
+#include "Button.h"
+#include "Reformat.h"
+#include "Panes.h"
+#include "Images.h"
+#include "Fetch.h"
+#include "Forms.h"
+#include "Iconbar.h"
+#include "Utils.h"
+#include "Printing.h"
+
+#include "struct.h"
+#include "tags.h"
+
+#define BULLET_GAP 12 /* width of gap following a bullet */
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+typedef struct reformat_width_data
+{
+  browser       *b;
+  int           token;  /* token_number */
+  HStream       *tp;    /* pointer to the token */
+  char          *data;  /* pointer to its data */
+  int           offset; /* the offset into the data to start at */
+  int           maxwid; /* the width to try and fit the token into */
+  int           bytes;  /* (returned) the number of bytes that will (might) fit */
+  int           width;  /* (returned) the actual width of the given number of bytes */
+} reformat_width_data;
+
+#if 0
+/*----------------------------------------------------------------------*/
+typedef struct reformat_line
+{
+  int y; /* y co-ordinate of the bottom of this line (window coords) */
+  int h; /* height of this line in OS units */
+  int b; /* the y offset of the font base line from the bottom */
+  int n; /* the number of line chunks on this line */
+} reformat_line;
+
+/*----------------------------------------------------------------------*/
+typedef struct reformat_line_chunk
+{
+  int t; /* the token number this chunk represents */
+  int o; /* the offset into the token this chunk starts at */
+  int l; /* the number of bytes from the token in this chunk (0=all the rest) */
+  int w; /* the width of this chunk in font coords */
+} reformat_line_chunk;
+#endif
+
+/*----------------------------------------------------------------------*/
+reformat_line *reformat_line_address(browser *b,int line)
+{
+  char *p;
+
+  p=((char*)b->hdata)+b->hsize+b->fsize+b->usize+b->tsize+b->dsize;
+  while(--line>0)
+    p+=WORDALIGN(sizeof(reformat_line))+
+       WORDALIGN(sizeof(reformat_line_chunk))*((reformat_line*)p)->n;
+  return((reformat_line*)p);
+}
+
+/*----------------------------------------------------------------------*/
+reformat_line_chunk *reformat_line_chunk_address(reformat_line *p,int chunk)
+{
+  reformat_line_chunk *n;
+
+  n=(reformat_line_chunk*)(((int)p)+WORDALIGN(sizeof(reformat_line)));
+  n=(reformat_line_chunk*)(((int)n)+chunk*WORDALIGN(sizeof(reformat_line_chunk)));
+  return(n);
+}
+
+/*----------------------------------------------------------------------*/
+reformat_line *reformat_next_line_address(reformat_line *l)
+{
+  return((reformat_line*)(((int)l)+WORDALIGN(sizeof(reformat_line_chunk))*l->n+
+         WORDALIGN(sizeof(reformat_line))));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int reformat_datasize(HStream *tp)
+{
+  if(tp->style & HR) return(0);
+  if(tp->style & IMG) return(0);
+  return(tp->text?strlen(tp->text):0);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+#include "stdio.h"
+void trace_chunks(browser *b,char *id)
+{
+  FILE                *f;
+  reformat_line       *lp;
+  reformat_line_chunk *cp;
+  HStream             *tp;
+  int                 i,j;
+
+  if(bbc_inkey(-3)) return;
+  f=fopen(":4.ftrace","a");
+  fprintf(f,"\n\n--------------------\nTrace id=%s\n%d lines\n\n",id,b->nlines);
+  lp=reformat_line_address(b,1);
+  for(i=1;i<=b->nlines;i++)
+  {
+    fprintf(f,"line %d @ %p: %d chunks in %d osunits from %d\n",i,lp,lp->n,lp->h,lp->y);
+    {
+      cp=reformat_line_chunk_address(lp,0);
+      for(j=0;j<lp->n;j++,cp++)
+      {
+        fprintf(f,"  chunk %d @ %p: tok=%d,off=%d,len=%d,wid=%d> ",j+1,cp,cp->t,cp->o,cp->l,cp->w);
+/*
+        if(cp->t)
+        {
+          tp=fetch_token_address(b,cp->t);
+          switch(tp->type)
+          {
+            case HTML_Text:
+            {
+              char *p;
+              int  n;
+
+              fprintf(f,"Text (%d bytes)=",tp->length);
+              p=((char*)fetch_token_data_address(b,cp->t))+cp->o;
+              for(n=0;n<cp->l;n++) fprintf(f,"%c",p[n]);
+            } break;
+            case HTML_Image: fprintf(f,"Image"); break;
+            case HTML_HR:    fprintf(f,"HR"); break;
+            case HTML_INDEX: fprintf(f,"ISINDEX"); break;
+            case HTML_Title: fprintf(f,"Title=%s",(char*)fetch_token_data_address(b,cp->t)); break;
+            case HTML_EOF:   fprintf(f,"EOF"); break;
+          }
+        }
+*/
+        fprintf(f,"\n");
+      }
+    }
+    lp=reformat_next_line_address(lp);
+  }
+  fprintf(f,"==========================\n");
+  fclose(f);
+}
+
+/*----------------------------------------------------------------------*/
+BOOL reformat_formatting(browser *b)
+{
+  if(b->suspend_format) return(FALSE);
+  if(b->nlines<=0) return(b->ntokens!=0);
+  if(b->last_reformat_token>=b->ntokens) return(FALSE);
+  return(TRUE);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *reformat_stop(browser *b)
+{
+  b->suspend_format=TRUE;
+  button_set_states(b);
+  return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static BOOL reformat_istext(HStream *tp)
+{
+  return((tp->style&(IMG | HR))==0);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *set_extent_fix(wimp_redrawstr *r)
+{
+wimp_wstate    state;
+
+return(wimp_set_extent(r));
+/*
+ERROUT(wimp_set_extent(r))
+ERROUT(wimp_get_wind_state(r->w,&state))
+return(wimp_open_wind(&state.o));
+*/
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *reformat_set_extent(browser *b,int extent)
+{
+  /* don't set the window extent smaller unless the reformat and the
+     fetch have both finished. Remember y extents are -ve so
+     parts of the if() statement appear to be inverted */
+  int width;
+
+  width=bbc_modevar(-1,11)*Wimpt_dx-44;
+  if(width<b->max_width+12) width=b->max_width+12; /* add a bit for aesthetic purposes */
+  extent-=12; /* add a bit for aesthetic purposes (a small gap at the bottom) */
+  if(extent<b->reformat_extent ||
+     width>b->reformat_width ||
+     ((extent>b->reformat_extent || width<b->reformat_width)
+      && !reformat_formatting(b) && !fetch_fetching(b)))
+  {
+    wimp_wstate    state;
+    wimp_redrawstr r;
+    int            offset;
+
+    offset=BUTTONBAR_HEIGHT+URLBAR_HEIGHT-browser_bar_height(b);
+    b->reformat_extent=extent;
+    b->reformat_width=width;
+    wimp_get_wind_state(b->w,&state);
+    extent=-extent+((b->status.flags&PANE_ISOPEN)?STATUS_HEIGHT:0);
+    if(extent<state.o.box.y1-state.o.box.y0) extent=state.o.box.y1-state.o.box.y0;
+    if(extent<DEFAULT_HEIGHT) extent=DEFAULT_HEIGHT;
+    r.box.x0=0;
+    r.box.x1=width;
+    r.box.y0=-1-extent;
+    r.box.y1=-offset;
+    r.w=b->w;
+    ERROUT(set_extent_fix(&r));
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *reformat_check_extent(browser *b)
+{
+  if(b->nlines)
+    return(reformat_set_extent(b,reformat_line_address(b,b->nlines)->y));
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *reformat_set_chunk_size_f(browser *b,int size)
+{
+  size=((size/BLOCKSIZE)+1)*BLOCKSIZE;
+  return(browser_set_chunk_size_f(b,CK_LINE,size));
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *reformat_add_line_f(browser *b,reformat_line **p)
+{
+  int oldbytes;
+
+  oldbytes=b->lbytes;
+  ERROUT(reformat_set_chunk_size_f(b,b->lbytes+WORDALIGN(sizeof(reformat_line))));
+  b->lbytes+=WORDALIGN(sizeof(reformat_line));
+  b->nlines++;
+  *p=(reformat_line*)(((int)reformat_line_address(b,0))+oldbytes);
+  memset(*p,0,sizeof(reformat_line));
+  (*p)->n=-1;
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *reformat_add_line_chunk_f(browser *b,reformat_line_chunk **p)
+{
+  int oldbytes;
+
+  oldbytes=b->lbytes;
+  ERROUT(reformat_set_chunk_size_f(b,b->lbytes+WORDALIGN(sizeof(reformat_line_chunk))));
+  b->lbytes+=WORDALIGN(sizeof(reformat_line_chunk));
+  *p=(reformat_line_chunk*)(((int)reformat_line_address(b,1))+oldbytes);
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *reformat_get_image_size(browser *b,int token,HStream *tp,wimp_box *box)
+{ /* get a box for the image in os coords relative to font base line, left edge */
+  int align;
+
+  ERROUT(image_get_token_image_size(b,token,box));
+  if((tp->type&TYPE_ALIGN_MASK)==TYPE_MIDDLE) {box->y0-=box->y1/2; box->y1/=2;}
+  if((tp->type&TYPE_ALIGN_MASK)==TYPE_TOP) {box->y0=-box->y1; box->y1=0;}
+  if(ISLINK(tp))
+  {
+    int b;
+
+    b=tp->maxlen*2;
+    box->x1+=b;
+    box->y1+=b;
+    box->x0-=b;
+    box->y0-=b;
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *reformat_format_from(browser *b,int startline)
+{ /* startline is the number of the last valid line structure */
+  int           bottom;
+  reformat_line *lp;
+
+  if(startline<0) startline=0;
+  b->suspend_format=FALSE;
+  b->last_reformat_token=0;
+  if(startline>b->nlines) startline=b->nlines;
+  bottom=0;
+  if(startline)
+  {
+    lp=reformat_line_address(b,startline);
+    bottom=lp->y;
+    lp=reformat_next_line_address(lp);
+  }
+  else lp=reformat_line_address(b,1);
+  if(startline<b->nlines)
+  {
+    int size;
+
+    size=((int)lp)-((int)reformat_line_address(b,1));
+    b->nlines=startline;
+    b->lbytes=size;
+    reformat_set_chunk_size_f(b,size);
+  }
+
+  if (!printing)
+  {
+    ERROUT(reformat_set_extent(b,bottom));
+    browser_use_idle_events(b);
+  }
+
+  b->ptr_link=-1;
+  browser_pointer_check(b);
+  form_check_caret(b);
+
+  return (!printing ? browser_update_bottom(b,bottom) : NULL); /* update blank bottom of window */
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int reformat_switch_width(char *spr)
+{
+  sprite_area *sa;
+  sprite_id   sid;
+  sprite_info info;
+  int         w,t=0;
+
+  sa=resspr_area();
+  sid.tag=sprite_id_name;
+  sid.s.name=spr;
+  if(sprite_readsize(sa,&sid,&info)) w=32;
+  else w=info.width<<bbc_modevar(info.mode,bbc_XEigFactor);
+  convert_pair_to_points(w,t,&w,&t);
+  return(w);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int reformat_switch_height(char *spr)
+{ /* get height of bullet in OS units */
+  sprite_area *sa;
+  sprite_id   sid;
+  sprite_info info;
+  int         h;
+
+  sa=resspr_area();
+  sid.tag=sprite_id_name;
+  sid.s.name=spr;
+  if(sprite_readsize(sa,&sid,&info)) h=32;
+  else h=info.height<<bbc_modevar(info.mode,bbc_YEigFactor);
+  return(h);
+}
+
+/*----------------------------------------------------------------------*/
+int reformat_bullet_width(int bullet)
+{ /* get width of bullet (1..n) in OS units */
+  char        spr[20];
+  sprite_area *sa;
+  sprite_id   sid;
+  sprite_info info;
+  int         w;
+
+  sprintf(spr,"b%d",(bullet+bullets-1)%bullets);
+  sa=resspr_area();
+  sid.tag=sprite_id_name;
+  sid.s.name=spr;
+  if(sprite_readsize(sa,&sid,&info)) w=32;
+  else w=info.width<<bbc_modevar(info.mode,bbc_XEigFactor);
+  return(w+BULLET_GAP);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int reformat_bullet_height(int bullet)
+{ /* get height of bullet in OS units */
+  char spr[20];
+  sprite_area *sa;
+  sprite_id   sid;
+  sprite_info info;
+  int         h;
+
+  sprintf(spr,"b%d",bullet%bullets);
+  sa=resspr_area();
+  sid.tag=sprite_id_name;
+  sid.s.name=spr;
+  if(sprite_readsize(sa,&sid,&info)) h=32;
+  else h=info.height<<bbc_modevar(info.mode,bbc_YEigFactor);
+  return(h);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *reformat_check_height(browser *b,reformat_line *lp,
+                                       int token,HStream *tp,HStream *tpLast,int offset)
+{
+  int  top,bot;
+
+  top=bot=0;
+  if(tp->style & IMG)
+  {
+    wimp_box box;
+
+    ERROUT(reformat_get_image_size(b,token,tp,&box));
+    top=box.y1;
+    bot=-box.y0;
+  }
+  else if(tp->style & HR)
+    top=48;
+  else if((tp->style & INPUT) && (tp->type & TYPE_RESET)==TYPE_CHECKBOX)
+  {
+    top=reformat_switch_height("opton")-8;
+    bot=8;
+  }
+  else if((tp->style & INPUT) && (tp->type & TYPE_RESET)==TYPE_RADIO)
+  {
+    top=reformat_switch_height("radioon")-8;
+    bot=8;
+  }
+  else if(ISBULLET(tp))
+  {
+    top=reformat_bullet_height(tp->indent);
+  }
+  else
+  {
+    int      h;
+    os_error *e=NULL;
+    wimp_box box;
+
+    if (
+         (tp->text) &&
+         (
+           (tp->style & FORM) ||
+           (
+             (*tp->text != 0)  &&
+            !(
+               *tp->text == 32 &&
+               *(tp->text + 1) == 0
+             )
+           )
+         )
+       )
+    {
+      h=redraw_find_token_font(tp);
+      e=fm_font_box(h,&box);
+      if(e) e=errorgen((int)e);
+      fm_lose_font(h);
+      top=box.y1;
+      bot=-box.y0;
+      if(!(tp->style&(ITALIC|BOLD)))
+        bot+=LEADING; /* don't do for bold/italic due to font manager bug */
+      if(bot<0) bot=0;
+      if(e) return(e);
+      if((tp->style&P) && offset<1) top+=16;
+      if(HEADER(tp->style)==1) {bot+=16;}
+      else if(HEADER(tp->style)==2) {bot+=16; if(!offset) top+=32;}
+      else if(HEADER(tp->style)==3) {bot+=16; if(!offset) top+=32;}
+      else if(HEADER(tp->style)==4) {bot+=16; if(!offset) top+=32;}
+      else if(HEADER(tp->style)==5) {if(!offset) top+=32;}
+      else if(HEADER(tp->style)==6) {if(!offset) top+=8;}
+      else
+      {
+        if(tpLast && (tp->style&BLOCKQUOTE)!=(tpLast->style&BLOCKQUOTE) && !offset) top+=top;
+      }
+    }
+  }
+  if(top%4) top+=4-(top%4);
+  if(bot<0) bot=0;
+  if(bot%4) bot+=4-(bot%4);
+  if(tp->style & TEXTAREA)
+  {
+    int r;
+
+    r=tp->rows;
+    if(r<3) r=3;
+    top=(top+bot)*r+20-bot;
+    bot+=16;
+  }
+  else if(tp->style & SELECT)
+  {
+    sprite_id   sid;
+    sprite_info info;
+    int         h;
+
+    sid.tag=sprite_id_name;
+    sid.s.name="gright";
+    if(sprite_readsize(resspr_area(),&sid,&info)) h=32;
+    else h=info.height<<bbc_modevar(info.mode,bbc_YEigFactor);
+    bot+=24;
+    top+=48;
+    if(top+bot<h) top+=h-top-bot;
+  }
+  else if(tp->style & INPUT)
+  {
+    switch(tp->type & TYPE_RESET)
+    {
+      case TYPE_TEXT: /*; no break - same as PASSWORD */
+      case TYPE_PASSWORD:
+        bot+=16;
+        top+=48;
+      break;
+      case TYPE_SUBMIT: /*; no break - same as RESET */
+      case TYPE_RESET:
+        bot+=16;
+        top+=48;
+      break;
+    }
+  }
+  if(top>lp->h-lp->b)
+  {
+    int d;
+
+    d=top-(lp->h-lp->b);
+    lp->h+=d;
+    lp->y-=d;
+  }
+  if(bot>lp->b)
+  {
+    int d;
+
+    d=bot-lp->b;
+    lp->h+=d;
+    lp->b+=d;
+    lp->y-=d;
+  }
+  return(NULL);
+}
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *reformat_token_width(reformat_width_data *w)
+{ /* do the width calculation on the token starting at the given offset. The
+     idea is to fit the token into maxwidth fontcoords. The actual width of
+     the piece is returned (which may be > or < w->maxwid) and the number of
+     bytes making up that width.
+   */
+
+  if(w->tp->style & (INPUT|TEXTAREA|SELECT))
+  {
+    if( (w->tp->type&TYPE_RESET)==TYPE_TEXT || (w->tp->type&TYPE_RESET)==TYPE_PASSWORD ||
+        (w->tp->style & (TEXTAREA|SELECT)))
+    {
+      int       h;
+      os_error  *e=NULL;
+      int       length;
+      wimp_box  box;
+      int       extra;
+
+      extra=0;
+      if(w->tp->style&TEXTAREA)
+      {
+        length=w->tp->cols;
+        if(length<1) length=30;
+        extra=0;
+      }
+      else if(w->tp->style&SELECT)
+      {
+        sprite_id   sid;
+        sprite_info info;
+        char        *p;
+        int         l;
+
+        sid.tag=sprite_id_name;
+        sid.s.name="gright";
+        if(!sprite_readsize(resspr_area(),&sid,&info))
+          extra=400*((info.width<<bbc_modevar(info.mode,bbc_XEigFactor))+4);
+        p=w->tp->value+8;
+        l=8;
+        while(*p!=0xff)
+        {
+          p++;
+          if(strlen(p)>l) l=strlen(p);
+          p+=strlen(p)+1;
+          p+=strlen(p)+1;
+        }
+        length=l;
+      }
+      else
+      {
+        length=w->tp->size;
+        if(length<1)
+        {
+          length=w->tp->maxlen;
+          if(length>40) length=40;
+        }
+      }
+      if(length<1) length=20;
+      if(!params.systemfont && !(w->tp->style&(PRE|TT))) length/=2; /* arbitrary adjustment for proportional */
+      h=redraw_find_token_font(w->tp);
+      e=fm_font_box(h,&box);
+      convert_pair_to_points(box.x0,box.y0,&box.x0,&box.y0);
+      convert_pair_to_points(box.x1,box.y1,&box.x1,&box.y1);
+      w->width=(box.x1-box.x0)*length+400*16+extra;
+      if(e) e=errorgen((int)e);
+      fm_lose_font(h);
+      w->bytes=0;
+      return(e);
+    }
+    else switch(w->tp->type & TYPE_RESET)
+    {
+      case TYPE_SUBMIT: /*; no break - same as RESET */
+      case TYPE_RESET:
+      {
+        int       h,end;
+        os_error  *e=NULL;
+        int       length;
+        char      *p;
+
+        p=form_button_text(w->tp);
+        length=strlen(p);
+        end=0;
+        while(end<length && p[end]!='\n') end++;
+        h=redraw_find_token_font(w->tp);
+        e=fm_get_string_width(h,p,1000000000,end-w->offset,-1,&w->bytes,&w->width);
+        w->width+=400*4*6;
+        w->bytes=0;
+        if(e) e=errorgen((int)e);
+        fm_lose_font(h);
+        return(e);
+      } break;
+      case TYPE_CHECKBOX: w->bytes=0; w->width=reformat_switch_width("opton"); break;
+      case TYPE_RADIO:    w->bytes=0; w->width=reformat_switch_width("radioon"); break;
+      case TYPE_IMAGE:
+      case TYPE_HIDDEN:   w->width=w->bytes=0; break;
+    }
+  }
+  else if(w->tp->style & IMG)
+  {
+    wimp_box box;
+
+    w->bytes=0;
+    w->width=0;
+    ERROUT(reformat_get_image_size(w->b,w->token,w->tp,&box));
+    convert_pair_to_points(box.x0,box.y0,&box.x0,&box.y0);
+    convert_pair_to_points(box.x1,box.y1,&box.x1,&box.y1);
+    w->width=box.x1-box.x0;
+  }
+  else if(w->tp->style & HR)
+  {
+    w->bytes=0;
+    w->width=w->maxwid;
+  }
+  else if(ISBULLET(w->tp))
+  {
+    int t;
+
+    w->bytes=0;
+    convert_pair_to_points(reformat_bullet_width(w->tp->indent),t,&w->width,&t);
+  }
+  else
+  {
+    int       h,end;
+    os_error  *e=NULL;
+    int       split,length;
+
+    length=w->tp->text?strlen(w->tp->text):0;
+    end=w->offset;
+    while(end<length && w->data[end]!='\n') end++;
+    split=(w->tp->style&PRE)?-1:' ';
+    h=redraw_find_token_font(w->tp);
+    if(end>w->offset)
+      e=fm_get_string_width(h,w->data+w->offset,w->maxwid,end-w->offset,split,&w->bytes,&w->width);
+    if(end<length && w->data[w->offset+w->bytes]=='\n')
+      w->bytes++; /* if there was a newline, include it in this chunk */
+    if(e) e=errorgen((int)e);
+    fm_lose_font(h);
+    return(e);
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL reformat_useless_token(HStream *t)
+{ /* check to see if a token is useless to the reformatter */
+  if(ISHEAD(t)) return(TRUE); /* its part of the document header */
+  return(FALSE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+ /* flags forcing a linebreak when they are on */
+#define LINEBREAK (P|BR|LI)
+ /* flags forcing a linebreak when they change */
+#define LINEBREAKSW (PRE|BLOCKQUOTE)
+ /* flags forcing a line break when they turn on */
+#define LINEBREAKON (DT | ADDRESS)
+ /* flags forcing a line break when they turn off */
+#define LINEBREAKOFF (H7 | ADDRESS)
+
+#define CENTRED(x) (((x->style&CENTER) || ((x->type&TYPE_ALIGN_MASK)==TYPE_CENTRE))!=FALSE)
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int reformat_sub_newline(browser *b,HStream *t,HStream *l,int offset)
+{
+  if(((t->style&HR) || (offset==0 && l && (l->style&HR)))) return(1);
+  if(offset==0 && (t->style&LINEBREAK)) return(2);
+  if(offset==0 && l)
+  {
+    if(t->indent!=l->indent) return(3);
+    if((t->style&H7)!=(l->style&H7) && !(l->style&LI)) return(4);
+    if((t->style&LINEBREAKSW)!=(l->style&LINEBREAKSW)) return(5);
+    if(CENTRED(t)!=CENTRED(l)) return(6);
+    if((t->style&LINEBREAKON) && !(l->style&LINEBREAKON)) return(7);
+    if(!(t->style&LINEBREAKOFF) && (l->style&LINEBREAKOFF)) return(8);
+  }
+  return(0);
+}
+
+/*----------------------------------------------------------------------*/
+BOOL reformat_newline(browser *b,HStream *t,HStream *l,int offset)
+{
+  int r;
+
+  r=reformat_sub_newline(b,t,l,offset);
+  return(r!=0);
+}
+
+/*----------------------------------------------------------------------*/
+void reformat_reformatter(browser *b)
+{
+  reformat_line       *lpCurr=NULL;
+  int                 lnCurr=0;
+  reformat_line_chunk *cpCurr=NULL,*cpLast=NULL;
+  HStream             *tpCurr=NULL,*tpLast=NULL;
+  int                 tnCurr=0,tnLast=0;
+  int                 bottom=0,extent;
+  BOOL                done=FALSE;
+  BOOL                newline=FALSE;
+  int                 linewidth=0;
+  int                 displaywidth;
+  int                 temp;
+  os_error            *e=NULL;
+  reformat_width_data wd;
+  int                 newlines=0;
+  int                 offset=0;
+  int                 newchunks=0;
+
+  if(b->nlines>1) bottom=reformat_line_address(b,b->nlines-1)->y;
+  extent=bottom;
+  convert_pair_to_points(b->display_width,0,&displaywidth,&temp);
+  if(b->nlines)
+  {
+    int           i;
+
+    lnCurr=b->nlines;
+    lpCurr=reformat_line_address(b,lnCurr);
+    cpLast=reformat_line_chunk_address(lpCurr,0);
+    tpLast=fetch_token_address(b,cpLast->t);
+    convert_pair_to_points(redraw_margin(tpLast),0,&linewidth,&temp);
+    for(i=0;i<lpCurr->n;i++,cpLast++) linewidth+=cpLast->w;
+    if(lpCurr->n>0)
+    {
+      cpLast=reformat_line_chunk_address(lpCurr,lpCurr->n-1);
+      tnCurr=tnLast=cpLast->t;
+      tpCurr=tpLast=fetch_token_address(b,tnLast);
+      offset=cpLast->o+cpLast->l;
+      if(cpLast->l<=0) offset=reformat_datasize(tpLast);
+      if(reformat_istext(tpCurr) && tpCurr->text && tpCurr->text[offset-1]=='\n') newline=TRUE;
+    }
+  }
+  else
+  {
+    newline=TRUE;
+  }
+  while(!e && reformat_formatting(b) && !done && (newlines<10 || !newline))
+  {
+    if(!tpCurr || offset>=reformat_datasize(tpCurr))
+    {
+      b->last_reformat_token=tnLast;
+      tnCurr=tnLast+1;
+      if(tnCurr<=b->ntokens)
+      {
+        tpCurr=fetch_token_address(b,tnCurr);
+        while(tpCurr && reformat_useless_token(tpCurr))
+        {b->last_reformat_token=tnCurr; tnCurr+=1; tpCurr=tpCurr->next;}
+//        while ((tpCurr) && (reformat_useless_token(tpCurr) || (!tpCurr->text && !(tpCurr->style & (IMG | HR | OL | UL | LI)))))
+//        {
+//          if (!newline && !reformat_useless_token(tpCurr) && reformat_newline(b,tpCurr,tpLast,0)) newline = 1;
+//          b->last_reformat_token=tnCurr;
+//          tnCurr+=1;
+//          tpCurr=tpCurr->next;
+//        }
+        if (!tpCurr) done=TRUE;
+
+        offset = 0;
+      }
+      else done=TRUE;
+    }
+    if(!done)
+    {
+      if(!(tpCurr->style&PRE) && !newline && linewidth>displaywidth) newline=TRUE;
+      if(!newline && reformat_newline(b,tpCurr,tpLast,offset)) newline=TRUE;
+      if(newline)
+      {
+        int y;
+
+        newline=FALSE;
+        newlines++;
+        if(lpCurr) y=lpCurr->y; else y=-BUTTONBAR_HEIGHT-URLBAR_HEIGHT-12-LEADING;
+        if(!newchunks) bottom=y; /* don't update the bottom line if it didn't change */
+        e=reformat_add_line_f(b,&lpCurr);
+        if(!e)
+        {
+          tpCurr=fetch_token_address(b,tnCurr);
+          tpLast=fetch_token_address(b,tnLast);
+          lpCurr->h=3;
+          lpCurr->y=y-lpCurr->h;
+          lpCurr->b=lpCurr->h/3;
+          lpCurr->n=0;
+          lnCurr=b->nlines;
+          convert_pair_to_points(redraw_margin(tpCurr),0,&linewidth,&temp);
+        }
+      }
+      if(!e)
+      {
+        wd.b=b;
+        wd.token=tnCurr;
+        wd.tp=tpCurr;
+        wd.data=fetch_token_data_address(b,tnCurr);
+        wd.offset=offset;
+        wd.maxwid=((tpCurr->style&PRE) && reformat_istext(tpCurr))?1000000000:displaywidth-linewidth;
+        if(tpCurr->style&BLOCKQUOTE) wd.maxwid-=48*400;
+        wd.bytes=wd.width=0;
+        e=reformat_token_width(&wd);
+        if(reformat_istext(tpCurr) && wd.bytes && wd.data[wd.offset+wd.bytes-1]=='\n') newline=TRUE;
+      }
+      if(!e && /* (wd.bytes || !reformat_istext(tpCurr)) && */
+         (wd.width<=wd.maxwid || lpCurr->n==0 || (tpCurr->style&PRE)))
+      {
+        newchunks++;
+        e=reformat_add_line_chunk_f(b,&cpCurr);
+
+        if(!e)
+        {
+          tpCurr=fetch_token_address(b,tnCurr);
+          tpLast=fetch_token_address(b,tnLast);
+          lpCurr=reformat_line_address(b,lnCurr);
+          lpCurr->n++;
+          cpCurr->t=tnCurr;
+          cpCurr->w=wd.width;
+          cpCurr->o=offset;
+          cpCurr->l=wd.bytes;
+          e=reformat_check_height(b,lpCurr,tnCurr,tpCurr,tpLast,offset);
+          if(!e)
+          {
+            int w;
+
+            offset+=cpCurr->l;
+            if(cpCurr->l<=0) offset=reformat_datasize(tpCurr)+1;
+            tnLast=tnCurr;
+            tpLast=tpCurr;
+            linewidth+=cpCurr->w;
+            convert_pair_to_os(linewidth,temp,&w,&temp);
+            if(w>b->max_width) b->max_width=w;
+            if(offset<reformat_datasize(tpCurr)) newline=TRUE;
+          }
+        }
+      }
+      else newline=TRUE;
+    }
+  }
+  if(e)
+  {
+    reformat_stop(b);
+    wimpt_complain(e);
+  }
+
+  if (!printing)
+  {
+    char * url;
+
+    url = browser_current_url(b);
+
+    reformat_set_extent(b,extent);
+    browser_update_bottom(b,bottom+4);
+
+    if (!b->stoplooking && url && fetch_fetching(b) && fetch_find_name_tag(url))
+    {
+      if (browser_display_local_reference_quietly(b, url, url))
+      {
+        wimp_wstate w;
+        w.o.w = b->w;
+        wimp_get_wind_state(w.o.w,&w);
+        if (w.o.y - bottom >= (w.o.box.y1 - w.o.box.y0)) b->stoplooking = 1;
+      }
+    }
+  }
+}

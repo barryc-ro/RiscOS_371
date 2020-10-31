@@ -1,0 +1,270 @@
+/* -*-C-*-
+ * Convert a Mac or PC format Type-1 font into a plain
+ * type-1 font.  The Mac format uses the resource
+ * fork of the file to carry binary data for the
+ * eexec portion of the description.  Each record
+ * in the resource file carries two bytes (after the
+ * length word) indicating what the record contains.
+ * The second byte is always 0.  The first contains:
+ * 
+ *   1: the record contains ASCII text, with \r instead
+ *      of \n to separate lines.
+ *   2: the record contains binary, which should be
+ *      output as pairs of hex digits.
+ *   5: terminator - no more records.
+ *
+ * This is based on looking at one font!  There may
+ * be other record types (3 and 4?)
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <setjmp.h>
+#include "frontend.h"
+
+#define TRUE 1
+#define FALSE 0
+
+static int lastBinary = FALSE;
+static int position = 0;
+
+static jmp_buf jmp;
+
+/* Break binary output into lines after this
+ * many hex pairs
+ */
+
+#define BREAK 32
+
+/* For hex conversion */
+
+static char *tab = "0123456789abcdef";
+
+
+static int readLongBigEndian (FILE *f)	  /* for the MAC */
+{
+    int i, r = 0;
+    for (i = 0; i < 4; i++)
+    {
+	int c = getc(f);
+	
+	if (c == EOF)
+	{
+	    longjmp(jmp, 1);
+	}
+
+	r = (r << 8) | (c & 0xff);
+    }
+	
+    return r;
+}
+
+int readLongLittleEndian (FILE *f)        /* for the PC */
+{
+    int i, r = 0;
+    for (i = 0; i < 4; i++)
+    {
+	int c = getc(f);
+	
+	if (c == EOF)
+	{
+	    longjmp(jmp, 1);
+	}
+
+	r |= (c << (i*8));
+    }
+	
+    return r;
+}
+
+
+static void readAscii (FILE *in, FILE *out, int len)
+{
+    if (lastBinary && position > 0)
+	putc('\n', out);
+    lastBinary = FALSE;
+    position = 0;
+    while (len--)
+    {
+	int b = fgetc(in);
+	if (b == EOF)
+	    longjmp(jmp, 2);
+	if (b == '\r')
+	    b = '\n';
+	putc(b, out);
+    }
+}
+
+static void readBinary (FILE *in, FILE *out, int len)
+{
+    int i;
+    for (i = 0; i < len; i++)
+    {
+	int b = fgetc(in);
+	if (b == EOF)
+	    longjmp(jmp, 3);
+	putc(tab[(b >> 4) & 0xF], out);
+	putc(tab[b & 0xF], out);
+	if (++position == BREAK)
+	{
+	    putc('\n', out);
+	    position = 0;
+	}
+    }
+    lastBinary = TRUE;
+}
+
+
+/*
+ * If anything goes wrong, just return FALSE.
+ */
+
+int preprocess_mac (char *mac, char *type1)
+{
+    FILE *in, *out;
+    int word;
+    char byte1, byte2;
+
+    if ((in = fopen(mac, "r")) == NULL)
+	return FALSE;
+    if ((out = fopen(type1, "w")) == NULL)
+    {
+	fclose(in);
+	return FALSE;
+    }
+
+   if (setjmp(jmp) != 0)
+   {
+       fclose(in);
+       fclose(out);
+       return FALSE;
+   }
+
+    /* Skip header */
+    word = readLongBigEndian(in);
+    fseek (in, word, 0);
+ 
+    while (1)
+    {
+	word = readLongBigEndian(in);
+	byte1 = getc(in);
+	byte2 = getc(in);
+
+	if (byte1 == EOF || byte2 == EOF)
+	    longjmp(jmp, 4);
+
+	switch (byte1)
+	{
+	case 1:
+	    readAscii(in, out, word - 2);
+	    break;
+	case 2:
+	    readBinary(in, out, word - 2);
+	    break;
+	case 5:
+	    fclose(in);
+	    fclose(out);
+	    return TRUE;
+
+	/* Ignore unknown segments types, and hope! */
+	}
+    }
+    /*NOTREACHED*/
+}
+
+
+int preprocess_pc (char *pc, char *type1)
+{
+    FILE *in, *out;
+    int word;
+    char byte1, byte2;
+
+    if ((in = fopen(pc, "r")) == NULL)
+	return FALSE;
+    if ((out = fopen(type1, "w")) == NULL)
+    {
+	fclose(in);
+	return FALSE;
+    }
+
+    if (setjmp(jmp) != 0)
+    {
+	fclose(in);
+	fclose(out);
+	return FALSE;
+    }
+
+    while (1)
+    {
+	byte1 = getc(in);
+	byte2 = getc(in);
+
+	if (byte1 == EOF || byte2 == EOF)
+	    longjmp(jmp, 4);
+
+	switch (byte2)
+	{
+	case 1:
+	    word = readLongLittleEndian(in);
+	    readAscii(in, out, word);
+	    break;
+	case 2:
+	    word = readLongLittleEndian(in);
+	    readBinary(in, out, word);
+	    break;
+	case 3:
+	    fclose(in);
+	    fclose(out);
+	    return TRUE;
+
+	/* Ignore unknown segments types, and hope! */
+	}
+    }
+    /*NOTREACHED*/
+}
+
+
+int guesstype (char *file)
+{
+    int c;
+    FILE *f = fopen(file, "r");
+    if (!f)
+	return FILETYPE_TYPE1;
+    c = getc(f);
+    if (c == EOF)
+    {
+	fclose(f);
+	return FILETYPE_TYPE1;
+    }
+    else if (c == '%')
+    {
+	fclose(f);
+	return FILETYPE_TYPE1;
+    }
+    else if (c == 128)
+    {
+	fclose(f);
+	return FILETYPE_PC;
+    }
+    else
+    {
+	/* Check for MAC more complicated */
+	int offset;
+	if (setjmp(jmp) != 0)
+	{
+	    fclose(f);
+	    return FILETYPE_TYPE1;
+	}
+	if (fseek(f, 0, 0) != 0)
+	    longjmp(jmp, 1);
+	offset = readLongBigEndian(f) + 2;
+	if (fseek(f, offset, 1) != 0)
+	    longjmp(jmp, 2);
+	c = getc(f);
+	fclose(f);
+	if (c == '%')
+	    return FILETYPE_MAC;
+	else
+	    return FILETYPE_TYPE1;
+    }
+}

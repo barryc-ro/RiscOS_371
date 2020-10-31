@@ -1,0 +1,227 @@
+/* route.c
+ *
+ * Author: Keith Ruttle (Acorn)
+ *
+ * Description
+ * ===========
+ * Routing routines
+ *
+ * Environment
+ * ===========
+ * Acorn RISC OS 3.11 or later.
+ *
+ * Compiler
+ * ========
+ * Acorn Archimedes C release 5.06 or later.
+ *
+ * Change record
+ * =============
+ *
+ * JPD  Jem Davies (Cambridge Systems Design)
+ *
+ *
+ * 09-Dec-94  17:42  JPD  Version 1.00
+ * First version with change record. Modified: #includes to be ANSI-compliant.
+ *
+ * 12-Jan-95  12:25  JPD  Version 1.01
+ * Add static declarations. Begin changes to allow compilation with -fah
+ * option.
+ *
+ * 14-Mar-95  15:49  JPD  Version 1.02
+ * Removed OldCode.
+ *
+ *
+ **End of change record*
+ */
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "sys/ioctl.h"
+#include "net/route.h"
+#include "protocols/routed.h"
+#include "netinet/in.h"
+
+#include "module.h"
+#include "routecode.h"
+#include "stubs.h"
+
+
+/******************************************************************************/
+
+struct rt_entry
+{
+   struct  rt_entry *rt_forw;
+   union
+   {
+      struct  rtentry rtu_rt;
+      struct
+      {
+         u_long  rtu_hash;
+         struct  sockaddr rtu_dst;
+         struct  sockaddr rtu_router;
+         short   rtu_flags;
+         int     rtu_metric;
+      } rtu_entry;
+   } rt_rtu;
+};
+
+#define rt_rt           rt_rtu.rtu_rt
+#define rt_hash         rt_rtu.rtu_entry.rtu_hash
+#define rt_dst          rt_rtu.rtu_entry.rtu_dst
+#define rt_router       rt_rtu.rtu_entry.rtu_router
+#define rt_flags        rt_rtu.rtu_entry.rtu_flags
+#define rt_metric       rt_rtu.rtu_entry.rtu_metric
+
+#define equal(a1, a2) \
+        (memcmp((caddr_t)(a1), (caddr_t)(a2), sizeof (struct sockaddr)) == 0)
+
+static void rtadd(struct sockaddr *dst, struct sockaddr *gate, int metric);
+static void rtchange(struct rt_entry *rt, struct sockaddr *gate, short metric);
+static void route_attach(struct rt_entry *rt);
+static struct rip msg;
+
+/******************************************************************************/
+
+void routed_init(void)
+{
+
+   struct sockaddr_in sin;
+
+   sin.sin_family = AF_INET;
+   sin.sin_port = htons((u_short)ROUTEDPORT);
+   sin.sin_addr.s_addr = INADDR_BROADCAST;
+   msg.rip_cmd = RIPCMD_REQUEST;
+   msg.rip_vers = RIPVERSION;
+   msg.rip_nets[0].rip_dst.sa_family = htons((u_short)AF_UNSPEC);
+   msg.rip_nets[0].rip_metric = htonl((u_long)HOPCNT_INFINITY);
+   (void) sendto(mns.mns_routedsock, (char *)&msg, sizeof(struct rip), 0,
+                                          (struct sockaddr *)&sin, sizeof(sin));
+   mns.mns_retrydelay = RETRY_DELAY;
+
+   return;
+
+} /* routed_init() */
+
+/******************************************************************************/
+
+static struct rt_entry *rtlookup(struct sockaddr *dst)
+{
+   struct rt_entry *rt;
+
+   for (rt = (struct rt_entry *)mns.mns_route; rt; rt = rt->rt_forw)
+      if (equal(&rt->rt_dst, dst))
+         return rt;
+
+   return 0;
+
+} /* rtlookup() */
+
+/******************************************************************************/
+
+int rip_input(struct sockaddr *from, struct rip *rip, int size)
+{
+   struct netinfo *n;
+   struct rt_entry *rt;
+
+   if (rip->rip_cmd != RIPCMD_RESPONSE)
+      return 0;
+
+   size -= 4;
+   n = rip->rip_nets;
+   for (; size > 0; size -= sizeof (struct netinfo), n++)
+   {
+      if (size < sizeof (struct netinfo))
+         break;
+      n->rip_metric = ntohl(n->rip_metric);
+      if (n->rip_metric == 0 || (unsigned) n->rip_metric >= HOPCNT_INFINITY)
+         continue;
+      n->rip_metric++;
+      rt = rtlookup(&n->rip_dst);
+      if (rt == 0)
+      {
+         rtadd(&n->rip_dst, from, n->rip_metric);
+         continue;
+      }
+
+     /*
+      * Update if from gateway and different,
+      * or shorter.
+      */
+      if ((equal(from, &rt->rt_router) && n->rip_metric != rt->rt_metric) ||
+            (unsigned) n->rip_metric < rt->rt_metric)
+         rtchange(rt, from, n->rip_metric);
+   }
+
+   return 1;
+
+} /* rip_input() */
+
+/******************************************************************************/
+
+static void rtadd(struct sockaddr *dst, struct sockaddr *gate, int metric)
+{
+   struct rt_entry *rt;
+   u_long d, l;
+
+   d = ntohl(((struct sockaddr_in *)dst)->sin_addr.s_addr) & ~0xffff;
+   l = ntohl(mns.mns_ifaddrs[0]) & ~0xffff;
+   if (d == l)
+      return;
+   rt = (struct rt_entry *)malloc(sizeof (*rt));
+   if (rt == 0)
+      return;
+   memset((char *)rt, 0, sizeof(struct rt_entry));
+   rt->rt_dst = *dst;
+   rt->rt_router = *gate;
+   rt->rt_flags = RTF_UP;
+   rt->rt_metric = metric;
+   if (metric > 1)
+      rt->rt_flags |= RTF_GATEWAY;
+   route_attach(rt);
+   (void) socketioctl(mns.mns_routedsock, SIOCADDRT, (char *)&rt->rt_rt);
+
+   return;
+
+} /* rtadd() */
+
+/******************************************************************************/
+
+static void rtchange(struct rt_entry *rt, struct sockaddr *gate, short metric)
+{
+   struct rtentry oldroute;
+
+   rt->rt_metric = metric;
+   if (!equal(&rt->rt_router, gate))
+   {
+      oldroute = rt->rt_rt;
+      rt->rt_router = *gate;
+      (void) socketioctl(mns.mns_routedsock, SIOCADDRT, (char *)&rt->rt_rt);
+      (void) socketioctl(mns.mns_routedsock, SIOCDELRT, (char *)&oldroute);
+   }
+
+   return;
+
+} /* rtchange() */
+
+/******************************************************************************/
+
+static void route_attach(struct rt_entry *rt)
+{
+/*
+ * Attach a route to the
+ * list of known routes.
+ */
+
+   struct rt_entry **r = (struct rt_entry **)&(mns.mns_route);
+
+   while (*r)
+      r = &((*r)->rt_forw);
+   *r = rt;
+
+   return;
+
+} /* route_attach() */
+
+/******************************************************************************/
+
+/* EOF route.c */

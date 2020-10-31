@@ -1,0 +1,206 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/*
+ * Title:    heap.c
+ * Purpose:  provide malloc-style heap allocation in a flex block
+ * History:  IDJ: 06-Feb-92: prepared for source release
+ *			 SJM: 10/93:	removed checks for flex budging as we've removed the
+ *                     		option from flex. Also if flex uses dynamic area
+ *							then heap defaults to using malloc/free.
+ *           SJM 12/93: took out defaulting to alloc/free
+ */
+
+#include "werr.h"
+#include "heap.h"
+#include "os.h"
+#include "flex.h"
+#include "msgs.h"
+#include <stdlib.h>
+#include "kernel.h"
+
+#include "mem_int.h"
+
+       int *Heap;
+static int heap__initialised=0;
+static BOOL heap__shrinkflex = TRUE;
+
+#define heap__BLOCKSIZE 4096
+#define OS_Heap 0x1D
+                   
+
+/*
+ * This is very naughty to know this, but it is impossible to resize a block
+ * if you don't.
+ */
+
+#define HEAP_BLOCK_OVERHEAD	8
+
+static void heap__check(void)
+{
+   if (heap__initialised == 0)
+     werr(TRUE, msgs_lookup("heap5:Heap not initialised"));
+}
+
+void heap_init(BOOL heap_shrink)
+{
+	os_regset r;
+	os_error *e;
+	 
+	/* is the flex block to be shrunk if poss. on heap free */
+	heap__shrinkflex = heap_shrink;
+	
+	/* create flex block to be used as heap */
+	alloc_nextiscalled("heap");
+	if (!flex_alloc((flex_ptr)&Heap, heap__BLOCKSIZE))
+	   werr (TRUE, msgs_lookup("heap1:Not enough memory to create heap -- free some application memory"));
+	
+	/* initialise heap as being in the flex block we just created */
+	r.r[0] = 0;
+	r.r[1] = (int) Heap;
+	r.r[3] = flex_size((flex_ptr)&Heap);
+	if ((e = os_swix(OS_Heap, &r)) != 0)
+	   werr (TRUE, e->errmess);
+	
+	heap__initialised = 1;
+}
+
+void *heap_realloc(void *oldptr, unsigned int size)
+{
+	os_regset r;
+	os_error *e;
+	
+	if (size == 0)
+	{
+		heap_free(oldptr);
+		return NULL;
+	}
+
+	heap__check();
+	
+	r.r[1] = (int) Heap;
+	r.r[2] = (int) oldptr;
+	
+	if (oldptr != NULL)
+	{
+	   r.r[0] = 6;
+	   if ((e = os_swix(OS_Heap, &r)) != 0)
+	      werr(TRUE, msgs_lookup("heap2:Heap_alloc error: %s"), e->errmess);
+	   size -= (r.r[3] - HEAP_BLOCK_OVERHEAD);
+	}
+
+	/* see if we can satisfy request in heap as it is */
+	r.r[0] = oldptr == NULL ? 2 : 4;   /* claim block from heap manager */
+	r.r[3] = (int) size;
+	
+	while((e = os_swix(OS_Heap, &r)) != 0)
+	{
+	   /* see if failure to allocate block */
+	
+	   if (e->errnum == 0x0184 /* HeapFail_Alloc */)
+	   {
+	      int *oldHeap = Heap;
+	      if (flex_extend((flex_ptr)&Heap, flex_size((flex_ptr)&Heap) 
+	                                     + heap__BLOCKSIZE))
+	      {
+	        if (Heap == oldHeap)    /* heap hasn't moved */ 
+	        {
+	          os_error *ext;
+	
+	          r.r[0] = 5;
+	          r.r[1] = (int)Heap;
+	          r.r[3] = (int)heap__BLOCKSIZE;
+	          if ((ext = os_swix(OS_Heap, &r)) != 0)
+	            werr(TRUE, msgs_lookup("heap2:Heap_alloc error: %s"), ext->errmess); 
+	            
+	          r.r[0] = oldptr == NULL ? 2 : 4;         /* claim block again */
+	          r.r[1] = (int) Heap;
+	          r.r[2] = (int) oldptr;
+	          r.r[3] = (int) size;
+	          /*e = os_swix(OS_Heap, &r);*/  
+	        }
+	        else
+	          return (void *)0;  /* flex has moved the heap */
+	      }
+	      else
+	        return (void *)0;  /* the flex area is full (ie. out of memory) */
+	   }
+	   else
+	     werr(1, msgs_lookup("heap3:Fatal internal heap error"));
+	 
+	}
+	
+	if (e == 0)
+	  return (void *)r.r[2];
+	else
+	  return (void *)0;
+}
+
+void *heap_alloc(unsigned int size)
+{
+	return heap_realloc(NULL, size);
+}
+
+void heap_free(void *heapptr)
+{          
+	os_regset r;
+	os_error *e;
+	static int free_count = 0;
+	int change_flex;
+	
+	if (heapptr == NULL)
+		return;
+
+	heap__check();
+	
+	if(!heap__shrinkflex)
+	{
+	   r.r[0] = 3;   /* release block */
+	   r.r[1] = (int) Heap;
+	   r.r[2] = (int) heapptr;
+	   if((e = os_swix(OS_Heap, &r)) != 0)
+	     werr(FALSE, msgs_lookup("heap4:Heap_free error: %s"), e->errmess);
+	}
+	else
+	{
+	   /* examine the size of the block being freed */
+	   r.r[0] = 6;
+	   r.r[1] = (int)Heap;
+	   r.r[2] = (int)heapptr;
+	   if((e = os_swix(OS_Heap, &r)) != 0)
+	     werr(FALSE, msgs_lookup("heap4:Heap_free error: %s"), e->errmess);
+	
+	   /* keep a count of max free space */
+	   free_count += r.r[3];
+	
+	   r.r[0] = 3;   /* release block */
+	   r.r[1] = (int) Heap;
+	   r.r[2] = (int) heapptr;
+	   if((e = os_swix(OS_Heap, &r)) != 0)
+	     werr(FALSE, msgs_lookup("heap4:Heap_free error: %s"), e->errmess);
+	
+	   r.r[0] = 5;   /* extend heap (with neg. increment to shrink) */
+	   r.r[1] = (int)Heap;
+	   r.r[3] = -free_count;
+	   if((e = os_swix(OS_Heap, &r)) != 0)
+	     change_flex = r.r[3]; /* a positive value if failed */
+	   else
+	     change_flex = -r.r[3]; /* a negative (preserved) value if ok */
+	   free_count -= change_flex; /* amend count accordingly */
+	   flex_extend((flex_ptr)&Heap, flex_size((flex_ptr)&Heap) 
+	                                      - change_flex);
+	}
+}
+
+/* eof heap.c */

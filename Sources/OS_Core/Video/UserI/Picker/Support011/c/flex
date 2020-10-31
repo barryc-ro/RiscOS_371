@@ -1,0 +1,375 @@
+/*flex.c - provide memory allocation for interactive programs*/
+
+/* Change list:
+ *   18-Nov-88: If setting the slotsize fails, the original value is restored
+ *   05-Dec-89: The concept of "budging" added. This allows the underlying C
+ *     system to ask flex to move its base of memory up or down by an
+ *     arbitrary amount. This allows malloc to grow and (if necessary)
+ *     shrink.
+ *   14th Jun 1994: Stolen by JRC for OSLib Support library.
+ */
+
+/*From CLib*/
+#include <kernel.h>
+#include <stddef.h>
+#include <string.h>
+
+/*From OSLib*/
+#include "os.h"
+#include "wimp.h"
+
+/*From Support*/
+#include "flex.h"
+#include "trace.h"
+#include "x.h"
+
+static bool Initialised = FALSE;
+
+x_STATIC_ERROR (Error1, 1, "Flex memory error")
+x_STATIC_ERROR (Error2, 2, "Not enough memory")
+x_STATIC_ERROR (Error3, 3, "Flex not initialised")
+
+/*This implementation goes above the original value of GetEnv, to memory
+specifically requested from the Wimp (about which the standard library, and
+malloc, know nothing). The heap is kept totally compacted all the time, with
+pages being given back to the Wimp whenever possible.*/
+
+typedef
+   struct flex_rec
+   {  flex_ptr anchor;     /*|*anchor| should point back to here*/
+      int size;            /*in bytes. Exact size of logical area*/
+      char data [UNKNOWN]; /*then the actual data follows*/
+   }
+   flex_rec;
+
+#define REC(N) struct {flex_ptr anchor; int size; int data [N];}
+#define sizeof_REC(N) (offsetof (flex_rec, data) + (N)*sizeof ((flex_ptr) NULL)->data)
+
+static flex_ptr
+   Base    /*lowest flex_rec - only for budging*/,
+   Free_P  /*free flex memory*/,
+   Lim     /*limit of flex memory*/;
+
+/*From base upwards, it's divided into flex_recs, including the space and align up to
+   next word*/
+
+static void Wimpslot (flex_ptr *top)
+
+   /*read/write the top of available memory. *top == -1 => just read*/
+
+{  char *memlim, *appspace;
+
+   if (*top != (flex_ptr) -1) *(char **) top -= 0x8000;
+   tracef ("Wimpslot: *top %d\n" _ *top);
+
+   /*read memory limit and appspace value*/
+   memlim = os_change_environment (os_HANDLER_MEMORY_LIMIT, NULL, NULL, NULL,
+         NULL, NULL);
+   appspace = os_change_environment (os_HANDLER_APPLICATION_SPACE, NULL,
+         NULL, NULL, NULL, NULL);
+
+   /*set memory limit before slot size change ...*/
+   if (appspace > memlim)
+      os_change_environment (os_HANDLER_MEMORY_LIMIT, appspace, NULL, NULL,
+            NULL, NULL);
+
+   /*set wimpslot size (or read it)*/
+   wimp_slot_size ((int) *top, -1, (int *) top, NULL, NULL);
+   *(char **) top += 0x8000;
+
+   /*.... and set memory limit back again*/
+   if (appspace > memlim)
+      os_change_environment (os_HANDLER_MEMORY_LIMIT, memlim, NULL, NULL,
+            NULL, NULL);
+}
+
+static bool More (int n)
+
+  /*Tries to get at least n more bytes, raising Lim and returning TRUE if it
+     can.*/
+
+{  flex_ptr prev = Lim;
+
+   *(char **) &Lim += n;
+   Wimpslot (&Lim);
+   tracef ("More: Free_P %d, prevlim %d, n %d, lim %d\n" _
+         Free_P _ prev _ n _ Lim);
+
+   if ((char *) Lim < (char *) prev + n)
+   {  tracef ("More FAILS\n");
+      Lim = prev; /*restore starting state: extra memory is useless*/
+      Wimpslot (&Lim);
+      return FALSE;
+   }
+   else
+      return TRUE;
+}
+
+static void Give (void)
+
+{  /*Gives away memory, lowering Lim, if possible*/
+
+#if TRACE
+   flex_ptr prev = Lim;
+#endif
+
+   Lim = Free_P;
+   Wimpslot (&Lim);
+
+   tracef ("Give: prev %d, Free_P %d, lim %d\n" _
+         prev _ Free_P _ Lim);
+}
+
+static bool Ensure (int n)
+
+{  n -= (char *) Lim - (char *) Free_P;
+   tracef ("Ensure %d: %x %x\n" _ n _ Lim _ Free_P);
+   return n <= 0 || More (n);
+}
+
+bool flex_alloc (flex_ptr anchor, int n)
+
+{  flex_ptr p;
+
+   tracef ("flex_alloc %x %d\n" _ anchor _ n);
+
+   if (!Initialised) x_THROW (Error3);
+
+   if (n < 0 || !Ensure (sizeof_REC (ALIGN (n))))
+   {  anchor->anchor = 0;
+      return FALSE;
+   }
+   else
+   {  p = Free_P;
+      *(char **) &Free_P += sizeof_REC (ALIGN (n));
+
+      p->anchor = anchor;
+      p->size = n;
+      anchor->anchor = (flex_ptr) p->data;
+      return TRUE;
+} }
+
+#if TRACE
+
+static flex_ptr Start;
+
+/*show all flex pointers for debugging purposes*/
+void flex_display (void)
+
+{  flex_ptr p;
+
+   tracef ("flex display: %x %x %x\n" _ Start _ Free_P _ Lim);
+
+   for (p = Start; p < Free_P; *(char **) &p += sizeof_REC (ALIGN (p->size)))
+   {  tracef ("flex block @ %x->%x->%x\n" _ p _ p->anchor _ *p->anchor);
+
+      if (*p->anchor != p->data) tracef ("   *** bad block ***\n");
+   }
+}
+
+#endif
+
+static void Reanchor (flex_ptr p, int by)
+
+  /*Move all the anchors from p upwards. This is in anticipation
+    of that block of the heap being shifted*/
+
+{  for (; p < Free_P; *( char **) &p += sizeof_REC (ALIGN (p->size)))
+   {  tracef ("Reanchor %x\n" _ p);
+      if (*(char **) p->anchor != p->data) x_THROW (Error1);
+      *(char **) p->anchor = &p->data [by];
+   }
+}
+
+void flex_free (flex_ptr anchor)
+
+{  flex_ptr p, *next;
+   int roundsize;
+
+   tracef ("flex_free %d\n" _ anchor);
+   if (!Initialised) x_THROW (Error3);
+
+   p = (flex_ptr) ((char *) anchor->anchor - offsetof (flex_rec, data));
+   roundsize = ALIGN (p->size);
+   next = (flex_ptr *) &p->data [roundsize];
+
+   if (p->anchor != anchor) x_THROW (Error1);
+
+   Reanchor (*next, -sizeof_REC (roundsize));
+   memmove (p, next, (char *) Free_P - (char *) next);
+   *(char **) &Free_P -= sizeof_REC (roundsize);
+   Give ();
+   anchor->anchor = 0;
+}
+
+int flex_size (flex_ptr anchor)
+
+{  flex_ptr p;
+
+   if (!Initialised) x_THROW (Error3);
+   p = (flex_ptr) ((char *) anchor->anchor - offsetof (flex_rec, data));
+   if (p->anchor != anchor) x_THROW (Error1);
+   return p->size;
+}
+
+int flex_extend (flex_ptr anchor, int newsize)
+
+{  flex_ptr p;
+
+   tracef ("flex_extend %d, newsize %d\n" _ anchor _ newsize);
+   if (!Initialised) x_THROW (Error3);
+
+   p = (flex_ptr) ((char *) anchor->anchor - offsetof (flex_rec, data));
+   return flex_midextend (anchor, p->size, newsize - p->size);
+}
+
+bool flex_midextend (flex_ptr anchor, int at, int by)
+
+{  flex_ptr p, next;
+
+   tracef ("flex_midextend %d, at %d, by %d\n" _ anchor _ at _ by);
+   if (!Initialised) x_THROW (Error3);
+
+   p = (flex_ptr) ((char *) anchor->anchor - offsetof (flex_rec, data));
+   if (p->anchor != anchor) x_THROW (Error1);
+   if (at > p->size) x_THROW (Error1);
+
+   if (by > 0)
+   {  int growth = ALIGN (p->size + by) - ALIGN (p->size);
+      /*Amount by which the block will actually grow*/
+
+      if (!Ensure (growth))
+         return FALSE;
+
+      next = (flex_rec *) (((char *) p->data) + ALIGN (p->size));
+      /*The move has to happen in two parts because the moving
+      of objects above is word-aligned, while the extension within
+      the object may not be*/
+
+      Reanchor (next, growth);
+      memmove ((char *) next + ALIGN (growth), next, (char *) Free_P - (char *) next);
+
+      *(char **) &Free_P += growth;
+
+      memmove (&p->data [at + by], &p->data [at], p->size - at);
+      p->size += by;
+   }
+   else if (by < 0)
+   {  /*The block shrinks*/
+      int shrinkage;
+
+      if (-by > at) x_THROW (Error1);
+
+      next = (flex_rec *) &p->data [ALIGN (p->size)];
+
+      by = -by; /*a positive value now*/
+      shrinkage = ALIGN (p->size) - ALIGN (p->size - by);
+         /*a positive value*/
+
+      memmove (&p->data [at - by], &p->data [at], p->size - at);
+      p->size -= by;
+
+      Reanchor (next, -shrinkage);
+      memmove ((char *) next - shrinkage, next, (char *) Free_P - (char *) next);
+      *(char **) &Free_P -= shrinkage;
+
+      Give ();
+  }
+
+  return TRUE;
+}
+
+/*stack checking off*/
+#pragma -s1
+
+static int Budge (int n, void **a)
+
+   /*The underlying system asks us to move all flex data up (if n +ve) or
+      down by n bytes. If you succeed, put the data allocated in *a and
+      return the size. size >= ALIGN (n) on successful exit, and will be a
+      multiple of four. If you fail, return what we can.  If n is -ve, no
+      result is required: success is assumed. Significant stack saving done
+      13-12-89 -- IDJ*/
+
+{  flex_ptr p;
+
+   /*no need to check flex initialised*/
+
+   if (n >= 0) /*all moving up*/
+   {  int align = ALIGN (n),
+         more = align - ((char *) Lim - (char *) Free_P);
+
+      /*try to satisfy the request*/
+      if (more > 0)   /*ie we have to increase slot*/
+      {  flex_ptr prev = Lim;
+
+         *(char **) &Lim += more;
+
+         /*in-line implementation (of Wimpslot) to reduce stack requirements -- IDJ*/
+         /*removed*/
+         Wimpslot (&Lim);
+
+         /*if we couldn't satisfy it, still give back what we can,
+            _kernel_alloc may be able to use it*/
+         if ((char *) Lim < (char *) prev + more)
+         {  Lim = prev;
+            Wimpslot (&Lim);
+            return 0;
+         }
+      }
+
+      tracef ("Budge: moving up\n");
+      for (p = Base; p < Free_P; *(char **) &p += sizeof_REC (ALIGN (p->size)))
+      {  tracef ("Reanchor %x\n" _ p);
+         *(char **) p->anchor = &p->data [align];
+      }
+
+      memmove ((char *) Base + align, Base, (char *) Free_P - (char *) Base);
+      *a = Base;
+      *(char **) &Base += align;
+      *(char **) &Free_P += align;
+      tracef ("Budge: success _ %d bytes moved\n" _ (char *) Free_P - (char *) Base);
+      return align;
+   }
+   else
+   {  /*all moving down*/
+      int align = ALIGN (-n); /*a +ve value*/
+
+      tracef ("Budge: moving down\n");
+      for (p = Base; p < Free_P; *(char **) &p += sizeof_REC (ALIGN (p->size)))
+      {  tracef ("Reanchor %x\n" _ p);
+         *(char **) p->anchor = &p->data [align];
+      }
+
+      memmove ((char *) Base - align, Base, (char *) Free_P - (char *) Base);
+      *(char **) &Base -= align;
+      *(char **) &Free_P -= align;
+      tracef ("Budge: moved down\n");
+   }
+
+   return 0;
+}
+
+/*stack checks on again*/
+#pragma -s0
+
+void flex_init (void)
+
+{  char *a;
+
+   Lim = (flex_ptr) -1;
+   Wimpslot (&Lim);
+
+#if TRACE
+   Start =
+#endif
+   Free_P = Lim;
+   Base = Free_P;
+   _kernel_register_slotextend (&Budge);
+   tracef ("Lim %d\n" _ Lim);
+   Initialised = TRUE;
+
+   /*Check that we're in the Wimp environment*/
+   if (!flex_alloc ((flex_ptr) &a, 1)) x_THROW (Error2);
+   flex_free ((flex_ptr) &a);
+}

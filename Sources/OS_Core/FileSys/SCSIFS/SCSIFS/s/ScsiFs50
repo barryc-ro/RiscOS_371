@@ -1,0 +1,605 @@
+; >ScsiFs50
+
+ TTL    "Initialisation and FS star commands"
+
+FSCreateBlock
+ =      0
+ =      0,0,fsnumber_SCSIFS
+ &      CreateTitle             ;>>>RCM was ScsiFsTitle
+ &      ScsiFsBootText
+ &      LowLevelEntry
+ &      MiscEntry
+
+; >>>>>>>>>
+; InitEntry
+; >>>>>>>>>
+
+InitEntry ROUT                           ; NO REENTRANCY CHECK NEEDED
+ [ Debug1
+   mess ,"InitEntry - In",NL
+ ]
+ Push   "R7-R11,SB,LR"
+ MOV    R10,#1          ;init flag
+ MOV    R11,R12
+
+ MOV    R0, #ModHandReason_Claim
+ MOV    R3, #:INDEX: WorkSize
+ SWI    XOS_Module              ;claim workspace
+ BVS    %FT95
+
+ MOV    SB, R2
+ STR    SB, [R11]
+
+
+ [ FloppySupport
+ MOV    R2, #0
+ STR    R2, Padding  ;>>>>Init floppy BlockSizes
+ STR    R2, BlockSizes          ;Block (sector size) for ScsiFs::4..7
+
+ ASSERT DrvFlags = 0
+ ASSERT DrvSequenceNum = 4
+ ASSERT SzDrvRec = 8
+ sbaddr R0, DrvRecs
+ MOV    R1, #LostUnitAtn
+ MOV    R2, #0
+ STMIA  R0!, {R1,R2}            ;Drive rec for ScsiFs::0
+ STMIA  R0!, {R1,R2}            ;                      1
+ STMIA  R0!, {R1,R2}            ;                      2
+ STMIA  R0!, {R1,R2}            ;                      3
+ |
+ MOV    R0, #0
+ STR    R0, BlockSizes
+ ]
+
+ BL     ReadCMOSflags           ;(->R0,R2,R3,R4,R5,V) read #floppies & winnies
+ [ FloppySupport
+ STRB   R3, Floppies
+ ]
+ STRB   R4, Winnies
+
+;Assume for the moment that user wants to start up with dir set as SCSI drives
+;remain attached, unlike floppies.
+
+
+ [ FloppySupport
+ ORR    R3, R3, R5, LSL #16     ;Combine floppy count and default drive
+ |
+ MOV    R3, R5, LSL #16
+ ]
+ ORR R3,R3,#&40000000    ;>>>RCM see what happens
+ [ LeftToDo
+ ! 0, "Left to do - think about Dir/NoDir bit"
+ ; Should we Set it, Clear it or read it from CMOS???
+ ; for now, set it (above)
+ ]
+ ORR    R3, R3, R4, LSL #8      ;OR in number of drives
+ BL     ReadDirCMOS             ;(->R0,R4,V)
+ BL     ReadFileCMOS            ;(->R0,R5,V)
+
+ [ DoBuffering
+        ASSERT F,"Read ahead/write behind NOT supported"
+ |
+ MOV R5,#0 ;NO background Xfers
+ ]
+
+ BL     ReadMapSizeCMOS         ;(->R0,R6,V)
+ STR    R6, MapSizes            ;Map sizes for ScsiFs::4..7
+ baddr  R0, FSCreateBlock
+ baddr  R1, org
+ MOV    R2, R11
+ SWI    XOS_FileCoreCreate      ;(R0-R6->R0-R2,V)
+ BVS    %FT85
+ STR    R0, FileCorePrivate
+ STR    R2, WinnieCallAfter
+ [ Debug1
+   mess ,"InitEntry - Out",NL
+ ]
+ Pull   "R7-R11,SB,PC",,^
+
+ LTORG
+
+
+
+; >>>>>>>>
+; DieEntry
+; >>>>>>>>
+
+DieEntry
+ [ Debug1
+   mess ,"DieEntry",NL
+ ]
+ Push   "R7-R11,SB,LR"
+ getSB
+
+ MOV    R10,#0                          ;Delete "FileCore%SCSI"
+ MOV    R0, #ModHandReason_Delete       ; filecore will close down all
+ baddr  R1, DieTitle                    ; open files before dying
+ SWI    XOS_Module                      ;
+ MOVVS  R9, R0
+
+ mapDrvToDevImm R1, #4          ;DeviceID for drive ScsiFs::4
+ LDR    R4, BlockSizes
+01
+ TST    R4, #&FF
+ [ MediaLocking
+ BLNE UnLockMedia
+ ]
+ MOVNE  R0, #2                  ;RC for ReleaseDevice 
+ MOVNE  R8, R12                 ;Access key
+ SWINE  XSCSI_Reserve
+ MOVVS  R9, R0
+ ADD    R1, R1, #1              ;Next deviceID
+ MOVS   R4, R4, LSR #8          ;
+ BNE    %BT01                   ;Loop until no more drives
+
+85
+ MOVVS  R9, R0
+ MOV    R0, #ModHandReason_Free
+ MOV    R2, SB
+ SWI    XOS_Module          ;Free workspace
+ [ Dev
+ wrhex  R0, VS
+ mess   VS,"Heap error",NL
+ ]
+95
+ MOVVS  R9, R0
+ [ Dev
+ wrhex  R10,VS
+ wrhex  R0, VS
+ mess   VS,"Error",NL
+ ]
+
+ MOVS   R0, R9
+ MOVNES R10,R10         ;only error on init (R10=0/1 for Die/Init)
+ Pull   "R7-R11,SB,PC",EQ,^
+
+ BL     SetV
+ [ Dev
+ wrhex  R0
+ mess   ,"ScsiFs Init Error",NL
+ ]
+ Pull   "R7-R11,SB,PC"
+
+ LTORG
+
+
+;>>>>>>>>>>>>
+;ServiceEntry
+;>>>>>>>>>>>>
+
+ServiceEntry
+ CMP    R1, #Service_Reset
+ MOVNES PC, LR
+ [ Debug1
+   mess ,"ServiceEntry, Service_Reset",NL
+ ]
+ Push   "R0-R4,R8,LR"
+ getSB
+ [ T
+;
+;Reservations are lost over reset, so Re-reserve each device/drive with
+; a non-zero BlockSize entry
+;
+ mapDrvToDevImm R1, #4          ;DeviceID for drive ScsiFs::4
+ LDR    R4, BlockSizes
+101
+ TST    R4, #&FF
+ BLNE   ReserveDevice
+ ADD    R1, R1, #1              ;Next deviceID
+ MOVS   R4, R4, LSR #8          ;
+ BNE    %BT101                  ;Loop until no more drives
+ |
+ MOV    R0, #0                  ;Reservation lost over reset, force 'Examine'
+ STR    R0, BlockSizes          ; on next access
+ ]
+
+ Pull   "R0-R4,R8,LR"
+ MOVS   PC, LR
+
+
+DoSwiRetryDiscOp ROUT
+ Push   "R8,LR"
+ LDR    R8, FileCorePrivate
+ SWI    XOS_FileCoreDiscOp
+ Pull   "R8,PC"
+
+
+DoNulSwi
+ MOVS   PC,LR
+
+
+DoSwiDrives ROUT
+ Push   "R8,LR"
+ LDR    R8, FileCorePrivate
+ SWI    XOS_FileCoreDrives
+ Pull   "R8,PC"
+
+
+DoSwiFreeSpace ROUT
+ Push   "R8,LR"
+ LDR    R8, FileCorePrivate
+ SWI    XOS_FileCoreFreeSpace
+ Pull   "R8,PC"
+
+;Retry word = (Retry word BIC R0) EOR (R1 AND R0)
+;exit R1 = R1 AND R0
+; R2 old value, R3 new value
+
+DoSwiDescribeDisc ROUT
+ Push   "R8,LR"
+ LDR    R8, FileCorePrivate
+ SWI    XOS_FileCoreDescribeDisc
+ Pull   "R8,PC"
+
+
+;
+; DoSwiTestReady
+; ==============
+;
+; On entry
+;   R1 = Drive number (4..7)
+;
+; On exit
+;   R0 = 0 - Drive NOT present
+;   R1 = 1 - Don't know
+;   R2 = 2 - Drive present & ready
+;
+DoSwiTestReady
+ Push   "R1,R2,LR"
+ SUB    StkPtr,StkPtr,#16
+ MOV    R0,#2                           ;DetermineDevice
+ mapDrvToDevLo R1, R1                   ;map drive onto device
+ MOV    R2,StkPtr
+ SWI    XSCSI_Initialise
+ ADD    StkPtr,StkPtr,#16
+
+ MOVVS  R0,#1
+ MOVVC  R0,#2
+ Pull   "R1,R2,LR"
+ MOVS   PC,LR
+
+
+; >>>>>>>>
+; SwiEntry
+; >>>>>>>>
+
+SwiEntry ROUT
+ Push   "SB,LR"
+ getSB
+ CMPS   R11,#FirstUnusedSwi
+ MOV    LR, PC
+ ADDLO  PC, PC, R11,LSL #2
+ B      %FT10
+05
+ B      DoSwiRetryDiscOp
+ B      DoNulSwi
+ B      DoSwiDrives
+ B      DoSwiFreeSpace
+
+ B      DoNulSwi
+ B      DoSwiDescribeDisc
+ B      DoSwiTestReady
+
+FirstUnusedSwi  * (.-%BT05)/4
+
+10
+ Pull   "SB,PC"
+
+
+SwiNames ROUT
+ = "SCSIFS",0
+ = "DiscOp",0
+ = "NOP",0
+ = "Drives",0
+ = "FreeSpace",0
+ = "NOP",0
+ = "DescribeDisc",0
+ = "TestReady",0
+ = 0
+ ALIGN
+
+FsCom   bit     (31-24)
+
+ MACRO
+ ComEntry $Com,$MinArgs,$MaxArgs,$GsTransBits,$HiBits
+ ASSERT $MinArgs<=$MaxArgs
+Com$Com DCB     "$Com",0
+ ALIGN
+ DCD    Do$Com
+ =       $MinArgs
+ =       $GsTransBits
+ =       $MaxArgs
+ =       $HiBits
+ DCD    Syn$Com
+ DCD    Help$Com
+ MEND
+
+
+ MACRO
+ Config $Com
+ DCB    "$Com",0
+ ALIGN
+ DCD    Con$Com
+ DCD    bit30
+ DCD    0
+ DCD    ConHelp$Com
+ MEND
+
+ComTab                                  ;general star commands
+ ComEntry SCSI,          0,0,0,0
+                                        ;filing system star commands
+                                        ;status/configure optioms
+ [ DoBuffering
+ Config SCSIFSbuffers
+ ]
+ Config SCSIFSDirCache
+ [ FloppySupport
+ Config SCSIFSFloppies
+ ]
+ Config SCSIFSdiscs
+ Config SCSIFSdrive
+
+ =      0
+ ALIGN
+
+
+; >>>>>>
+; DoSCSI
+; >>>>>>
+
+DoSCSI
+ Push   "LR"             ; NO REENTRANCY CHECK NEEDED
+ MOV    R0, #FscSelectFs
+ baddr  R1, CreateTitle         ;>>>RCM was ScsiFsTitle
+ SWI    XOS_FSControl
+ Pull   "PC"
+
+
+; CONFIGURE/STATUS HANDLERS
+
+ [ DoBuffering
+; >>>>>>>>>>>>>>>>
+; ConSCSIFSbuffers
+; >>>>>>>>>>>>>>>>
+
+ShortConSynSCSIFSbuffers
+ = "SCSIFSbuffers <D>",0
+ ALIGN
+
+ConSCSIFSbuffers
+ Push   "R0-R6,SB,LR"
+ getSB
+ MOVS   R1, R0
+ BNE    %FT05
+
+; print syntax message
+ baddr  R0, ShortConSynSCSIFSbuffers
+ SWI    XOS_Write0
+ SWIVC  XOS_NewLine
+ B      ConfigReturn
+
+05
+ TEQS   R1, #1
+ BNE    %FT15
+
+; print status message
+ BL     ReadFileCMOS    ;(->R0,R5,V)
+ BVS    ConfigReturn
+ SWI    XOS_WriteS
+ Text   "SCSIFSbuffers"
+ BVS    ConfigReturn
+10
+ MOV    R0, R5
+ BL     WrDec           ;(R0->R0,V)
+ SWIVC  XOS_NewLine     ;(->R0,V)
+ B      ConfigReturn
+
+; parse configure
+15
+ MOV    R0, #10 :OR: bit31 :OR: bit30
+ SWI    XOS_ReadUnsigned        ;(R0-R2->R0-R2,V)
+ BVS    ConfigReturn
+ MOV    R1, #FileCMOS
+ B      ConWrite
+ ]
+
+
+; >>>>>>>>>>>>>>>>>
+; ConSCSIFSDirCache
+; >>>>>>>>>>>>>>>>>
+
+ShortConSynSCSIFSDirCache
+ = "SCSIFSDirCache <D>[K]",0
+ ALIGN
+
+ConSCSIFSDirCache
+ Push   "R0-R6,SB,LR"
+ getSB
+ MOVS   R1, R0
+ BNE    %FT05
+
+; print syntax message
+ baddr  R0, ShortConSynSCSIFSDirCache
+ SWI    XOS_Write0
+ SWIVC  XOS_NewLine
+ B      ConfigReturn
+
+05
+ TEQS   R1, #1
+ BNE    %FT15
+
+; print status message
+ BL     ReadDirCMOS    ;(->R0,R4,V)
+ BVS    ConfigReturn
+ SWI    XOS_WriteS
+ Text   "SCSIFSDirCache"
+ BVS    ConfigReturn
+10
+ MOV    R0, R4, LSR #10
+ BL     WrDec           ;(R0->R0,V)
+ MOVVC  R0, #"K"
+ SWIVC  XOS_WriteC
+ SWIVC  XOS_NewLine     ;(->R0,V)
+ B      ConfigReturn
+
+; parse configure
+15
+ MOV    R0, #10 :OR: bit30
+ SWI    XOS_ReadUnsigned        ;(R0-R2->R0-R2,V)
+ BVS    ConfigReturn
+ MOV    R1, #DirCMOS
+ B      ConWrite
+
+ShortConSynSCSIFSdrive
+ = "SCSIFSdrive <D>",0
+ ALIGN
+
+; >>>>>>>>>>>>>>
+; ConSCSIFSdrive
+; >>>>>>>>>>>>>>
+
+ConSCSIFSdrive ROUT
+ Push   "R0-R6,SB,LR"
+ getSB
+ MOVS   R1, R0
+ BNE    %FT05
+
+; print syntax message
+ baddr  R0, ShortConSynSCSIFSdrive
+ SWI    XOS_Write0
+ SWIVC  XOS_NewLine
+ B      ConfigReturn
+
+05
+ BL     ReadCMOSflags   ;(->R0,R2,R4,R5,V)
+ BVS    ConfigReturn
+ TEQS   R1, #1
+ BNE    %FT15
+
+; print status message
+ SWI    XOS_WriteS
+ Text   "SCSIFSDrive"
+ BVS    ConfigReturn
+10
+ MOV    R0, R5
+ BL     WrDec           ;(R0->R0,V)
+ SWIVC  XOS_NewLine     ;(->R0,V)
+ B      ConfigReturn
+
+; parse configure
+15
+ BIC    R2, R2, #2_00111000                     ;clear old bits
+ BL     ParseAnyDrive           ;(R1->R0,R1,V)
+ BVS    ConfigReturn
+ ORR    R2, R2, R0, LSL #3      ;form new byte
+ MOV    R1, #CMOSflags
+ B      ConWrite
+
+
+ [ FloppySupport
+; >>>>>>>>>>>
+; ConSCSIFSFloppies
+; >>>>>>>>>>>
+
+ShortConSynSCSIFSFloppies
+ = "SCSIFSFloppies   <D>",0
+ ALIGN
+
+ConSCSIFSFloppies ROUT
+ Push   "R0-R6,SB,LR"
+ getSB
+ MOVS   R1, R0
+ BNE    %FT05
+
+; print syntax message
+ baddr  R0, ShortConSynSCSIFSFloppies
+ SWI    XOS_Write0
+ SWIVC  XOS_NewLine
+ B      ConfigReturn
+
+05
+ BL     ReadCMOSflags    ;(->R0,R2,R4,R5,V)
+ BVS    ConfigReturn
+ TEQS   R1, #1
+ BNE    %FT15
+
+; print status message
+ SWI    XOS_WriteS
+ Text   "SCSIFSFloppies  "
+ BVS    ConfigReturn
+10
+ MOV    R0, R3
+ BL     WrDec           ;(R0->R0,V)
+ SWIVC  XOS_NewLine     ;(->R0,V)
+ B      ConfigReturn
+
+; parse configure
+15
+ BIC    R3, R2, #2_11000000                     ;clear old bits
+ MOV    R0, #10 :OR: bit31 :OR: bit29
+ MOV    R2, #4
+ SWI    XOS_ReadUnsigned        ;(R0-R2->R0-R2,V)
+ BVS    ConfigReturn
+ ORR    R2, R3, R2, LSL #6      ;form new byte
+ MOV    R1, #CMOSflags
+ B      ConWrite
+ ]
+
+
+; >>>>>>>>>>>>>>
+; ConSCSIFSdiscs
+; >>>>>>>>>>>>>>
+
+ShortConSynSCSIFSdiscs
+ = "SCSIFSdiscs <D>",0
+ ALIGN
+
+ConSCSIFSdiscs ROUT
+ Push   "R0-R6,SB,LR"
+ getSB
+ MOVS   R1, R0
+ BNE    %FT05
+
+; print syntax message
+ baddr  R0, ShortConSynSCSIFSdiscs
+ SWI    XOS_Write0
+ SWIVC  XOS_NewLine
+ B      ConfigReturn
+
+05
+ BL     ReadCMOSflags   ;(->R0,R2,R4,R5,V)
+ BVS    ConfigReturn
+ TEQS   R1, #1
+ BNE    %FT15
+
+; print status message
+ SWI    XOS_WriteS
+ Text   "SCSIFSdiscs"
+ BVS    ConfigReturn
+10
+ MOV    R0, R4
+ BL     WrDec           ;(R0->R0,V)
+ SWIVC  XOS_NewLine     ;(->R0,V)
+ B      ConfigReturn
+
+; parse configure
+15
+ BIC    R3, R2, #2_00000111                     ;clear old bits
+ MOV    R0, #10 :OR: bit31 :OR: bit29
+ MOV    R2, #4         
+ SWI    XOS_ReadUnsigned        ;(R0-R2->R0-R2,V)
+ BVS    ConfigReturn
+ ORR    R2, R3, R2              ;form new byte
+ MOV    R1, #CMOSflags
+
+ConWrite
+ MOV    R0, #OsbyteWriteCMOS
+ SWI    XOS_Byte    ;(R0-R2->R0-R2,V)
+ConfigReturn
+ STRVS  R0, [SP]
+ Pull   "R0-R6,SB,LR"
+ BIC    LR, LR, #NZCV           ;return with NZC clear
+ ORRVS  LR, LR, #V_bit          ;V set <=> error
+ MOVS   PC,LR
+
+ END

@@ -1,0 +1,897 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Internet/whoami/whoami.c:networking  1.3  $
+ * $Source: /ax/networking:Internet/whoami/whoami.c: $
+ *
+ * Functions to implement bootp and revarp
+ *
+ * Copyright(c) 1994 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	whoami.c,v $
+ * Revision 1.3  95/01/24  17:17:46  kwelton
+ * Whoops - missed an occurence of MMAXOFF within revarp_broadcastclientaddrs,
+ * which should have been changed to MAXOFF(m) in the new mbuf scheme.
+ * 
+ * Revision 1.2  95/01/24  16:24:53  kwelton
+ * Several changes, mostly concerned with fixing remote address lookup,
+ * which was badly broken in the DCI 2 version of the module.  Added the
+ * new routine revarp_broadcastclientaddrs(), which implements the
+ * functionality of the new ioctl SIOCSWHOTHEYARE.
+ * 
+ * Used the opportunity to add a few debug lines.
+ * 
+ * Revision 1.1  94/12/02  11:58:02  kwelton
+ * Initial revision
+ * 
+ */
+#include "kernel.h"
+#include "swis.h"
+
+#include "sys/param.h"
+#include "sys/systm.h"
+#include "sys/syslog.h"
+#include "sys/time.h"
+#include "sys/mbuf.h"
+#include "sys/socket.h"
+#include "sys/errno.h"
+#include "sys/ioctl.h"
+#include "sys/bootp.h"
+
+#include "net/if.h"
+#include "net/route.h"
+
+#include "netinet/in.h"
+#include "netinet/in_var.h"
+#include "netinet/in_pcb.h"
+#include "netinet/in_systm.h"
+#include "netinet/ip.h"
+#include "netinet/if_ether.h"
+#include "netinet/ip_icmp.h"
+#include "netinet/ip_var.h"
+#include "netinet/icmp_var.h"
+#include "netinet/tcp.h"
+#include "netinet/udp.h"
+#include "netinet/udp_var.h"
+
+#include "debug.h"
+
+char *inet_ntoa();
+void revarp_myaddr();
+
+#define BOOTPSERVERVAR "Inet$BootServer"
+#define BOOTPSERVERFILE "Inet$BootFile"
+
+int if_whoamimns(struct ifnet *ifp)
+{
+    ifp->if_flags |= IFF_NEED_IPADDR;
+    if_askwhoiam(ifp, IFF_NEED_IPADDR, revarp_myaddr, 0);
+    return (0);
+}
+
+if_askwhoiam(struct ifnet *ifp, int need, void (*proc)(), int flag)
+{
+    int f = ifp->if_flags;
+
+    if (f & IFF_LOOPBACK)
+	return;
+
+    if ((f & IFF_BROADCAST) == 0)
+	return;
+
+    if (f & need)
+	(*proc)(ifp, flag);
+}
+
+#define IPADDR_MAX_WAIT 500
+
+int whoamiaddr = 0;
+int boot_tries = 0;
+int kernel_escape_seen = 0;
+
+int if_whoamiaddr(struct ifnet *ifp, int cmd)
+{
+    void bootwakeup();
+    int bootp_myaddr();
+
+    kernel_escape_seen = 0;
+    whoamiaddr = 0;
+
+    if (boot_tries == 0)
+	boot_tries = 1;
+
+    if (cmd == SIOCGWHOIAMRB)
+    {
+	struct arpcom *ac = (struct arpcom *)ifp;
+	printf("	 Physical address is %s\n",
+	       ether_sprintf(&ac->ac_enaddr[0]));
+    }
+
+    ifp->if_flags |= IFF_NEED_IPADDR;
+    timeout(bootwakeup, (caddr_t)0, backoff(boot_tries));
+
+    if (cmd == SIOCGWHOIAMR || cmd == SIOCGWHOIAMRB)
+	if_askwhoiam(ifp, IFF_NEED_IPADDR, revarp_myaddr, 1);
+
+    if (cmd == SIOCGWHOIAMB || cmd == SIOCGWHOIAMRB)
+	if_askwhoiam(ifp, IFF_NEED_IPADDR, (void (*)())bootp_myaddr, 1);
+
+    bootsleep(cmd);
+    if ((ifp->if_flags & IFF_NEED_IPADDR) != 0)
+    {
+	ifp->if_flags &= ~IFF_NEED_IPADDR;
+
+	if (kernel_escape_seen)
+	{
+	    untimeout(bootwakeup, (caddr_t)0);
+	    boot_tries = 1;
+	}
+
+	else boot_tries++;
+	if_down(ifp);
+	return (-1);
+    }
+
+    untimeout(bootwakeup, (caddr_t)0);
+    boot_tries = 1;
+    return (0);
+}
+
+#if 0
+# define HZ 100 /* ticks per second */
+#endif /* 0/1 */
+
+int backoff(int retry)
+{
+    static unsigned char timeouts[] = { 10, 10, 15, 15, 20, 30, 60 };
+    int t, s;
+
+    t = retry - 1;
+    if( t >= sizeof(timeouts)/sizeof(timeouts[0]) )
+	t = (sizeof(timeouts)/sizeof(timeouts[0])) - 1;
+
+    /*
+     * Construct a random delay between 0.5 and 1.5
+     * times the value in the timeouts list
+     */
+    t = timeouts[t] * HZ;
+    s = (getrand() % t) + (t / 2);
+    return (s);
+}
+
+int getrand(void)
+{
+    _kernel_oserror *e;
+    _kernel_swi_regs rin, rout;
+    int rand();
+
+    e = _kernel_swi(XOS_Bit | OS_ReadMonotonicTime, &rin, &rout);
+    return (rout.r[0] % rand());
+}
+
+bootsleep(int cmd)
+{
+    while (whoamiaddr == 0)
+    {
+	user_mode_donothing();
+
+	if (cmd == SIOCGWHOIAMRB &&
+	    left_alt_is_pressed() && right_alt_is_pressed())
+	{
+	    kernel_escape_seen = 1;
+	    break;
+	}
+    }
+}
+
+static void bootwakeup(void)
+{
+    whoamiaddr = 1;
+}
+
+#define MASK_MAX_WAIT	500
+
+int whoamimask = 0;
+
+int if_whoamimask(struct ifnet *ifp)
+{
+    void request_netmask(), wakeup();
+
+    ifp->if_flags |= IFF_NEED_MASK;
+    timeout(wakeup, (caddr_t)&whoamimask, MASK_MAX_WAIT);
+    if_askwhoiam(ifp, IFF_NEED_MASK, request_netmask, 0);
+    sleep((caddr_t)&whoamimask, PZERO+1);
+
+    if ((ifp->if_flags & IFF_NEED_MASK) != 0)
+    {
+	ifp->if_flags &= ~IFF_NEED_MASK;
+	return (-1);
+    }
+    else
+	untimeout(wakeup, (caddr_t)&whoamimask);
+
+    return (0);
+}
+
+static	u_long	BOOTPclient = 68;
+
+int in_bootpresponse(u_short port)
+{
+    return ((u_long)port == BOOTPclient ? 1 : 0);
+}
+
+static u_long BOOTPserver = 67;
+
+/*
+ * A bootstrap packet reply has been received
+ */
+bootp_udp_input(struct ifnet *ifp, struct mbuf *m)
+{
+    BOOTP pkt;
+    int len = sizeof(pkt);
+#ifdef OldCode
+    u_char *cp = (u_char *)&pkt;
+#endif
+    struct ifreq ifr;
+    struct sockaddr_in *sin;
+    struct arpcom *ac = (struct arpcom *)ifp;
+
+    bzero((caddr_t)&pkt, sizeof(pkt));
+
+#ifdef OldCode
+    while (len > 0 && m)
+    {
+	int i = MIN(len, m->m_len);
+	bcopy(mtod(m, caddr_t), (caddr_t)cp, i);
+	cp += i;
+	len -= i;
+	m = m->m_next;
+    }
+#else
+    (void)EXPORT(m, len, &pkt);
+#endif
+
+    /*
+     * from 91/04/03 KWelton RISC iX fix
+     *
+     * make damn sure that this packet is for
+     * us: broadcast BOOTP replies reach this
+     * far, it is not a good idea to take any
+     * notice of any replies not intended for
+     * this machine.
+     */
+    if( bcmp(ac->ac_enaddr, pkt.chaddr, pkt.hlen) )
+	return;
+
+    setriscosvar(BOOTPSERVERVAR, inet_ntoa(pkt.siaddr));
+    setriscosvar(BOOTPSERVERFILE, pkt.file);
+    bzero((caddr_t)&ifr, sizeof(ifr));
+    sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = pkt.yiaddr;
+    (void) in_control((struct socket *)0, SIOCSIFADDR, (caddr_t)&ifr, ifp);
+    ifp->if_flags &= ~IFF_NEED_IPADDR;
+    bootwakeup();
+}
+
+/*
+ * Special version of IP output used during bootstrap.
+ * This is needed since we do not at this stage know our IP address
+ * and the normal ip_output uses the IP address to route the packet.
+ * The packet in mbuf chain m contains a skeletal IP
+ * header (with len, off, ttl, proto, tos, src, dst).
+ * The mbuf chain containing the packet will be freed.
+ */
+bootp_ip_output(struct mbuf *m, struct ifnet *ifp)
+{
+    register struct ip *ip;
+    struct sockaddr_in dst;
+    int hlen = sizeof(struct ip);
+
+    ip = mtod(m, struct ip *);
+    ip->ip_v = IPVERSION;
+    ip->ip_off &= IP_DF;
+    ip->ip_id = htons(ip_id++);
+    ip->ip_hl = hlen >> 2;
+
+    dst.sin_family = AF_INET;
+    dst.sin_addr = ip->ip_dst;
+
+    ip->ip_len = htons((u_short)ip->ip_len);
+    ip->ip_off = htons((u_short)ip->ip_off);
+    ip->ip_sum = 0;
+    ip->ip_sum = in_cksum(m, hlen);
+    return ((*ifp->if_output)(ifp, m, (struct sockaddr *)&dst));
+}
+
+extern int udp_ttl;
+
+/*
+ * A special version of udp_output called while
+ * attempting to obtain IP address
+ */
+bootp_udp_output(struct mbuf *md, struct ifnet *ifp,
+		 u_long laddr, short lport,
+		 u_long faddr, short fport)
+{
+    register struct mbuf *m;
+    register struct udpiphdr *ui;
+    register int len = 0;
+
+    /*
+     * Calculate data length and get a mbuf
+     * for UDP and IP headers.
+     */
+    for (m = md; m; m = m->m_next)
+	len += m->m_len;
+
+#ifdef OldCode
+    MGET(m, M_DONTWAIT, MT_HEADER);
+    if (m == 0)
+    {
+	m_freem(md);
+	return (ENOBUFS);
+    }
+#else
+    if( (m = ALLOC_S(MINCONTIG, NULL)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("bootp_udp_output: ALLOC_S failed\n");
+#endif
+	FREEM(md);
+	return(ENOBUFS);
+    }
+
+    m->m_type = MT_HEADER;
+#endif
+
+    /*
+     * Fill in mbuf with extended UDP header
+     * and addresses and length put into network format.
+     */
+    m->m_off = MAXOFF(m) - sizeof (struct udpiphdr);
+    m->m_len = sizeof (struct udpiphdr);
+    m->m_next = md;
+
+    ui = mtod(m, struct udpiphdr *);
+    ui->ui_next = ui->ui_prev = 0;
+    ui->ui_x1 = 0;
+    ui->ui_pr = IPPROTO_UDP;
+    ui->ui_len = htons((u_short)len + sizeof (struct udphdr));
+    ui->ui_src.s_addr = htonl(laddr);
+    ui->ui_dst.s_addr = htonl(faddr);
+    ui->ui_sport = htons(lport);
+    ui->ui_dport = htons(fport);
+    ui->ui_ulen = ui->ui_len;
+    ui->ui_sum = 0;
+    ((struct ip *)ui)->ip_len = sizeof (struct udpiphdr) + len;
+    ((struct ip *)ui)->ip_ttl = udp_ttl;
+
+    return (bootp_ip_output(m, ifp));
+}
+
+int bootp_myaddr(struct arpcom *ac, int retry)
+{
+    struct mbuf *m0;
+    BOOTP   pkt;
+    int len;
+    caddr_t cp;
+    char *server = "", *file = "";
+
+#ifdef OldCode
+    struct mbuf *m;
+
+    if ((m0 = m = m_get(M_DONTWAIT, MT_DATA)) == NULL)
+	return (ENOBUFS);
+
+    bzero((char *)&pkt, sizeof(pkt));
+    pkt.op = BOOTREQUEST;
+    pkt.htype = 1;
+    pkt.hlen = 6;
+    pkt.xid = time(0);
+    pkt.secs = htons(retry);
+    bcopy((caddr_t)&ac->ac_enaddr[0], &pkt.chaddr[0], pkt.hlen);
+    strcpy(&pkt.sname[0], server);  /* If known */
+    strcpy(&pkt.file[0], file);		    /* If known */
+    len = sizeof(pkt);
+    cp = (caddr_t)&pkt;
+
+    while (len > 0)
+    {
+	int i = MIN(len, OLDMLEN);
+	bcopy(cp, mtod(m, caddr_t), i);
+	m->m_len = i;
+	cp += i;
+	len -= i;
+
+	if (len > 0)
+	{
+	    struct mbuf *mnew = m_get(M_DONTWAIT, MT_DATA);
+	    if (mnew == 0)
+	    {
+		m_freem(m0);
+		return (ENOBUFS);
+	    }
+
+	    m->m_next = mnew;
+	    m = mnew;
+	    m->m_len = 0;
+	}
+    }
+#else
+    cp = (caddr_t)&pkt;
+    bzero(cp, sizeof(pkt));
+
+    pkt.op = BOOTREQUEST;
+    pkt.htype = 1;
+    pkt.hlen = 6;
+    pkt.xid = time(0);
+    pkt.secs = htons(retry);
+    bcopy((caddr_t)&ac->ac_enaddr[0], &pkt.chaddr[0], pkt.hlen);
+    strcpy(&pkt.sname[0], server);  /* If known */
+    strcpy(&pkt.file[0], file);		    /* If known */
+    len = sizeof(pkt);
+
+    if( (m0 = ALLOC(len, cp)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("bootp_myaddr: ALLOC failed\n");
+#endif
+	return(ENOBUFS);
+    }
+    m0->m_type = MT_DATA;
+#endif
+
+    return(bootp_udp_output(m0, &ac->ac_if, 0, BOOTPclient,
+			    INADDR_BROADCAST, BOOTPserver));
+}
+
+/*
+ * REVerse Address Resolution Protocol (revarp) is used by a diskless
+ * client to find out its IP address when all it knows is its Ethernet address.
+ */
+static int revarp = 1;
+
+void revarp_myaddr(struct arpcom *ac, int flag)
+{
+    register struct ifnet *ifp = &ac->ac_if;
+    register struct sockaddr_in *sin;
+    struct ifreq ifr;
+    register struct mbuf *m;
+    register struct ether_arp *ea;
+    register struct ether_header *eh;
+    struct sockaddr sa;
+
+#ifdef DEBUG
+    if( DODEBUG(DBGADDRSRCH) )
+	Printf("\n\021\06revarp_myaddr: h/w addr %s on i/f %s%d, flag = %d\n",
+	       ether_sprintf(ac->ac_enaddr), ifp->if_name, ifp->if_unit, flag);
+#endif
+
+    if (flag)
+    {
+	/*
+	 * We need to give the interface a temporary address just
+	 * so it gets initialized. Hopefully, the address won't get used.
+	 * Also force trailers to be off on this interface.
+	 */
+	bzero((caddr_t)&ifr, sizeof(ifr));
+	sin = (struct sockaddr_in *)&ifr.ifr_addr;
+	sin->sin_family = AF_INET;
+	sin->sin_addr = in_makeaddr(INADDR_ANY, (u_long) 0xFFFFFF );
+	ifp->if_flags |= IFF_NOTRAILERS;
+
+	(void) in_control((struct socket *)0, SIOCSIFADDR, (caddr_t)&ifr, ifp);
+	if( ac->ac_ipaddr.s_addr && \
+	   ac->ac_ipaddr.s_addr != sin->sin_addr.s_addr )
+	{
+#ifdef DEBUG
+	    if( DODEBUG(DBGADDRSRCH) )
+		Printf("\021\01revarp_myaddr: ac_ipaddr = %x, sin_addr = %x\n",
+		       ac->ac_ipaddr.s_addr, sin->sin_addr.s_addr);
+#endif
+	    return;
+	}
+    }
+
+#ifdef OldCode
+    if ((m = m_get(M_DONTWAIT, MT_DATA)) == NULL)
+	return;
+#else
+    if( (m = ALLOC_S(MINCONTIG, NULL)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("revarp_myaddr: ALLOC_S failed\n");
+#endif
+	return;
+    }
+
+    m->m_type = MT_DATA;
+#endif
+
+    m->m_len = sizeof(struct ether_arp);
+    m->m_off = MAXOFF(m) - m->m_len;
+    ea = mtod(m, struct ether_arp *);
+    bzero((caddr_t)ea, sizeof (*ea));
+
+    sa.sa_family = AF_UNSPEC;
+    eh = (struct ether_header *)sa.sa_data;
+    bcopy((caddr_t)etherbroadcastaddr, (caddr_t)eh->ether_dhost,
+	  sizeof(eh->ether_dhost));
+    bcopy((caddr_t)&ac->ac_enaddr[0], (caddr_t)eh->ether_shost,
+	  sizeof(eh->ether_shost));
+
+    eh->ether_type = ETHERTYPE_REVARP;
+
+    ea->arp_hrd = htons(ARPHRD_ETHER);
+    ea->arp_pro = htons(ETHERTYPE_IP);
+    ea->arp_hln = sizeof(ea->arp_sha);	    /* hardware address length */
+    ea->arp_pln = sizeof(ea->arp_spa);	    /* protocol address length */
+    ea->arp_op = htons(REVARP_REQUEST);
+    bcopy((caddr_t)&ac->ac_enaddr[0],(caddr_t)ea->arp_sha,sizeof(ea->arp_sha));
+    bcopy((caddr_t)&ac->ac_enaddr[0],(caddr_t)ea->arp_tha,sizeof(ea->arp_tha));
+#ifdef DEBUG
+    if( DODEBUG(DBGADDRSRCH) )
+    {
+	int err = (ifp->if_output)(ifp, m, &sa);
+
+	Printf("\021\06revarp_myaddr: ifp->if_output (@%x) returns %d\n",
+	       ctosym(ifp->if_output), err);
+    }
+    else
+#endif
+    (*ifp->if_output)(ifp, m, &sa);
+}
+
+/*
+ * These defines copied from netinet/if_ether.c
+ */
+#define ARPTAB_BSIZ	10		 /* bucket size (16) */
+#define ARPTAB_NB	20		/* number of buckets (37) */
+#define ARPTAB_SIZE	(ARPTAB_BSIZ * ARPTAB_NB)
+
+extern struct arptab arptab[];
+
+/*
+ * Reverse-ARP input. If this is a request we look the ethernet address
+ * of the sender up in the arp table (server side).
+ * If this is a response, the incoming packet contains our
+ * internet address (client).
+ */
+revarpinput(struct arpcom *ac, struct mbuf *m)
+{
+    register struct ether_arp *ea;
+    register struct arptab *at = 0;
+    register struct ether_header *eh;
+    struct ifnet *ifp = &ac->ac_if;
+    struct ifreq ifr;
+    struct ifaddr *ifa;
+    struct sockaddr sa;
+    struct sockaddr_in *sin;
+    u_long serverip, thisip;
+
+    IF_ADJ(m);
+    ea = mtod(m, struct ether_arp *);
+    if (m->m_len < sizeof *ea)
+	goto out;
+
+    if (ac->ac_if.if_flags & IFF_NOARP)
+	goto out;
+
+    if (ntohs(ea->arp_pro) != ETHERTYPE_IP)
+	goto out;
+
+    if(!revarp)
+	goto out;
+
+    switch(ntohs(ea->arp_op))
+    {
+      case REVARP_REPLY:
+	/*
+	 * don't bother, unless we are actively looking for an address
+	 */
+	if( (ifp->if_flags & IFF_NEED_IPADDR) == 0 )
+	    goto out;
+
+	if (bcmp((caddr_t)ea->arp_tha, (caddr_t)&ac->ac_enaddr[0], 6) == 0)
+	{
+	    bcopy((caddr_t)ea->arp_tpa, (caddr_t)&ac->ac_ipaddr,
+		  sizeof(ac->ac_ipaddr));
+	    wakeup((caddr_t)&revarp);
+	}
+
+	bzero((caddr_t)&ifr, sizeof(ifr));
+	sin = (struct sockaddr_in *)&ifr.ifr_addr;
+	sin->sin_family = AF_INET;
+	sin->sin_addr = ac->ac_ipaddr;
+	(void) in_control((struct socket *)0, SIOCSIFADDR, (caddr_t)&ifr, ifp);
+	ifp->if_flags &= ~IFF_NEED_IPADDR;
+
+	bcopy((caddr_t)ea->arp_spa, &serverip, sizeof(serverip));
+	bcopy((caddr_t)ea->arp_tpa, &thisip, sizeof(thisip));
+	revarp_event(serverip, thisip);
+	setriscosvar(BOOTPSERVERVAR, inet_ntoa(serverip));
+	bootwakeup();
+
+	break;
+
+      case REVARP_REQUEST:
+	/*
+	 * it is dangerous to send a reply while we are
+	 * actively looking for an address
+	 */
+	if( (ifp->if_flags & IFF_NEED_IPADDR) != 0 )
+	    goto out;
+
+	for (at = arptab ; at < &arptab[ARPTAB_SIZE] ; at++)
+	{
+	    if( at->at_flags & ATF_PERM && !bcmp((caddr_t)at->at_enaddr,
+						 (caddr_t)ea->arp_tha, 6) )
+		break;
+	}
+
+	if (at < &arptab[ARPTAB_SIZE])
+	{
+	    /* found a match, send it back */
+	    eh = (struct ether_header *)sa.sa_data;
+	    bcopy(ea->arp_sha, eh->ether_dhost,
+		  sizeof(ea->arp_sha));
+	    bcopy((caddr_t)(&at->at_iaddr), ea->arp_tpa,
+		  sizeof(at->at_iaddr));
+
+	    /* search for interface address to use */
+	    for (ifa = ifp->if_addrlist; ifa; ifa = ifa->ifa_next)
+	    {
+		if (ifa->ifa_ifp == ifp)
+		{
+		    bcopy((caddr_t)&((struct sockaddr_in *)&ifa->ifa_addr)->sin_addr,
+			  ea->arp_spa, sizeof(ea->arp_spa));
+		    break;
+		}
+	    }
+
+	    if (ifa == 0)
+		break;
+
+	    bcopy((caddr_t)ac->ac_enaddr, (caddr_t)ea->arp_sha,
+		  sizeof(ea->arp_sha));
+	    bcopy((caddr_t)ac->ac_enaddr, (caddr_t)eh->ether_shost,
+		  sizeof(ea->arp_sha));
+	    eh->ether_type = ETHERTYPE_REVARP;
+	    ea->arp_op = htons(REVARP_REPLY);
+	    sa.sa_family = AF_UNSPEC;
+	    (*ac->ac_if.if_output)(&ac->ac_if, m, &sa);
+	    return;
+	}
+
+	break;
+
+      default:
+	break;
+    }
+
+  out:
+#ifdef OldCode
+    m_freem(m);
+#else
+    FREEM(m);
+#endif
+    return;
+}
+
+#define Internet_Event	 19
+#define RarpReply	  4
+
+revarp_event(u_long serverip, u_long thisip)
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = Internet_Event;
+    r.r[1] = RarpReply;
+    r.r[2] = (int)serverip;
+    r.r[3] = (int)thisip;
+    (void)_kernel_swi(XOS_Bit | OS_GenerateEvent, &r, &r);
+}
+
+/*
+ * this routine is from the InternetAG sources - it was run in
+ * response to an SIOCGWHOIAMMNS ioctl() issued by the NetG
+ * module -- unfortunately, the person who used this ioctl()
+ * was severely brain damaged, as the same ioctl() has a completely
+ * different functionality in the Internet, and InternetAG modules,
+ * so the ioctl() has now been changed to SIOCSWHOTHEYARE.
+ *
+ * The routine broadcasts a REVARP_REPLY packet, which AUN clients
+ * pick up (via the RarpReply Internet event), and fill in the blank
+ * target address field (ea->arp_tha[3]) with their station number
+ * from CMOS RAM.  This is all so disgusting it makes my head hurt.
+ *
+ * XXX
+ *
+ * this routine is *actually* passed a struct ifnet, but intimate
+ * knowledge of the way the Internet module hangs together (i.e. the
+ * fact that the definitive struct ifnets within the system are actually
+ * fields within struct arpcoms) allows the parameter to be implicitly
+ * cast to a struct arpcom pointer.
+ */
+void revarp_broadcastclientaddrs(struct arpcom *ac)
+{
+    struct ifnet *ifp = &ac->ac_if;
+    struct mbuf *m;
+    struct ether_arp *ea;
+    struct ether_header *eh;
+    struct ifaddr *ifa;
+    struct sockaddr sa;
+
+#ifdef OldCode
+    if ((m = m_get(M_DONTWAIT, MT_DATA)) == NULL)
+	return;
+#else
+    if( (m = ALLOC_C(MINCONTIG, NULL)) == NULL )
+	return;
+
+    m->m_type = MT_DATA;
+#endif
+
+    m->m_len = sizeof(struct ether_arp);
+    m->m_off = MAXOFF(m) - m->m_len;
+    ea = mtod(m, struct ether_arp *);
+
+#ifdef OldCode
+    memset ((caddr_t)ea, 0, sizeof (*ea));
+#endif
+
+    sa.sa_family = AF_UNSPEC;
+    eh = (struct ether_header *)sa.sa_data;
+    memcpy((caddr_t)eh->ether_dhost, (caddr_t)etherbroadcastaddr,
+	   sizeof(eh->ether_dhost));
+    memcpy((caddr_t)eh->ether_shost, (caddr_t)&ac->ac_enaddr[0],
+	   sizeof(eh->ether_shost));
+    eh->ether_type = ETHERTYPE_REVARP;
+    ea->arp_hrd = htons(ARPHRD_ETHER);
+    ea->arp_pro = htons(ETHERTYPE_IP);
+    ea->arp_hln = sizeof(ea->arp_sha);	    /* hardware address length */
+    ea->arp_pln = sizeof(ea->arp_spa);	    /* protocol address length */
+    ea->arp_op = htons(REVARP_REPLY);
+    memcpy((caddr_t)ea->arp_sha, (caddr_t)&ac->ac_enaddr[0],
+	   sizeof(ea->arp_sha));
+    memcpy((caddr_t)ea->arp_tha, (caddr_t)&ac->ac_enaddr[0],
+	   sizeof(ea->arp_tha));
+
+    for(ifa = ifp->if_addrlist; ifa; ifa = ifa->ifa_next)
+    {
+	if (ifa->ifa_ifp == ifp)
+	{
+	    memcpy(ea->arp_spa, 
+		   (caddr_t)&((struct sockaddr_in *)&ifa->ifa_addr)->sin_addr,
+		   sizeof(ea->arp_spa));
+	    memcpy(ea->arp_tpa, 
+		   (caddr_t)&((struct sockaddr_in *)&ifa->ifa_addr)->sin_addr,
+		   sizeof(ea->arp_tpa));
+
+	    ea->arp_tpa[3] = 0;		   /* MNS station field */
+	    break;
+	}
+    }
+
+    if (ifa == 0)
+    {
+
+#ifdef OldCode
+	m_freem(m);
+#else
+        FREEM(m);
+#endif
+    }
+    else
+	(*ifp->if_output)(ifp, m, &sa);
+}
+
+extern int send_flags;		/* Allow broadcasts during boot */
+
+/*
+ * Whilst booting, attempt to find our netmask
+ * by broadcasting an ICMP_MASKREQ
+ */
+void request_netmask(struct ifnet *ifp, int flag)
+{
+    struct mbuf *m;
+    struct ip *ip;
+
+#ifdef OldCode
+    if ((m  = m_get(M_DONTWAIT, MT_HEADER)) == NULL)
+	return;
+#else
+    if( (m = ALLOC_S(MINCONTIG, NULL)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("request_netmask: ALLOC_s failed\n");
+#endif
+	return;
+    }
+    m->m_type = MT_HEADER;
+#endif
+
+    /*
+     * Fill in mbuf with IP header and addresses
+     * and length put into network format.
+     */
+    m->m_off = MAXOFF(m) - sizeof (struct ip);
+    m->m_len = sizeof (struct ip);
+    ip = mtod(m, struct ip *);
+    ip->ip_v = IPVERSION;
+    ip->ip_hl = 5;
+    ip->ip_tos = 0;
+    ip->ip_len = htons(sizeof(struct ip));
+    ip->ip_id = 0;
+    ip->ip_off = 0;
+    ip->ip_ttl = MAXTTL;
+    ip->ip_p = IPPROTO_RAW;
+    ip->ip_sum = 0;
+    ip->ip_dst = ((struct arpcom *)ifp)->ac_ipaddr;
+    ip->ip_src = in_makeaddr(in_netof(ip->ip_dst), INADDR_BROADCAST);
+    send_flags = SO_DONTROUTE | SO_BROADCAST;
+    icmp_error(ip, ICMP_MASKREQ, 0, ifp);
+    send_flags = 0;
+}
+
+#define satosin(sa) ((struct sockaddr_in *)(sa))
+
+setriscosvar(char *var, char *str)
+{
+    _kernel_oserror *e;
+    _kernel_swi_regs rin, rout;
+
+    rin.r[0] = (int)var;
+    rin.r[1] = (int)str;
+    rin.r[2] = strlen(str)+1;
+
+    if (rin.r[2] <= 1)
+	return;
+
+    rin.r[3] = 0;
+    rin.r[4] = 0;
+    e = _kernel_swi(XOS_Bit | OS_SetVarVal, &rin, &rout);
+}
+
+char *inet_ntoa(struct in_addr in)
+{
+    static char b[18];
+    char *p;
+
+    p = (char *)&in;
+#define UC(b)	(((int)b)&0xff)
+    sprintf(b, "%d.%d.%d.%d", UC(p[0]), UC(p[1]), UC(p[2]), UC(p[3]));
+    return (b);
+}
+
+#define KEYSCAN 121
+#define LEFTALT 5
+#define RIGHTALT 8
+
+int left_alt_is_pressed(void)
+{
+    _kernel_swi_regs rin, rout;
+    _kernel_oserror *e;
+
+    rin.r[0] = KEYSCAN;
+    rin.r[1] = LEFTALT | 0x80;
+    e = _kernel_swi(XOS_Bit | OS_Byte, &rin, &rout);
+    return (rout.r[1]);
+}
+
+int right_alt_is_pressed()
+{
+    _kernel_swi_regs rin, rout;
+    _kernel_oserror *e;
+
+    rin.r[0] = KEYSCAN;
+    rin.r[1] = RIGHTALT | 0x80;
+    e = _kernel_swi(XOS_Bit | OS_Byte, &rin, &rout);
+    return (rout.r[1]);
+}
+
+/* EOF whoami.c */

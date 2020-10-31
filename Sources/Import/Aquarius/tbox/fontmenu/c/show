@@ -1,0 +1,193 @@
+/* Title:   show.c
+ * Purpose: show a FontMenu Object
+ * Author:  TGR
+ * History: 11-Jan-94: TGR: created
+ *
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "const.h"
+#include "macros.h"
+#include "services.h"
+#include "debug.h"
+#include "mem.h"
+#include "string32.h"
+#include "messages.h"
+#include "objects.toolbox.h"
+#include "objects.fontmenu.h"
+
+#include "object.h"
+#include "auxiliary.h"
+#include "task.h"
+
+#include "show.h"
+
+_kernel_oserror *show_menu_coords (_kernel_swi_regs *user_regs);
+
+extern _kernel_oserror *show_object (_kernel_swi_regs *r, TaskDescriptor *t)
+{
+
+   /*
+    * request to show an object
+    * R0 = 3
+    * R1 = Object ID
+    * R2 = internal handle returned when Object was created
+    * R3 = wimp task handle of caller (use to identify task descriptor)
+    * R4 -> user regs R0-R9
+    *     R0 =  flags
+    *     R1 =  Object ID
+    *     R2 =  "show type"
+    *         0 => default place
+    *         1 => R3 points to buffer with full data for showing
+    *         2 => R3 points to buffer with coordinates
+    *     R3 = 0
+    *  OR R3 -> buffer giving Object-specific data for showing this
+    *         Object
+    *     R4 =  Parent Object ID
+    *     R5 =  Parent Component ID
+    */
+
+   /*
+    * Function to "display" an Object on the screen.  If R2 == 0, then
+    * display in default place.
+    * If Object has bit set to say warn before show, then we should just
+    * send Toolbox Event, and wait for the next call to Wimp_Poll after
+    * the event is delivered before the Object is actually shown
+    * (ie catch it in the prefilter).
+    *
+    */
+   _kernel_swi_regs     regs,
+                       *user_regs = (_kernel_swi_regs *) r->r[4];
+   _kernel_oserror     *e;
+   FontMenuInternal    *menu_int  = (FontMenuInternal *) r->r[2];
+   FontMenu_AboutToBeShown_Event
+                       *about_to_be_shown;
+   ToolboxEvent         toolbox_event;
+
+   DEBUG debug_output ("s","FontMenu: entering show, menu_int @0x%x, object_id = 0x%x\n",(int)menu_int, (int)menu_int->object_id);
+
+   if (global_menu.wimp_menu)
+      mem_freek (global_menu.wimp_menu);
+   if (global_menu.wimp_menu_indirect)
+      mem_freek (global_menu.wimp_menu_indirect);
+
+   global_menu.current = menu_int;
+
+   if ((e = show_menu_coords (user_regs)) != NULL)
+      return e;
+
+   DEBUG debug_output ("s","FontMenu: entering Font_ListFonts\n");
+
+   regs.r[1] = 0;
+   regs.r[2] = (1<<21|1<<19) /* tick font indicated by R6 + return font menu defn */
+             | ((global_menu.current->flags & FontMenuInternal_IncludeSystemFont) ? 1<<20: 0);
+   regs.r[3] = 0;
+   regs.r[4] = 0;
+   regs.r[5] = 0;
+   regs.r[6] = 0;
+
+   if ((e = _kernel_swi (Font_ListFonts, &regs, &regs)) != NULL)
+      return e;
+
+   if ((global_menu.wimp_menu = mem_alloc (regs.r[3])) == NULL)
+      return make_error (FontMenu_AllocFailed,0);
+
+   global_menu.menu_size = regs.r[3];
+
+   if ((global_menu.wimp_menu_indirect = mem_alloc (regs.r[5])) == NULL) {
+      e = make_error (FontMenu_AllocFailed,0);
+      goto clearup1;
+   }
+   global_menu.indirect_size = regs.r[5];
+
+   DEBUG debug_output ("s","FontMenu: global_menu.current @0x%x; menu_int @0x%x\n",(int)global_menu.current,(int)menu_int);
+   if ((e = generate_fontmenu()) != NULL)
+      goto clearup2;
+
+   global_menu.t = t;
+
+   if (user_regs->r[0] & 2) {
+      global_menu.flags &= ~GLOBAL_MENU_INFO_FLAGS_TOP_LEVEL;
+
+      regs.r[0] = 0;
+      regs.r[1] = (int) global_menu_state;
+
+      if ((e = _kernel_swi (Wimp_GetMenuState, &regs, &regs)) != NULL) {
+         goto clearup2;
+      }
+      r->r[0] = (int) global_menu.wimp_menu;
+   } else {
+      global_menu.flags |= GLOBAL_MENU_INFO_FLAGS_TOP_LEVEL;
+
+      *global_menu_state = -1;
+   }
+   if (global_menu.current->flags & FontMenuInternal_GenerateShowEvent) {
+
+      global_menu.flags &= ~GLOBAL_MENU_INFO_FLAGS_SHOW_NEXT;
+
+      regs.r[0]                    =  0;                     /* flags*/
+      regs.r[1]                    =  user_regs->r[1];       /* Object id */
+      regs.r[2]                    =  -1;                    /* Component id */
+      regs.r[3]                    =  (int) &toolbox_event;
+
+      toolbox_event.hdr.size       =  sizeof(FontMenu_AboutToBeShown_Event);
+      toolbox_event.hdr.event_code =  FontMenu_AboutToBeShown;
+      toolbox_event.hdr.flags      =  user_regs->r[0];
+
+      about_to_be_shown            = (FontMenu_AboutToBeShown_Event *) &toolbox_event;
+      about_to_be_shown->show_type = user_regs->r[2];
+      about_to_be_shown->x         = global_menu.x;
+      about_to_be_shown->y         = global_menu.y;
+
+      if ((e = _kernel_swi (Toolbox_RaiseToolboxEvent, &regs, &regs)) != NULL)
+         return e;
+
+   } else {
+      global_menu.flags |= GLOBAL_MENU_INFO_FLAGS_IS_SHOWING;
+      return (~user_regs->r[0] & 2) ? menu_show_actual () : menu_show_submenu_actual ();
+   }
+   return NULL;
+
+   clearup2:
+      mem_freek(global_menu.wimp_menu_indirect);
+      global_menu.wimp_menu_indirect = NULL;
+   clearup1:
+      mem_freek(global_menu.wimp_menu);
+      global_menu.wimp_menu = NULL;
+      global_menu.current   = NULL;
+      return e;
+}
+
+_kernel_oserror *show_menu_coords (_kernel_swi_regs *user_regs) {
+
+   _kernel_oserror  *e           = NULL;
+   _kernel_swi_regs  regs;
+   DisplayInfo      *coords      = (DisplayInfo *) user_regs->r[3];
+   wimp_PointerInfo  ptr_info;
+
+   switch (user_regs->r[2]) {
+
+      case 1:
+      case 2:
+         global_menu.x = coords->x;
+         global_menu.y = coords->y;
+         break;
+      default:
+         regs.r[1] = (int) &ptr_info;
+
+         if ((e = _kernel_swi (Wimp_GetPointerInfo, &regs, &regs)) != NULL) return e;
+
+         global_menu.x = ptr_info.x - 64;
+         global_menu.y = ptr_info.y;
+         break;
+   }
+   DEBUG debug_output ("s","FontMenu: global_menu.current @0x%x\n",(int)global_menu.current);
+   DEBUG debug_output ("s","FontMenu: show coordinates are (%d,%d)\n",global_menu.x,global_menu.y);
+   return e;
+}

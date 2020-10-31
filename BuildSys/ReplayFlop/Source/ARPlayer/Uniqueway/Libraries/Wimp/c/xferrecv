@@ -1,0 +1,270 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/* Title: c.xferrecv
+ * Purpose: general purpose import of data by dragging icon
+ * History: IDJ: 07-Feb-92: prepared for source release
+ *          SJM: 10/3/92:   split off sending of datasaveok and added xferrecv_sendsaveok()
+ *                          for when we don't support ram transfer.
+ *          SJM: 11/93:     added void *handle parameter to doimport and bufferprocessor
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "os.h"
+#include "wimpx.h"
+#include "wimpt.h"
+#include "win.h"
+#include "xfersend.h"
+#include "werr.h"
+#include "event.h"
+#include "xferrecv.h"
+#include "msgs.h"
+
+#define NO_SCRAP_FILE   msgs_lookup("Exferrecv1:Can't transfer file - !Scrap directory not seen.")
+#define XFER_FAILED     msgs_lookup("Exferrecv2:Data transfer failed.")
+
+#define SCRAP_FILE      "Wimp$Scrap"
+#define REMOVE_SCRAP    "%remove "SCRAP_FILE
+
+#define OS_ReadVarVal 0x23
+
+typedef enum
+{
+   xferrecv_state_Ask,
+   xferrecv_state_Talk,
+   xferrecv_state_Done,
+   xferrecv_state_Broken
+} xferrecv_stateval ;
+
+
+static wimp_t xferrecv_sendertask ;
+static wimp_msgstr xferrecv_ack;
+
+static xferrecv_buffer_processor xferrecv_processbuff ;
+static char *xferrecv_buffer ;
+static int xferrecv_buffersize ;
+static int xferrecv_state ;
+static int xferrecv_msgid ;
+
+static int scrap_ref = 0 ;
+static int xferrecv__fileissafe ;
+static void *xferrecv_handle;
+
+static char xferrecv_leafname[32] = { 0 };
+
+int xferrecv_checkinsert(char **filename)
+{
+   wimp_eventstr *e = wimpt_last_event();
+
+   if ((e->e==wimp_ESENDWANTACK || e->e == wimp_ESEND) &&
+       (e->data.msg.hdr.action == wimp_MDATALOAD ||
+        e->data.msg.hdr.action == wimp_MDATAOPEN))
+   {
+      xferrecv__fileissafe = e->data.msg.hdr.your_ref != scrap_ref ||
+                             scrap_ref==0 ;
+      xferrecv_ack.hdr.action = wimp_MDATALOADOK ;
+      xferrecv_ack.hdr.size = sizeof(wimp_msghdr) ;
+      xferrecv_sendertask = e->data.msg.hdr.task ;
+      xferrecv_ack.hdr.your_ref = e->data.msg.hdr.my_ref ;
+      *filename = e->data.msg.data.dataload.name ;
+      return e->data.msg.data.dataload.type ;
+   }
+   else 
+      return -1 ;
+}
+
+
+void xferrecv_insertfileok(void)
+{
+   /* An insert has been completed successfully. This sends an acknowledge back
+      to the original application. */
+
+   if (!xferrecv__fileissafe)
+   {
+      os_cli(REMOVE_SCRAP);
+   }
+   scrap_ref = 0 ;
+   (void) wimp_sendmessage(wimp_ESEND, &xferrecv_ack, xferrecv_sendertask);
+}
+
+
+int xferrecv_checkprint(char **filename)
+{
+   wimp_eventstr *e = wimpt_last_event();
+
+   if ((e->e==wimp_ESENDWANTACK || e->e == wimp_ESEND) &&
+       (e->data.msg.hdr.action == wimp_MPrintTypeOdd))
+   {
+      xferrecv__fileissafe = 0 ;
+      xferrecv_ack.hdr.action = wimp_MPrintTypeKnown ;
+      xferrecv_ack.hdr.size = sizeof(wimp_msghdr)+sizeof(wimp_msgprint) ;
+      xferrecv_sendertask = e->data.msg.hdr.task ;
+      xferrecv_ack.hdr.your_ref = e->data.msg.hdr.my_ref ;
+      *filename = e->data.msg.data.print.name ;
+      return e->data.msg.data.print.type ;
+   }
+   else 
+      return -1 ;
+}
+
+
+void xferrecv_printfileok(int type)
+{
+   xferrecv_ack.data.print.type = type ;
+   (void) wimp_sendmessage(wimp_ESEND, &xferrecv_ack, xferrecv_sendertask);
+}
+
+
+int xferrecv_checkimport(int *estsize)
+{
+    wimp_eventstr *e = wimpt_last_event();
+    
+    if ((e->e==wimp_ESENDWANTACK || e->e == wimp_ESEND) &&
+        e->data.msg.hdr.action == wimp_MDATASAVE)
+    {
+        xferrecv_ack.hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdatasaveok) ;
+        xferrecv_sendertask = e->data.msg.hdr.task ;
+        xferrecv_ack.hdr.your_ref = e->data.msg.hdr.my_ref ;
+        xferrecv_ack.hdr.action = wimp_MDATASAVEOK ;
+        xferrecv_ack.data.datasave = e->data.msg.data.datasave;
+        *estsize = xferrecv_ack.data.datasaveok.estsize
+                = e->data.msg.data.datasave.estsize ;
+
+        strncpy(xferrecv_leafname, e->data.msg.data.datasave.leaf, sizeof(xferrecv_leafname)-1);
+
+        return xferrecv_ack.data.datasaveok.type = e->data.msg.data.datasave.type ;
+    }
+    else
+        return -1 ;
+}
+
+static void  xferrecv_sendRAMFETCH(void)
+{
+   char *addr = xferrecv_ack.data.ramfetch.addr ;
+   int size = xferrecv_ack.data.ramfetch.nbytes ;
+   int action = xferrecv_ack.hdr.action ;
+
+   xferrecv_ack.hdr.action = wimp_MRAMFETCH ;
+   xferrecv_ack.data.ramfetch.addr = xferrecv_buffer ;
+   xferrecv_ack.data.ramfetch.nbytes = xferrecv_buffersize ;
+   (void) wimp_sendmessage(wimp_ESENDWANTACK, &xferrecv_ack, xferrecv_sendertask);
+   xferrecv_msgid = xferrecv_ack.hdr.my_ref ;
+
+   xferrecv_ack.data.ramfetch.addr=addr ;
+   xferrecv_ack.data.ramfetch.nbytes=size ;
+   xferrecv_ack.hdr.action = action ;
+}
+
+void xferrecv_sendsaveto(const char *filename, BOOL safe)
+{
+    strcpy(xferrecv_ack.data.datasaveok.name, filename);
+    xferrecv_ack.data.datasaveok.estsize = safe ? 0 : -1;
+    (void) wimp_sendmessage(wimp_ESEND, &xferrecv_ack, xferrecv_sendertask);
+    scrap_ref = xferrecv_ack.hdr.my_ref;
+    xferrecv__fileissafe = safe;
+}
+
+void xferrecv_sendsaveok(void)
+{
+     if (getenv(SCRAP_FILE)==0)
+         werr(0, NO_SCRAP_FILE);
+     else
+        xferrecv_sendsaveto("<"SCRAP_FILE">", FALSE);
+}
+
+static BOOL xferrecv_unknown_events(wimp_eventstr *e, void *handle)
+{
+   handle = handle ;
+
+   if ((e->e == wimp_ESEND || e->e == wimp_ESENDWANTACK) &&
+       e->data.msg.hdr.your_ref == xferrecv_msgid &&
+       e->data.msg.hdr.action == wimp_MRAMTRANSMIT)
+   {
+      if (e->data.msg.data.ramtransmit.nbyteswritten == xferrecv_buffersize)
+      {
+         /* other end has filled our buffer; better try and allocate some more
+            space */
+         if (xferrecv_processbuff(&xferrecv_buffer, &xferrecv_buffersize, xferrecv_handle))
+         {
+            /* can go on */
+            xferrecv_ack.hdr.your_ref = e->data.msg.hdr.my_ref ;
+            xferrecv_sendRAMFETCH() ;
+            xferrecv_state = xferrecv_state_Talk ;
+         }
+         else
+         {
+            xferrecv_state = xferrecv_state_Broken ;
+         }
+      }
+      else
+      {
+         xferrecv_buffersize = e->data.msg.data.ramtransmit.nbyteswritten ;
+         xferrecv_state = xferrecv_state_Done ;
+      }
+   }
+   else if (e->e == wimp_EACK && e->data.msg.hdr.my_ref == xferrecv_msgid)
+   {
+      /* got our message back */
+
+      if (xferrecv_state == xferrecv_state_Ask)
+         xferrecv_sendsaveok();
+      else
+        werr(0, XFER_FAILED);
+      xferrecv_state = xferrecv_state_Broken ;
+   }
+   else 
+      return FALSE ;
+
+   return TRUE ;
+}
+
+int xferrecv_doimport(char *buf, int size, xferrecv_buffer_processor p, void *handle)
+{
+    /* Receives data into the buffer; calls the buffer processor if the buffer
+      given becomes full. Returns TRUE if the transaction completed sucessfully.
+    */
+    
+    win_add_unknown_event_processor(xferrecv_unknown_events, 0) ;
+    
+    xferrecv_processbuff = p ;
+    xferrecv_handle = handle;
+    xferrecv_buffer = buf ;
+    xferrecv_buffersize = size ;
+    xferrecv_sendRAMFETCH() ;
+    xferrecv_state = xferrecv_state_Ask ;
+    xferrecv__fileissafe = FALSE ;
+
+    do
+        event_process() ;
+    while (xferrecv_state < xferrecv_state_Done) ;
+    
+    win_remove_unknown_event_processor(xferrecv_unknown_events, 0) ;
+    
+    return (xferrecv_state == xferrecv_state_Done ? xferrecv_buffersize : -1 ) ;
+}
+
+BOOL xferrecv_file_is_safe(void)
+{
+    return xferrecv__fileissafe ;
+}
+
+const char *xferrecv_import_leafname(void)
+{
+    return xferrecv_leafname;
+}
+
+/* end */

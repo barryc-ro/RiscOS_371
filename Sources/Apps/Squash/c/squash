@@ -1,0 +1,646 @@
+/* -> c.squash
+ * Function which actually squashes files, either in place or
+ * file to file.  If UTILITY is defined then this will build
+ * into a "Squash" command line utility.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+
+#include "kernel.h"
+#include "swis.h"
+#ifndef UTILITY
+#include "visdelay.h"
+#endif
+
+#include "squash.h"
+#include "debug.h"
+
+#define MINBUFSZ 1024
+
+#define min(a, b) (a < b ? a : b)
+
+/* Keep global workspace and current size, the workspace will only be
+ * freed when we get back to the Wimp poll loop (ie. prevent alloc and
+ * free for every file squashed in a directory).
+ */
+static int  worksize = 0,
+            input_size = 0,
+            output_size = 0,
+            input = -1,
+            output = -1;
+static char *temp_name = NULL,
+            *workspace = NULL,
+            *input_store = NULL,
+            *output_store = NULL;
+
+#ifndef UTILITY
+/* Use flex to allocate memory in the Wimp application. */
+#include "flex.h"
+#define dealloc(pvar)           (flex_free((flex_ptr)(pvar)))
+#else
+/* Use malloc to allocate memory in the utility. */
+#define dealloc(pvar)           (free(*(pvar)))
+#endif
+
+#define MESSAGES 0
+#ifdef UTILITY
+#undef MESSAGES
+#define MESSAGES 1
+#endif
+#ifdef RISCOS_200
+#undef MESSAGES
+#define MESSAGES 1
+#endif
+
+#if MESSAGES
+char *error[] = {
+  "Run out of store",
+  "Invalid Squash header",
+  "Unknown menu click",
+  "To save, drag the icon to a directory viewer"
+};
+#endif
+
+#ifdef UTILITY
+static void usage(int err)
+{
+  if (err == 0)
+    fprintf(stderr, "Squash version %s - compress/uncompress files\n\n", SQUASH_VERS);
+  fprintf(stderr, "Syntax: Squash <source file> [<destination file>]\n");
+  exit(err);
+}
+
+void show_error_num(int fatal, int errno)
+{
+  fprintf(stderr, "Squash: %s\n", error[errno]);
+  if (fatal)
+    exit(1);
+}
+
+void show_error(int fatal, char *text, char *fname)
+{
+  if (fname != NULL)
+    fprintf(stderr, "Squash (file '%s'): %s\n", fname, text);
+  else
+    fprintf(stderr, "Squash: %s\n", text);
+  if (fatal)
+    exit(1);
+}
+#endif
+
+/* Allocate or reallocate memory with the given size. */
+static int alloc(char **pmemp, int size)
+{
+#ifndef UTILITY
+  /* Application uses flex. */
+  if (*pmemp == NULL)
+    return flex_alloc((flex_ptr)pmemp, size);
+  else
+    return flex_extend((flex_ptr)pmemp, size);
+#else
+  char *tmp = realloc(*pmemp, size);
+  return tmp != NULL ? *pmemp = tmp, 1 : 0;
+#endif
+}
+
+/* Allocate input and output buffers. We try to get enough to do the operation
+ * in one go but if we can't then we halve the required amounts until we get
+ * some memory or the sizes drop below a minimum threshold (failed).
+ */
+static int alloc_buffers(int inwanted, int outwanted)
+{
+  int done_input = 0, insz = input_size;
+
+  do {
+    if (inwanted < MINBUFSZ) inwanted = MINBUFSZ;
+    if (outwanted < MINBUFSZ) outwanted = MINBUFSZ;
+    if (inwanted <= insz) {
+      done_input = 1;                   /* Got enough already. */
+    } else {
+      if (alloc(&input_store, inwanted) != 0) {
+        input_size = inwanted;
+        done_input = 1;
+      } else {
+        inwanted /= 2;
+        outwanted /= 2;
+      }
+    }
+    if (done_input) {
+      if (outwanted <= output_size) {
+        return 0;                       /* Got enough already. */
+      } else {
+        if (alloc(&output_store, outwanted) != 0) {
+          output_size = outwanted;
+          return 0;
+        } else {
+          inwanted /= 2;
+          outwanted /=2;
+          insz = 0;                     /* Force input buffer to be reallocated. */
+          done_input = 0;
+        }
+      }
+    }
+  } while ((inwanted >= MINBUFSZ) || (outwanted >= MINBUFSZ));
+  return -1;
+}
+
+void free_workspace(void)
+{
+  tracef0("Freeing Squash workspace\n");
+
+  if (workspace != NULL) {
+    dealloc(&workspace);
+    workspace = NULL;
+    worksize = 0;
+  }
+
+  if (input_store != NULL) {
+    dealloc(&input_store);
+    input_store = NULL;
+    input_size = 0;
+  }
+
+  if (output_store != NULL) {
+    dealloc(&output_store);
+    output_store = NULL;
+    output_size = 0;
+  }
+}
+
+static int create_file(char *name, int size)
+{
+  _kernel_oserror *err;
+  _kernel_swi_regs r;
+  tracef2("create_file \"%s\", size %d bytes\n",name,size);
+  r.r[0] = 11;
+  r.r[1] = (int)name;
+  r.r[2] = 0;
+  r.r[4] = 0;
+  r.r[5] = size;
+  if ((err = _kernel_swi(OS_File, &r, &r)) != NULL) {
+    show_error(0, err->errmess, name);
+    return -1;
+  }
+  return 0;
+}
+
+int open_file(char *name, int reason)
+{
+  _kernel_oserror *err;
+  _kernel_swi_regs r;
+  tracef1("open_file \"%s\"\n",name);
+  r.r[0] = reason;
+  r.r[1] = (int)name;
+  r.r[2] = 0;
+  if ((err = _kernel_swi(OS_Find, &r, &r)) != NULL) {
+    show_error(0, err->errmess, name);
+    return -1;
+  }
+  return r.r[0];
+}
+
+void close_file(int handle)
+{
+  _kernel_oserror *err;
+  _kernel_swi_regs r;
+  tracef0("closing file ...\n");
+  r.r[0] = 0;
+  r.r[1] = handle;
+  if ((err = _kernel_swi(OS_Find, &r, &r)) != NULL)
+    show_error(0, err->errmess, NULL);
+  tracef0("file closed\n");
+}
+
+int file_RW(int op, int handle, char *buffer, int count, char *fname)
+{
+  _kernel_oserror *err;
+  _kernel_swi_regs r;
+  if (count == 0)
+    return 0;
+  r.r[0] = op;
+  r.r[1] = handle;
+  r.r[2] = (int)buffer;
+  r.r[3] = count;
+  if ((err = _kernel_swi(OS_GBPB, &r, &r)) != NULL) {
+    show_error(0, err->errmess, fname);
+    return -1;
+  }
+  return 0;
+}
+
+static int delete_file(char *name, int force)
+{
+  _kernel_oserror *err;
+  _kernel_swi_regs r;
+  r.r[1] = (int)name;
+  if (force) {
+    r.r[0] = 27;
+    r.r[3] = 0x03;
+    err = _kernel_swi(OS_FSControl, &r, &r);
+  } else {
+    r.r[0] = 6;
+    err = _kernel_swi(OS_File, &r, &r);
+  }
+  if (err != NULL) {
+    show_error(0, err->errmess, name);
+    return -1;
+  }
+  return 0;
+}
+
+/*
+ * Copy/move a file (possibly across filing systems) (eg from ADFS to RAMFS).
+ */
+int copy_object(char *from, char *to, int move)
+{
+  _kernel_oserror *err;
+  _kernel_swi_regs r;
+  r.r[1] = (int)from;
+  r.r[2] = (int)to;
+  if (move) {
+    /* If moving then try simple rename first. */
+    r.r[0] = 25;
+    if (_kernel_swi(OS_FSControl, &r, &r) == NULL)
+      return 0;
+  }
+  r.r[0] = 26;
+  r.r[3] = move ? 0x83 : 1;
+  if ((err = _kernel_swi(OS_FSControl, &r, &r)) != NULL) {
+    show_error(0, err->errmess, to);
+    return -1;
+  }
+  return 0;
+}
+
+/*
+ * Set the type of a file (a non-critical operation, so ignore errors).
+ */
+static void set_type(char *fname, int type)
+{
+  _kernel_swi_regs r;
+  r.r[0] = 18;
+  r.r[1] = (int)fname;
+  r.r[2] = type;
+  (void)_kernel_swi(OS_File, &r, &r);
+}
+
+static char *gen_temp_name()
+{
+  char *name = malloc(27);
+  sprintf(name, "<Wimp$ScrapDir>.sq%08X", time(0));
+  return name;
+}
+
+static void tidy_up(int end_visdelay)
+{
+#ifndef UTILITY
+  if (end_visdelay) visdelay_end();
+#endif
+  if (input != -1) {
+    close_file(input);
+    input = -1;
+  }
+  if (output != -1) {
+    close_file(output);
+    output = -1;
+  }
+  if (temp_name) {
+    delete_file(temp_name, 0);
+    free(temp_name);
+    temp_name = NULL;
+  }
+#ifdef UTILITY
+  free_workspace();
+#endif
+}
+
+#ifdef UTILITY
+int main(int argc, char **argv)
+#else
+int do_squash(int argc, char **argv)
+#endif
+{
+  squash_header header = {
+    SQUASH_ID,
+    0,
+    0,
+    0,
+    0
+  };
+  char *file_from = argv[1];
+  char *file_to = argv[2];
+  int file_type;
+  int load_addr;
+  int exec_addr;
+  int attributes;
+  _kernel_swi_regs r;
+  _kernel_oserror *err;
+  char *load_to;
+  int  insize,
+       outsize,
+       real_input_size,
+       real_output_size,
+       size;
+  int do_compress = 1;
+  int all_in_one = 0;
+  int file_to_file = (argc == 3);
+
+#ifdef UTILITY
+  /* Check command line parameters. */
+  if (argc < 2 || argc > 3)
+    usage(1);
+  if (strcmp(argv[1], "-help") == 0)
+    usage(0);
+#endif
+
+  /* Get stats on the input file and ensure that it is not a directory. */
+  r.r[0] = 5;
+  r.r[1] = (int)file_from;
+  if ((err = _kernel_swi(OS_File, &r, &r)) != NULL) {
+    show_error(0, err->errmess, file_from);
+    tidy_up(0);
+    return -1;
+  }
+  file_type = r.r[0];
+  if (file_type == 2) {
+    tidy_up(0);
+    return 0;
+  }
+  load_addr = r.r[2];
+  exec_addr = r.r[3];
+  insize = r.r[4];
+  attributes = r.r[5];
+
+  /* If compressing to same file then make sure it's not protected and is
+   * not smaller than the header size.
+   */
+  if (!file_to_file && (attributes & 0x08)) {
+    /* File is locked. */
+    /* Use create_file to generate the appropriate error message. */
+    create_file(file_from, insize);
+    tidy_up(0);
+    return -1;
+  }
+  real_input_size = insize;
+  if (insize <= sizeof(squash_header)) {
+    tidy_up(0);
+    if (file_to_file)
+      if (copy_object(file_from, file_to, 0) == -1)
+        return -1;
+    return 0;                   /* Do nothing quietly with very small files. */
+  }
+
+  /* Determine from the filetype whether we are compressing or decompressing. */
+  file_type = (load_addr & 0x000fff00) >> 8;
+  do_compress = !(((load_addr & 0xfff00000) == 0xfff00000) && (file_type == SQUASH_TYPE));
+
+  /* Open the input file. */
+  if ((input = open_file(file_from, OPEN_RO)) == -1) {
+    tidy_up(0);
+    return -1;
+  }
+
+  if (!file_to_file && (attributes & 0x02) == 0) {
+    /* File is read only. */
+    /* Use file_RW to generate the appropriate error message. */
+    file_RW(Wdata, input, 0, 1, file_from);
+    tidy_up(0);
+    return -1;
+  }
+
+  /* If compressing then set up the header, if decompressing then read it,
+   * check it and get the input size.
+   */
+  if (do_compress) {
+    header.length = (unsigned int)insize;
+    header.load = load_addr;
+    header.exec = exec_addr;
+  } else {
+    if (file_RW(Rdata, input, (char *)&header, sizeof(header), file_from) == -1) {
+      tidy_up(0);
+      return -1;
+    }
+    if (memcmp(header.id, SQUASH_ID, 4) != 0 || header.reserved != 0) {
+      tidy_up(0);
+      show_error_num(0, invalid_header);
+      return -1;
+    }
+    insize -= sizeof(header);
+  }
+
+  /* Find out from the Squash module how much work space we require and the
+   * maximum output size.
+   */
+  r.r[0] = 0x08;
+  r.r[1] = (int)insize;
+  if ((err = _kernel_swi((do_compress ? Squash_Compress : Squash_Decompress), &r, &r)) != NULL) {
+    tidy_up(0);
+    show_error(0, err->errmess, NULL);
+    return -1;
+  }
+  if (worksize < r.r[0]) {
+    tracef1("Allocating %d bytes for Squash workspace\n",r.r[0]);
+    if (alloc(&workspace, r.r[0]) == 0) {
+      tidy_up(0);
+      show_error_num(0, out_of_store);
+      return -1;
+    }
+    worksize = r.r[0];
+  }
+  outsize = (do_compress) ? r.r[1] + sizeof(squash_header) : header.length;
+  tracef2("Input/output data sizes are %d and %d\n",insize,outsize);
+
+  /* Get input and output buffers. */
+  if (alloc_buffers(insize, outsize)) {
+    tidy_up(0);
+    show_error_num(0, out_of_store);
+    return -1;
+  }
+  tracef2("Input/output buffer sizes are %d and %d\n",input_size,output_size);
+
+  if (input_size >= insize && output_size >= outsize) {
+    all_in_one = 1;
+  } else {
+    /* Check for in place. */
+    if (!file_to_file)
+      temp_name = file_to = gen_temp_name();
+    /* If decompressing then make sure there is enough room for the file. */
+    if (!do_compress) {
+      if (create_file(file_to, outsize) == -1) {
+        tidy_up(0);
+        return -1;
+      }
+    }
+    if ((output = open_file(file_to, CREATE_RW)) == -1) {
+      tidy_up(0);
+      return -1;
+    }
+    all_in_one = 0;
+  }
+
+  /* Set up and enter the main loop. */
+  real_output_size = do_compress ? sizeof(header) : 0;
+  if (all_in_one)
+   r.r[0] = 0x4;                /* All in one so new op, no more input. */
+  else
+   r.r[0] = 0x2;                /* In stages so new op, more input. */
+  r.r[3] = 0;                   /* Initially, no remaining input bytes. */
+  if (do_compress) {
+    /* Put the header in the first buffer to be written. */
+    *(squash_header *)output_store = header;
+    r.r[4] = (int)output_store + sizeof(squash_header);
+    r.r[5] = (int)output_size - sizeof(squash_header);
+  } else {
+    r.r[4] = (int)output_store;
+    r.r[5] = (int)output_size;
+  }
+  size = input_size;            /* Size of input buffer. */
+  load_to = input_store;        /* Address to load to. */
+#ifndef UTILITY
+  visdelay_begin();
+#endif
+  while (insize || r.r[0]) {    /* More input or Squash module has more output. */
+    /* At this point size contains the amount of free bytes in the input
+     * buffer and load_addr points to the first of those bytes.  We now
+     * determine how many bytes to load and load them.
+     */
+    size = min(insize, size);
+    if (size) {
+      tracef1("reading %d bytes\n",size);
+      if (file_RW(Rdata, input, load_to, size, file_from) == -1) {
+        tidy_up(1);
+        return -1;
+      }
+      insize -= size;
+      if (insize == 0) {
+        close_file(input);
+        input = -1;
+      }
+    }
+    if (insize == 0)
+      r.r[0] &= ~0x2;   /* Reset more input flag. */
+    r.r[1] = (int)workspace;
+    r.r[2] = (int)input_store;
+    /* Add the no. of bytes loaded to the number left in the input buffer
+     * after the last compress/decompress.
+     */
+    r.r[3] += (int)size;
+    err = (do_compress) ? _kernel_swi(Squash_Compress, &r, &r) : _kernel_swi(Squash_Decompress, &r, &r);
+    if (err) {
+      tidy_up(1);
+      show_error(0, err->errmess, NULL);
+      return -1;
+    }
+    size = output_size - r.r[5];    /* Number of bytes produced. */
+    real_output_size += size;
+    if (all_in_one) {
+      /* If not using temp file (whole file in memory) then we need to open
+       * the original for writing before the write is done.
+       */
+      if (do_compress && real_output_size >= real_input_size) {
+        tidy_up(1);
+        if (file_to_file)
+          if (copy_object(file_from, file_to, 0) == -1)
+            return -1;
+        return 0;                    /* Do nothing if there is no improvement. */
+      }
+      /* Check for in place. */
+      if (!file_to_file) {
+        file_to = file_from;
+        /* Set the type of the output file to data (get round PC partitions being
+         * treated as directories, we must restore type if create/write goes wrong).
+         */
+        set_type(file_to, 0xFFD);
+      }
+      /* Try to create the output file - will fail if not enough room. */
+      if (create_file(file_to, real_output_size) == -1) {
+        if (!file_to_file)
+          set_type(file_to, file_type);
+        tidy_up(1);
+        return -1;
+      }
+      /* Open output file for writing. */
+      if ((output = open_file(file_to, CREATE_RW)) == -1) {
+        tidy_up(1);
+        return -1;
+      }
+    }
+    tracef1("writing %d bytes\n",size);
+    if (file_RW(Wdata, output, output_store, size, file_to) == -1) {
+      tidy_up(1);
+      return -1;
+    }
+    if (r.r[0] && r.r[3]) {    /* May have some input left. */
+      /* r.r[3] contains the number of input bytes left to process and r.r[2]
+       * points to the first of those bytes.
+       */
+      memcpy(input_store, (void *)r.r[2], r.r[3]);
+      load_to = input_store + r.r[3];
+      size = input_size - r.r[3];
+    } else {
+      load_to = input_store;
+      size = input_size;
+    }
+    if (!all_in_one && r.r[0]) {
+      r.r[0] = 0x3;    /* Set more input & continue flags for loop. */
+      r.r[4] = (int)output_store;
+      r.r[5] = (int)output_size;
+    }
+#ifndef UTILITY
+    visdelay_percent(100-insize*100/real_input_size);
+#endif
+  }
+#ifndef UTILITY
+  visdelay_end();
+#endif
+  close_file(output);
+  output = -1;
+
+  /* If we did the operation in stages then check the results and remove or
+   * rename any temporary files.
+   */
+  if (!all_in_one) {
+    if (do_compress && real_output_size >= real_input_size) {
+      if (file_to_file) {
+        delete_file(file_to, 1);
+        if (copy_object(file_from, file_to, 0) == -1) {
+          tidy_up(0);
+          return -1;
+        }
+      }
+      tidy_up(0);
+      return 0;
+    }
+    if (!file_to_file) {
+      tracef2("moving file, from = \"%s\", to = \"%s\"\n",file_from,file_to);
+      if (copy_object(file_to, file_from, 1)) {
+        tidy_up(0);
+        return -1;
+      }
+      free(temp_name);
+      temp_name = NULL;
+      file_to = file_from;
+    }
+  }
+
+  /* Set original time stamp, file type and attributes. */
+  r.r[0] = 1;
+  r.r[1] = (int)file_to;
+  r.r[2] = header.load;
+  r.r[3] = header.exec;
+  r.r[5] = attributes;
+  if ((err = _kernel_swi(OS_File, &r, &r)) != NULL) {
+    show_error(0, err->errmess, file_to);
+    tidy_up(0);
+    return -1;
+  }
+  /* Change the file type if compressing. */
+  if (do_compress)
+    set_type(file_to, SQUASH_TYPE);
+  tidy_up(0);
+  return 0;
+}

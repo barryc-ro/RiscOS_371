@@ -1,0 +1,216 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/fslib/ifswrap.c:networking  1.2  $
+ * $Source: /ax/networking:Starling/ShareFS/fslib/ifswrap.c: $
+ *
+ * Copyright (c) 1995 ANT Ltd., Cambridge, England
+ *
+ * $Log:	ifswrap.c,v $
+ * Revision 1.2  95/01/09  14:13:12  kwelton
+ * The header file _swis.h no longer exists, it has been adsorbed into the
+ * (new) system version of swis.h.
+ * 
+ * Revision 1.1  95/01/04  17:57:26  kwelton
+ * Initial revision
+ * 
+ */
+
+/*
+ *   Module wrapping for FS
+ */
+#include "FS.h"
+#include "ifscore.h"
+#include "swis.h"
+#include "debug.h"
+#include "RO3ONLY.h"
+
+#if !RISCOS3ONLY
+static int fakeimage=0;
+#endif
+/*
+        This is the finalisation code
+*/
+void ifs_finalise( void )
+{
+        /*
+                Close your filing system down here and free up all your memory NOW.
+                If you do not then all your filing system's junk is going to be left
+                cluttering up the RMA as this module is just about to be killed.
+        */
+	DEBUGf("ifs_finalise..");
+#if !RISCOS3ONLY
+	fs_terminate();
+#endif
+        Terminate_FileEntrys();
+#if !RISCOS3ONLY
+    if (fakeimage)
+    {   static void closedrives(void);
+	closedrives();
+        _swix(Free_DeRegister,_IN(0),FilingSystemInformationWord & 0xFF); /* Filing system numbe */
+	_swix(OS_FSControl,_INR(0,1),FSControl_RemoveFilingSystem,FilingSystemName);
+    }
+    else
+#endif
+	_swix(OS_FSControl,_INR(0,1),36,ImageFilingSystemFileType);
+    DEBUGf("ok\n");
+}
+
+typedef void fn(void);
+
+fn veneer_ientry_open,veneer_ientry_getbytes,veneer_ientry_putbytes,veneer_ientry_args,veneer_ientry_close,veneer_ientry_file,veneer_ientry_func;
+
+/*
+        Declare FS to FileSwitch
+*/
+_kernel_oserror *declare_fs( void )
+{
+        _kernel_oserror *err;
+        static int information_block[ Information_Block_Size ];
+
+	DEBUGf("declare_ifs..");
+        information_block[0] = ImageFilingSystemInformationWord;
+        information_block[1] = ImageFilingSystemFileType;
+        information_block[2] = (int)&veneer_ientry_open                - (int)Image_RO_Base;
+        information_block[3] = (int)&veneer_ientry_getbytes            - (int)Image_RO_Base;
+        information_block[4] = (int)&veneer_ientry_putbytes            - (int)Image_RO_Base;
+        information_block[5] = (int)&veneer_ientry_args                - (int)Image_RO_Base;
+        information_block[6] = (int)&veneer_ientry_close               - (int)Image_RO_Base;
+        information_block[7] = (int)&veneer_ientry_file                - (int)Image_RO_Base;
+        information_block[8] = (int)&veneer_ientry_func                - (int)Image_RO_Base;
+        err = _swix(OS_FSControl,_INR(0,3),35,Image_RO_Base,
+				(int)information_block - (int)Image_RO_Base,private_word);
+#if !RISCOS3ONLY
+	if (err)
+	{ fakeimage=1;
+	  DEBUGf("fakeimage");
+        information_block[0] = (int)FilingSystemName                    - (int)Image_RO_Base;
+        information_block[1] = (int)ModuleName                          - (int)Image_RO_Base;
+        information_block[2] = (int)&veneer_fsentry_open                - (int)Image_RO_Base;
+        information_block[3] = (int)&veneer_fsentry_getbytes            - (int)Image_RO_Base;
+        information_block[4] = (int)&veneer_fsentry_putbytes            - (int)Image_RO_Base;
+        information_block[5] = (int)&veneer_fsentry_args                - (int)Image_RO_Base;
+        information_block[6] = (int)&veneer_fsentry_close               - (int)Image_RO_Base;
+        information_block[7] = (int)&veneer_fsentry_file                - (int)Image_RO_Base;
+        information_block[8] = FilingSystemInformationWord;
+        information_block[9] = (int)&veneer_fsentry_func                - (int)Image_RO_Base;
+        information_block[10] = (int)&veneer_fsentry_gbpb               - (int)Image_RO_Base;
+
+        err = _swix(OS_FSControl,_INR(0,3),FSControl_AddFilingSystem,Image_RO_Base,
+				(int)information_block - (int)Image_RO_Base,private_word);
+        if ( !err )
+	  _swix(Free_Register,_INR(0,2),FilingSystemInformationWord & 0xFF,veneer_fsentry_free,private_word);
+
+	}
+#endif
+	DEBUGf("returns %s\n",err?err->errmess:"ok");
+        return err;
+}
+
+_kernel_oserror *ifs_initialise(void)
+{
+        _kernel_oserror *err;
+        err = Initialise_FileEntrys(  );
+        if ( !err )
+          err = declare_fs( );
+        return err;
+}
+
+void ifs_service(_kernel_swi_regs *r)
+{
+        r=r;
+        switch( r->r[1] )
+        {
+        case Service_FSRedeclare:
+                declare_fs( );
+                break;
+        }
+}
+
+#if !RISCOS3ONLY
+#define DRIVES 4
+static char drivename[DRIVES][256];
+static ImageEntry *driveie[DRIVES];
+static int drivehandle[DRIVES];
+
+/*{{{  */ static char *fixfilename( char *n ) /* return file name of i */
+{
+    char *b1;
+    static char buf[256];
+    strcpy(buf,n);
+    b1 = strrchr(buf,';');
+    if (b1)
+    { *b1 = ':';
+      if (b1>buf && b1[-1]==';')
+        b1[-1]=':';
+    }
+    return buf;
+}
+/*}}}  */
+
+char *fixsf(char *sf)
+{ int i;
+  if (!fakeimage)
+    return sf;
+  DEBUGf("fixsf(%s)",sf?sf:"NULL");
+  if ( !sf || !sf[0] )
+    return NULL;
+  for (i=0;i<DRIVES;i++)
+    if (!strcmp(sf,drivename[i]))
+    {
+      DEBUGf("Returns %p\n",driveie[i]);
+      return (char *)driveie[i];
+    }
+  for (i=0;i<DRIVES;i++)
+    if (!drivename[i][0])
+    { char *n=fixfilename(sf);
+      strcpy(drivename[i],sf);
+      drivehandle[i]=_kernel_osfind( 0x40, n );
+      if (drivehandle[i]<0)
+      { DEBUGf("Error %s",_kernel_last_oserror()->errmess);
+        drivehandle[i]=0;
+      }
+      DEBUGf("Open %s=%d,",n,drivehandle[i]);
+      driveie[i]=FileEntry_NewImage(drivehandle[i],0);
+      DEBUGf("Returns %p\n",driveie[i]);
+      return (char *)driveie[i];
+    }
+  return NULL;  /* close a file here */
+}
+
+static void closedrives(void)
+{ int i;
+  for (i=0;i<DRIVES;i++)
+  if (drivename[i][0])
+  { FileEntry_OldImage(driveie[i]);
+    _kernel_osfind( 0, (char*)drivehandle[i] );
+  }
+}
+
+char *FileEntry_DiscName(FileEntry *fe)
+{ fe=fe;
+  return 0;
+}
+
+char *FileEntry_SpecialField(FileEntry *fe)
+{ int k;
+  int h;
+  if (fakeimage)
+  {
+  h=FileEntry_ImageHandle(fe);
+  for (k=0;k<DRIVES;k++)
+    if (h==drivehandle[k])
+      return drivename[k];
+  }
+  return 0;
+}
+#else
+char *FileEntry_DiscName(FileEntry *fe)
+{ fe=fe;
+  return 0;
+}
+
+char *FileEntry_SpecialField(FileEntry *fe)
+{ fe=fe;
+  return 0;
+}
+#endif

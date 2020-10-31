@@ -1,0 +1,581 @@
+/* > tracks.c
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "dboxes.h"
+#include "file.h"
+#include "msgs.h"
+#include "xferrecv.h"
+#include "werr.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "dboxinc.h"
+#include "macros.h"
+#include "strfn.h"
+#include "wmisc.h"
+
+#include "arutils.h"
+
+#include "compress.h"
+
+#define CANCEL_FIELD    1
+#define OK_FIELD        0
+
+#define INSERT_FIELD    20
+#define DELETE_FIELD    21
+
+#define TRACK_NUM_FIELD 7
+#define NTRACKS_FIELD   19
+
+#define FILE_NUM_FIELD  15
+#define NFILES_FIELD    11
+
+#define FILENAME_FIELD      3
+#define DESCRIPTION_FIELD   5
+#define COMPRESS_FIELD      22
+
+#define SOUND_INFO_FIELD    23
+
+#define TRACKS_IDENT        "tracks"
+
+#define MONO                msgs_lookup("mono")
+#define STEREO_LR           msgs_lookup("stereo")
+#define STEREO_RL           msgs_lookup("stereor")
+#define NCHANS              msgs_lookup("nchans")
+
+#define NO_SOUNDTRACK       msgs_lookup("Mtracks0")
+#define TRACK_STRUCTURES    msgs_lookup("Mtracks1")
+#define SOUND_INFO_FORMAT   msgs_lookup("Mtracks2")
+#define TYPE1_FORMAT        msgs_lookup("Mtracks3")
+#define CANT_ADD_TO_LOCALS  msgs_lookup("Mtracks4") 
+
+static int              srcfile_current = 0;
+static int              track_current = 0;
+
+static array            copy_of_array = NULL;
+static compress_flag    copy_of_compress_flags;
+
+static dbox             track_d = NULL;
+
+/* ------------------------------------------------------------------------------------------ */
+
+static int srcfile_free(sound_trackstr *sp)
+{
+    c_free((mem_ptr)&sp->sound);
+    c_free((mem_ptr)&sp->filename);
+    return sp->ntracks;
+}
+
+void srcfile_deleteall(array src)
+{
+    int i, n = NSRCFILES(src);
+    for (i = 0; i < n; i++)
+        srcfile_free(SRCFILE_PTR(src, i));
+
+    array_delete(src, 0, n);
+}
+
+int srcfile_delete(array src, int entry)
+{
+    int ntracks = srcfile_free(SRCFILE_PTR(src, entry));
+
+    array_delete(src, entry, 1);
+
+    return ntracks;
+}
+
+BOOL srcfile_insert(array src, int entry, int n)
+{
+    int nsrcfiles = NSRCFILES(src);
+    if (entry > nsrcfiles)
+        entry = nsrcfiles;
+    if (array_insert(src, entry, n))
+    {
+        sound_trackstr *sp = SRCFILE_PTR(src, entry);
+        memset(sp, 0, n*sizeof(sound_trackstr));
+        return TRUE;
+    }
+    oom_err(TRACK_STRUCTURES, n*sizeof(sound_trackstr));
+    return FALSE;
+}
+
+int srcfile_copy(array src, int entry, const char *filename,
+                        const armovie_soundstr *sound, int ntracks)
+{
+    if (NSRCFILES(src) != 0 || srcfile_insert(src, 0, 1))
+    {
+        sound_trackstr *sp = SRCFILE_PTR(src, entry);
+        int size = ntracks * sizeof(armovie_soundstr);
+        if (c_alloc((mem_ptr)&sp->sound, size))
+        {
+            memcpy(sp->sound, sound, size);
+            sp->ntracks = ntracks;
+            strrplc(&sp->filename, filename);
+    
+            return ntracks;
+        }
+        oom_err(TRACK_STRUCTURES, size);
+    }
+    return 0;
+}
+
+/*
+ * This function scans through all the tracks registered to see if
+ * any of them are marked as being 16bit linear for compression.
+ * If any are it returns TRUE.
+ */
+
+BOOL srcfile_scanforcompression(array src)
+{
+    int file, track, n = NSRCFILES(src);
+    for (file = 0; file < n; file++)
+    {
+        sound_trackstr *sp = SRCFILE_PTR(src, file);
+        for (track = 0; track < sp->ntracks; track++)
+        {
+            armovie_soundstr *sound = &sp->sound[track];
+            if (sound->format == 2 && sound->precision == 16 &&
+                    strcmpi(sound->filename, "adpcm"))
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+/*
+ * Copy array contents and return number of tracks in total
+ */
+
+static int copy_array(array from, array to)
+{
+    int i, n = NSRCFILES(from),
+        ntracks = 0;
+
+/* clear out destination */
+    srcfile_deleteall(to);
+    if (n && srcfile_insert(to, 0, n))
+        for (i = 0; i < n; i++)
+        {
+            sound_trackstr *sp = SRCFILE_PTR(from, i);
+            ntracks += srcfile_copy(to, i, sp->filename, sp->sound, sp->ntracks);
+        }
+
+    return ntracks;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+static void notify_fn1(int val, void *handle);
+static void notify_fn2(int val, void *handle);
+
+static dbox_incstr  track_inc =
+{
+    1, 0,
+    1, 1,
+    0, 0, notify_fn1
+},                  srcfile_inc =
+{
+    1, 0,
+    1, 1,
+    0, 0, notify_fn2
+};
+
+/* ------------------------------------------------------------------------------------------ */
+
+static void fade_track(dbox d, BOOL fade)
+{
+    dboxinc_fade(d, TRACK_NUM_FIELD, fade, FALSE);
+    dbox_fadestate(d, NTRACKS_FIELD, fade);
+    dbox_fadestate(d, DESCRIPTION_FIELD, fade);
+    dbox_fadestate(d, SOUND_INFO_FIELD, fade);
+}
+
+static void fade_srcfile(dbox d, BOOL fade)
+{
+    dboxinc_fade(d, FILE_NUM_FIELD, fade, FALSE);
+    dbox_fadestate(d, FILENAME_FIELD, fade);
+    dbox_fadestate(d, NFILES_FIELD, fade);
+
+    dbox_fadestate(d, DELETE_FIELD, fade);
+}
+
+static char *audio_channels_string(char *buffer, armovie_soundstr *sp)
+{
+    switch (sp->channels)
+    {
+        case 1:
+            strcpy(buffer, MONO);
+            break;
+        case 2:
+            strcpy(buffer, sp->sflags & armovie_ReversedStereo ? STEREO_RL : STEREO_LR);
+            break;
+        default:
+            sprintf(buffer, NCHANS, sp->channels);
+            break;
+    }
+    return buffer;
+}
+
+static void set_track(dbox d, sound_trackstr *sp, int num)
+{
+    if (sp && sp->ntracks)
+    {
+        armovie_soundstr *sound;
+        char buffer[16];
+    
+        fade_track(d, FALSE);
+
+        if (num >= sp->ntracks)
+            num = sp->ntracks - 1;
+
+        sound = &sp->sound[num];
+
+        dbox_setfieldf(d, SOUND_INFO_FIELD, SOUND_INFO_FORMAT,
+            sound->format,
+            audio_channels_string(buffer, sound),
+            sound->rate,
+            sound->rate < 256 ? "µs" : "Hz");
+
+        switch (sound->format)
+        {
+            case replay_StandardAudio:
+                dbox_setfieldf(d, DESCRIPTION_FIELD, TYPE1_FORMAT,
+                    sound->precision, msgs_lookup(sound->filename));
+                break;
+
+            case replay_IndirectAudio:
+            {
+                arsnd_info info;
+                arsnd_readinfo(sound->filename, &info, TRUE);
+                dbox_setfield(d, DESCRIPTION_FIELD, info.description);
+                arsnd_freeinfo(&info);
+                break;
+            }
+
+            default:
+                dbox_setfield(d, DESCRIPTION_FIELD, "");
+                break;
+        }
+
+        track_current = num;
+        dbox_setnumeric(d, TRACK_NUM_FIELD, num + 1);
+
+    }
+    else
+    {
+        fade_track(d, TRUE);
+
+        dbox_setfield(d, TRACK_NUM_FIELD, "");
+        dbox_setfield(d, DESCRIPTION_FIELD, "");
+        dbox_setfield(d, SOUND_INFO_FIELD, "");
+    }
+}
+
+static void set_srcfile(dbox d, compress_str *cp, int num)
+{
+    int nsrcfiles = NSRCFILES(cp->srcfile);
+
+    if (nsrcfiles == 0)
+    {
+        fade_srcfile(d, TRUE);
+
+        dbox_setfield(d, FILE_NUM_FIELD, "");
+        dbox_setfield(d, NFILES_FIELD, "");
+        dbox_setfield(d, FILENAME_FIELD, "");
+        dbox_setfield(d, NTRACKS_FIELD, "");
+
+        set_track(d, NULL, 0);
+    }
+    else
+    {
+        sound_trackstr *sp;
+    
+        fade_srcfile(d, FALSE);
+
+        if (num >= nsrcfiles)
+            num = nsrcfiles - 1;
+
+        sp = SRCFILE_PTR(cp->srcfile, num);
+
+        srcfile_current = num;
+        dbox_setnumeric(d, FILE_NUM_FIELD, num + 1);
+        dbox_setnumeric(d, NFILES_FIELD, nsrcfiles);
+        dbox_setfield(d, FILENAME_FIELD, strsafe(sp->filename));
+        dbox_setnumeric(d, NTRACKS_FIELD, sp->ntracks);
+
+        track_inc.max = sp->ntracks;
+        srcfile_inc.max = nsrcfiles;
+
+        set_track(d, sp, 0);
+    }
+}
+
+static void notify_fn1(int val, void *handle)
+{
+    compress_str    *cp = handle;
+    sound_trackstr  *sp = SRCFILE_PTR(cp->srcfile, srcfile_current);
+    set_track(track_d, sp, val - 1);
+}
+
+static void notify_fn2(int val, void *handle)
+{
+    compress_str *cp = handle;
+    set_srcfile(track_d, cp, val - 1);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+static void set_fields(dbox d, compress_str *cp)
+{
+    set_srcfile(d, cp, 0);
+
+    dbox_setnumeric(d, COMPRESS_FIELD, cp->o.flags & compress_CompressAudio);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+static void tracks_events(dbox d, void *handle)
+{
+    compress_str    *cp = handle;
+    dbox_field      action = dbox_get(d);
+
+    switch (action)
+    {
+        case dbox_CLOSE:
+            tracks_dispose();
+            break;
+
+        case CANCEL_FIELD:
+            cp->nsoundtracks = copy_array(copy_of_array, cp->srcfile);
+            cp->o.flags &= ~compress_CompressAudio;
+            cp->o.flags |= copy_of_compress_flags & compress_CompressAudio;
+            if (dbox_persist())
+                set_fields(d, cp);
+            else
+                tracks_dispose();
+            break;
+
+        case OK_FIELD:
+            if (dbox_persist())
+                copy_array(cp->srcfile, copy_of_array);
+            else
+                tracks_dispose();
+            break;
+
+        case INSERT_FIELD:
+            if (NSRCFILES(cp->srcfile) != 0 && SRCFILE_PTR(cp->srcfile, 0)->filename == NULL)
+                werr(0, CANT_ADD_TO_LOCALS);
+
+            else if (srcfile_insert(cp->srcfile, srcfile_current + 1, 1))
+                set_srcfile(d, cp, srcfile_current + 1);
+            break;
+
+        case DELETE_FIELD:
+            cp->nsoundtracks -= srcfile_delete(cp->srcfile, srcfile_current);
+            set_srcfile(d, cp, srcfile_current);
+            break;
+
+        case COMPRESS_FIELD:
+            cp->o.flags &= ~compress_CompressAudio;
+            if (dbox_getnumeric(d, COMPRESS_FIELD))
+                cp->o.flags |= compress_CompressAudio;
+            break;
+
+        default:
+            (void) (dboxinc_processinc(d, TRACK_NUM_FIELD, action, &track_inc, cp) ||
+                    dboxinc_processinc(d, FILE_NUM_FIELD, action, &srcfile_inc, cp));
+            break;
+    }
+}
+
+/*
+ * When a Replay file with sound is dropped on, then replace 'srcfile_current' with it.
+ */
+
+static BOOL tracks_rawevents(dbox d, void *event, void *handle)
+{
+    compress_str    *cp = handle;
+    wimp_eventstr   *e = event;
+    char            *filename;
+
+    switch (xferrecv_checkinsert(&filename))
+    {
+        case filetype_ARMovie:
+        {
+            armovie_hdr *hdr;
+            if (armovie_identify(filename, &hdr))
+            {
+                if (hdr->nsoundtracks)
+                {
+                    if (NSRCFILES(cp->srcfile))
+                        cp->nsoundtracks -= srcfile_free(SRCFILE_PTR(cp->srcfile, srcfile_current));
+
+                    cp->nsoundtracks += srcfile_copy(cp->srcfile, srcfile_current, filename, hdr->sound, hdr->nsoundtracks);
+
+                    set_srcfile(d, cp, srcfile_current);
+                }
+                else
+                    werr(0, NO_SOUNDTRACK, filename);
+                armovie_freehdr(hdr);
+            }
+            xferrecv_insertfileok();
+            return TRUE;
+        }
+    }
+    return FALSE;
+    UNUSED(e);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+void tracks_open(compress_str *cp)
+{
+    dbox d = track_d;
+    if (d)
+        bring_to_front(dbox_syshandle(d));
+
+    else if ((d = dbox_new(TRACKS_IDENT)) != NULL)
+    {
+        track_d = d;
+
+        dbox_showstatic(d);
+        dbox_eventhandler(d, tracks_events, cp);
+        dbox_raw_eventhandler(d, tracks_rawevents, cp);
+
+        tracks_refresh(cp);
+    }
+}
+
+void tracks_dispose(void)
+{
+    if (track_d)
+    {
+        dbox_savepos(track_d);
+        dbox_dispose(&track_d);
+        track_d = NULL;
+    }
+}
+
+BOOL is_tracks_open(void)
+{
+    return track_d != NULL;
+}
+
+void tracks_refresh(compress_str *cp)
+{
+    dbox d = track_d;
+    if (d)
+    {
+        if (copy_of_array == NULL)
+            copy_of_array = array_new(0, sizeof(sound_trackstr), c_alloc, c_free);
+        copy_array(cp->srcfile, copy_of_array);
+        copy_of_compress_flags = cp->o.flags;
+
+        set_fields(d, cp);
+    }
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+#if 0
+BOOL tracks_savetext(compress_str *cp)
+{
+    filehandle  f;
+    char        filename[256];
+    sprintf(filename, "%s.%sTracks", cp->work_dir, index_string(cp));
+    if (os_err(file_open(fopt_Write, filename, &f)) == NULL)
+    {
+        int i, nsrcfiles = NSRCFILES(cp->srcfile);
+        for (i = 0; i < nsrcfiles; i++)
+        {
+            sound_trackstr *sp = SRCFILE_PTR(cp->srcfile, i);
+            file_writef(f, "%s\n", strsafe(sp->filename));
+        }
+
+        file_close(f);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static int scan_tracks(const char *filename, int filetype, int size, void *handle)
+{
+    compress_str *cp = handle;
+    armovie_hdr *hdr;
+    if (armovie_identify(filename, &hdr))
+    {
+        int n = NSRCFILES(cp->srcfile);
+        if (hdr->nsoundtracks && srcfile_insert(cp->srcfile, n, 1))
+            cp->nsoundtracks += srcfile_copy(cp->srcfile, n, filename, hdr->sound, hdr->nsoundtracks);
+        armovie_freehdr(hdr);
+    }
+    return 1;
+    UNUSED(size);
+    UNUSED(filetype);
+}
+
+/*
+ * If a tracks file exists then zero the current soundtrack count
+ * and replace with info from the file, scanning each movie listed again.
+ */
+
+BOOL tracks_loadtext(compress_str *cp)
+{
+    char filename[256];
+    sprintf(filename, "%s.%sTracks", cp->work_dir, index_string(cp));
+
+    if (file_size(filename, NULL) > 0)
+    {
+        srcfile_deleteall(cp->srcfile);
+        cp->nsoundtracks = 0;
+        return batch_scandir(filename, scan_tracks, cp);
+    }
+
+    return FALSE;
+}
+
+#endif
+
+static opt_line_t track_opts[] =
+{
+    { "Track", NULL, NULL, opt_MallocString, 256, offsetof(sound_trackstr, filename) },
+    { NULL, NULL, NULL, opt_EndOfList }
+};
+
+void tracks_write(optfile of, int code, array srcfile)
+{
+    int i, n = NSRCFILES(srcfile);
+    for (i = 0; i < n; i++)
+    {
+        sound_trackstr *sp = SRCFILE_PTR(srcfile, i);
+        if (sp->filename)
+            opt_write(of, code, track_opts, sp);
+    }
+}
+
+int tracks_read(optfile of, array srcfile)
+{
+    armovie_hdr     *hdr;
+    sound_trackstr  entry;
+    int             nsoundtracks = 0;
+
+    opt_read(of, track_opts, &entry);
+    if (armovie_identify(entry.filename, &hdr))
+    {
+        int n = NSRCFILES(srcfile);
+        if (hdr->nsoundtracks && srcfile_insert(srcfile, n, 1))
+            nsoundtracks = srcfile_copy(srcfile, n, entry.filename, hdr->sound, hdr->nsoundtracks);
+        armovie_freehdr(hdr);
+    }
+    return nsoundtracks;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+/* eof tracks.c */

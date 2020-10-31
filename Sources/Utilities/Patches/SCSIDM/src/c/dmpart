@@ -1,0 +1,1514 @@
+/*
+ * $Header: /smsa/bsd:etc/scsidm/dmpart.c:bsd  1.10  $
+ * $Source: /smsa/bsd:etc/scsidm/dmpart.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:        dmpart.c,v $
+ * Revision 1.10  90/08/13  15:21:54  jroach
+ * Bring Risc OS and RISCiX version in line with each other.
+ * 
+ * Revision 1.9  90/08/02  15:55:05  kwelton
+ * Initialise lastblok to 0 in getparts(): this does no other useful
+ * purpose than keep the compiler quiet.
+ * getapart() now allows the maximum allowable partition length to be
+ * entered as a default.
+ * 
+ * Revision 1.8  90/05/25  10:56:10  kwelton
+ * A couple of small changes to the way RISCiX partitions are initialised.
+ * Fixed a bug in new_structure where linkbits failed to take account of
+ * the device block size.
+ * 
+ * Revision 1.7  89/09/13  17:57:48  kwelton
+ * Put in a fix provided by Richard Manby where dr_log2alloc was always set to
+ * 10 (allocation units of 1K) within new_structure(). This is OK up to disk
+ * sizes of ~250 Mb, but broke the directory structure for bigger disks. The
+ * new version now looks at the disk size & tries to set an appropriate
+ * allocation unit.
+ * 
+ * Revision 1.6  89/06/20  18:28:09  kwelton
+ * Added code to restrict a partition's length to a multiple of BLKDEV_IOSIZE.
+ * This is a restriction imposed by the kernel's block device I/O routines.
+ * 
+ * Revision 1.5  89/06/15  10:04:47  kwelton
+ * P_BOOT no longer exists on SCSI devices, removed code to name that
+ * partition.
+ * 
+ * Revision 1.4  89/05/25  10:29:34  kwelton
+ * 
+ * Added code to align the start of all partitions on a DEV_BSIZE
+ * boundary.
+ * 
+ * Revision 1.3  89/04/27  10:27:20  kwelton
+ * Fixed what looked like a sign extension problem with the unix start
+ * cylinder number: this turned out not to be the bug I was chasing, but
+ *  it is a good idea to keep the `fix' in anyway.
+ * 
+ * Revision 1.2  89/04/18  18:40:33  kwelton
+ * Tidied up a prompt to look more like all the others.
+ * 
+ * Revision 1.1  89/04/06  11:22:04  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /smsa/bsd:etc/scsidm/dmpart.c:bsd  1.10  $";
+#endif
+
+/*> partition.c <*/
+/*-----------------------------------------------------------------------*/
+/*                     (c) 1988 Acorn Computers Ltd.                     */
+/*        provide ARTHUR/RISC OS ADFS winchester mapping structures      */
+/*-----------------------------------------------------------------------*/
+
+/*
+ * Modified by ABray to make all internal routines static - otherwise it
+ * breaks the existing library - which is still needed to perform block I/O
+ */
+
+#include <stdio.h>
+#include <string.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "ps_direct.h"
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <dev/ps_direct.h>
+#endif
+#include "scsidm.h"
+#include "partition.h"
+
+static char inpbuf[CANBSIZ];
+static char prompt[CANBSIZ];
+
+        /* import externals */
+import char **iphelp;
+import u_int unixstart, unixlen;
+import u_char nptblocks;
+import u_char part_gotmap;
+import struct d_parms *cdev;
+
+        /* declare external functions */
+import unsigned long iplims(), vdul();
+import void *malloc();
+
+        /* declare routines defined this segment */
+u_char fn_sum();
+void initparts();
+bool getparts();
+static bool putparts(), getapart();
+
+/*-----------------------------------------------------------------------*/
+
+#define bufsize (0x8000)      /* maximum buffer size of 32K */
+#define deflog2alloc (10)     /* default allocation size */
+
+/*-----------------------------------------------------------------------*/
+
+#ifdef DEBUG
+static void debug_mem(base,amount)
+
+char *base;
+int amount;
+
+{
+ u_char cchr;
+ int cwidth = 0;
+ int cdepth = 0;
+
+ for (; (amount > 0); amount--)
+ {
+   if (cwidth == 0)
+    printf("%04x: ",cdepth);
+
+   cchr = (u_char)*base++;
+   printf("%02x ",cchr);
+   if (cwidth++ == (16 - 1))
+   {
+     cwidth = 0;
+     cdepth += 16;
+     printf("\n");
+   }
+ }
+}
+#endif /* DEBUG */
+
+/*-----------------------------------------------------------------------*/
+/*-----------------------------------------------------------------------*/
+/*-----------------------------------------------------------------------*/
+/* getword and putword:
+ * small functions to construct non-aligned word values
+ */
+static u_int getword(addr)
+
+u_char *addr;
+
+{
+ u_int value = 0;
+ int loop;
+
+ for (loop = 0; (loop < 4); loop++)
+  value |= ((*addr++ & 0xFF) << (8 * loop));
+
+ return(value);
+}
+
+static void putword(addr,value)
+
+u_char *addr;
+u_int value;
+
+{
+ int loop;
+
+ for (loop = 0; (loop < 4); loop++)
+  *addr++ = ((value & (0xFF << (8 * loop))) >> (8 * loop));
+}
+
+/*-----------------------------------------------------------------------*/
+/*
+ * the original BASIC implementation utilised a very large number of global
+ * variables, with all the small procedures and functions directly accessing
+ * them...
+ * this initial implementation has replaced these routines by MACROs...
+ * this is NOT very efficient but was the quickest and easiest way to get the
+ * code to execute correctly...
+ */
+
+#define calcids(u,l,w,o) {                                      \
+                          idsperzone = u / (l + 1);             \
+                          ids = idsperzone * w + o / (l + 1);   \
+                         }
+
+#define calczones(dr,s,m,z0,a) {                                         \
+                                usedbits = bytespersec(dr) * 8 - s;      \
+                                wholezones = (m + z0) / usedbits;        \
+                                oddbits = (m + z0) % usedbits;           \
+                                if (oddbits != 0)                        \
+                                 zones = wholezones + 1;                 \
+                                else                                     \
+                                 zones = wholezones;                     \
+                                mapzone = zones / 2;                     \
+                                if (mapzone == 0)                        \
+                                 mapadd = 0;                             \
+                                else                                     \
+                                 mapadd = (usedbits * mapzone - z0) * a; \
+                                maplen = zones * bytespersec(dr);        \
+                               }
+
+#define disctomap(v,d,a,z0,u,s) {                                       \
+                                 int bit;                               \
+                                 int zone;                              \
+                                 bit = ((d) / (a)) + (z0);              \
+                                 zone = (bit / (u));                    \
+                                 bit = bit + (bit / (u)) * (s) + 4 * 8; \
+                                 v = bit;                               \
+                                }
+
+#define writelength(o,l) {                                                \
+                          int off = (o);                                  \
+                          if ((l) <= linkbits)                            \
+                           {                                              \
+                            printf("writelength: fatal program error\n"); \
+                            exit(1);                                      \
+                           }                                              \
+                          off = off + (l) - 1;                            \
+                          buf[off / 8] += (1 << (off % 8));               \
+                         }
+
+#define writelink(o,l) {                                                  \
+                        int     bit;                                      \
+                        u_char *add;                                      \
+                        u_int   mask;                                     \
+                        u_int   value;                                    \
+                        if ((l) >= (1 << linkbits))                       \
+                         {                                                \
+                          printf("writelink: fatal program error\n");     \
+                          exit(1);                                        \
+                         }                                                \
+                        bit = (o) % 8;                                    \
+                        add = (u_char *)(buf + ((o) / 8));                \
+                        mask = (1 << linkbits) - 1;                       \
+                        value = (getword(add) & ~(mask<<bit))|((l)<<bit); \
+                        putword(add,value);                               \
+                       }
+
+/*-----------------------------------------------------------------------*/
+
+static void checkput(i,check)
+
+u_int i, *check;
+
+{
+ *check = (*check >> 13) ^ ((*check & ((1 << 13) - 1)) << (32 - 13)) ^ i;
+}
+
+/*-----------------------------------------------------------------------*/
+
+static void sum(base,len)
+
+char *base;
+int len;
+
+{
+ /* calculate an old style checksum */
+ base[len - 1] = fn_sum((u_char *)base,len);
+}
+
+/*-----------------------------------------------------------------------*/
+
+
+/*-----------------------------------------------------------------------*/
+/* writerootdir:
+ * write the default root directory onto the current drive
+ */
+static int writerootdir(bbptr,rootdiradd,newmap)
+
+ADFS_bblock *bbptr;
+int rootdiradd, newmap;
+
+{
+ ADFS_drecord *dr = &(bbptr->bb_discrec);
+ char  *buf;
+ int   *ibuf;
+ int    bf;
+ u_int  check;
+ int    i;
+
+#ifdef DEBUG
+ printf("writerootdir: rootdiradd = &%x\n",rootdiradd);
+#endif
+
+ if ((buf = malloc(bufsize)) == NULL)
+ {
+#ifdef DEBUG
+   printf("writerootdir: failed to allocate buffer memory\n");
+#endif
+   return(-1);
+ }
+
+ ibuf = (int *)buf;
+
+ /* zero the buffer */
+ for (i=0; (i < dirsize); i++)
+  buf[i] = 0x00;
+
+ buf[1] = ((hmagic >>  0) & 0xFF);
+ buf[2] = ((hmagic >>  8) & 0xFF);
+ buf[3] = ((hmagic >> 16) & 0xFF);
+ buf[4] = ((hmagic >> 24) & 0xFF);
+
+ bf = dirsize;
+
+ if (newmap == NEWMAP)
+ {
+   buf[bf - 38] = ((dr->dr_rootSIN >>  0) & 0xFF);
+   buf[bf - 37] = ((dr->dr_rootSIN >>  8) & 0xFF);
+   buf[bf - 36] = ((dr->dr_rootSIN >> 16) & 0xFF);
+   buf[bf - 35] = ((dr->dr_rootSIN >> 24) & 0xFF);
+ }
+ else
+ {
+   buf[bf - 38] = (((dr->dr_rootSIN / 0x0100) >>  0) & 0xFF);
+   buf[bf - 37] = (((dr->dr_rootSIN / 0x0100) >>  8) & 0xFF);
+   buf[bf - 36] = (((dr->dr_rootSIN / 0x0100) >> 16) & 0xFF);
+   buf[bf - 35] = (((dr->dr_rootSIN / 0x0100) >> 24) & 0xFF);
+ }
+
+ buf[bf - 35] = '$';
+ buf[bf - 16] = '$';
+
+ buf[bf - 5] = ((hmagic >>  0) & 0xFF);
+ buf[bf - 4] = ((hmagic >>  8) & 0xFF);
+ buf[bf - 3] = ((hmagic >> 16) & 0xFF);
+ buf[bf - 2] = ((hmagic >> 24) & 0xFF);
+
+ check = 0;
+
+ checkput((u_int)ibuf[0],&check);
+ checkput((u_int)buf[4],&check);
+
+ i = (bf - 40);
+
+ while ((i & 3) != 0)
+ {
+   checkput((u_int)buf[i],&check);
+   i++;
+ }
+
+ while (i < (bf - 4))
+ {
+   checkput((u_int)ibuf[(i / sizeof(int))],&check);
+   i += 4;
+ }
+
+ check = check ^ (check >> 16);
+ check = (check ^ (check >> 8)) & 0xFF;
+
+ buf[bf - 1] = (u_char)check;
+
+#ifdef DEBUG
+ printf("writerootdir: directory memory\n");
+ debug_mem(buf,dirsize);
+#endif
+
+ if( wrtdev((long)rootdiradd,buf,(long)dirsize,FALSE) != GOOD )
+ {
+   printf("writerootdir: failed to write directory block\n");
+   free(buf);
+   return(-1);
+ }
+
+ free(buf);
+ return(0);
+}
+
+/*-----------------------------------------------------------------------*/
+/*- E X T E R N A L  functions ------------------------------------------*/
+/*-----------------------------------------------------------------------*/
+
+/************************************************************************/
+
+ADFS_bblock *read_bblock()
+
+{
+        /*
+         * subroutine read_bblock() -
+         *
+         * routine reads the shape for the current drive
+         * returns a pointer to the drives boot block (which contains all the
+         * necessary shape information) or NULL if the shape could NOT be read
+         *
+         * The caller MUST release the allocated buffer when
+         * it has finished with it
+         *
+         * NOTE: after calling this routine ADFS still sees the drive
+         * shape as the default used... the user must re-specify the
+         * disc shape with the information read (or changed) before
+         * performing any operations on the disc...
+         *
+         */
+
+        ADFS_bblock *bbptr = NULL;
+
+        if ((bbptr = malloc(BOOTSIZE)) != NULL)
+        {
+         /*
+          * read the boot block from current drive
+          * into the allocated buffer
+          *
+          */
+         if( rddev((long)ADFSBOOT,(char *)bbptr,(long)BOOTSIZE,FALSE) != GOOD )
+         {
+          printf("read_bblock: failed to read boot block\n");
+          free(bbptr);
+          return(NULL);
+         }
+        }
+
+        return(bbptr);
+}
+
+/************************************************************************/
+
+/* new_structure:
+ * construct a RISC OS ADFS winchester map
+ * on entry the passed boot block contains all the necessary information to
+ * describe the disc and will be updated with all the calculated information
+ *
+ * the "dsize" passed is the size of the desired ADFS partition and not
+ * necessarily that of the complete winchester...
+ * 
+ * returns:
+ *          -2 : bad "log2alloc" number
+ *          -1 : general failure
+ *           0 : successful
+ */
+
+int new_structure(bbptr,dsize)
+
+u_int dsize;
+ADFS_bblock *bbptr;
+
+{
+ ADFS_drecord *dr = &(bbptr->bb_discrec);
+ int    zone0bits = (60 * 8);
+ int    zonebits  = (bytespersec(dr) * 8);
+ int    alloc = 0;
+ int    mapbits = 0;
+ int    roundsize = 0;
+ int    bestzones = 0;
+ int    bestcyloff = 0;
+ int    dummyspare = 0;
+ int    sparebits = 0;
+ int    linkbits = 0;
+ int    usedbits = 0;
+ int    wholezones = 0;
+ int    oddbits = 0;
+ int    zones = 0;
+ int    mapzone = 0;
+ int    mapadd = 0;
+ int    maplen = 0;
+ int    crucial = 0;
+ int    crucialend = 0;
+ int    bestlinkbits = 0;
+ int    bestspare = 0;
+ int    cyloff = 0;
+ u_int  defect = 0;
+ u_int *defptr = NULL;
+ int    rootdiradd = defrootadd;
+ int    ids = 0;
+ int    idsperzone = 0;
+ int    discendbit = 0;
+ int    zoneendbit = 0;
+ int    defectend = 0;
+ int    nextdefect = 0;
+ int    nextdef = 0;
+ int    i = 0;
+ char  *buf = NULL;
+ char  *tptr = NULL;
+ int    zone = 0;
+ u_int *zonestart = NULL;
+ char  *zstemp = NULL;
+ int    zonestartbit = 0;
+ int    usedzoneendbit = 0;
+ int    zonebit = 0;
+ int    prefree = 0;
+ int    length = 0;
+ int    ptr = 0;
+ int    defectstart = 0;
+ int    done1 = FALSE;
+ int    done2 = FALSE;
+ int    tmp_alloc = 0;
+       
+ static char sectionhelp[63];
+
+ static char *sectioniphelp[] =
+ {
+  "The  current command is section a disk. Enter the ",
+  sectionhelp,
+  "default value supplied.",
+  ""
+ };
+
+/*
+ * The minimum and maximum size of log2alloc
+ * 256 bytes to 4Kbytes
+ */
+#define MIN_ALLOC       8
+#define MAX_ALLOC       12
+
+#ifdef DEBUG
+ printf("new_structure: bbptr = &%x\n",(int)bbptr);
+ printf("new_structure: log2alloc %d\n",log2alloc(dr));
+ printf("new_structure: rootdiradd = &%x\n",rootdiradd);
+#endif
+
+ /*
+  * 89/08/15 KWelton
+  *
+  * dr_log2alloc is unset so the code uses a default of 10
+  * (1K), this is OK up to ~250 MBytes, then falls over because
+  * the free space map is broken. Use 1K for all sizes up to 150MB,
+  * (stops allocation getting v. slow), 2K for 150 -> 300 MB, and
+  * 4K for 300MB & above (filecore cannot support disks > 512MB).
+  */
+/* RCM>>>                                                                   */
+/*                                                                          */
+/*  By experiment, it would seem that a free space allocation unit of 1K    */
+/*  (ie dr_log2alloc=10) is valid for upto 250Mb of RISC OS partition.      */
+/*  Above this (actually 253MBytes), a bad free space map is produced, This */
+/*  leads to 'Broken directory' messages from filecore.                     */
+/*                                                                          */
+/*  For safety, lets use:                                                   */
+/*    1K        10       0..150MBytes                                       */
+/*    2K        11     150..300                                             */
+/*    4K        12     300..600 (Filecore limit is 512 MByte)               */
+/*                                                                          */
+#if 1
+  if( dsize <= (150 * 1024 * 1024) )
+    dr->dr_log2alloc = 10;
+  else if( dsize <= (300 * 1024 * 1024) )
+    dr->dr_log2alloc = 11;
+  else
+    dr->dr_log2alloc = 12;
+#else
+ /*
+  * This test is not needed with the above patch
+  * provided, as the condition is never true.
+  */
+ if ((log2alloc(dr) < MIN_ALLOC) || (log2alloc(dr) > MAX_ALLOC))
+  dr->dr_log2alloc = deflog2alloc;
+#endif /* 1 */
+
+
+/*
+ * 91/11/24 David Roberts
+ *
+ * Added the following so the experienced user can select the optimum
+ * value of dr->dr_log2alloc. If the user doesn't take the default
+ * value and it blows up in their face then they only have themselves to blame.
+ */
+
+
+ /* fill in the large file allocation unit for the help message */
+ sprintf(sectionhelp,
+         "large file allocation unit (default %d), press enter to use the",
+                dr->dr_log2alloc);
+ iphelp = sectioniphelp;
+
+ /* read the large file allocation unit */
+ sprintf(prompt,"large file allocation unit: %d? (%d bytes) >",
+        dr->dr_log2alloc,(1 << dr->dr_log2alloc));
+
+ tmp_alloc  = (int)iplims(inpbuf,prompt,vdul,MIN_ALLOC,MAX_ALLOC,TRUE);
+
+ /* test for bad value */
+ if(tmp_alloc == BADARG )
+        /* routine failed */
+        return(FALSE);
+  /*
+   * If we have entered any value then set dr_log2alloc to it
+   * if not, dr_log2alloc already has a default value set.
+   */
+  else if( tmp_alloc != USEDEFAULT )
+          dr->dr_log2alloc = tmp_alloc;
+
+ alloc = (1 << log2alloc(dr));
+
+ /* do NOT ask the user for "log2alloc" (it should be in the disc record) */
+ /*
+  * 91/11/24 David Roberts
+  *
+  * Indeed it should; however there should be a way for this to be altered to
+  * help solve the level 3 -> level 4 copying problem.
+  */
+
+ /* 
+  * 91/11/24 David Roberts
+  *
+  * The following six lines were taken from the file cmd.c
+  * to get the output to the user in the correct order.
+  */
+
+#if defined(SCSIDM_FOR_RISCOS)
+    fputs("Writing RISC OS partition...",stdout);
+#elif defined(SCSIDM_FOR_RISCiX)
+    fputs("Writing SCSIFS partition...",stdout);
+#endif
+    fflush(stdout);
+
+ mapbits = (dsize / alloc);
+ roundsize = (mapbits * alloc);
+ bestzones = (1 << 30);             /* init to rogue values */
+ bestcyloff = (1 << 30);
+
+ for (dummyspare = 1; (dummyspare <= 1); dummyspare++)
+ {
+#ifdef DEBUG
+   printf("new_structure: dummyspare loop\n");
+   printf("new_structure: sparebits loop from 32 to %d\n",(zonebits - zone0bits - 8 * 8));
+#endif /* DEBUG */
+
+   for (sparebits = (4 * 8); (sparebits <= (zonebits - zone0bits - 8 * 8)); sparebits++)
+   {
+#ifdef DEBUG
+     printf("new_structure: sparebits loop (%d)\n",sparebits);
+#endif
+
+     calczones(dr,sparebits,mapbits,zone0bits,alloc);
+
+     /*
+      * LinkBits must be wide enough to allow addressing of any
+      * bit within a sector, up to a maximum of 15 bits (max. size
+      * of FreeLink field in a zone header)
+      *
+      *  For 256 byte sector discs, linkbits must be 11..15
+      *      512                                     12..15
+      *     1024                                     13..15
+      */
+     linkbits = dr->dr_log2secsize + 2;  /* N.B. gets incremented in the loop */
+
+#ifdef DEBUG
+     printf("new_structure: start with linkbits = %d\n",
+            linkbits);
+#endif
+
+     do
+     {
+#ifdef DEBUG
+       printf("new_structure: calcids: ids = %d, (1 << linkbits) = %d\n",ids,(1 << linkbits));
+#endif
+       linkbits += 1;
+       calcids(usedbits,linkbits,wholezones,oddbits);
+     } while (ids > (1 << linkbits));
+
+#ifdef DEBUG
+     printf("new_structure: linkbits = %d\n",linkbits);
+#endif
+
+     if (((sparebits - (4 * 8)) > 0) && ((sparebits - (4 * 8)) <= linkbits))
+      continue; /* sparebits */
+
+     if ((oddbits > 0) && (oddbits <= linkbits))
+      continue; /* sparebits */
+
+     if ((linkbits > 15) || (zones > 127))
+     {
+       printf("new_structure: allocation unit too small\n");
+       return(-2);
+     }
+
+     if (zones <= bestzones)
+     {
+#ifdef DEBUG
+       printf("new_structure: zones (%d) <= bestzones (%d)\n",zones,bestzones);
+#endif
+
+       crucial = zones * bytespersec(dr) * 2 + dirsize;
+
+#ifdef DEBUG
+       printf("new_structure: crucial %d\n",crucial);
+#endif
+
+       if (mapzone == 0)
+       {
+         crucial = ADFSBOOT + BOOTSIZE;
+#ifdef DEBUG
+         printf("new_structure: mapzone == 0: crucial %d\n",crucial);
+#endif
+       }
+
+       if (crucial < (alloc * (linkbits + 1)))
+        crucial = alloc * (linkbits + 1);
+
+       crucialend = mapadd + crucial;
+       defptr = (u_int *)&(bbptr->bb_defectlist[0]);
+
+#ifdef DEBUG
+       printf("new_structure: defptr = &%x\n",(int)defptr);
+#endif
+
+       do
+       {
+         defect = *defptr;
+         defptr++;
+       } while ((defect < END_DEFECT) && ((defect < mapadd) || (defect >= crucialend)));
+
+       cyloff = mapadd % (bytespersec(dr) * secspertrk(dr) * heads(dr));
+
+#ifdef DEBUG
+       printf("new_structure: cyloff %d\n",cyloff);
+       printf("new_structure: bestcyloff %d\n",bestcyloff);
+       printf("new_structure: defect &%x\n",defect);
+       printf("new_structure: END_DEFECT &%x\n",END_DEFECT);
+#endif
+
+       if ((defect >= END_DEFECT) && (cyloff < bestcyloff))
+       {
+#ifdef DEBUG
+         printf("new_structure: updating \"best\" flags\n");
+#endif
+         bestcyloff = cyloff;
+         bestlinkbits = linkbits;
+         bestspare = sparebits;
+         bestzones = zones;
+       }
+
+       if (bestcyloff != 0)
+        continue; /* next sparebits */
+
+#ifdef DEBUG
+       printf("new_structure: abandoning \"sparebits\" loop\n");
+#endif
+       goto next_dummyspare;
+     }
+     else
+     {
+#ifdef DEBUG
+       printf("new_structure: zones (%d) > bestzones (%d)\n",zones,bestzones);
+       printf("new_structure: abandoning \"sparebits\" loop\n");
+#endif
+       goto next_dummyspare;
+     }
+   } /* sparebits */
+
+next_dummyspare:
+#ifdef DEBUG
+   printf("new_structure: end of dummyspare loop\n");
+#else
+   /* to stop the compiler complaining about no command after the label */
+   ptr = ptr;
+#endif
+ } /* dummyspare */
+
+ if (bestzones == (1 << 30))
+ {
+   printf("new_structure: cannot use this allocation size\n");
+   return(-2);
+ }
+#ifdef DEBUG
+printf("after bestzones\n");
+#endif
+ linkbits = bestlinkbits;
+ sparebits = bestspare;
+
+ calczones(dr,sparebits,mapbits,zone0bits,alloc);
+ calcids(usedbits,linkbits,wholezones,oddbits);
+
+ crucial = zones * bytespersec(dr) * 2 + dirsize;
+
+ if (mapzone == 0)
+  crucial = ADFSBOOT + BOOTSIZE;
+
+ if (crucial < alloc * (linkbits + 1))
+  crucial = alloc * (linkbits + 1);
+
+ if ((crucial % alloc) != 0)
+  crucial += alloc - crucial % alloc;
+
+ if (mapzone == 0)
+ {
+   rootdiradd = ADFSBOOT + BOOTSIZE;
+   dr->dr_rootSIN = 0x0200 + (ADFSBOOT + BOOTSIZE) / bytespersec(dr) + 1;
+#ifdef DEBUG
+   printf("new_structure: mapzone == 0: rootdiradd = &%x\n",rootdiradd);
+#endif
+ }
+ else
+ {
+   rootdiradd = mapadd + maplen * 2;
+   dr->dr_rootSIN = 0x0200 + zones * 2 + 1;
+#ifdef DEBUG
+   printf("new_structure: mapzone != 0: rootdiradd = &%x\n",rootdiradd);
+#endif
+ }
+
+ dr->dr_idwidth = linkbits;
+ dr->dr_zones = zones;
+ put_nonmapbits(dr,sparebits);
+
+ if ((buf = malloc(bufsize)) == NULL)
+ {
+#ifdef DEBUG
+   printf("new_structure: unable to allocate buffer memory\n");
+#endif
+   return(-1);
+ }
+
+#ifdef DEBUG
+ printf("new_structure: buf = &%x\n",(int)buf);
+#endif
+
+ /* zero the necessary part of the buffer */
+ for (i = 0; (i < (zones * bytespersec(dr))); i++)
+  buf[i] = 0x00;
+
+ tptr = (char *)dr;
+
+ for (i = 0; (i < 60); i++)
+  buf[i + 4] = tptr[i];
+
+ /* in our world the defect list and UNIX start cylinder information are placed
+  * into the passed boot block structure before calling this routine
+  */
+ /* calculate the checksum on the boot block (1 byte at end of block) */
+ sum((char *)bbptr,BOOTSIZE);
+ /* and write the boot block onto the disc */
+
+#ifdef DEBUG
+ printf("new_structure: boot block memory\n");
+/* debug_mem((char *)bbptr,BOOTSIZE);*/
+#endif
+
+ if( wrtdev((long)ADFSBOOT,(char *)bbptr,(long)BOOTSIZE,FALSE) != GOOD )
+ {
+#ifdef DEBUG
+   printf("new_structure: failed to write boot block onto disc\n");
+#endif
+   ptr = ptr;
+ }
+
+#ifdef DEBUG
+ printf("new_structure: creating map\n");
+#endif
+
+ ptr = 0;
+ defectstart = 0;
+ disctomap(discendbit,dsize,alloc,zone0bits,usedbits,sparebits);
+ zonestart = (u_int *)buf;
+ zonestartbit = 0;
+
+#ifdef DEBUG
+ printf("new_structure: about to start zone loop (0 < %d)\n",zones);
+#endif
+
+ for (zone=0; (zone < zones); zone++)
+ {
+#ifdef DEBUG
+   printf("new_structure: zone = %d\n",zone);
+   printf("new_structure: zonestart = &%x\n",(int)zonestart);
+#endif
+
+   zonestart[0] = (1 << (15 + freelink * 8));
+
+   zoneendbit = zonestartbit + zonebits;
+   usedzoneendbit = zoneendbit - sparebits + 4 * 8;
+
+   if (usedzoneendbit > discendbit)
+    usedzoneendbit = discendbit;
+
+   prefree = zonestartbit + freelink * 8;
+   zonebit = zonestartbit + 4 * 8;
+
+   if (zone == 0)
+   {
+#ifdef DEBUG
+     printf("new_structure: zone == 0\n");
+#endif
+
+     zonebit = zonebit + zone0bits;
+     length = ((ADFSBOOT + BOOTSIZE) / alloc);
+
+     if (length < (linkbits + 1))
+      length = linkbits + 1;
+
+     writelink(zonebit,2);
+     writelength(zonebit,length);
+     zonebit = zonebit + length;
+   }
+   else
+   {
+     if (zone == mapzone)
+     {
+#ifdef DEBUG
+       printf("new_structure: zone == mapzone\n");
+#endif
+
+       length = (crucial / alloc);
+
+       writelink(zonebit,2);
+       writelength(zonebit,length);
+
+       zonebit = zonebit + length;
+     }
+   }
+
+   do
+   {
+#ifdef DEBUG
+     printf("new_structure: main do loop\n");
+#endif
+
+     if (zonebit > defectstart)
+     {
+       disctomap(defectstart,bbptr->bb_defectlist[ptr],alloc,zone0bits,usedbits,sparebits);
+#ifdef DEBUG
+       printf("new_structure: defectstart = &%x, usedzoneendbit = &%x, zoneendbit = &%x\n",defectstart,usedzoneendbit,zoneendbit);
+#endif
+
+       if (defectstart >= usedzoneendbit)
+        defectstart = zoneendbit;
+       else
+       {
+         defectend = defectstart + 1;
+         ptr++;
+
+#ifdef DEBUG
+         printf("new_structure: ptr = %d\n",ptr);
+#endif
+
+         do
+         {
+           done1 = TRUE;
+
+           do
+           {
+             done2 = TRUE;
+             disctomap(nextdefect,bbptr->bb_defectlist[ptr],alloc,zone0bits,usedbits,sparebits);
+     
+             if (nextdefect < usedzoneendbit)
+             {
+               if (nextdefect > (zoneendbit - (linkbits + 1)))
+                nextdef = zoneendbit - (linkbits + 1);
+               else
+                nextdef = nextdefect;
+ 
+               if ((nextdef - defectend) < (linkbits + 1))
+               {
+                 if ((nextdefect + 1) > defectend)
+                  defectend = nextdefect + 1;
+ 
+                 ptr++;
+
+#ifdef DEBUG
+                 printf("new_structure: ptr = %d\n",ptr);
+#endif
+
+                 done2 = FALSE;
+               }
+             }
+           } while (done2 == FALSE);
+ 
+           if ((defectend - defectstart) < (linkbits + 1))
+           {
+             defectend = defectstart + linkbits + 1;
+ 
+             if (defectend > zoneendbit)
+              defectend = zoneendbit;
+     
+             done1 = FALSE;
+           }
+ 
+           if ((defectend > (zoneendbit - (linkbits + 1))) && (defectend != zoneendbit))
+           {
+             defectend = zoneendbit;
+             done1 = FALSE;
+           }
+
+           if ((defectend - defectstart) < (linkbits + 1))
+            defectstart = defectend - (linkbits + 1);
+         } while (done1 == FALSE);
+       }
+     }
+
+     if (zonebit > defectstart)
+     {
+       printf("PROGRAM ERROR 1\n");
+       free(buf);
+       exit(1);
+     }
+
+     if (defectstart > zonebit)
+     {
+#ifdef DEBUG
+       printf("new_structure: defectstart > zonebit\n");
+#endif
+
+       writelink(prefree,(zonebit - prefree));
+   
+       if (defectstart >= usedzoneendbit)
+       {
+         writelength(zonebit,(usedzoneendbit - zonebit));
+
+         if (zoneendbit > usedzoneendbit)
+         {
+           writelink(usedzoneendbit,1);
+           writelength(usedzoneendbit,(zoneendbit - usedzoneendbit));
+         }
+       }
+       else
+        writelength(zonebit,(defectstart - zonebit));
+
+       prefree = zonebit;
+     }
+
+     if (defectstart < zoneendbit)
+     {
+#ifdef DEBUG
+       printf("new_structure: defectstart < zoneendbit\n");
+#endif
+
+       if (defectend > (usedzoneendbit - (linkbits + 1)))
+        defectend = zoneendbit;
+
+       writelink(defectstart,1);
+       writelength(defectstart,(defectend - defectstart));
+       zonebit = defectend;
+     }
+     else
+      zonebit = zoneendbit;
+
+   } while (zonebit != zoneendbit);
+
+   writelink(prefree,0);
+
+   zstemp = (char *)zonestart;
+
+#ifdef DEBUG
+   printf("new_structure: zstemp = &%x, crosscheck = %d\n",(int)zstemp,crosscheck);
+#endif
+
+   if (zone == 0)
+   {
+     zstemp[crosscheck] = 0xFF;
+#ifdef DEBUG
+     printf("new_structure: zone == 0\n");
+#endif
+   }
+   else
+   {
+     zstemp[crosscheck] = 0x00;
+#ifdef DEBUG
+     printf("new_structure: zone != 0\n");
+#endif
+   }
+
+#ifdef DEBUG
+   printf("new_structure: &zstemp[0] = &%x\n",(int)&zstemp[0]);
+   printf("new_structure: zonestart = &%x\n",(int)zonestart);
+   printf("new_structure: bytespersec(dr) = &%x\n",bytespersec(dr));
+#endif /* DEBUG */
+
+   zstemp[0] = (u_char)newmapcheck((char *)zonestart,bytespersec(dr));
+
+   zonestart = (u_int *)((u_int)zonestart + bytespersec(dr));
+   zonestartbit = zoneendbit;
+
+#ifdef DEBUG
+   printf("new_structure: about to do next zone loop (zone = %d)\n",zone);
+#endif
+ } /* NEXT zone */
+
+#ifdef DEBUG
+ printf("new_structure: map memory\n");
+ /*debug_mem(buf,maplen);*/
+#endif
+
+#ifdef DEBUG
+ printf("new_structure: writing map\n");
+#endif
+ if( wrtdev((long)mapadd,buf,(long)maplen,FALSE) != GOOD )
+ {
+   printf("new_structure: failed to write 1st map copy\n");
+   return(-1);
+ }
+
+ if( wrtdev((long)(mapadd + maplen),buf,(long)maplen,FALSE) != GOOD )
+ {
+   printf("new_structure: failed to write 2nd map copy\n");
+   return(-1);
+ }
+
+ writerootdir(bbptr,rootdiradd,NEWMAP);
+
+ if (buf != NULL)
+  free(buf);
+
+ return(0);
+}
+
+/*-----------------------------------------------------------------------*/
+
+u_char fn_sum(base,len)
+
+u_char *base;
+int len;
+
+{
+ int sum = 0;
+ int c = 0;
+ int i;
+
+ for (i = (len - 2); (i >= 0); i -= 1)
+ {
+   sum = sum + base[i] + c;
+   if (sum < 0x0100)
+    c = 0;
+   else
+   {
+     sum = sum & 0xFF;
+     c = 1;
+   }
+ }
+
+ return((u_char)sum);
+}
+
+/************************************************************************/
+
+void initparts(ptable,dofull)
+
+Table *ptable;
+bool dofull;
+
+{
+        /*
+         * subroutine initparts() -
+         *
+         * routine initiallises the partition table by clearing all
+         * user-definable partitions. if DOFULL is TRUE, it also sets
+         * the ALL partition to cover the entire disk, and supplies
+         * default names for the partitions.
+         *
+         */
+
+        /* declare autos */
+        register int i;
+        register Partition *pptr;
+
+        /* set defaults for all table entries */
+        for( i = 0; i < NUSERPART; ++i )
+        {
+         /* clear the entry for this partition */
+         pptr = ((Partition *)(ptable->pt)) + i;
+         pptr->flags = 0;
+         pptr->start = 0;
+         pptr->length = 0;
+
+         if( dofull )
+          /* set no name for this partition */
+          strcpy(pptr->text,"<unnamed>");
+        }
+
+        if( dofull )
+        {
+         /* supply names for those partitions which deserve one */
+         strcpy(ptable->pt[P_ROOT].text,"Root");
+         strcpy(ptable->pt[P_SWAP].text,"Swap");
+        }
+
+        /* now fill in the ALL partition */
+        pptr = ((Partition *)(ptable->pt)) + P_ALL;
+        strcpy(pptr->text,"All");
+        pptr->start = 0;
+        pptr->length = cdev->d_size / cdev->d_bloksize;
+        pptr->flags = PT_VALID;
+
+        /*
+         * set mask for partitions containing a spare copy
+         * of the partition table (currently none)
+         */
+        part_gotmap = 0;
+
+        /* finished */
+        return;
+}
+
+/************************************************************************/
+
+bool getparts(ptable,argc,argv)
+
+Table *ptable;
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine getparts() -
+         *
+         * routine prompts for, & fills in the sizes for the partitions
+         * in ptable that have been marked as PT_VALID. the ALL partition
+         * has already been initiallised to cover the entire disk.
+         * returned value is true if all partitions read OK, else false.
+         *
+         */
+
+        /* declare autos */
+        register int i, defblok, lastblok = 0;
+        register Partition *pptr;
+
+        if( argc > 0 )
+         /* use command line to fill in the partitions */
+         return(putparts(ptable,argv));
+
+        else
+        {
+         register int j = -1;
+
+         /* ask user to fill in all required partitions */
+         for( i = 0; i < NUSERPART; ++i )
+         {
+          /* set partition pointer */
+          if( ((pptr = ((Partition *)(ptable->pt)) + i)->flags
+                & PT_VALID) != PT_VALID )
+           /* this partition is not wanted */
+           continue;
+
+          /* set default start block */
+          if( j == -1 )
+          {
+           /*
+            * set default block to the start of the UNIX
+            * partition
+            */
+           defblok = unixstart;
+           
+           /* calculate what the last block is */
+           lastblok = (unixstart + unixlen) - 1;
+
+           /* make sure that lastblock is properly aligned */
+           while( alignpart(lastblok) )
+            /* must DECREMENT the last block to align it */
+            --lastblok;
+          }
+
+          else
+          {
+           register Partition *tpptr;
+
+           /*
+            * calculate default start block, try to leave the
+            * extra copy of the partition table at the end of
+            * each partition untouched
+            */
+           tpptr = ((Partition *)(ptable->pt)) + j;
+           defblok = tpptr->start + tpptr->length + nptblocks;
+           defblok = (defblok > lastblok) ?
+                     lastblok : (defblok + alignpart(defblok));
+          }
+
+          /* keep a copy of the previous valid partition */
+          j = i;
+
+          if( !getapart(pptr,defblok,unixstart,((unixstart + unixlen) - 1),i) )
+           return(FALSE);
+         }
+        }
+
+        /* all done */
+        return(TRUE);
+}
+
+/************************************************************************/
+
+static bool putparts(ptable,argv)
+
+Table *ptable;
+char **argv;
+
+{
+        /*
+         * subroutine putparts() -
+         *
+         * routine uses the data in argv to fill out the partition table.
+         * it has already been verified that argv contains enough entries
+         * to specify all the partitions. returned value is TRUE if table
+         * filled out OK, else false.
+         *
+         */
+
+        /* declare autos */
+        register int i, lastblok, pend, align, scale;
+        register Partition *pptr;
+
+        /* calculate last block on the disk */
+        lastblok = (unixstart + unixlen) - 1;
+        /* make sure that lastblock is properly aligned */
+        while( alignpart(lastblok) )
+         /* must DECREMENT the last block to align it */
+         --lastblok;
+
+        /* loop over all args */
+        for( i = 0; i < NUSERPART; ++i )
+        {
+         /*
+          * address current entry in the partition table
+          * and check whether this is required
+          */
+         if( ((pptr = ((Partition *)(ptable->pt)) + i)->flags
+                & PT_VALID) != PT_VALID )
+          continue;
+
+         /* read the start block */
+         if( (pptr->start = atoi(*(argv++))) == 0 )
+         {
+          printf("Bad integer input: %s\n",*--argv);
+          return(FALSE);
+         }
+
+         if( (align = alignpart(pptr->start)) > 0 )
+         {
+          pptr->start += align;
+          printf("partition %d: aligned start to block no. %d\n",
+                 i, pptr->start);
+         }
+
+         if( pptr->start < unixstart || pptr->start > lastblok )
+         {
+          printf("bad start block (%d) for partition %d\n",pptr->start,i);
+          return(FALSE);
+         }
+
+         /*
+          * calculate the end of the partition, check that it
+          * is not past the end of the disk
+          */
+         if( (pptr->length = atoi(*(argv++))) == 0 )
+         {
+          printf("Bad integer input: %s\n",*--argv);
+          return(FALSE);
+         }
+         else
+          /* allow for alignment adjustments */
+          pptr->length -= align;
+
+         if( (pend = ((pptr->start + pptr->length) - 1)) > ((unixstart + unixlen) - 1) )
+         {
+          printf("bad length (%d) for partition %d\n",pptr->length,i);
+          return(FALSE);
+         }
+
+         /* scale the partition length to a multiple of BLKDEV_IOSIZE */
+         if( (scale = scalepart(pptr->length)) != 0 )
+         {
+          pptr->length -= scale;
+          printf("partition %d: scaled length to %d blocks\n",
+                 i, pptr->length);
+         }
+
+         /* 
+          * mark this partition as having a spare 
+          * copy of the partition table.
+          */
+         part_gotmap |= 1 << i;
+        }
+
+        /* loop has finished OK */
+        return(TRUE);
+}
+
+/************************************************************************/
+
+static bool getapart(partition,defblok,firstblok,lastblok,partno)
+
+Partition *partition;
+unsigned int defblok, firstblok, lastblok, partno;
+
+{
+        /*
+         * subroutine getapart() -
+         *
+         * routine reads the information for the passed partition, using
+         * defblok as the default start block. returned value is true if
+         * partition read OK, else false.
+         *
+         */
+
+        /* declare autos */
+        register int maxlen, maxstart, align, scale;
+        char prompt[CANBSIZ];
+        char inpbuf[CANBSIZ];
+        
+        static char partnhelp[62];
+
+        static char *pblokiphelp[] =
+        {
+         "The  current command is partition a disk. Enter the starting",
+         partnhelp,
+         "default value supplied.",
+         ""
+        };
+
+        static char *pleniphelp[] =
+        {
+         "The current command is partition a disk. Enter the length of",
+         partnhelp,
+         ""
+        };
+
+        /* break up the input */
+        putchar('\n');
+
+        /* calculate the maximum starting block number */
+        maxstart = lastblok;
+        while( alignpart(maxstart) )
+         /* must DECREMENT block number */
+         --maxstart;
+
+        /* fill in the partition number for the help message */
+        sprintf(partnhelp,
+                "logical block number for partition %d, press enter to use the",
+                partno);
+        iphelp = pblokiphelp;
+
+        /* read the start block number */
+        sprintf(prompt,"Starting block for partition %d? (%d) >",
+                partno,defblok);
+
+        partition->start = (int)iplims(inpbuf,prompt,vdul,firstblok,maxstart,TRUE);
+
+        /* test for bad value */
+        if( partition->start == BADARG )
+         /* routine failed */
+         return(FALSE);
+
+        else if( partition->start == USEDEFAULT && *inpbuf == '\0' )
+         /* set default value */
+         partition->start = defblok;
+
+        if( (align = alignpart(partition->start)) > 0 )
+        {
+         partition->start += align;
+         printf("aligned start to block no. %d\n", partition->start);
+        }
+
+        /* prepare input help message */
+        sprintf(partnhelp,"partition %d, in the number of logical blocks.",
+                partno);
+        iphelp = pleniphelp;
+
+        /* calculate max. length of this partition */
+        maxlen = (lastblok - partition->start) + 1;
+
+        /*
+         * scale maxlen before prompting for length, test for
+         * silly number (I believe this has happened, but cannot
+         * provoke it at the moment.)
+         */
+        if( (maxlen = maxlen - scalepart(maxlen)) < 0 )
+        {
+            printf("** Internal Error ** Max. partition length (%d) < 0\n",
+                   maxlen);
+            return(FALSE);
+        }
+
+        printf("The maximum allowable length of this partition is %d blocks\n",
+               maxlen);
+
+        sprintf(prompt,"Length of partition %d? (%d) >",partno,maxlen);
+
+        /* read the partition length */
+        partition->length = (int)iplims(inpbuf,prompt,vdul,0,maxlen,TRUE);
+
+        /* test for bad value */
+        if( partition->length == BADARG )
+         /* return failure */
+         return(FALSE);
+
+        else if( partition->length == USEDEFAULT && *inpbuf == '\0' )
+            /* set default value */
+            partition->length = maxlen;
+
+        /* scale the partition length */
+        if( (scale = scalepart(partition->length)) != 0 )
+        {
+         partition->length -= scale;
+         printf("scaled length to %d blocks\n", partition->length);
+        }
+
+        /* mark this partition as having spare copy of partition table */
+        part_gotmap |= 1 << partno;
+
+        /* finished */
+        return(TRUE);
+}
+
+/************************************************************************/
+
+bool chkboot(bbptr)
+
+ADFS_bblock *bbptr;
+
+{
+        /*
+         * subroutine chkboot() -
+         *
+         * routine checks that the passed boot block has a valid checksum.
+         * returns TRUE is it has, else FALSE.
+         *
+         */
+
+        /* declare autos */
+        u_char bbsum;
+        register ADFS_drecord *drptr;
+
+        /* calculate the checksum */
+        bbsum = fn_sum((u_char *)bbptr,BOOTSIZE);
+
+        /* check for agreement */
+        drptr = &(bbptr->bb_discrec);
+        return( (bbsum == drptr->dr_csum) ? TRUE : FALSE );
+}
+
+/************************************************************************/

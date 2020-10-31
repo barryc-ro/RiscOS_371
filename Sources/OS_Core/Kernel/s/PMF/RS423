@@ -1,0 +1,700 @@
+; > $.Source.PMF.rs423
+
+; ************************************************************
+; ***    C h a n g e   L i s t  (better late than never!)  ***
+; ************************************************************
+
+; Date       Description
+; ----       -----------
+; 15-Feb-88  Changed ModifyControl6850 to fix GTE/CMD control register
+;             sensitivity problem
+; 08-Apr-88  Transmit code doesn't need to reload DCDDSRCopy, it's got the
+;             register in R2
+; 12-Apr-88  Removed DCDDSRCopy - bits are now in SerialFlags
+;            Started code to do SerialFlags bits and SWI SerialOp
+; 18-Apr-88  Started XON/XOFF stuff
+; 13-May-88  Added new SerialOps to read/set baud rates
+
+; *****************************************************************************
+;
+;       RS423IRQ - Entry point for 6551 interrupt
+;
+
+RS423IRQ ROUT
+        [ AssemblingArthur
+        Push    R14                     ; stack R14 if new MOS IRQ vector
+        |
+        BYTEWS  WsPtr                   ; already set up in new IRQ scheme
+        ]
+        LDR     R11, =ACIA
+        LDRB    R2, ACIAStatus          ; clear interrupt and read status
+
+; if we want to support 6850 IRQ mask variable, then some code needed here
+; to mess around with the bits
+
+        TST     R2, #ACIATDRE           ; if TDRE bit set then push status
+        ADRNE   R0, %FT20               ; and address of TX processing routine
+        Push    "R0,R2", NE
+
+        TST     R2, #ACIARDRF           ; if RDRF bit set then push status
+        ADRNE   R0, %FT10               ; and address of RX processing routine
+        Push    "R0,R2", NE
+
+        LDR     R1, SerialFlags                 ; get old DCD,DSR bits
+        EOR     R0, R1, R2, LSL #DCDDSRShift    ; difference between old/new
+        ANDS    R0, R0, #(1:SHL:SF_DCDHigh):OR:(1:SHL:SF_DSRHigh)
+        Pull    PC, EQ                          ; [same, so return]
+
+        EOR     R1, R1, R0                      ; R1 := new
+        STR     R1, SerialFlags                 ; store new version
+        TST     R1, #(1:SHL:SF_DCDIgnore)       ; if ignoring DCD
+        BNE     %FT04                           ; then don't generate event
+        TST     R1, #(1:SHL:SF_DCDHigh)         ; if DCD is now non-zero
+        BNE     RS423Error                      ; then generate event
+04
+        TST     R1, #(1:SHL:SF_DSRIgnore)       ; if ignoring DSR
+        TSTEQ   R1, #(1:SHL:SF_DSRHigh)         ; or it's still high
+        Pull    PC, NE                          ; then no action
+
+        TST     R0, #(1:SHL:SF_DSRHigh)         ; else if DSR has changed
+        BLNE    RSBUSY                          ; then it's changed to zero,
+                                                ; so reenable TX IRQ if poss
+        Pull    PC                              ; then finish IRQ
+
+; Process receive interrupt
+
+10
+        Pull    R2                              ; pull stacked status
+        LDRB    R3, RS423conflag                ; RXirq enabled ?
+        TST     R3, #RXEN6850
+        Pull    PC, EQ                          ; no, then exit
+
+        LDRB    R0, ACIARxData                  ; read data (and clear RDRF)
+        LDR     R1, SerialFlags
+        MOV     R3, #(ACIAOverRun :OR: ACIAFramingError :OR: ACIAParityError)
+        TST     R1, #(1:SHL:SF_DCDIgnore)       ; if not ignoring DCD
+        ORREQ   R3, R3, #ACIADCD                ; then it causes event
+        TST     R2, R3
+        BNE     RS423Error
+
+; no error on receive
+
+        TST     R1, #(1:SHL:SF_XONXOFFOn)       ; if not doing xon/xoff
+        BEQ     %FT15                           ; then skip
+        TEQ     R0, #XOFFChar                   ; else if XOFF char
+        ORREQ   R1, R1, #(1:SHL:SF_HeXOFFedMe)  ; then set bit
+        STREQ   R1, SerialFlags                 ; store back
+        Pull    PC, EQ                          ; and exit
+
+        TEQ     R0, #XONChar                    ; else if XON char
+        BICEQ   R1, R1, #(1:SHL:SF_HeXOFFedMe)  ; then clear bit
+        STREQ   R1, SerialFlags                 ; store back
+        BEQ     EnableTXI                       ; and reenable TXI
+
+15
+        LDRB    R2, RS423InputSupr              ; RS423 input suppressed ?
+        TEQ     R2, #0                          ; NZ => suppressed
+        Pull    PC, NE                          ; return if suppressed
+
+        MOV     R1, #Buff_RS423In               ; RS423 input buffer id
+        MOV     R2, R0                          ; R2 := character
+        BL      DoInsertESC                     ; insert into buffer
+                                                ; possibly checking for ESC
+        BL      CountRS                         ; count spaces left
+
+        Pull    PC, CS                          ; enough left, so exit
+        B       RLO                             ; this pulls PC
+
+; Process transmit interrupt
+
+20
+        Pull    R2                              ; restore stacked status
+        LDR     R1, SerialFlags
+        TST     R1, #(1:SHL:SF_DSRIgnore)       ; if ignoring DSR
+        BNE     %FT25                           ; then skip
+        TST     R2, #ACIADSR                    ; else if DSR high
+        BNE     TXDINT                          ; then don't send char
+25
+        LDRB    R0, XONXOFFChar                 ; is there an XON or XOFF
+        TEQ     R0, #0                          ; to send (R0 = 0 if not)
+        MOVNE   R1, #0                          ; If so, then zero character
+        STRNEB  R1, XONXOFFChar
+        BNE     %FT40                           ; and send this char
+
+        TST     R1, #(1:SHL:SF_HeXOFFedMe)      ; if we are XOFFed
+        BNE     TXDINT                          ; then shut up
+28
+        CLRV
+        MOV     R1, #Buff_RS423Out              ; RS423 output buffer id
+        BL      REMOVE
+        BCC     %FT30                           ; character to send
+
+        LDRB    R0, PrinterDrivType
+        TEQ     R0, #2                          ; RS423 printer ?
+        BNE     TXDINT                          ; no, then shut down RS423
+
+        CLRV
+        MOV     R1, #Buff_Print                 ; printer buffer id
+        BL      REMOVE
+
+        MOVCS   R1, #0                          ; if no char, mark
+        STRCS   R1, PrinterActive               ; printer driver dormant
+        BCS     TXDINT                          ; and shut down RS423
+30
+        LDR     R1, SerialFlags
+        TST     R1, #(1:SHL:SF_XONXOFFOn)       ; if xon/xoff not on
+        BEQ     %FT40                           ; then skip
+        TEQ     R0, #XOFFChar                   ; else if XOFF char
+        ORREQ   R1, R1, #(1:SHL:SF_UserXOFFedHim) ; then set user bit
+        TEQ     R0, #XONChar                    ; else if XON char
+        BICEQ   R1, R1, #(1:SHL:SF_UserXOFFedHim) ; then clear user bit
+        STR     R1, SerialFlags                 ; store back always
+        BNE     %FT40                           ; and skip if not XON char
+
+; user sending an XON char, so only let it thru if we're not trying to XOFF him
+
+        TST     R1, #(1:SHL:SF_IXOFFedHim)      ; if we're trying to XOFF him
+        BNE     %BT28                           ; then don't send XON, go and
+                                                ; look for another character
+40
+        STRB    R0, ACIATxData                  ; write data
+        Pull    PC
+
+
+TXDINT                                          ; disable TX interrupt
+        MOV     R0, #&80                        ; indicate RS423
+        STRB    R0, RS423use                    ; not in use
+
+        LDR     R0, SerialFlags
+        TST     R0, #(1:SHL:SF_XONXOFFOn)       ; if XON/XOFF
+        BNE     DisableTXI                      ; then just disable TXI
+
+        LDRB    R0, RS423conflag
+        TST     R0, #RXEN6850
+        BEQ     RLO                             ; RXI disabled, so shut him up
+
+        BL      CountRS
+        BCS     DisableTXI                      ; no overflow, just disable TXI
+RLO
+        LDR     R1, SerialFlags
+        TST     R1, #(1:SHL:SF_XONXOFFOn)       ; if XON/XOFF
+        ORRNE   R1, R1, #(1:SHL:SF_IXOFFedHim)
+        STRNE   R1, SerialFlags
+        MOVNE   R1, #XOFFChar
+        BNE     SendXONXOFF
+
+        MOV     R1, #RLOTXD6850                 ; tell him to shut up
+        B       RSED
+
+SendXONXOFF
+        STRB    R1, XONXOFFChar
+EnableTXI
+        MOV     R1, #RHITXE6850
+        B       RSED
+
+DisableTXI
+        MOV     R1, #RHITXD6850                 ; just disable transmit irq
+RSED
+        MOV     R2, #&9F                        ; alter bits 5,6 of control
+        Pull    R14
+
+; and drop thru to ...
+
+; *****************************************************************************
+;
+;       ModifyControl6850 - Simulate update of 6850 control register
+;
+;       Changed 15-Feb-88 to only modify control register if different
+;        (GTE/CMD chips corrupt received characters if control register is
+;        written to (unnecessarily) just after a character has been received)
+;       Change uses R4 as a temporary, which is therefore pushed + pulled
+;        in addition to R1 and R2, in the middle of the routine.
+;
+; in:   WsPtr -> OsbyteVars
+;       R2 = AND mask
+;       R1 = EOR mask
+;
+; out:  R1 = old value of register (taken from soft copy)
+;       R0, R2, R3 preserved
+;
+
+ModifyControl6850 ROUT
+        Push    "R0, R3, R4, R11, R14"
+
+        PHPSEI                                  ; doesn't really "push" it
+        LDR     R11, =ACIA
+
+        LDRB    R3, RS423conflag                ; load soft copy
+        AND     R0, R2, R3                      ; AND with mask
+        EOR     R0, R0, R1                      ; EOR with mask
+        STRB    R0, RS423conflag                ; store back to soft copy
+        MOV     R4, R1                          ; save EOR mask in R4
+        MOV     R1, R3                          ; old copy into R1
+
+; now R0 = new register, R1 and R2 must be preserved
+
+        AND     R3, R0, #DIVBITS6850
+        TEQ     R3, #DIVRESET6850               ; reset ACIA ?
+        STREQB  R0, ACIAReset                   ; any old data will do
+        BEQ     %FT20                           ; and finish there
+
+        Push    "R1, R2"
+        MVN     R2, R2                          ; NOT (AND mask)
+        ORR     R2, R2, R4                      ; (EOR mask) OR NOT (AND mask)
+        TST     R2, #WSB6850                    ; if zero then not modifying
+        LDREQB  R1, ACIACommand                 ; format bits, so fake new bits
+        ANDEQ   R1, R1, #(ACIAPME :OR: ACIAPMC0 :OR: ACIAPMC1) ; in com. reg
+        BEQ     %FT10                           ; and leave control reg alone
+
+        AND     R3, R0, #WSB6850                ; get word select bits
+
+        ADR     R1, ControlDPS                  ; point to table
+        LDRB    R1, [R1, R3, LSR #WSBSHIFT]     ; get bits for control reg
+
+        LDRB    R2, ACIAControl                 ; get current register
+        BIC     R4, R2, #ACIAWSB                ; zero those bits in current
+        ORR     R4, R4, R1                      ; or in new bits
+        TEQ     R4, R2                          ; if different
+        STRNEB  R4, ACIAControl                 ; then store back
+
+        ADR     R1, CommandDPS
+        LDRB    R1, [R1, R3, LSR #WSBSHIFT]     ; get bits for command reg
+                                                ; ABC00000
+10
+        AND     R0, R0, #RXEN6850 :OR: RTBITS6850 ; isolate RXI,RTS/TXI
+        ORR     R1, R1, R0, LSR #3              ; ABCgeF00
+        TST     R0, #RXEN6850
+        EORNE   R1, R1, #(&10 :OR: ACIARIRD)    ; ABC0eFg0
+        TST     R1, #&04
+        EOREQ   R1, R1, #&08                    ; ABC0EFg0
+        EOR     R1, R1, #ACIARIRD               ; ABC0EFG0
+        LDRB    R3, ACIACommand
+        AND     R3, R3, #(ACIAREM :OR: ACIADTR :OR: ACIATIC0 :OR: ACIATIC1)
+
+        LDR     R4, SerialFlags
+        TST     R4, #(1:SHL:SF_SendingBreak)    ; if sending break
+        BICNE   R1, R1, #(ACIATIC0 :OR: ACIATIC1) ; then use hardware bits
+        BICEQ   R3, R3, #(ACIATIC0 :OR: ACIATIC1) ; else use software bits
+
+        ORR     R1, R1, R3
+        STRB    R1, ACIACommand
+        Pull    "R1, R2"
+20
+        PLP
+        Pull    "R0, R3, R4, R11, PC"
+
+; *****************************************************************************
+;
+; Comes here either a) when DCD or DSR have changed to non-zero,
+; or b) when a receive interrupt happens and error bits are set
+;
+; Converts 6551 status register in R2 into
+; 6850 status register shifted right one bit in R1 (DSR in bit 2)
+; then calls event (with char in R2 for case b) above)
+;
+
+RS423Error ROUT
+
+; R2 = x | DSR | DCD | x | x | OV | FE | PE
+
+        MOVS    R1, R2, LSR #1          ; bit 1=OV, bit 0=FE, C=PE
+        MOV     R1, R1, LSL #3          ; bit 4=OV, bit 3=FE
+        AND     R1, R1, #(1:SHL:4) :OR: (1:SHL:3) ; remove other bits
+        ORRCS   R1, R1, #(1:SHL:5)      ; bit 5=PE, bit 4=OV, bit 3=FE
+        AND     R2, R2, #(1:SHL:6) :OR: (1:SHL:5) ; R2 bit 6=DSR, bit 5=DCD
+        ORR     R1, R1, R2, LSR #4      ; 0|0|PE|OV|FE|DSR|DCD|0
+
+        MOV     R2, R0                  ; char in R2 (if receive)
+        MOV     R0, #Event_RS423Error
+        BL      OSEVEN
+
+        Pull    PC
+
+
+; *****************************************************************************
+
+; Tables for converting Data/Parity/Stop bits in 6850
+; to control and command registers in 6551
+
+ControlDPS
+        =       ControlBits7e2, ControlBits7o2, ControlBits7e1, ControlBits7o1
+        =       ControlBits8n2, ControlBits8n1, ControlBits8e1, ControlBits8o1
+
+CommandDPS
+        =       CommandBits7e2, CommandBits7o2, CommandBits7e1, CommandBits7o1
+        =       CommandBits8n2, CommandBits8n1, CommandBits8e1, CommandBits8o1
+
+        ALIGN
+
+; *****************************************************************************
+;
+;       CountRS - See if there are "enough" spaces left in RS423 buffer
+;
+; in:   WsPtr -> OsbyteVars
+;
+; out:  C=0 => spaces < limit
+;       C=1 => spaces >= limit
+;
+
+CountRS ROUT
+        Push    R14
+        MOV     R1, #Buff_RS423In       ; RS423 input buffer id
+        CMP     R1, #0                  ; V=0, C=1 so count spaces
+        BL      CnpEntry
+        ORR     R1, R1, R2, LSL #8      ; get combined result
+        LDRB    R2, RS423HandShake      ; limiting number of spaces
+        CMP     R1, R2                  ; C=1 => (spaces >= limit)
+        Pull    PC
+
+; *****************************************************************************
+;
+;       SerialOp - Handler for SWI OS_SerialOp
+;
+
+SerialOp ROUT
+        TEQP    PC, #SVC_mode :OR: I_bit        ; disable IRQs
+        LDR     R11, =ACIA
+        BYTEWS  R12
+        CMP     R0, #(SerialOpTableEnd-SerialOpTable) :SHR: 2
+        BCS     BadSerialOp
+        LDR     R10, [PC, R0, LSL #2]           ; SerialOpTable must follow
+        ADD     PC, PC, R10                     ; immediately
+
+SerialOpTable
+        &       ReadWriteFlags-SerialOpTable-4
+        &       ReadWriteDataFormat-SerialOpTable-4
+        &       SendBreak-SerialOpTable-4
+        &       SendByte-SerialOpTable-4
+        &       GetByte-SerialOpTable-4
+        &       SetRXBaudRate-SerialOpTable-4
+        &       SetTXBaudRate-SerialOpTable-4
+SerialOpTableEnd
+
+BadSerialOp
+        ADR     R0, ErrorBlock_UnknownSerialOp
+        ORR     R14, R14, #V_bit
+        ExitSWIHandler
+
+        MakeErrorBlock UnknownSerialOp
+
+; *****************************************************************************
+;
+;       ReadWriteFlags - Read/write serial flags
+;
+; in:   R1 = EOR mask
+;       R2 = AND mask
+;       R11 -> ACIA
+;       R12 -> BYTEWS
+;
+; out:  R1 = old flags
+;       R2 = new flags
+;
+; Flags are defined in $.Hdr.RS423
+; Still to do - if setting DSRIgnore then possibly wake up TX
+;
+
+ReadWriteFlags ROUT
+        Push    "R9, R14"
+        MVN     R10, #SF_ModifyBits     ; R10 = bits that aren't modifyable
+        BIC     R1, R1, R10             ; EOR mask must have those bits clear
+        ORR     R2, R2, R10             ; AND mask must have those bits set
+
+        LDR     R10, SerialFlags
+
+        MOV     R14, #IOC               ; now read ring indicator bit
+        LDRB    R14, [R14, #IOCIRQSTAA]
+        TST     R14, #ring_bit
+        BICEQ   R10, R10, #1:SHL:SF_Ringing ; clear or set bit accordingly
+        ORRNE   R10, R10, #1:SHL:SF_Ringing
+
+        LDRB    R14, ACIACommand        ; now read DTR bit
+        TST     R14, #ACIADTR           ; NZ => on
+        BICNE   R10, R10, #1:SHL:SF_DTROff
+        ORREQ   R10, R10, #1:SHL:SF_DTROff
+
+; R10 is now the complete 'old' SerialFlags
+
+        AND     R9, R10, R2
+        EOR     R2, R9, R1
+        MOV     R1, R10
+
+; now reflect 'new' SerialFlags DTR setting in hardware
+
+        TST     R2, #1:SHL:SF_DTROff
+        BICNE   R14, R14, #ACIADTR      ; R14 is new command register setting
+        ORREQ   R14, R14, #ACIADTR
+        STRB    R14, ACIACommand        ; (R11 still points to ACIA)
+
+; if DSRIgnore has just been turned on and DSR is high then reenable TX
+
+        EOR     R10, R1, R2             ; form mask of bits which have changed
+        AND     R10, R10, R2            ; from 0 to 1
+
+        TST     R10, #1:SHL:SF_XONXOFFOn ; if we just enabled xon/xoff
+        BICNE   R2, R2, #(1:SHL:SF_HeXOFFedMe):OR:(1:SHL:SF_IXOFFedHim):OR:(1:SHL:SF_UserXOFFedHim)                     ; then clear all these bits
+        STR     R2, SerialFlags
+
+        TST     R10, #1:SHL:SF_DSRIgnore ; if DSR ignore has changed to high
+        TSTNE   R2, #1:SHL:SF_DSRHigh   ; and actual state is high
+        BLNE    DoRSBUSY                ; then reenable transmit
+
+        Pull    "R9, R14"
+        ExitSWIHandler
+
+DoRSBUSY ROUT
+        Push    "R0-R2,R14"
+        BL      RSBUSY
+        Pull    "R0-R2,PC"
+
+; *****************************************************************************
+;
+;       ReadWriteDataFormat - Read/write data format (word length, stop bits
+;        and parity)
+;
+; in:   R1 = -1 => just read format
+;       R1 <> -1 => set format to R1
+;
+;       Bits 0,1 : 0 => 8 bit word
+;                  1 => 7 bit word
+;                  2 => 6 bit word
+;                  3 => 5 bit word
+;
+;       Bit 2    : 0 => 1 stop bit
+;                  1 => 2 stop bits
+;               OR 1.5 stop bits if 5 bit word without parity
+;               OR 1   stop bit  if 8 bit word with parity
+;
+;       Bit 3    : 0 => parity disabled (no parity bit)
+;                  1 => parity enabled
+;
+;       Bits 4,5 : 0 => odd parity
+;                  1 => even parity
+;                  2 => parity bit always 1 on TX (ignored on RX)
+;                  3 => parity bit always 0 on TX (------""-----)
+;
+;       Thus bits 0..2 go to bits 5..7 of the control register, and
+;            bits 3..5 go to bits 5..7 of the command register.
+;
+;       R11 -> ACIA
+;       R12 -> BYTEWS
+;
+; out:  R1 = old format in bits 0..5 as above
+;
+
+ReadWriteDataFormat ROUT
+        Push    "R9, R14"
+
+        LDRB    R10, ACIAControl
+        MOV     R9, R10, LSR #5         ; R9 = control format bits in 0..2
+        EOR     R10, R10, R9, LSL #5    ; R10 = control non-format bits
+
+        LDRB    R14, ACIACommand
+        AND     R12, R14, #(ACIAPME :OR: ACIAPMC0 :OR: ACIAPMC1)
+        EOR     R14, R14, R12           ; R14 = command non-format bits
+
+        ORR     R9, R9, R12, LSR #5-3   ; R9 = complete old state
+
+        CMP     R1, #-1                 ; just reading ?
+        BEQ     %FT10
+
+; now update real registers
+
+        ORR     R10, R10, R1, LSL #5    ; new control register
+        STRB    R10, ACIAControl        ; (bits above 7 don't matter)
+
+        MOV     R10, R1, LSR #3
+        ORR     R14, R14, R10, LSL #5   ; new command register
+        STRB    R14, ACIACommand        ; (bits above 7 don't matter)
+
+; now work out if new format corresponds to a BBC format, and if so, update
+; 6850 control register copy
+
+        AND     R1, R1, #&3F            ; only use bits 0..5
+        ADR     R14, ReverseFormatTable
+        LDRB    R14, [R14, R1]
+        TEQ     R14, #&FF               ; if &FF then not BBC format
+        BEQ     %FT10                   ; so don't modify 6850 soft copy
+
+        BYTEWS  R12
+        LDRB    R10, RS423conflag
+        BIC     R10, R10, #WSB6850      ; clear existing word bits out
+        ORR     R10, R10, R14           ; OR in new bits
+        STRB    R10, RS423conflag       ; and store back
+10
+        MOV     R1, R9                  ; R1 = old state
+        Pull    "R9, R14"
+        ExitSWIHandler
+
+ReverseFormatTable
+        =       &14, &FF, &FF, &FF, &10, &FF, &FF, &FF
+        =       &1C, &0C, &FF, &FF, &1C, &04, &FF, &FF
+        =       &14, &FF, &FF, &FF, &10, &FF, &FF, &FF
+        =       &18, &08, &FF, &FF, &18, &00, &FF, &FF
+        =       &14, &FF, &FF, &FF, &10, &FF, &FF, &FF
+        =       &FF, &FF, &FF, &FF, &FF, &FF, &FF, &FF
+        =       &14, &FF, &FF, &FF, &10, &FF, &FF, &FF
+        =       &FF, &FF, &FF, &FF, &FF, &FF, &FF, &FF
+        ALIGN
+
+; *****************************************************************************
+;
+;       SendBreak - Send a break for R1 centiseconds
+;
+; in:   R1 = length of break in centiseconds
+;       R11 -> ACIA
+;       R12 -> BYTEWS
+;
+; out:  R1 preserved
+;
+
+SendBreak ROUT
+        Push    "R9, R14"
+        LDR     R10, SerialFlags        ; protect command register during break
+        ORR     R10, R10, #(1:SHL:SF_SendingBreak)
+        STR     R10, SerialFlags
+
+        LDRB    R10, ACIACommand
+;       BIC     R10, R10, #(ACIATIC0 :OR: ACIATIC1)
+        ASSERT  RonBreak = (ACIATIC0 :OR: ACIATIC1)
+        ORR     R10, R10, #RonBreak
+        STRB    R10, ACIACommand
+
+        TEQP    PC, #SVC_mode           ; enable IRQs
+
+        [ AssemblingArthur :LOR: Module
+        MOV     R14, #MetroGnome        ; use monotonic variable now
+        |
+        ADR     R14, RealTime           ; doesn't exist in my world
+        ]
+        LDR     R10, [R14]
+        ADD     R10, R10, R1            ; R10 = target time
+10
+        LDR     R9, [R14]
+        CMP     R9, R10
+        BMI     %BT10                   ; not BLT (these are clock numbers)
+
+        TEQP    PC, #SVC_mode :OR: I_bit ; disable IRQs again
+
+        LDR     R10, SerialFlags        ; deprotect command register
+        BIC     R10, R10, #(1:SHL:SF_SendingBreak)
+        STR     R10, SerialFlags
+
+        Push    "R1, R2"                ; now update 6551 command register
+        MOV     R1, #0                  ; from the 6850 control soft copy
+        MOV     R2, #&FF                ; (to put back the RTS setting)
+        BL      ModifyControl6850
+        Pull    "R1, R2, R9, R14"
+
+        ExitSWIHandler
+
+; *****************************************************************************
+;
+;       SendByte - Attempt to put a byte into transmit buffer, and wake up
+;        transmit process
+;
+; in:   R1 = character
+;       R11 -> ACIA
+;       R12 -> BYTEWS
+;
+; out:  R1 preserved
+;       C=0 => character inserted
+;       C=1 => buffer was full
+;
+
+SendByte ROUT
+        Push    "R0-R2, R14"
+        MOV     R0, R1                  ; put character in R0
+        MOV     R1, #Buff_RS423Out
+        BL      INSRT
+        Pull    "R0-R2, R14", CS        ; if failed then nowt else to do
+        ORRCS   R14, R14, #C_bit
+        ExitSWIHandler CS
+
+; character successfully inserted, so try to wake up transmit process
+; (R12 still -> ByteWS)
+
+        BL      RSBUSY
+        Pull    "R0-R2, R14"
+        BIC     R14, R14, #C_bit
+        ExitSWIHandler
+
+; *****************************************************************************
+;
+;       GetByte - Attempt to remove a byte from receive buffer, and reenable
+;        RTS if now enough space in buffer
+;
+; in:   R11 -> ACIA
+;       R12 -> BYTEWS
+;
+; out:  C=0 => R1 = character read
+;       C=1 => R1 preserved, buffer was empty
+;
+
+GetByte ROUT
+        Push    "R0-R2, R14"
+        MOV     R1, #Buff_RS423In
+        CLRV
+        BL      REMOVE                  ; out: R2 = char, if C=0
+        STRCC   R2, [R13, #1*4]         ; store char in stacked R1
+        LDR     R14, [R13, #3*4]        ; reload stacked R14
+        BICCC   R14, R14, #C_bit        ; set/clear carry appropriately
+        ORRCS   R14, R14, #C_bit
+        STR     R14, [R13, #3*4]        ; store back
+
+; (R12 -> BYTEWS still)
+
+        BLCC    RSETX                   ; if removed char, then reenable RTS
+                                        ; if enough spaces
+        Pull    "R0-R2, R14"
+        ExitSWIHandler
+
+        LTORG
+
+; *****************************************************************************
+;
+;       SetRXBaudRate - Set/read receive baud rate
+;
+; in:   R1 = -1 => read RX baud rate
+;       R1 = 0..15 => set RX baud rate to this
+
+SetRXBaudRate ROUT
+        Push    "R0,R2,R3, R14"
+        LDRB    R11, SerULAreg
+        AND     R11, R11, #&78          ; get RX bits
+        MOV     R11, R11, LSR #3
+        ADR     R10, ReverseSerProcTable
+        LDRB    R11, [R10, R11]
+        CMP     R1, #-1
+        BLNE    DoOsbyte07              ; if setting then call setting routine
+        MOV     R1, R11
+        Pull    "R0,R2,R3, R14"
+        ExitSWIHandler
+
+; *****************************************************************************
+;
+;       SetTXBaudRate - Set/read transmit baud rate
+;
+; in:   R1 = -1 => read TX baud rate
+;       R1 = 0..15 => set TX baud rate to this
+
+SetTXBaudRate ROUT
+        Push    "R0,R2,R3, R14"
+        LDRB    R11, SerULAreg
+        AND     R11, R11, #&87          ; get TX bits
+        TST     R11, #&80
+        EORNE   R11, R11, #&88          ; put bit 7 into bit 3
+        ADR     R10, ReverseSerProcTable
+        LDRB    R11, [R10, R11]
+        CMP     R1, #-1
+        BLNE    DoOsbyte08              ; if setting then call setting routine
+        MOV     R1, R11
+        Pull    "R0,R2,R3, R14"
+        ExitSWIHandler
+
+
+ReverseSerProcTable
+        =       8, 4, 6, 2, 7, 3, 5, 1
+        =       15, 11, 13, 9, 14, 10, 12, 16
+
+
+        END

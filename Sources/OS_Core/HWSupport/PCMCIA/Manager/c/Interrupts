@@ -1,0 +1,442 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Interrupts.c                                                                     ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA_Support Code Module                                        ***/
+/***  Version:       0.01                                                              ***/
+/***                                                                                   ***/
+/***  By:            William Turner, Acorn Computers Ltd.                              ***/
+/***  Date:          25th January 1993                                                 ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains the code to deal with card insert/remove interrupts      ***/
+/***                 passed from the Hardware driver(s). The IRQ_Card handler is       ***/
+/***                 entered via a CallBack routine...                                 ***/
+/***                                                                                   ***/
+/***  History:       0.01 25th January - Original version                              ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include "kernel.h"
+#include "time.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Variables.h"
+#include "Driver.h"
+#include "Error.h"
+#include "Debug.h"
+#include "Swi.h"
+#include "Cis.h"
+#include "Misc.h"
+#include "Interrupts.h"
+#include "Services.h"
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  IRQ_CardHandler(regs, private word)                                              ***/
+/***                                                                                   ***/
+/***  This function is called from the hardware driver whenever a card has been        ***/
+/***  inserted or removed. It is called as a callback routine, in order to improve     ***/
+/***  interrupt latency. Note that system interrupts have been re-enabled, but PCMCIA  ***/
+/***  card detect ones are still disabled, and should be reenabled at exit via fn 18.  ***/
+/***                                                                                   ***/
+/***  NOTE: It has a custom veneer which sorts the registers to match a std IRQ handler***/
+/***                                                                                   ***/
+/***  Returns:                                                                         ***/
+/***    nothing                                                                        ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+_kernel_oserror *IRQ_CardHandler(_kernel_swi_regs *reg, void *pw)
+    {
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+    DRIVER_REGISTERS            drvregs;
+
+    #if Debug == TRUE
+        DebugMessage("mK", "        In the insert/remove IRQ callback handler in the PCMCIA Manager.\n\n");
+        DebugMessage("mK", "        Slot handle is &%08X\n", reg ->r[1]);
+        DebugMessage("mK", "        R2 value is &%08X\n", reg ->r[2]);
+    #endif
+
+
+    SetUpHWDriver_CallRegs(reg ->r[2], &drvregs);
+    drvregs.r[7] = reg ->r[1]; /** slothandle **/
+
+    /** Gorra do the card detect entry stuff to debounce etc **/
+    HardwareFunction(HARDWARE_FUNCTION__CARDDETECT_ENTRY, &drvregs, &DRV_Error);
+
+    /** Now decide the reason for the IRQ, by checking the status register of the irq'ing slot **/
+    HardwareFunction(HARDWARE_FUNCTION__GET_CARD_STATUS, &drvregs, &DRV_Error); /** Do it **/
+
+    if((drvregs.r[0] & STATUS__CARD_DETECT) == IRQ__CARD_INSERT) {
+        #if Debug == TRUE
+            DebugMessage("mK", "        Going to deal with a card insertion.\n");
+        #endif
+        error = IRQ_CardInsert(reg);
+    }
+    else
+    {
+        #if Debug == TRUE
+            DebugMessage("mK", "        Going to deal with a card removal.\n");
+        #endif
+        error = IRQ_CardRemove(reg);
+    }
+
+
+    Send_SlotChanged_ServiceCall(reg ->r[1]); /** FOR THE DESKTOP FILER'S BENEFIT, and PCCARDFSs! **/
+
+
+    /** Finally, call the tidy-up routine in the hardware driver that reenables the irq etc... **/
+    SetUpHWDriver_CallRegs(reg ->r[2], &drvregs);
+    drvregs.r[7] = reg ->r[1];
+    HardwareFunction(HARDWARE_FUNCTION__CARDDETECT_EXIT, &drvregs, &DRV_Error);
+
+
+    return(SetError(error));
+}
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  IRQ_CardInsert(registers)                                                        ***/
+/***                                                                                   ***/
+/***  This function is called when a card is inserted into a slot. It resets the card, ***/
+/***  reads its CIS, and then allocates card drives etc if it is a memory card, and    ***/
+/***  loads the driver (if present) if it is an I/O card. It will usually be called    ***/
+/***  via a callback, but is also called on module initialisation.                     ***/
+/***                                                                                   ***/
+/***  Returns:                                                                         ***/
+/***    an error if 'owt guz wrong.                                                    ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode IRQ_CardInsert(_kernel_swi_regs *entry_regs)
+    {
+    DRIVER_REGISTERS            driver_regs;
+    _kernel_swi_regs            kernregs;
+    int                         loop;
+    int                         carddrivenumber = 0;
+    char                        tempbuff1[257];
+    char                        tempbuff2[257];
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+
+    /***************************************************/
+    /*** Given the slot address, initialise the slot ***/
+    /***************************************************/
+    #if Debug == TRUE
+        DebugMessage("mK", "Entering ********** IRQ_CardInsert ********\n");
+    #endif
+
+    SetUpHWDriver_CallRegs(entry_regs ->r[2], &driver_regs);
+
+    #if Debug == TRUE
+        DebugMessage("mK", "    HW driver call registers set up\n");
+    #endif
+    /** See whether the card inserted is 5v or not.... **/
+    driver_regs.r[7] = entry_regs ->r[1];
+    HardwareFunction(HARDWARE_FUNCTION__GET_CARD_STATUS, &driver_regs, &DRV_Error);
+    if((driver_regs.r[0] & STATUS__VOLTAGE_SENSE) != STATUS__VOLTAGE_SENSE) return(ERROR__ONLY_SUPPORT_5V); /** Phht! **/
+
+    HardwareFunction(HARDWARE_FUNCTION__CARD_INITIALISE, &driver_regs, &DRV_Error); /* Does the necessary power cycling */
+
+    /***********************************************************/
+    /*** First things first, fill in the right carddrive     ***/
+    /***********************************************************/
+    if(entry_regs ->r[2] > 0) { /** ie if it is not the first-registered hardware driver **/
+        for(loop = 0; loop < entry_regs ->r[2]; loop++) carddrivenumber += HardwareDriver[loop].NumberOfSlots;
+    }
+    carddrivenumber += entry_regs ->r[1];
+    #if Debug == TRUE
+        DebugMessage("mK","\n    We're using carddrive %d\n", carddrivenumber);
+    #endif
+    /* Note, this doesn't seem to allow reentrancy - global vars & all -spills into CIStoPartn */
+    CardDrive[carddrivenumber].SlotHandle = entry_regs ->r[1];
+    CardDrive[carddrivenumber].PCCardDriver = MAX_PCCARD_DRIVERS;
+    CardDrive[carddrivenumber].HardwareDriver = entry_regs ->r[2]; /* We told it to tell us this on IRQ installation */
+    CardDrive[carddrivenumber].PartitionLength = 0;
+    CardDrive[carddrivenumber].PartitionStart = 0;
+    CardDrive[carddrivenumber].PartitionDataType = 0;
+    /** We don't care about the partition information yet, 'cos we're using physical reads **/
+
+    /*************************************************************************************************/
+    /*** Next, see whether the card is a DOS Pseudofloppy or not, by reading the first 0x20 bytes  ***/
+    /*** of common memory.                                                                         ***/
+    /*************************************************************************************************/
+    kernregs.r[0] = 0;                  /* Read physical, common memory, no scatter */
+    kernregs.r[1] = carddrivenumber;    /* Read from the right carddrive! */
+    kernregs.r[2] = 0;                  /* Start at byte 0 */
+    kernregs.r[3] = (int)BufferSpace;   /* Destination */
+    kernregs.r[4] = 0x20;               /* Bytes to read (32) */
+    error = PCMCIA_Read(&kernregs);     /* Do the read */
+
+    if((*BufferSpace == 0xe9) || ((*BufferSpace == 0xeb) && (*(BufferSpace+2) == 0x90))) {
+        /*************************************************************************************************/
+        /*** It's a DOS pseudo-floppy, so we need to store the 'partition' data from the DOS bootblock ***/
+        /*************************************************************************************************/
+        kernregs.r[0] = *(BufferSpace+0x0b) + ((*(BufferSpace+0x0c)) << 8);    /* bytes per sector */
+        kernregs.r[1] = *(BufferSpace+0x13) + ((*(BufferSpace+0x14)) << 8);    /* sectors in volume*/
+
+        CardDrive[carddrivenumber].PartitionLength = kernregs.r[0] * kernregs.r[1];  /* bpv */
+        CardDrive[carddrivenumber].PartitionStart = 0;
+        CardDrive[carddrivenumber].PartitionDataType = 0;
+        CardDrive[carddrivenumber].Status = PARTITION_STATUS__PCCARDFS; /** Default it to being a blank SRAM memory card **/
+
+        #if Debug == TRUE
+            DebugMessage("mK", "---------DOS PSEUDOFLOPPY DETECTED-----------\n");
+            DebugMessage("mK", "Length is %d\n", kernregs.r[0] * kernregs.r[1]);
+        #endif
+    }
+    else
+    {
+        /***************************************************************************************************/
+        /*** It's not a DOS pseudo-floppy, so read the card's CIS (or some of it) into the 'BufferSpace' ***/
+        /***************************************************************************************************/
+        #if Debug == TRUE
+            DebugMessage("mK", "---------It's NOT a DOS pseudofloppy-----------\n");
+        #endif
+        kernregs.r[0] = 1; /** dummy ReadCis reason code **/
+        kernregs.r[1] = carddrivenumber; /* Indicates the right carddrive */
+        kernregs.r[2] = (int)BufferSpace;
+        kernregs.r[4] = BufferSize;
+
+        /*******************************************************************************************************/
+        /*** Maybe we should check here whether the BufferSpace is already in use, & allocate space if reqd ****/
+        /*** This'll cause a real headache with re-entrancy!                                                ****/
+        /*******************************************************************************************************/
+        error = Cis_ReadCis(&kernregs);
+        /** if error here, invalid cis, so card unformatted - pretend it is a sillily small PCCARDFS partition (1 byte long!)? **/
+        /** also, deal with case when not all CIS read (allocate enough space for entire cis & re-read: make sure uncommon!) **/
+
+        if(error == ERROR__INVALID_CIS) {
+            #if Debug == TRUE
+                DebugMessage("mK","ERROR: Invalid CIS!\n");
+            #endif
+            CardDrive[carddrivenumber].PartitionLength = 1;
+            CardDrive[carddrivenumber].PartitionStart = 0;
+            CardDrive[carddrivenumber].PartitionDataType = 0;
+            CardDrive[carddrivenumber].Status = PARTITION_STATUS__NOCIS; /** Default it to being a blank SRAM memory card **/
+        }
+        else
+        {
+            /***********************************************************************************************/
+            /*** Now decode the CIS for any hardware-related tuples, and set up the hardware that way... ***/
+            /***********************************************************************************************/
+            error = DecodeCIStoHardware(carddrivenumber, (int)BufferSpace, BufferSize, kernregs.r[3]); /** Only deals with h/w stuff **/
+
+            /******************************************************************************/
+            /*** Find the Level1 and Level2 Tuples to see if anyone recognises the card ***/
+            /******************************************************************************/
+            CardDrive[carddrivenumber].PCCardDriver = MAX_PCCARD_DRIVERS;    /* Defaults to SRAM drivers */
+
+            for(loop=0;loop<MAX_PCCARD_DRIVERS;loop++) if(PCCardDriver[loop].FunctionAddress!=0) tempbuff1[0] = 5;
+            if(tempbuff1[0] == 5) { /* ie if there is at least one PCCard driver regd */
+                #if Debug == TRUE
+                    DebugMessage("mK", "Going to find the level one and level two tuples*****************************\n");
+                #endif
+                tempbuff1[0] = 0;
+                tempbuff2[0] = 0;               /* Initialise 'em to 'not found' */
+
+                kernregs.r[0] = 5;              /* Find tuple for level1 info */
+                kernregs.r[1] = carddrivenumber; /* Indicates the temporary carddrive */
+                kernregs.r[2] = (int)BufferSpace;
+                kernregs.r[4] = BufferSize;
+                kernregs.r[5] = CISTPL_VERS_1;
+                kernregs.r[6] = 1; /* Just find the first copy (there must only be one anyway...) */
+                error = Cis_FindTuple(&kernregs);
+                if(error == NO_ERROR) {
+                    #if Debug == TRUE
+                        DebugMessage("mK", "found the level 1 tuple....");
+                    #endif
+                    kernregs.r[0] = 3;
+                    kernregs.r[7] = (int)tempbuff1;
+                    error = Cis_ReadTuple(&kernregs);
+                }
+                kernregs.r[0] = 5;              /* Find tuple for level2 info */
+                kernregs.r[1] = carddrivenumber; /* Indicates the temporary carddrive */
+                kernregs.r[2] = (int)BufferSpace;
+                kernregs.r[4] = BufferSize;
+                kernregs.r[5] = CISTPL_VERS_2;
+                kernregs.r[6] = 1; /** Just the first (and only) one **/
+                error = Cis_FindTuple(&kernregs);
+                if(error == NO_ERROR) {
+                    #if Debug == TRUE
+                        DebugMessage("mK", "found the level 2 tuple....");
+                    #endif
+                    kernregs.r[0] = 3;
+                    kernregs.r[7] = (int)tempbuff2;
+                    error = Cis_ReadTuple(&kernregs);
+                }
+
+                /*********************************************************************/
+                /*** Got the tuples, now pass them round all the PCCard drivers... ***/
+                /*********************************************************************/
+                loop = 0;
+
+                /**Should set up card to attr mem here **/
+
+                while(loop < MAX_PCCARD_DRIVERS) {
+                    if(PCCardDriver[loop].FunctionAddress != 0) { /** if driver in this slot */
+                        SetUpPCCDriver_CallRegs(carddrivenumber, &driver_regs);
+                        driver_regs.r[0] = PCCARD_FUNCTION__IDENTIFY;
+                        driver_regs.r[1] = CardDrive[carddrivenumber].SlotHandle;
+                        driver_regs.r[2] = (int)(&(HardwareDriver[CardDrive[carddrivenumber].HardwareDriver].NumberOfSlots));
+                        driver_regs.r[5] = (int)tempbuff1;
+                        driver_regs.r[6] = (int)tempbuff2;
+                        #if Debug == TRUE
+                            DebugMessage("mK", "Gonna call driver %d from the irq thingy\n", loop);
+                        #endif
+                        PCCardFunction(PCCardDriver[loop].FunctionAddress, PCCardDriver[loop].R12Value, &driver_regs, &DRV_Error);
+                        #if Debug == TRUE
+                            DebugMessage("mK", "PCCard driver called! Returned %d\n", driver_regs.r[0]);
+                        #endif
+                        if(driver_regs.r[0] != 0) {
+                            CardDrive[carddrivenumber].PCCardDriver = loop;             /* Store driver used */
+                            CardDrive[carddrivenumber].PartitionStart = driver_regs.r[0];  /* And indicate whether it recog the carddrive as io/mem */
+                            /*** call the initialise function here... ***/
+                            driver_regs.r[0] = PCCARD_FUNCTION__INITIALISE;
+                            driver_regs.r[1] = CardDrive[carddrivenumber].SlotHandle;
+                            driver_regs.r[2] = (int)(&(HardwareDriver[CardDrive[carddrivenumber].HardwareDriver].NumberOfSlots));
+                            PCCardFunction(PCCardDriver[loop].FunctionAddress, PCCardDriver[loop].R12Value, &driver_regs, &DRV_Error);
+                            /** Link the io irq here, if required **/
+                            if(PCCardDriver[loop].IRQAddress != 0) {
+                                #if Debug == TRUE
+                                    DebugMessage("mK","*****CARD INSERTED HAS AN IO IRQ HANDLER*****\n");
+                                #endif
+                                SetUpHWDriver_CallRegs(loop, &driver_regs);
+                                driver_regs.r[1] = (1<<16) | 0x80000000; /** Install the IRQ interrupt **/
+                                driver_regs.r[2] = 0;
+                                driver_regs.r[3] = 0;
+                                driver_regs.r[4] = PCCardDriver[loop].IRQAddress;
+                                driver_regs.r[5] = PCCardDriver[loop].R12Value;
+                                driver_regs.r[6] = CardDrive[carddrivenumber].HardwareDriver;
+                                driver_regs.r[7] = carddrivenumber;
+                                HardwareFunction(HARDWARE_FUNCTION__IRQ_HANDLER_INSTALL, &driver_regs, &DRV_Error);
+                            }
+                            loop = MAX_PCCARD_DRIVERS; /* Make sure we exit the loop now we've got a handler */
+                        }
+                        else loop++;
+                    }
+                    else loop++;
+                }
+                /**Set card back to prev data space here? how know prev space? dont' set back if was initilase called**/
+            }
+            else
+            {
+                /** Um, no drivers - best see for ourselves whether it is IO or memory.... **/
+                /** Setup partitionstart to reflect the decision... **/
+                /** Hang on a minute - what's the point of this? **/
+            }
+        }
+    }
+
+    /***************************************************************************************************************/
+    /*** Find out about filing-system partitions which are on the card, picking one to be 'visible'              ***/
+    /***************************************************************************************************************/
+    if(CardDrive[carddrivenumber].PartitionLength == 0) { /** valid CISed card **/
+        /** Now, let's see if there are any FS partitions on the card, **/
+        /** and allocate a carddrive for one **/
+        DecodeCIStoPartition((int)BufferSpace, BufferSize, kernregs.r[3], carddrivenumber);
+    }
+
+    error = NO_ERROR; /** FIX?*/
+    return(error);
+}
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  IRQ_CardRemove(slot address)                                                     ***/
+/***                                                                                   ***/
+/***  This function is called when a card is removed from a slot. It unlinks the card  ***/
+/***  drives & does the hardware-required finalisation (slot power-down etc). It also  ***/
+/***  issues the CardRemoved function to the PCCard driver.                            ***/
+/***                                                                                   ***/
+/***  Returns:                                                                         ***/
+/***    0 if successful, non-zero if fails. It should never fail.                      ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode IRQ_CardRemove(_kernel_swi_regs *entry_regs)
+    {
+    DRIVER_REGISTERS            driver_regs;
+    int                         loop;
+    int                         carddrivenumber = 0;
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+
+
+    if(entry_regs ->r[2] > 0) { /** ie if it is not from the first-registered hardware driver **/
+        for(loop = 0; loop < entry_regs ->r[2]; loop++) carddrivenumber += HardwareDriver[loop].NumberOfSlots;
+    }
+    carddrivenumber += entry_regs ->r[1];
+    #if Debug == TRUE
+        DebugMessage("mK","    We think we're acting on carddrive %d\n", carddrivenumber);
+    #endif
+
+    /****************************************************************************************************/
+    /*** Given the slot handle, look up the corresponding card drive & mark as unused.                ***/
+    /*** First, see whether we need to inform a PCCard driver of the removal (ie it has an I/O driver)***/
+    /****************************************************************************************************/
+    if(CardDrive[carddrivenumber].PCCardDriver != MAX_PCCARD_DRIVERS) {
+        /** Don't forget to uninstall the irq handler too!!!!! **/
+        SetUpPCCDriver_CallRegs(carddrivenumber, &driver_regs);
+        driver_regs.r[0] = PCCARD_FUNCTION__CARD_REMOVED; /** code for card removed function **/
+        driver_regs.r[1] = CardDrive[carddrivenumber].SlotHandle;
+        driver_regs.r[2] = (int)(&(HardwareDriver[CardDrive[carddrivenumber].HardwareDriver].NumberOfSlots));
+        #if Debug == TRUE
+            DebugMessage("mK", "This card was using a PCCard driver, which we now call to tell it the card has gone.\n");
+        #endif
+        PCCardFunction(PCCardDriver[CardDrive[carddrivenumber].PCCardDriver].FunctionAddress,
+                       PCCardDriver[CardDrive[carddrivenumber].PCCardDriver].R12Value,
+                       &driver_regs, &DRV_Error);
+    }
+
+    CardDrive[carddrivenumber].SlotHandle = 0; /* Mark card drive as empty */
+    CardDrive[carddrivenumber].Status = PARTITION_STATUS__DRIVEEMPTY;  /** Drive empty, Sir! **/
+    CardDrive[carddrivenumber].PartitionLength = 0;
+    CardDrive[carddrivenumber].DeviceType = 6; /* SRAM until proven otherwise */
+    #if Debug == TRUE
+        DebugMessage("mK", "Card drive %d is now marked as unused.\n", carddrivenumber);
+    #endif
+
+    /****************************************/
+    /*** Finally, do the power-down stuff ***/
+    /****************************************/
+    SetUpHWDriver_CallRegs(entry_regs ->r[2], &driver_regs);
+    driver_regs.r[7] = entry_regs ->r[1];
+    HardwareFunction(HARDWARE_FUNCTION__CARD_FINALISE, &driver_regs, &DRV_Error);
+    return(error);
+}
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Send_SlotChanged_ServiceCall()                                                   ***/
+/***                                                                                   ***/
+/***  Sends the 'slot status changed' service call                                     ***/
+/***                                                                                   ***/
+/***  Return Value:                                                                    ***/
+/***    None.                                                                          ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+void Send_SlotChanged_ServiceCall(int slotid)
+    {
+    _kernel_swi_regs    callregs;
+
+    #if Debug == TRUE
+        DebugMessage("gK", "Sending out a Slot_Changed service call\n");
+    #endif
+
+    callregs.r[0] = __SVC__SLOT_CHANGED;
+    callregs.r[1] = SERVICE__PCMCIA;
+    callregs.r[2] = slotid;
+    _kernel_swi(OS_ServiceCall, &callregs, &callregs); /** Tell the world we're up & running */
+}
+
+
+

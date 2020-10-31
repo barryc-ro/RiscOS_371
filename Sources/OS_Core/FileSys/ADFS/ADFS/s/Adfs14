@@ -1,0 +1,3508 @@
+       SUBT    IDE Winchester low level routines -> Adfs14
+
+; Change record
+; =============
+;
+; CDP - Christopher Partington, Cambridge Systems Design
+; SBP - Simon Proven
+; MJS - Mike Stephens
+;
+;
+; 07-Jan-91  10:00  CDP
+; IDE driver started.
+;
+; 11-Mar-91  16:38  CDP
+; TestPresent routine, previously conditioned out, now removed.
+; WinIDEWaitNotBusy added as it's needed all over the place.
+;
+; 13-Mar-91  14:51  CDP
+; Fixed incorrect updated of scatter list entry on read error.
+;
+; 14-Mar-91  13:18  CDP
+; Fixed typos in WinClaimIDEIRQs and WinReleaseIDEIRQs (PollPtr
+; instead of WinIDEPollPtr - unfortunately, PollPtr is defined
+; in the ST506 driver).
+;
+; 18-Mar-91  18:15  CDP
+; Added WinIDEUpdateScatterList routine and calls in IRQHandler.
+; (This update is done in more than one place but not between sectors
+; of a chunk anymore and therefore not critical timing.)
+; Increments WinIDECommandActive when starting a background op and
+; decrements it following the background callback.
+;
+; 20-Mar-91  13:04  CDP
+; Added WinIDEPowerSetup and WinIDEKillPowerSetup.
+; WinIDEWaitReady changed to take a timeout parameter instead of using
+; a fixed value and to return R0,V instead of Z.
+;
+; 27-Mar-91  10:47  CDP
+; WinIDEPowerSetup now checks and clears a flag to determine whether
+; it has installed a callback to remove itself. Without this, the
+; callback could get added more than once before the first execution
+; and this seems to be bad for the machine.
+;
+; 08-Apr-91  17:22  CDP
+; WinIDEStartTransfer now limits the number of sectors to be transferred
+; by one IDE op to WinIDEMaxSectorsPerTransfer instead of 256 sectors.
+; This is to work around problems with some manufacturers' firmware,
+; notably Seagate. It should not affect performance dramatically.
+; Code previously conditional on IDEUseRAMCode now made permanent.
+; Code to calculate new disc address from drive registers at end of lump
+; now made conditional on IDETrustDrive. If this is false, the new disc
+; address is calculated from the lump size.
+;
+; 01-May-91  10:39  CDP
+; WinIDEIRQHandler now updates scatter list on write error, using the
+; controller's registers (sanity checked) to determine how much was written.
+; This was previously not done because there are bugs with some drives in
+; this area.
+;
+; 15-Jul-91  11:57  CDP
+; Applied fix suggested by Conner to fix problem with CP3044 (and other
+; non-CAM drives?): it is impossible to select a drive that is busy and it
+; is impossible to determine whether a drive is busy until is has been
+; selected. The combined hardware/software fix, which is especially
+; necessary when selecting a slave drive after reset, is to pull up the BUSY
+; bit on the bus so that it always reads as 1 when neither drive is driving
+; the bus and select drives by repeatedly writing to the drive/head register
+; when trying to determine whether the drive is busy (changes to
+; WinIDEWaitReady).
+;
+; 13-Jan-92  11:51  CDP
+; Added LockIDEController and UnlockIDEController.
+; WinIDEDoBackground: removed controller locking (now handled elsewhere);
+; now issues callback to FileCore if nothing to do.
+; WinIDECallbackBg: calls UnlockIDEController.
+; WinIDECallbackBg now preserves registers so that callers don't need to;
+; callers changed.
+;
+; 14-Jan-92  17:04  CDP
+; WinIDECommandDisc changed to wait after selecting drive before testing
+; status (similar to WinIDEWaitReady). ANDS in same routine changed to AND
+; (there was no point in the S but it did no harm).
+;
+; 15-Jan-92  13:01  CDP
+; WinIDEPowerSetup changed to use Lock/UnlockIDEController.
+;
+; 02-Apr-92  16:18  CDP
+; Changed WinIDECallbackBg to unlock controller *before* calling FileCore
+; as FileCore appears to call the low-level entry point from the callback
+; routine under certain circumstances.
+; WinIDESetDriveAndHead now masks head number to be only bits 0..3 for
+; safety (avoids too large head number causing wrong drive to be selected).
+;
+;
+; 23-Aug-1994 SBP
+; Changed disc addressing system to support LBA mode when appropriate.
+; Not all drives support this, so the WinIDEDriveLBAFlag variable is
+; used to determine whether a drive supports LBA or not.  Some commands
+; can't use LBA, so there's WinIDESetPhysAddressCHS - which will always
+; use CHS addressing.  WinIDESetPhysAddress will choose LBA or CHS
+; according to the relevant parameters passed.
+;
+; 24-Aug-94 SBP
+; Modified WinIDEPhysAddrToLogical to support LBA mode.
+;
+; 06-Sep-1994 SBP
+; Added support for BigDisc addressing (sector addresses).
+;
+; 06-12-94 16:52 SBP
+; Fixed WinIDESetPhysAddress when BigDisc turned on.
+;
+; 08-12-94 11:04 SBP
+; Incorporated comments from CDP:
+;
+; Made SetPhysAddress preserve flags and make chouce of
+; calling SetPhysAddress or SetPhysAddressCHS use cond.
+; BLs instead of branching round code.  
+;
+; Removed unnecessary branch round single instruction, line 1156.
+;
+; Fixed WinIDEIRQHandler to correctly clear 'in irq' flag on exit.
+;
+; Conditialised some more instructions to avoid branch.
+;
+; Removed spurious load of R5 before WinIDEAdjustStatus
+;
+; 27-02-96 MJS
+; StrongARM changes for modifying code
+; 
+;*End of change record*
+
+;*********************************************************************
+;
+; This file contains the following routines:
+;
+; WinIDEDoForeground
+;    Carries out the foreground part of a data transfer operation.
+;
+; WinIDEDoBackground
+;    Initiates the background part of a data transfer operation.
+;
+; WinIDEStartTransfer
+;    Starts a data transfer operation.
+;
+; WinIDEIRQHandler
+;    Handles interrupts from the IDE discs.
+;
+; WinIDETimeout
+;    Called when a data transfer operation times out.
+;
+; WinIDEUpdateScatterList
+;    Updates scatter list by the length of a transfer.
+;
+; WinIDECallbackFg
+;    The callback routine for foreground data transfer operations.
+;
+; WinIDECallbackBg
+;    The callback routine for background data transfer operations.
+;
+; WinIDESetPhysAddress
+;    Translates a logical disc address to a physical disc address and
+;    sets up the IDE parameter block accordingly.  Uses CHS or LBA
+;    addressing according to drive boot block flag.
+;
+; WinIDESetPhysAddressCHS
+;    Same as WinIDESetPhysAddress but only uses CHS.
+;
+; WinIDESetDriveAndHead
+;    Sets up the drive/head parameter byte in the IDE parameter block.
+;
+; WinIDECommandDisc
+;    Issues a command to an IDE disc.
+;
+; WinIDEDecodeDriveStatus
+;    Decodes drive status into an error number
+;
+; WinIDEPhysAddrToLogical
+;    Calculates logical disc address of current sector from contents
+;    of IDE registers.
+;
+; WinIDEInstallTransferCode
+;    Copies code into RAM for moving data to/from the IDE discs.
+;
+; WinIDEReadASector
+;    Reads up to a sector from an IDE disc.
+;
+; WinIDEWriteASector
+;    Writes up to a sector to an IDE disc.
+;
+; WinIDEPowerSetup
+;    Entered on timer event to setup power-saving mode of drives.
+;
+; WinIDEKillPowerSetup
+;    Callback routine to remove WinIDEPowerSetup when finished.
+;
+; WinIDEPollCommand
+;    Start a command and poll for the IRQ that indicates completion.
+;
+; WinIDEResetDrives
+;    Resets the IDE drives and enables interrupts in the controller.
+;
+; WinIDEWaitReady
+;    Waits for an IDE drive to become ready.
+;
+; WinIDEWaitNotBusy
+;    Waits for controller to become not busy.
+;
+; WinIDECheckEscape
+;    Checks if escape is allowed during an op and, if it is, checks whether
+;    it has been pressed.
+;
+; WinClaimIDEIRQs
+;    Installs an interrupt handler for IDE discs.
+;
+; WinReleaseIDEIRQs
+;    Removes an interrupt handler for IDE discs.
+;
+; WinTickerHandler
+;    Called every centisecond from TickerV.
+;
+; WinClaimTickerV
+;    Installs a routine on TickerV.
+;
+; WinReleaseTickerV
+;    Removes a routine from TickerV.
+;
+; DoMicroDelay
+;    Delays a specified number of 1/2 microsecond units.
+;
+; LockIDEController
+;    Sets flag to lock IDE controller.
+;
+; UnlockIDEController
+;    Clears flag to unlock IDE controller.
+;
+;*********************************************************************
+
+WinIDEDoForeground ROUT
+;
+; Do the foreground part of an operation
+;
+; Entry:
+;    R1 = operation as passed by FileCore
+ [ BigDisc
+;    R2 = sector disc address
+ |
+;    R2 = byte disc address
+ ]
+;    R3 -> buf or scatter list
+;    R4 = length of transfer
+;    IDE -> IDE controller
+;    MODE: SVC
+;
+; Exit:
+;    VS => error occurred
+;          R0 = error code
+;    VC => no error
+;          R0 undefined
+;    R1 preserved
+ [ BigDisc
+;    R2 updated sector disc address
+ |
+;    R2 updated byte disc address
+ ]
+;    R3 updated scatter list/buffer pointer
+;    R4 updated amount to transfer
+;    R5 undefined
+;    All other registers preserved
+
+; check that there really is something to do
+
+        TEQS    R4,#0
+        BICEQS  PC,LR,#V_bit            ; return (no error) if nothing to do
+
+ [ Debug21
+        
+        DLINE   "WinIDEDoForeground"
+ ]
+
+; if scatter list, first transfer is first entry in scatter list
+;            else, first transfer is passed R3,R4
+
+        TSTS    R1,#ScatterBit
+        ADREQ   R0,WinIDEFakeScatterList        ; if no scatter, fake it...
+        STMEQIA R0,{R3,R4}
+        MOVEQ   R3,R0                   ; ...and set R3 to point to it
+        BEQ     %FT20                   ; ...and branch (R4 also = limit)
+
+; scatter list provided
+
+10
+        LDMIA   R3,{R0,R5}              ; get scatter list entry
+        TEQS    R0,#0                   ; addr < 0 ?
+        ADDMI   R3,R3,R0                ; if yes, add in...
+        BMI     %BT10                   ; and go again
+
+; got non-negative address from scatter list entry, check for 0 len
+
+        TEQS    R5,#0                   ; null entry?
+        BICEQS  PC,LR,#V_bit            ; return (no error) if nothing to do
+
+; found the first scatter list entry that has adr >= 0 and len != 0
+
+20
+ [ Debug21
+        
+        DLINE   "WinIDEDoForeground actually got stuff to do"
+ ]
+; R3 -> scatter list entry to do
+; R4 = data to transfer in foreground
+
+; flag "transfer in progress"
+
+        MOV     R0,#0
+        STRB    R0,WinIDEOpDone
+
+; set the callback address
+
+        ADDR    R0,WinIDECallbackFg
+        STR     R0,WinIDECallbackPtr
+
+; adjust length in R4 to take account of bytes to end of disc
+
+        LDR     R0,WinIDEDiscSize       ; get size of disc
+
+ [ BigDisc
+        ASSERT  WinIDEBytesPerSector=512
+        MOV     R0,R0,LSR #9            ; convert to sectors (assume disc has whole no. of sectors!)
+        Push    "LR"
+        LDR     LR, WinIDEDiscSize2
+        ORR     R0, R0, LR, LSL #(32-9) ; add in discsize2
+        Pull    "LR"
+        SUB     R0,R0,R2                ; R0= sectors to end of disc
+        CMP     R0,#&800000             ; check to see if >4G bytes (&800000 sectors)
+ [ Debug21a
+
+        DREG    R0,"Length to end of disc :"
+ ]
+        BHS     %FT23                   ; > 4G, beyond max possible transfer
+        MOV     R0,R0,LSL #9
+        CMPS    R0,R4                   ;
+        MOVCC   R4,R0                   ; ...use it instead
+ [ Debug21a
+        
+        DREG    R4,"Transfer length set to :"
+ ]
+ |
+        SUB     R0,R0,R2                ; R0 = bytes to end
+        CMPS    R0,R4                   ; if < transfer requested...
+        MOVCC   R4,R0                   ; ...use it instead
+ ]
+
+23
+; R3 -> scatter list entry
+; R4 = max data to be transferred
+
+        Push    "LR"
+
+; Convert disc address passed to Cylinder/Head/Sector or LBA
+
+ [ Debug21
+        
+        DLINE   "WinIDEDoForeground call to WinIDESetPhysAddress"
+ ]
+        CMP     R1,#WinIDEFileCoreOpFormat
+        BLNE    WinIDESetPhysAddress    ; (R2->R0)
+        BLEQ    WinIDESetPhysAddressCHS ; (R2->R0)
+
+; Start the transfer
+
+ [ Debug21
+        
+        DLINE   "WinIDEDoForeground phys address set so start transfer..."
+ ]
+        BL      WinIDEStartTransfer     ; (R3-R4,IDE->R0,V)
+ [ Debug21
+        
+        DLINE   "Transfer start returned"
+ ]
+        Pull    "PC",VS                 ; return if error
+
+; Enable CPU IRQs
+
+        MOV     LR,PC                   ; save current irq state
+        TEQP    PC,#SVC_mode            ; enable IRQs
+
+; busy wait loop
+
+30
+        LDRB    R0,WinIDEOpDone         ; get flag
+        TEQS    R0,#0                   ; has IRQ set it yet?
+        BEQ     %BT30                   ; branch if not
+
+        TEQP    PC,LR                   ; restore IRQ state
+
+; operation has completed - load registers for return
+
+        LDRB    R0,WinIDECompletion     ; get completion code
+        LDR     R1,WinIDEFileCoreOp     ; get op
+        LDR     R2,WinIDEDiscAddress    ; get updated disc address
+        LDR     R3,WinIDEScatterPtr     ; get scatter list pointer
+
+        Pull    "LR"
+        TSTS    R1,#ScatterBit          ; was there a scatter list provided?
+        LDMEQIA R3,{R3,R4}              ; if no, get faked one
+        BEQ     SetVOnR0
+
+; Scatter list provided - if we exhausted the current entry, step to
+; next so that any background part of this op has something to transfer.
+
+        LDR     R4,[R3,#4]              ; if yes, get amount left
+        CMPS    R4,#0                   ; exhausted ?
+        ADDLE   R3,R3,#8                ; if yes, step to next
+
+; It doesn't matter if R3 now points to a negative entry as this will
+; be handled.
+
+; Must return R4 = amount of original request not transferred, not amount
+; of scatter list entry.
+
+        LDR     R4,WinIDETransferLimit
+
+ [ Debug21
+
+        DREG    R4,"WinIDEStartTransfer : Limit at end = "
+ ]
+
+        B       SetVOnR0
+
+;*********************************************************************
+
+WinIDEDoBackground      ROUT
+;
+; Start a background data transfer
+;
+; Entry:
+ [ BigDisc
+;    R2 = sector disc address
+ |
+;    R2 = byte disc address
+ ]
+;    R3 -> scatter list (we know there is a scatter list)
+;    IDE -> IDE controller
+;
+; Exit:
+;    VS => error
+;          R0 = error code
+;    VC => no error
+;          R0 undefined
+;    R3 updated to point to first real entry in scatter list
+;    R5 undefined
+;    All other registers preserved
+
+        Push    "R4,LR"
+ [ Debug21
+        
+        DLINE   "WinIDEDoBackground"
+ ]
+
+; Get first chunk address/length from scatter list. Don't need to check
+; for scatter list as will only do a background op when a scatter list
+; has been provided.
+
+10
+        LDMIA   R3,{R0,R5}              ; get scatter list entry
+        TEQS    R0,#0                   ; offset backwards?
+        ADDMI   R3,R3,R0                ; if yes, add in...
+        BMI     %BT10                   ; and go again
+
+; got non-negative address from scatter list entry, check for 0 len
+
+        TEQS    R5,#0                   ; null entry?
+        BEQ     %FT80                   ; branch if so
+
+; Found the first scatter list entry that has adr >= 0 and len != 0
+; Set transfer length to bytes to end of disc as it will be a null entry in
+; the scatter list which will really terminate the transfer.
+
+ [ BigDisc
+        ASSERT  WinIDEBytesPerSector=512
+        LDR     R4,WinIDEDiscSize       ; size of disc...
+        MOV     R4,R4,LSR #9            ; ...in sectors
+        LDR     LR, WinIDEDiscSize2
+        ORR     R4, R4, LR, LSL #(32-9)
+        SUB     R4,R4,R2                ; R4 = sectors to end
+
+; SBP 13 Dec 1996 Fix for ADFSBuffers<>0 on >2G discs
+
+ [ {FALSE}
+        CMPS    R4,#&800000             ; is this >=4Gbytes...
+        MVNHS   R4,#0                   ; yes, so R4=4G-1
+ |
+        CMPS    R4,#&400000             ; is this >=2Gbytes...
+        MVNHS   R4,#&80000000           ; yes, so R4=2G-1
+ ]
+        MOVLO   R4,R4,LSL #9            ; no, so R4 = bytes to end
+ [ Debug21a
+        
+        DREG    R4,"Length set to :"
+ ]
+ |
+        LDR     R4,WinIDEDiscSize       ; get size of disc
+        SUB     R4,R4,R2                ; R4 = bytes to end
+ ]
+
+; set the callback address
+
+        ADDR    R0,WinIDECallbackBg
+        STR     R0,WinIDECallbackPtr
+
+; Set up Cylinder/Head/Sector and do the background bit
+
+        LDR     LR,WinIDEFileCoreOp
+        CMP     LR,#WinIDEFileCoreOpFormat
+
+        BLNE    WinIDESetPhysAddress    ; (R2->R0)
+        BLEQ    WinIDESetPhysAddressCHS
+
+; Start the transfer
+; R3 -> scatter list entry
+; R4 = max data to be transferred
+
+ [ Debug21
+        
+        DLINE   "Start transfer..."
+ ]
+        BL      WinIDEStartTransfer     ; (R3-R4,IDE->R0,V)
+ [ Debug21
+        
+        DLINE   "Transfer start returned"
+ ]
+        Pull    "R4,PC",VC              ; return if ok
+
+; background op not started
+; R0 = completion code
+; Don't do background callback here as caller will when it sees error
+
+        Pull    "R4,LR"
+        ORRS    PC,LR,#V_bit            ; error
+
+;****** Never fall through
+
+80
+; nothing to do in background: callback FileCore
+
+        MOV     R0,#0                   ; status = ok
+        BL      WinIDECallbackBg
+
+        Pull    "R4,LR"
+        BICS    PC,LR,#V_bit            ; return to caller (status ok)
+
+;*********************************************************************
+
+WinIDEStartTransfer     ROUT
+;
+; Called to start a data transfer op (read, write, verify, format)
+;
+; Entry:
+;    R3 -> scatter list entry
+;    R4 =  overall limit on transfer
+;    IDE -> IDE controller
+;    WinIDECommandCode = IDE opcode for this op
+;    MODE: SVC
+;
+; Exit:
+;    VS => some error occurred starting xfer
+;          R0 = error code
+;    VC => no error
+;          R0 undefined
+;    All other registers preserved
+
+        Push    "R1-R6,R8-R9,LR"
+
+ [ Debug21
+        
+        DLINE   "WinIDEStartTransfer:Start transfer"
+ ]
+
+; save limit - will decrement on each transfer
+
+        STR     R4,WinIDETransferLimit
+
+; save scatter list pointer
+
+        STR     R3,WinIDEScatterPtr             ; save for IRQ etc.
+
+; check for escape if enabled - must do this after limit and scatterptr
+; setup
+
+        BL      WinIDECheckEscape               ; (->R0,V)
+        Pull    "R1-R6,R8-R9,PC",VS             ; return if escape
+
+ [ Debug21
+        
+        DLINE   "WinIDEStartTransfer: Escape not pressed"
+ ]
+; no escape - save scatter list pointer and first entry
+; first scatter list entry is known to be valid
+
+        STR     R3,WinIDETmpScatterPtr
+        MOV     R8,R3
+        LDMIA   R3,{R0,R5}
+        sbaddr  R1,WinIDETmpScatterEntry
+        STMIA   R1,{R0,R5}
+
+; See how much there is to transfer in the scatter list (upto the amount
+; passed as the limit on the transfer). This is safe to do even when the
+; scatter list has been faked provided that we stop when our limit has been
+; reached.
+
+        MOV     R1,#0                           ; bytes found in scatter list
+10
+        LDMIA   R3,{R0,R5}                      ; get scatter entry
+        TEQS    R0,#0                           ; wrap around?
+        ADDMI   R3,R3,R0                        ; yes, add it in
+        BMI     %BT10                           ; and go again
+
+; found real entry in scatter list
+
+        TEQS    R5,#0                           ; end of scatter list?
+        BEQ     %FT20                           ; branch if so
+        ADD     R1,R1,R5                        ; add in length
+
+        CMPS    R1,R4                           ; hit limit?
+        ADDCC   R3,R3,#8                        ; if not, step to next entry
+        BCC     %BT10                           ; branch if so
+
+
+20
+; Have added up what we found in scatter list.
+; Check total in scatter list is less than limit as final addition may
+; have exceeded limit
+; R1 = length to try to transfer
+
+        CMPS    R1,R4                           ; found more than limit?
+        MOVHI   R1,R4                           ; if yes, use limit
+
+; R1 = bytes we want = MIN(amount in scatter list, limit)
+
+ [ Debug21
+        
+        DREG    R1, "WinIDEStartTransfer:Bytes we want="
+ ]
+ [ IDEAllowTrackWrap
+ |
+
+; See if there is that much data left on track
+
+        LDRB    R4,WinIDESecsPerTrk             ; R4 = secs per track
+        LDRB    R2,WinIDEAdrSector              ; R2 = 0..WinIDESecsPerTrk-1
+        SUB     R4,R4,R2                        ; NOTE R4 != 0
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R4,R4,LSL #9                    ; convert to bytes
+
+; R1 = bytes we want
+; R4 = bytes left on track
+; make R1 = MIN(R1,R4)
+
+        CMPS    R4,R1                           ; want less than on track?
+        MOVLO   R1,R4                           ; if yes, ask for that much
+
+; R1 = MIN(bytes we want, bytes on track)
+
+ ]
+
+; Check that this will not blow maximum allowed request of IDE drive
+; Note: request of 0 (i.e. 256 MOD 256) requests 256 sectors
+
+ [ WinIDEMaxSectorsPerTransfer = 256
+
+        CMPS    R1,#256 * WinIDEBytesPerSector  ; R1 > max allowed?
+        MOVHI   R1,#256 * WinIDEBytesPerSector  ; if yes, R1 = max allowed
+        MOV     R9,R1                           ; save size of xfer
+
+ |
+        MOV     R9,#WinIDEMaxSectorsPerTransfer ; get max size of xfer
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R9,R9,LSL #9                    ; convert to bytes
+        CMPS    R1,R9                           ; R1 > max allowed?
+        MOVHI   R1,R9                           ; if yes, R1 = max allowed
+        MOVLS   R9,R1                           ; save size of xfer
+ ]
+
+; R1 = R9 = bytes to transfer in one IDE op (lump size)
+
+ [ Debug21
+        
+        DREG    R6, "WinIDEStartTransfer: command="
+        DREG    R1, "WinIDEStartTransfer: Lump size="
+ ]
+        STR     R9,WinIDELumpSize               ; save for IRQ
+        STR     R9,WinIDESaveLumpSize
+
+; R6 = command
+; R9 = lump size
+; Calculate and save the number of bytes to be used from the first sector
+; (the blocksize). If this is a real data transfer op (read or write) this
+; should be the minimum of the sector size and the size of the first
+; entry in the scatter list. Since all except the final entry in the list
+; must be a multiple of the sector size, it is ok to use the minimum of
+; the sector size and the lump size.
+; For verify, the blocksize will be the same as the lumpsize as we only
+; get an IRQ when all sectors have been verified.
+
+        CMPS    R9,#WinIDEBytesPerSector        ; MIN(lumpsize, sector size)
+        MOVHI   R9,#WinIDEBytesPerSector
+
+        LDRB    R6,WinIDECommandCode            ; get command
+        TEQS    R6,#IDECmdVerify                ; verify?
+ [ EngineeringMode
+        TEQNES  R6,#IDECmdVerifyEng
+ ]
+        MOVEQ   R9,R1                           ; if yes, blocksize = lumpsize
+        STR     R9,WinIDEBlockSize
+
+; R6 = command
+; R1 = bytes to transfer in this lump
+; If format, CAM 2.1 says that sector count register should contain
+;    number of sectors per track
+
+        TEQS    R6,#IDECmdFormatTrk             ; format?
+        LDREQB  R1,WinIDESecsPerTrk             ; if yes, get secs/trk
+
+; If not format, round up to whole number of sectors
+;    = (bytes + bytes_per_sector-1)/bytes_per_sector
+
+        ADDNE   R1,R1,#WinIDEBytesPerSector     ; else round xfer to sectors
+        SUBNE   R1,R1,#1
+        ASSERT  WinIDEBytesPerSector = 512
+        MOVNE   R1,R1,LSR #9
+
+; R1 = number of sectors we will ask for this time
+;      (the final one may not be transferred in its entirety)
+; If format, R1 = sectors/track
+
+        STRB    R1,WinIDEParmSecCount
+
+; set value for features/precomp register
+
+        LDRB    R1,WinIDEPrecomp
+        STRB    R1,WinIDEParmPrecomp
+
+; R6 = command
+
+        MOV     R0,R6                           ; R0 = command code
+ [ Debug21
+        
+        DLINE   "WinIDEStartTransfer: command disc"
+ ]
+        BL      WinIDECommandDisc               ; (R0,IDE->R0,V)
+ [ Debug21
+        
+        DLINE   "WinIDEStartTransfer: command disc returned"
+ ]
+        Pull    "R1-R6,R8-R9,PC",VS
+
+; Op started ok (V=0), R0 = R6 = command
+; Start timer - this times out the whole IDE op i.e. not each sector.
+; If a FileCore op takes more than one IDE op, the timer gets restarted
+; for each IDE op.
+
+        MOV     R0,#WinIDETimeoutTransfer
+        STR     R0,WinTickCount
+        ADDR    R0,WinIDETimeout
+        STR     R0,WinTickCallAddress
+
+; WinIDETimeout will now be called if the timeout expires
+
+; Enable interrupt.
+; If it's motherboard IDE, will need to enable IRQ in IOC.
+; If podule IDE, the IRQ is always enabled in IOC but must be enabled
+; on the podule. In either case, the interrupt is always enabled
+; on the IDE controller itself.
+; For podule, assumes that register is write-only and that bits other
+; than the enable bit are safe to alter.
+
+        PHPSEI  LR                              ; IRQs off (preserves C/V)
+
+        ADD     R0,SB,#:INDEX:WinIDEIRQPtr      ; R0-> interrupt mask reg
+        ASSERT  WinIDEIRQBits = WinIDEIRQPtr + 4
+        LDMIA   R0,{R0,R1}
+        LDR     R2,=DefaultIDE
+        TEQS    R2,IDE                          ; motherboard?
+        LDREQB  R2,[R0]                         ; yes, get IOC mask
+        ORR     R2,R2,R1                        ; or in enable bit
+        STRB    R2,[R0]                         ; write to IOC/podule
+
+        PLP     LR                              ; restore IRQ state
+
+; if write or format op, write first sector of data
+
+ [ Debug21
+        
+        DLINE   "WinIDEStartTransfer: Check for write or format"
+ ]
+        TEQS    R6,#IDECmdWriteSecs             ; write?
+        TEQNES  R6,#IDECmdFormatTrk             ; or format?
+        Pull    "R1-R6,R8-R9,LR",NE             ; return if not
+        BICNES  PC,LR,#V_bit
+
+ [ Debug21
+        
+        DLINE   "WinIDEStartTransfer: was write or format - transfer 1st sector"
+ ]
+; it was a data out op
+; R8 -> scatter list
+; R9 = bytes we want from/for first sector
+; Wait for DRQ to become asserted: according to CAM 2.1, this can
+; take as long as 700us although Conner drives appear to assert it
+; immediately. This loop is inaccurate because the resolution of
+; the delay routine is only 0.5us but it is good enough for this.
+; NOTE: if this is part of a background op (except for the first part
+; which is started in foreground), IRQs are disabled.
+; DRIVES THAT TAKE A LONG TIME TO ASSERT DRQ WILL RUIN INTERRUPT LATENCY
+
+        MOV     R1,#700                         ; counter for loop
+80
+        LDRB    R0,IDERegAltStatus              ; get status
+        AND     R0,R0,#IDEStatusDRQ             ; mask bits except DRQ
+        TEQS    R0,#IDEStatusDRQ                ; EQ => got DRQ
+        SUBNES  R1,R1,#1                        ; if not, decrement count...
+        MOVNE   R0,#1*2                         ; ...and wait (1/2 us units)
+        BLNE    DoMicroDelay                    ; (preserves flags)
+        BNE     %BT80
+
+; have got DRQ or are giving up waiting
+
+        TEQS    R1,#0                           ; giving up?
+        MOVEQ   R0,#WinIDEErrNoDRQ              ; if so, return error
+        Pull    "R1-R6,R8-R9,LR",EQ
+        ORREQS  PC,LR,#V_bit
+
+; got DRQ so write data
+
+        LDR     R1,[R8,#0]                      ; R1 -> buffer
+        MOV     R0,R9                           ; R0 = max bytes to move
+
+; R0 = length to transfer (up to 512 bytes will be moved)
+; R1 -> buffer
+; Call data write routine
+
+        MOV     LR,PC                           ; set link
+        LDR     PC,WinIDEWritePtr               ; (R0,R1,IDE->R0,R1)
+                                                ; returns here
+
+; Do NOT adjust buffer address and lengths as the write may fail.
+; IRQ routine does update.
+; All done - return
+
+        Pull    "R1-R6,R8-R9,LR"
+        BICS    PC,LR,#V_bit
+        LTORG
+
+;*********************************************************************
+
+; The following variables define the registers pushed by the
+; IRQ routine that the timer routine must also push.
+;
+; WinIDEIRQRegsA are the registers pushed before switching processor
+; modes. WinIDEIRQRegsB are the main registers.
+;
+; LR is not included in either set but MUST be pushed/pulled
+
+                GBLS    WinIDEIRQRegsA          ; regs pushed
+                GBLS    WinIDEIRQRegsB
+
+WinIDEIRQRegsA  SETS    "R0"
+WinIDEIRQRegsB  SETS    "R0-R8,IDE"
+
+;*********************************************************************
+
+WinIDEIRQHandler        ROUT
+;
+; Called from an IRQ from the IDE system during a data transfer op.
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: IRQ
+;    IRQs disabled
+;
+; Exit:
+;    All registers and flags preserved
+
+; Switch to SVC mode so can enable IRQs without R14 being destroyed
+; by the first IRQ. Should also allow us to use HostFS debug routines
+; once the interrupt has been cleared.
+
+        Push    "$WinIDEIRQRegsA,LR"
+        MOV     R0,PC                           ; save mode
+        TEQP    PC,#SVC_mode :OR: I_bit         ; keep IRQs disabled
+        NOP
+
+; Now in SVC mode - save regs
+
+        Push    "$WinIDEIRQRegsB,LR"
+
+; Set flag to indicate currently in IRQ to prevent timer interfering
+; when IRQ being processed.
+
+        MOV     R0,#&FF
+        STRB    R0,WinIDEIRQFlag
+
+; Set IDE -> IDE controller
+
+        LDR     IDE,WinIDEPtr           ; IDE -> IDE hardware
+
+; Disable IRQs from the IDE controller so can reenable interrupts
+; without risk of interrupt from IDE whilst servicing this one
+
+;        MOV     R0,#bit1                ; -IEN
+;        STRB    R0,IDERegDigOutput
+
+        ADD     R4,SB,#:INDEX:WinIDEIRQPtr ; R4 -> address of irq mask reg
+        ASSERT  WinIDEIRQBits = WinIDEIRQPtr + 4
+        LDMIA   R4,{R4,R5}              ; get mask and bits
+        LDR     R1,=DefaultIDE          ; get address of motherboard IDE
+        TEQS    R1,IDE                  ; motherboard?
+        LDREQB  R1,[R4]                 ; yes, get IOC mask
+        BIC     R1,R1,R5                ; clear enable bit
+        STRB    R1,[R4]                 ; write to IOC/podule
+
+ [ Debug22; :LOR: {TRUE}
+;       
+        DLINE   "I",cc
+;        DLINE   "IDE IRQ incoming..."
+ ]
+
+; Now safe for data transfer routines to reenable IRQs to improve
+; IRQ latency - they must restore state on exit
+
+; Set R3 -> TmpScatterEntry
+;     R4,R5 = TmpScatterEntry
+;     R7 = IDE command code of current op
+
+        sbaddr  R3,WinIDETmpScatterEntry ; R3 -> tmp scatter entry
+        LDMIA   R3,{R4,R5}              ; get tmp scatter entry
+        LDRB    R7,WinIDECommandCode    ; R7 = IDE command code
+
+; Get status (will clear IRQ) and check for error
+
+        LDRB    R8,IDERegStatus
+        TSTS    R8,#IDEStatusErrorBits  ; test here for speed
+        BNE     %FT80                   ; ...and branch if error
+
+ [ Debug22
+        
+        DLINE   "No error - block transfer expected"
+ ]
+
+; No error - get blockSize (bytes of this sector to move)
+
+        LDR     R6,WinIDEBlockSize      ; R0 = bytes to move
+
+; R3 -> TmpScatterEntry
+; R4,R5 = TmpScatterEntry
+; R6 = bytes of this sector we want (blockSize)
+; R7 = IDE command code of current command
+; R8 = status from controller
+
+; If read op, need to read data - check for DRQ first
+
+        TEQS    R7,#IDECmdReadSecs      ; read?
+        TSTEQS  R8,#IDEStatusDRQ        ; got DRQ?
+        MOVEQ   R0,#WinIDEErrNoDRQ      ; error if not
+        BEQ     %FT85
+
+ [ Debug22
+        
+        DREG    R7, "Is a DRQ as expected for command "
+ ]
+
+; NE => not read or read and DRQ asserted
+
+        TEQS    R7,#IDECmdReadSecs      ; read? (check again)
+ [ Debug22
+        BNE     %FT01
+        LDR     LR, WinIDEReadPtr
+        
+        DREG    LR, "ReadSecs with routine at "
+01
+ ]
+        MOVEQ   R1,R4                   ; if so, R1 = buf address
+        MOVEQ   R0,R6                   ; ...R0 = bytes we want
+        MOVEQ   LR,PC                   ; ...set link
+        LDREQ   PC,WinIDEReadPtr        ; ...(R0,R1,IDE->R0,R1)
+                                        ; ...returns here
+ [ Debug22
+        
+        DLINE   "Update scatter list"
+ ]
+
+; Note: The read routine should have enabled IRQs whilst we have the
+;       scatter list entry sitting in registers. This should be ok as
+;       are supposed to disable interrupts only when writing to scatter
+;       list and updating process block.
+;       If read, IRQs are disabled now until leaving the IRQ routine.
+;       Hence IRQs will be disabled from the final write to the scatter
+;       list up to updating the process block as required.
+
+; Now update a few things:
+; adjust tmp scatter list entry for data transferred
+
+        ADD     R4,R4,R6                ; bump scatter.address
+        SUB     R5,R5,R6                ; decrement scatter.length
+        STMIA   R3,{R4,R5}              ; write to tmp scatter entry
+
+; adjust lump size
+
+        LDR     R2,WinIDELumpSize       ; decrement bytes to go
+        SUB     R2,R2,R6
+        STR     R2,WinIDELumpSize
+
+; adjust overall limit
+
+        LDR     R0,WinIDETransferLimit
+ [ Debug21a
+
+        DREG    R0,"WinIDETransferLimit = "
+ ]
+        SUB     R0,R0,R6
+        STR     R0,WinIDETransferLimit
+ [ Debug21a
+
+        DREG    R0,"WinIDETransferLimit = "
+ ]
+
+; See if this transfer is complete
+; R2 = updated lumpsize
+
+        CMPS    R2,#0
+        BLE     %FT30                   ; branch if finished lump
+
+ [ Debug22
+        
+        DLINE   "More of lump to do"
+ ]
+; More of this lump to do
+; If we've exhausted this scatter list entry, move to next
+
+        CMPS    R5,#0                   ; exhausted?
+        BGT     %FT10                   ; branch if not
+
+; Exhausted this scatter list entry - find next good entry
+
+        LDR     R3,WinIDETmpScatterPtr  ; R3 -> scatter list
+        ADD     R3,R3,#8                ; step to next entry
+05
+        LDMIA   R3,{R4,R5}              ; get the entry
+        TEQS    R4,#0                   ; address < 0
+        ADDMI   R3,R3,R4                ; add it in if so
+        BMI     %BT05                   ; and go again
+
+; Got a scatter list entry with a proper address.
+; No need to check length as that was done when we determined the
+; lumpsize for this IDE op and it must be non-zero if lump not
+; finished.
+
+        STR     R3,WinIDETmpScatterPtr
+        sbaddr  R3,WinIDETmpScatterEntry ; save in tmp scatter entry
+        STMIA   R3,{R4,R5}
+
+10
+; R2 = remaining lump size
+; R3 -> TmpScatterEntry
+; R4,R5 = TmpScatterEntry
+; Set up blocksize for next sector
+; This should be the minimum of the sector size and the size of the first
+; entry in the scatter list. Since all except the final entry in the list
+; must be a multiple of the sector size, it is ok to use the minimum of
+; the sector size and the lump size.
+
+        CMPS    R2,#WinIDEBytesPerSector        ; MIN(wanted, bytespersector)
+        MOVHI   R2,#WinIDEBytesPerSector
+        STR     R2,WinIDEBlockSize
+
+; If write or format op, move data
+; Should never be format because only one sector gets written per track
+; and only one track at a time can be formatted.
+; R7 = IDE command code
+; R8 = status from controller
+
+        TEQS    R7,#IDECmdWriteSecs     ; write?
+        TEQNES  R7,#IDECmdFormatTrk     ; ...or format ?
+        BNE     %FT99                   ; return if not
+
+; It's a write (or format)
+
+        TSTS    R8,#IDEStatusDRQ        ; must have DRQ for write
+        MOVEQ   R0,#WinIDEErrNoDRQ
+        BEQ     %FT85                   ; error if not
+
+ [ Debug22
+        
+        DLINE   "It's a write and DRQ is asserted - good"
+ ]
+
+; It IS write or format op and we have DRQ
+; R3 still -> TmpScatterEntry
+; R4,R5 still hold TmpScatterEntry
+
+        MOV     R1,R4                   ; R1 -> buffer
+        MOV     R0,R2                   ; R0 = bytes to move
+
+; R0 = length to transfer (up to 512 bytes will be moved)
+; R1 -> buffer
+; call data write routine
+
+ [ Debug22
+        
+        DLINE   "About to do a write"
+ ]
+
+        MOV     LR,PC                   ; set link
+        LDR     PC,WinIDEWritePtr       ; (R0,R1,IDE->R0,R1)
+                                        ; returns here
+
+; Do NOT adjust buffer address and lengths as the write may fail
+; Note: the data write routine should have enabled IRQs.
+;       However, the final write to the scatter list is not done
+;       until the NEXT IRQ. Hence IRQs will be disabled from the
+;       final write to the scatter list up to updating the process
+;       block as required.
+
+; All done for now
+
+        BNE       %FT99
+
+;****** Never fall through
+
+30
+; End of lump so must have hit one of
+; a) overall limit on transfer
+; b) amount in scatter list when op started
+; c) WinIDEMaxSectorsPerTransfer sectors
+;
+; IDE -> IDE controller
+; R3 = TmpScatterPtr
+; R4 = TmpScatterEntry.addr
+; R5 = TmpScatterEntry.len
+; R6 = previous block size
+; R7 = current op
+; R8 = status from controller (= OK - no longer needed)
+ [ Debug22
+
+;       DLINE   "E",cc
+        DLINE   "End of lump"
+ ]
+
+ [ IDETrustDrive
+
+; Update real scatter list with amount transferred
+; This is ok even if the scatter list was faked as the first update
+; will terminate the updating
+
+        MOV     R2,R6                   ; save block size
+        LDR     R6,WinIDESaveLumpSize   ; R6 = amount transferred
+        LDR     R3,WinIDEScatterPtr     ; R3 -> scatter list at start of op
+        BL      WinIDEUpdateScatterList ; (R3,R6->R3-R6,R8)
+        MOV     R6,R2                   ; restore R6 = block size
+
+
+; R3 -> real scatter list
+; R4,R5 = scatter list entry (possibly R5=0)
+; R6 = size of previous lump
+
+; Convert physical address back to logical address
+
+        BL      WinIDEPhysAddrToLogical         ; (IDE->R1,R2)
+
+; R2 = disc address of current sector - adjust for data just transferred
+; If the op is VERIFY, must add just one sector not the whole blocksize
+; which, for verify, is the same as the lumpsize.
+; If the op is NOT verify, add the bytes out of this sector that we
+; actually wanted (blocksize).
+
+        TEQS    R7,#IDECmdVerify                ; if verify...
+  [ EngineeringMode
+        TEQNES  R7,#IDECmdVerifyEng
+  ]
+ [ BigDisc
+        ADDEQ   R2,R2,#1                        ; add 1 sector
+        ASSERT  WinIDEBytesPerSector=512        ;
+        ADDNE   R2,R2,R6,LSR #9                 ;
+ |
+        ADDEQ   R2,R2,#WinIDEBytesPerSector     ; ...add 1 sector...
+        ADDNE   R2,R2,R6                        ; ...else add blocksize
+ ]
+
+
+ |
+
+; Update disc address by amount transferred
+ [ BigDisc
+        MOV     R1,R6                           ; save block size
+        LDR     R2,WinIDEDiscAddress            ; get disc address...
+        LDR     R6,WinIDESaveLumpSize           ; R6 = amount transferred
+ [ Debug22
+        
+        DREG    R2,"Disc addr in: "
+        DREG    R3,"Sector offset in: "
+        DREG    R6,"Lump size in: "
+ ]
+        ASSERT  WinIDEBytesPerSector=512        ;
+        ADD     R2,R2,R6,LSR #9                 ; R2 = updated disc address
+        STR     R2,WinIDEDiscAddress            ;
+ [ Debug22
+
+        DREG    R2,"Disc addr out: "
+        DREG    R3,"Sector offset out: "
+ ]
+ |
+        MOV     R1,R6                           ; save block size
+        LDR     R2,WinIDEDiscAddress            ; get disc address
+        LDR     R6,WinIDESaveLumpSize           ; R6 = amount transferred
+        ADD     R2,R2,R6                        ; R2 = updated disc address
+        STR     R2,WinIDEDiscAddress            ; save it
+ ]
+
+ [ Debug20
+        Push    "R1,R2"
+        BL      WinIDEPhysAddrToLogical ; (IDE->R1,R2)
+        Pull    "R1,R2"
+        
+        DREG    R2,"Calc "
+ ]
+
+; Update real scatter list with amount transferred
+; This is ok even if the scatter list was faked as the first update
+; will terminate the updating
+; R6 = amount transferred
+
+        LDR     R3,WinIDEScatterPtr     ; R3 -> scatter list at start of op
+        BL      WinIDEUpdateScatterList ; (R3,R6->R3-R6,R8)
+        MOV     R6,R1                   ; restore R6 = block size
+
+; R2 = disc address of next sector
+; R3 -> real scatter list
+; R4,R5 = scatter list entry (possibly R5=0)
+; R6 = size of previous lump
+
+ ]
+
+; Check if hit overall limit
+; If no scatter list was provided, limit will be hit at same time as
+; fake scatter list is exhausted so no problems
+
+ [ Debug22
+
+;       DLINE    "C",cc
+        DLINE   "Consider whether to continue"
+ ]
+        LDR     R0,WinIDETransferLimit  ; check if hit limit
+        CMPS    R0,#0
+        MOVLE   R0,#0                   ; if done, set completion code...
+        BLE     %FT90                   ; ...and branch
+
+ [ Debug22
+
+;       DLINE   "T",cc
+        DREG    R0, "Continuing with transfer limit = "
+ ]
+
+; Not hit overall limit
+
+        CMPS    R5,#0                   ; end of scatter entry?
+        BGT     %FT40                   ; branch if not
+
+; Exhausted this scatter list entry - find next good entry
+
+        ADD     R3,R3,#8                ; step to next entry
+35
+        LDMIA   R3,{R4,R5}              ; get the entry
+        TEQS    R4,#0                   ; address < 0
+        ADDMI   R3,R3,R4                ; add it in if so
+        BMI     %BT35                   ; and go again
+
+; Got a scatter list entry with a proper address - check length
+
+        TEQS    R5,#0                   ; zero length?
+        MOVEQ   R0,#0                   ; if so, set completion code...
+        BEQ     %FT90                   ; ...and branch
+
+40
+; More to do
+; R2 = updated disc address
+; R3 -> real scatter list
+; R4,R5 hold scatter list entry
+
+        LDR     LR,WinIDEFileCoreOp
+        CMP     LR,#WinIDEFileCoreOpFormat
+
+        BLNE    WinIDESetPhysAddress    ; set up for next xfer (R2,IDE->R0)
+        BLEQ    WinIDESetPhysAddressCHS
+
+; if ok, start the next transfer
+
+        LDR     R4,WinIDETransferLimit  ; R4 = limit on transfer
+ [ Debug21
+        
+;       DLINE   "S",cc
+        DLINE   "Start transfer..."
+ ]
+        BL      WinIDEStartTransfer;InIRQ ; start next transfer
+ [ Debug21
+        
+        DLINE   "Transfer start returned"
+ ]
+        BVC     %FT99                   ; all done if started ok
+        B       %FT90                   ; branch if error
+
+;****** Never fall through
+
+80
+; Drive error - decode status
+;
+; R3 -> TmpScatterPtr
+; R4,R5 = TmpScatterEntry
+; R7 = IDE command code
+; R8 = contents of drive status register
+; IDE -> IDE controller
+ [ Debug22
+        
+        DREG    r8, "Drive error "
+ ]
+
+        MOV     R0,R8                   ; decode error
+        BL      WinIDEDecodeDriveStatus ; (R0->R0)
+
+; Set R3 -> real scatter list (start point of transfer)
+
+        LDR     R3,WinIDEScatterPtr
+
+; If the command was verify or write, we must adjust the amount remaining
+; from the contents of the IDE registers: verify only gets an interrupt at
+; the end or after error, not after each sector; write interrupts do not
+; indicate whether the previous sector has been written to disc but only
+; that the controller is ready to accept more data - the final interrupt
+; indicates that all data has been written.
+; SaveLumpSize tells us how much we WOULD have updated the transfer by
+; if the entire op had succeeded. The sector register says how many sectors
+; were not verified/written.
+
+        TEQS    R7,#IDECmdVerify        ; if not verify...
+ [ EngineeringMode
+        TEQNES  R7,#IDECmdVerifyEng
+ ]
+        TEQNES  R7,#IDECmdWriteSecs     ; ...or write...
+        BNE     %FT85                   ; ...branch
+
+; Op was verify or write
+
+        LDRB    R2,IDERegSecCount       ; get sectors not done
+        LDR     R6,WinIDESaveLumpSize   ; and what we SHOULD have done
+        ASSERT  WinIDEBytesPerSector = 512
+        SUBS    R6,R6,R2,LSL #9         ; R6 = amount done
+
+; R6 = amount verified/written before the error occurred.
+; If >0, update the scatter list entry - this is all that needs to be updated
+; as the op is now aborting.
+; If <=0, do NOT update scatter list - controller is misbehaving
+
+        BLGT    WinIDEUpdateScatterList ; (R3,R6->R3-R6,R8)
+
+85
+; Error:
+;    a) status wrong
+;    b) read but no DRQ
+;    c) write but no DRQ
+
+ [ Debug22
+        
+        DLINE   "Transfer expected, but DRQ not asserted"
+ ]
+
+ [ IDETrustDrive
+
+; convert physical address back to logical address
+
+        BL      WinIDEPhysAddrToLogical ; (IDE->R1,R2)
+
+ |
+
+; Convert physical address back to logical address
+; Do this by reading drive registers as, even though they may be unreliable
+; in no error conditions, they *must* be valid in error conditions.
+
+        BL      WinIDEPhysAddrToLogical ; (IDE->R1,R2)
+ ]
+
+
+WinIDEIRQError
+;
+; An error has occurred during processing of the IRQ.
+; (Also branched to when a command times out.)
+; Possibles are
+;    a) status wrong
+;    b) read but no DRQ
+;    c) write but no DRQ
+;    d) timeout
+;
+; R0 = error code
+; R2 = disc address of error
+; R3 -> real scatter list
+; R7 = IDE command code
+; IDE -> IDE controller
+;
+; Read:
+;    Must update the scatter list to indicate the amount read before
+;    the error occurred.
+; Verify:
+;    If timeout, IDE registers are probably trashed so report the error
+;    as occuring at the start of the verify. If not timeout, we have
+;    already sorted out the error address and amount not verified.
+; Write and Format:
+;    If timeout, we cannot tell how much the drive actually wrote to the
+;    disc so must return disc address = disc address at start of op and
+;    not update the scatter list. If not timeout, we have already sorted
+;    out the error address and updated the scatter list (for write).
+
+ [ Debug22
+        
+        DLINE   "IDEIRQError - tidy up"
+ ]
+
+        TEQS    R7,#IDECmdReadSecs      ; read?
+        LDREQ   R6,WinIDESaveLumpSize   ; if so, R6=intended xfer size
+        LDREQ   R4,WinIDELumpSize       ; ...R4=amount not transferred
+        SUBEQ   R6,R6,R4                ; ...R6=amount actually transferred
+        BLEQ    WinIDEUpdateScatterList ; (R3,R6->R3-R6,R8)
+
+ [ IDEResetOnError
+
+; Reset the drives to switch the access lights off
+; Note: this also enables the interrupt in the drive controller
+
+        BL      WinIDEResetDrives       ; preserves all regs
+ ]
+
+90
+; Either:
+;    a) found entry in scatter list with 0 length field or have hit
+;       overall limit on op - we have finished
+; or:
+;    b) some error has occurred
+; R0 = completion code
+; R2 = disc address to return
+; R3 -> scatter list
+
+; Disable IRQs from IDE
+; For podule, assumes that register is write-only and that bits other
+; than the enable bit are safe to alter
+
+        ADD     R4,SB,#:INDEX:WinIDEIRQPtr ; R4 -> address of irq mask reg
+        ASSERT  WinIDEIRQBits = WinIDEIRQPtr + 4
+        LDMIA   R4,{R4,R5}              ; get mask and bits
+        LDR     R1,=DefaultIDE          ; get address of motherboard IDE
+        TEQS    R1,IDE                  ; motherboard?
+        LDREQB  R1,[R4]                 ; yes, get IOC mask
+        BIC     R1,R1,R5                ; clear enable bit
+        STRB    R1,[R4]                 ; write to IOC/podule
+
+; R0 = completion code
+; R2 = disc address
+; R3 -> scatter list
+; Call callback
+
+ [ Debug22
+        
+        DLINE   "Finished - call callback"
+ ]
+        MOV     LR,PC                   ; save link
+        LDR     PC,WinIDECallbackPtr    ; branch to callback routine
+
+; Callback returns here
+
+; Clear "in IRQ" flag
+
+        MOV     R0,#0
+        STRB    R0,WinIDEIRQFlag
+
+        B       %FT100
+
+99
+
+; Common exit from IRQ routine
+; Switches back to mode saved on stack in LR, clears "in irq" flag
+; and reenables IRQ in IDE digital output register.
+
+; Clear "in IRQ" flag
+
+        MOV     R0,#0
+        STRB    R0,WinIDEIRQFlag
+
+        ADD     R4,SB,#:INDEX:WinIDEIRQPtr ; R4 -> address of irq mask reg
+        ASSERT  WinIDEIRQBits = WinIDEIRQPtr + 4
+        LDMIA   R4,{R4,R5}              ; get mask and bits
+        LDR     R1,=DefaultIDE          ; get address of motherboard IDE
+        TEQS    R1,IDE                  ; motherboard?
+        LDREQB  R1,[R4]                 ; yes, get IOC mask
+        ORR     R1,R1,R5                ; set enable bit
+        STRB    R1,[R4]                 ; write to IOC/podule
+
+100
+
+; Reenable IRQ in IDE controller.
+; This happens even when there is nothing further to do as that
+; latch is only used to kill interrupts during the IRQ routine. At
+; all other times, it stays enabled.
+
+;        MOV     R0,#0                   ; IEN
+;        STRB    R0,IDERegDigOutput
+
+ [ Debug22
+        
+        DLINE   "End of IRQ - return"
+ ]
+
+; Return from interrupt
+; First restore SVC regs and switch back to original mode
+
+        Pull    "$WinIDEIRQRegsB,LR"
+
+        TEQP    PC,R0
+        NOP
+
+; Now back in original mode
+
+        Pull    "$WinIDEIRQRegsA,PC",,^
+
+        LTORG
+
+;*********************************************************************
+
+WinIDETimeout   ROUT
+;
+; Called when a timeout occurs on an IDE data transfer op which would
+; normally have been terminated by an IRQ and thus would have been
+; handler by WinIDEIRQHandler.
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: IRQ or SVC
+;    IRQs disabled
+;
+; Exit:
+;    All registers preserved
+
+; Switch to SVC mode as will join main thread of IRQ
+
+        Push    "$WinIDEIRQRegsA,LR"    ; same regs as IRQHandler
+        MOV     R0,PC                   ; save mode
+        TEQP    PC,#SVC_mode :OR: I_bit ; keep IRQs disabled
+        NOP
+
+; Now in SVC mode - save main regs
+
+        Push    "$WinIDEIRQRegsB,LR"    ; same regs as IRQHandler
+
+; Set up registers suitable for branching to IRQ code
+
+        LDR     IDE,WinIDEPtr           ; IDE -> IDE hardware
+        LDR     R2,WinIDEDiscAddress    ; R2 = disc address of start of op
+        LDRB    R7,WinIDECommandCode    ; R7 = IDE command code
+
+; If it's read, adjust disc address by amount transferred so far
+; (if write, cannot be sure where timeout occurred without examining
+; the IDE registers which will be invalid).
+
+        TEQS    R7,#IDECmdReadSecs      ; read?
+ [ BigDisc
+        LDREQ   R3,WinIDESaveLumpSize   ; if so, R3 = size of transfer
+        LDREQ   R4,WinIDELumpSize       ; ...R4 = amount left to transfer
+        SUBEQ   R3,R3,R4                ; ...R3 = amount transferred
+        ASSERT  WinIDEBytesPerSector=512
+        ADDEQ   R2,R2,R3,LSR #9         ; ...update R2
+ |
+        LDREQ   R3,WinIDESaveLumpSize   ; if so, R3 = size of transfer
+        LDREQ   R4,WinIDELumpSize       ; ...R4 = amount left to transfer
+        SUBEQ   R3,R3,R4                ; ...R3 = amount transferred
+        ADDEQ   R2,R2,R3                ; ...update R2
+ ]
+
+        LDR     R3,WinIDEScatterPtr     ; R3 -> scatter list
+        MOV     R0,#WinIDEErrTimeout    ; R0 = error code
+
+; R0 = completion code
+; R2 = disc address
+; R3 -> real scatter list
+; R7 = IDE command code
+; Branch to IRQ handler which will tidy up and call the callback.
+
+        B       WinIDEIRQError
+
+;*********************************************************************
+
+WinIDEUpdateScatterList ROUT
+;
+; Updates scatter list by the length of a transfer
+;
+; Entry:
+;    R3 -> scatter list
+;    R6 = amount transferred
+;
+; Exit:
+;    R3 updated
+;    R4,R5 = final scatter list entry
+;    R8 undefined
+;    All other registers and flags preserved
+
+10
+        LDMIA   R3,{R4,R5}              ; get scatter list entry
+        TEQS    R4,#0                   ; wrap?
+        ADDMI   R3,R3,R4                ; add in if so
+        BMI     %BT10                   ; and go again
+
+; found non-negative scatter list entry
+
+        CMPS    R6,R5                   ; if total > this entry
+        MOVCS   R8,R5                   ; ...R8 = this entry
+        MOVCC   R8,R6                   ; else R8 = total
+        ADD     R4,R4,R8                ; adjust scatter.addr
+        SUB     R5,R5,R8                ; adjust scatter.len
+        STMIA   R3,{R4,R5}              ; write to scatter list
+ [ Debug21
+        
+        DREG    R4,"Scatter list addr ="
+        DREG    R5,"Scatter list len  ="
+ ]
+        SUBS    R6,R6,R8                ; adjust total
+        ADDGT   R3,R3,#8                ; if more, step to next entry
+        BGT     %BT10                   ; ...and go again
+
+        MOVS    PC,LR                   ; return
+
+;*********************************************************************
+
+WinIDECallbackFg        ROUT
+;
+; The callback routine for the foreground part of background ops.
+; Called on completion of the transfer.
+;
+; Entry:
+;    R0 = completion code
+;    R2 = disc address
+;    R3 -> scatter list
+;    IDE -> IDE controller
+;    SB -> static workspace
+;    MODE: SVC
+;    IRQs disabled
+;
+; Exit:
+;    R0 undefined
+
+; save completion code, disc address and scatter list pointer for foreground
+
+ [ BigDisc
+; sector offset should be valid at this point
+ ]
+
+        STRB    R0,WinIDECompletion
+        STR     R2,WinIDEDiscAddress
+        STR     R3,WinIDEScatterPtr
+
+; cancel timer
+
+        MOV     R0,#0
+        STR     R0,WinTickCallAddress
+        STR     R0,WinTickCount                 ; speeds up ticker routine
+
+; tell foreground that we've finished
+
+        MOV     R0,#&FF
+        STRB    R0,WinIDEOpDone
+        MOV     R0,#0
+;       STR     R0,WinIDELumpSize
+;       STR     R0,WinIDESaveLumpSize
+        MOVS    PC,LR                           ; and return
+
+;*********************************************************************
+
+WinIDECallbackBg        ROUT
+;
+; The callback routine for the background part of background ops.
+; Called on completion of the transfer.
+;
+; Entry:
+;    R0 = completion code
+;    R2 = disc address
+;    R3 -> scatter list
+;    IDE -> IDE controller
+;    SB -> static workspace
+;    MODE: SVC
+;    IRQ state: undefined
+;
+; Exit:
+;    All registers and flags preserved
+;    WinIDEDiscAddress is not updated
+
+        Push    "R0-R5,LR"
+
+ [ BigDisc
+; sector offset should be valid at this point
+ ]
+
+; Cancel timer
+
+        MOV     R1,#0
+        STR     R1,WinTickCallAddress
+        STR     R1,WinTickCount         ; speeds up ticker routine
+
+; Call WinIDEAdjustStatus to put completion code in format suitable for
+; FileCore
+
+ [ BigDisc
+        BL      WinIDEAdjustStatus      ; (R0,R2,R5->R0,R1,R2,R6,V)
+ |
+        BL      WinIDEAdjustStatus      ; (R0,R2->R0,R2,R5,V)
+ ]
+
+; Set process status
+
+        TEQS    R0,#0                   ; error?
+        MOVEQ   R1,#0                   ; if not, status = 0
+        MOVNE   R1,R3                   ; else status -> scatter entry
+
+; Now update process block
+; R0 = process error word
+; R1 = process status
+; R3 -> scatter list
+;
+; Find start of scatter list
+
+        MOV     R4,R3                   ; R4 -> scatter list
+10
+        LDR     R5,[R4,#8]!             ; get next entry
+        TEQS    R5,#0                   ; backwards offset?
+        BPL     %BT10                   ; branch if not
+
+; found negative buffer address - must be offset to start of scatter list
+; store process error & status
+
+        ADD     R4,R4,R5                ; R4 -> top of scatter list
+        STMDB   R4,{R0,R1}              ; write process error & status
+
+; Before calling FileCore, unlock the controller as FileCore may call the
+; driver low-level entry point from its callback routine
+
+        BL      UnlockIDEController
+
+; Save registers and call FileCore in SVC mode.
+; NOTE: despite documentation, it does not preserve R2
+
+        MOV     R1,SB                   ; save static base
+
+        LDR     SB,FileCorePrivate      ; uses our SB
+        MOV     LR,PC                   ; set return address
+        LDR     PC,[R1,#:INDEX:WinnieCallAfter] ; preserves R0-R1,R3-R11,R13
+
+; Call to FileCore returns here
+
+        MOV     SB,R1                   ; restore static base
+
+        Pull    "R0-R5,PC",,^
+
+;*********************************************************************
+
+WinIDECallbackBg_LockFailed        ROUT
+;
+; The callback routine for the background part of background ops.
+; Called on completion of the transfer.
+;
+; Entry:
+;    R0 = completion code
+;    R2 = disc address
+;    R3 -> scatter list
+;    IDE -> IDE controller
+;    SB -> static workspace
+;    MODE: SVC
+;    IRQ state: undefined
+;
+; Exit:
+;    All registers and flags preserved
+;    WinIDEDiscAddress is not updated
+
+        Push    "R0-R5,LR"
+
+ [ BigDisc
+; sector offset should be valid at this point
+ ]
+
+; Cancel timer
+
+        MOV     R1,#0
+        STR     R1,WinTickCallAddress
+        STR     R1,WinTickCount         ; speeds up ticker routine
+
+; Call WinIDEAdjustStatus to put completion code in format suitable for
+; FileCore
+
+ [ BigDisc
+        BL      WinIDEAdjustStatus      ; (R0,R2,R5->R0,R1,R2,R6,V)
+ |
+        BL      WinIDEAdjustStatus      ; (R0,R2->R0,R2,R5,V)
+ ]
+
+; Set process status
+
+        TEQS    R0,#0                   ; error?
+        MOVEQ   R1,#0                   ; if not, status = 0
+        MOVNE   R1,R3                   ; else status -> scatter entry
+
+; Now update process block
+; R0 = process error word
+; R1 = process status
+; R3 -> scatter list
+;
+; Find start of scatter list
+
+        MOV     R4,R3                   ; R4 -> scatter list
+10
+        LDR     R5,[R4,#8]!             ; get next entry
+        TEQS    R5,#0                   ; backwards offset?
+        BPL     %BT10                   ; branch if not
+
+; found negative buffer address - must be offset to start of scatter list
+; store process error & status
+
+        ADD     R4,R4,R5                ; R4 -> top of scatter list
+        STMDB   R4,{R0,R1}              ; write process error & status
+
+; Before calling FileCore, unlock the controller as FileCore may call the
+; driver low-level entry point from its callback routine
+
+;        BL      UnlockIDEController
+
+; Save registers and call FileCore in SVC mode.
+; NOTE: despite documentation, it does not preserve R2
+
+        MOV     R1,SB                   ; save static base
+
+        LDR     SB,FileCorePrivate      ; uses our SB
+        MOV     LR,PC                   ; set return address
+        LDR     PC,[R1,#:INDEX:WinnieCallAfter] ; preserves R0-R1,R3-R11,R13
+
+; Call to FileCore returns here
+
+        MOV     SB,R1                   ; restore static base
+
+        Pull    "R0-R5,PC",,^
+;*********************************************************************
+
+WinIDESetPhysAddress    ROUT
+;
+; Calculates the physical disc address and stores it in the parameter
+; block.  LBA addressing will be used if enabled for this drive,
+; otherwise CHS will be used (by calling WinSetIDEPhysAddressCHS)
+;
+; Use of LBA is far faster than CHS because shifts used all over
+; the place - no need for divide.
+;
+; Entry:
+;
+;    R2 = disc address
+;    WinIDEDriveNum valid
+;
+; Exit:
+;    R0 undefined
+;    All other registers preserved
+;
+
+        Push    "R1,LR"
+
+        LDRB    R1,WinIDEDriveNum       ; get drive number
+        sbaddr  LR,WinIDEDriveLBAFlags  ; get addr of flags
+        LDRB    R0,[LR,R1]              ; get CHS/LBA flag
+        CMP     R0,#0
+        BEQ     %FT10                   ; choose CHS/LBA from flag
+
+        BIC     R0,R2,#DiscBits         ; R0 = disc addr minus drive num
+
+ [ BigDisc
+        CMPS    R0,#7
+        BLO     %FT10                   ; if so, use CHS
+ |
+        CMPS    R0,#BootEnd             ; are we in early disk address?
+        BLO     %FT10                   ; if so, use CHS
+ ]
+
+        ; use LBA addressing as drive supports it
+
+ [ BigDisc
+ |
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R0,R0,LSR #9            ; LBA number, ie sector number (from disc start)
+ ]
+
+        ASSERT  IDEAllowTrackWrap
+
+        ; bits 0..7 of LBA
+
+        STRB    R0,WinIDEParmLBA0to7
+
+        ; bits 8..15 of LBA
+
+        MOV     R0,R0,LSR #8
+        STRB    R0,WinIDEParmLBA8to15
+
+        ; bits 16..23 of LBA
+
+        MOV     R0,R0,LSR #8
+        STRB    R0,WinIDEParmLBA16to23
+
+        ; now drive, 24..27 of LBA and the LBA flag
+
+        MOV     R0,R0,LSR #8
+
+        ORR     R0,R0,#IDEDrvLBA24to27MagicBits         ; magic bits - with LBA flag set
+        ORR     R0,R0,R1,LSL #IDEDriveShift             ; insert drive number
+        STRB    R0,WinIDEParmDrvLBA24to27               ; and store
+
+        Pull    "R1,PC",,^
+
+10
+        ; use CHS addressing - drive doesn't support LBA
+        Pull    "R1,LR"
+
+        ASSERT  . = WinIDESetPhysAddressCHS
+
+;*********************************************************************
+
+WinIDESetPhysAddressCHS    ROUT
+;
+; Calculates cylinder/head/sector and stores them in parameter block.
+;
+;
+; Entry:
+;    R2 = disc address
+;    IDE -> IDE controller
+ [ IDEFixedLowSector
+;    WinIDEDriveNum, WinIDESecsPerTrk, WinIDEHeads valid
+ |
+;    WinIDEDriveNum, WinIDESecsPerTrk, WinIDEHeads, WinIDEStartSec valid
+ ]
+;
+; Exit:
+;    R0 undefined
+;    All other registers preserved
+ [ IDEAllowTrackWrap
+ |
+;    WinIDEAdrSector = sector number (from 0, not adjusted)
+ ]
+;    WinIDEParms updated
+
+        Push    "R1,LR"
+
+ [ Debug20
+        
+        DREG    R2,"WinIDESetPhysAddressCHS "
+        ADRL    LR, WinIDEParmSecNumber
+        DREG    LR, "WinIDESetPhysAddressCHS: WinIDEParmSecNumber="
+        ADRL    LR, WinIDEParmCylLo
+        DREG    LR, "WinIDESetPhysAddressCHS: WinIDEParmCylLo="
+        ADRL    LR, WinIDEParmCylHi
+        DREG    LR, "WinIDESetPhysAddressCHS: WinIDEParmCylHi="
+ ]
+
+; convert disc address to physical address
+
+        BIC     R0,R2,#DiscBits         ; R0 = disc address (minus drive num)
+
+ [ BigDisc
+ |
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R0,R0,LSR #9            ; R0 = sector number (from disc start)
+ ]
+        LDRB    R1,WinIDESecsPerTrk
+        BL      Divide                  ; R0 div R1 -> R0 remainder R1
+
+; R0 = tracks
+; R1 = sector on track from 0
+
+ [ IDEAllowTrackWrap
+ |
+        STRB    R1,WinIDEAdrSector      ; save sector number from 0 for calcs
+ ]
+ [ IDEFixedLowSector
+        ADD     R1,R1,#WinIDELowSector  ; adjust sector according to lowest
+ |
+        LDRB    LR,WinIDEStartSec       ; adjust sector number...
+        ADD     R1,R1,LR                ; ...according to start number
+ ]
+ [ Debug20
+        
+        DREG    R1,"WinIDESetPhysAddressCHS: ParmSecNumber=",cc
+ ]
+        STRB    R1,WinIDEParmSecNumber
+ [ Debug20
+        
+        DLINE   "...set"
+ ]
+
+; R0 = tracks
+
+        LDRB    R1,WinIDEHeads          ; get number of heads
+        BL      Divide                  ; R0 div R1 -> R0 remainder R1
+
+; R0 = cylinder number from 0
+; R1 = head number from 0
+; save cylinder parameters
+
+ [ Debug20
+        
+        DREG    R1,"WinIDESetPhysAddressCHS: ParmCylLo=",cc
+ ]
+        STRB    R0,WinIDEParmCylLo
+        MOV     R0,R0,LSR #8
+ [ Debug20
+        
+        DLINE   "...set"
+        DREG    R1,"WinIDESetPhysAddressCHS: ParmCylHi=",cc
+ ]
+        STRB    R0,WinIDEParmCylHi
+ [ Debug20
+        
+        DLINE   "...set"
+ ]
+
+; Fall through to WinIDESetDrvHead to work out drive/head parameter
+; R1 = head number
+
+        MOV     R0,R1
+        Pull    "R1,LR"
+        ASSERT  . = WinIDESetDriveAndHead
+
+;*********************************************************************
+
+WinIDESetDriveAndHead   ROUT
+;
+; Sets up the drive/head parameter byte.
+;
+; Entry:
+;    R0 = head number
+;    WinIDEDriveNum = drive number
+;
+; Exit:
+;    R0 undefined
+;    All other registers preserved
+;    WinIDEParmDrvHead valid
+
+        Push    "LR"
+
+        AND     R0,R0,#&0F                      ; must only be b0..b3
+        LDRB    LR,WinIDEDriveNum               ; get drive number
+        ORR     R0,R0,LR,LSL #IDEDriveShift     ; put it in place
+        ORR     R0,R0,#IDEDrvHeadMagicBits      ; include magic bits
+        STRB    R0,WinIDEParmDrvHead
+
+        Pull    "PC",,^
+
+;*********************************************************************
+
+WinIDECommandDisc       ROUT
+;
+; Writes parameters and command to the IDE system, assuming that the
+; address (drive/cylinder/head/start sector) has already been set up.
+; Checks controller not busy, checks drive ready and only then writes
+; to the drive.
+;
+; Entry:
+;    R0 = command
+;    IDE -> IDE controller
+;    WinIDEParms contain parameters for command
+;    WinIDEHardware onwards contains details of IDE hardware
+;
+; Exit:
+;    VS => error
+;          R0 = error code (controller busy or drive not ready)
+;    VC => all ok
+;          R0 preserved
+;    All other registers preserved
+
+        Push    "R1,LR"
+
+; check controller not busy
+
+        LDRB    LR,IDERegAltStatus              ; get status
+        TSTS    LR,#IDEStatusBSY
+ [ Debug21
+        BREG    LR, "WinIDECommandDisc: AltStatus="
+ ]
+
+; return error if busy
+
+        MOVNE   R0,#WinIDEErrCmdBusy
+        Pull    "R1,LR",NE
+        ORRNES  PC,LR,#V_bit
+
+; not busy, select drive
+
+        LDRB    LR,WinIDEParmDrvHead            ; select drive
+        STRB    LR,IDERegDrvHead
+ [ Debug21
+        BREG    LR, "WinIDECommandDisc: Head set to "
+ ]
+
+; Wait for other bits in status to become valid
+
+        MOV     R1,R0                           ; save command in R1
+        MOV     R0,#1*2                         ; 1/2 us units
+        BL      DoMicroDelay
+        MOV     R0,R1                           ; put command back in R0
+
+; check drive ready
+
+        LDRB    LR,IDERegAltStatus              ; get status
+ [ Debug21
+        BREG    LR, "WinIDECommandDisc: AltStatus="
+ ]
+        AND     LR,LR,#IDEStatusBSY :OR: IDEStatusDRDY
+        TEQS    LR,#IDEStatusDRDY
+        MOVNE   R0,#WinIDEErrCmdNotRdy          ; return error if not ready
+        Pull    "R1,LR",NE
+        ORRNES  PC,LR,#V_bit
+
+; drive ready so write parms to it <<<can optimise this bit by aligning parms
+
+        LDRB    LR,WinIDEParmPrecomp
+ [ Debug20
+        BREG    LR,"WinIDECommandDisc: Precomp="
+ ]
+        STRB    LR,IDERegPrecomp
+
+        LDRB    LR,WinIDEParmSecCount
+ [ Debug20
+        BREG    LR,"WinIDECommandDisc: SecCount="
+ ]
+        STRB    LR,IDERegSecCount
+
+        LDRB    LR,WinIDEParmSecNumber
+ [ Debug20
+        BREG    LR,"WinIDECommandDisc: SecNumber="
+ ]
+        STRB    LR,IDERegSecNumber
+
+        LDRB    LR,WinIDEParmCylLo
+ [ Debug20
+        BREG    LR,"WinIDECommandDisc: CylLo="
+ ]
+        STRB    LR,IDERegCylLo
+
+        LDRB    LR,WinIDEParmCylHi
+ [ Debug20
+        BREG    LR,"WinIDECommandDisc: CylHi="
+ ]
+        STRB    LR,IDERegCylHi
+
+        LDRB    LR,WinIDEParmDrvHead
+ [ Debug20
+        BREG    LR,"WinIDECommandDisc: DrvHead="
+ ]
+        STRB    LR,IDERegDrvHead
+
+ [ Debug20
+        BREG    R0,"WinIDECommandDisc: Command="
+ ]
+        STRB    R0,IDERegCommand
+ [ Debug20
+        
+        DLINE   "WinIDECommandDisc: disc commanded successfully"
+ ]
+
+        Pull    "R1,LR"
+        BICS    PC,LR,#V_bit                    ; no error
+
+;*********************************************************************
+
+WinIDEDecodeDriveStatus ROUT
+;
+; Decodes drive status into an error number
+;
+; Entry:
+;    R0 = contents of status register
+;    IDE -> IDE controller
+;
+; Exit:
+;    R0 = error code or 0
+;    All other registers and flags preserved
+;
+; There must be a better way to do this!
+
+        TSTS    R0,#IDEStatusBSY        ; drive busy?
+        MOVNE   R0,#WinIDEErrBusy       ; if so, return it
+        MOVNES  PC,LR
+
+        TSTS    R0,#IDEStatusWFT        ; write fault?
+        MOVNE   R0,#WinIDEErrWFT        ; if so, return it
+        MOVNES  PC,LR
+
+        TSTS    R0,#IDEStatusERR        ; other error?
+        MOVEQ   R0,#0                   ; if not, return no error
+        MOVEQS  PC,LR
+
+; error given by contents of error register
+
+        LDRB    R0,IDERegError          ; get error reg
+        TSTS    R0,#IDEErrorBBK         ; bad block?
+        MOVNE   R0,#WinIDEErrBBK        ; if so, return it
+        MOVNES  PC,LR
+
+        TSTS    R0,#IDEErrorUNC         ; uncorrected data error?
+        MOVNE   R0,#WinIDEErrUNC        ; if so, return it
+        MOVNES  PC,LR
+
+        TSTS    R0,#IDEErrorIDNF        ; sector id not found?
+        MOVNE   R0,#WinIDEErrIDNF       ; if so, return it
+        MOVNES  PC,LR
+
+        TSTS    R0,#IDEErrorABRT        ; command abort?
+        MOVNE   R0,#WinIDEErrABRT       ; if so, return it
+        MOVNES  PC,LR
+
+        TSTS    R0,#IDEErrorNTK0        ; can't find track 0?
+        MOVNE   R0,#WinIDEErrNTK0       ; if so, return it
+        MOVNES  PC,LR
+
+        TSTS    R0,#IDEErrorNDAM        ; no data address mark?
+        MOVNE   R0,#WinIDEErrNDAM       ; if so, return it
+
+        MOVEQ   R0,#WinIDEErrUnknown    ; else must be unknown error
+        MOVS    PC,LR
+
+;*********************************************************************
+
+WinIDEPhysAddrToLogical ROUT
+;
+; Calculate logical disc address of current sector from contents
+; of IDE registers - does not include this sector.
+;
+; if CHS mode is in use then
+;
+; = ((cylinder * heads + head) * sectorspertrk + sector) * sectorsize
+;
+; else
+;
+; = LBA * sectorsize
+;
+; fi
+;
+; To determine CHS/LBA operation, the routine reads the drive
+; select bit from the controller, and uses this to check the
+; CHS/LBA mode of the drive.
+;
+; NOTE: if all is ok
+;          the IDE registers contain the address of the last sector
+;          transferred, not the next to be transferred which is what we want
+;          to return (i.e. need to add 1 sector)
+;       if an error occurred
+;          the registers contain the address of the sector where the error
+;          occurred which IS what we want to return.
+;       The caller will have to adjust the address accordingly
+;
+; Entry:
+;    IDE controller registers valid
+;    IDE -> controller
+;    SB -> static workspace
+;
+; Exit:
+;    R1 undefined
+;    R2 = logical disc address
+;    Flags preserved
+
+; first, we decide if current drive is to use CHS or LBA, by
+; reading the LBA/CHS bit from the SDH register
+
+        LDRB    R2,IDERegDrvHead        ; get drive/head in R2
+        TST     R2,#&40                 ; check LBA bit
+        BNE     %FT10                   ; if set, use LBA code
+
+; use CHS...
+
+        LDRB    R2,IDERegCylLo
+        LDRB    R1,IDERegCylHi
+        ORR     R2,R2,R1,LSL #8         ; R2 = cylinder
+
+        LDRB    R1,WinIDEHeads          ; R1 = heads
+        MUL     R2,R1,R2                ; R2 = whole cylinders * trackspercyl
+        LDRB    R1,IDERegDrvHead        ; R1 = selected head
+        AND     R1,R1,#&0F              ; mask to get head number
+        ADD     R2,R2,R1                ; R2 = whole tracks
+
+        LDRB    R1,WinIDESecsPerTrk     ; R1 = sectors on each track
+        MUL     R2,R1,R2                ; R2 = sectors on whole tracks
+        LDRB    R1,IDERegSecNumber      ; R1 = sector on current track
+        ADD     R2,R2,R1                ; R2 = whole sectors
+
+; R2 now contains the sector address indicated by the IDE registers.
+; We need to adjust this because the sectors may (will) not start at 0.
+
+ [ IDEFixedLowSector
+        SUB     R2,R2,#WinIDELowSector  ; adjust sector number
+ |
+        LDRB    R1,WinIDEStartSec       ; R1 = lowest-numbered sector on track
+        SUB     R2,R2,R1
+ ]
+
+; R2 = adjusted sector number - convert to a byte address
+
+ [ BigDisc
+ |
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R2,R2,LSL #9
+ ]
+ [ Debug20
+        
+        DREG    R2,"Get "
+ ]
+        MOVS    PC,LR
+
+10
+        ; generate the info based on the LBA addressing mechanism
+        ; we already have some of the address in R2, bits 24..27
+
+        AND     R2,R2,#&0f              ; mask off LBA/DRV/magic bits
+        LDRB    R1,IDERegLBA16to23      ; get bits 16..23
+        ORR     R2,R1,R2,LSL #8         ; shove them in
+        LDRB    R1,IDERegLBA8to15       ; get bits 8 to 15
+        ORR     R2,R1,R2,LSL #8         ; shove them in
+        LDRB    R1,IDERegLBA0to7        ; get bits 0 to 7
+        ORR     R2,R1,R2,LSL #8         ; shove them in
+ [ BigDisc
+ |
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R2,R2,LSL #9
+ ]
+
+        MOVS    PC,LR
+
+
+;*********************************************************************
+
+WinIDEInstallTransferCode       ROUT
+;
+; Installs code to move data to/from the IDE disc in RAM (for speed).
+; When the transfer is to be made, WinIDEReadASector or
+; WinIDEWriteASector should be called. For entry conditions, see those
+; routines.
+;
+; NOTE: we have to use a different variable to that used by the ST506 driver
+;       to record what sort of transfer code is currently in RAM because we
+;       HAVE to use MEMC1 code whereas the ST506 driver may use MEMC1A code.
+;       We must be sure to invalidate the ST506 driver's variable and it
+;       must invalidate ours as and when.
+;
+; Entry (to this routine):
+;    R1 = filecore opcode
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+; check that this op really does need data transfer code
+
+        AND     R0,R1,#OpMask                   ; get opcode
+        TEQS    R0,#WriteTrkOp                  ; format?
+        MOVEQ   R0,#WriteSecsOp                 ; if so, treat as write
+
+        TEQS    R0,#ReadSecsOp                  ; is it read ?
+        TEQNES  R0,#WriteSecsOp                 ; if not, is it write ?
+        MOVNES  PC,LR                           ; if not needed, return
+
+; this op *does* need transfer code
+; <<<can optimise by checking if using our code or podule's
+
+; see what code is currently in RAM
+
+        Push    "LR"
+
+        LDRB    LR,WinIDERAMOp          ; find out what code's installed
+        TEQS    R0,LR                   ; the one we want?
+        Pull    "PC",EQ,^               ; if so, return
+
+; code in RAM not the one we want so copy new code
+
+        Push    "R1-R10"
+
+ [ Debug21
+        BREG    R0,"Copying code to RAM for op: "
+ ]
+
+; Copy new code into RAM.
+; Since this is the same code that the ST506 transfer code uses, it must
+; address the IDE discs via the same register.
+
+        ASSERT  IDE = HDC
+
+        ADR     R10,LowCodeLocation     ; R10 -> where code will go
+        TEQS    R0,#ReadSecsOp
+        baddr   R9,ALowReadCodeStart,EQ ; R9 -> code to copy
+        baddr   R9,ALowWriteCodeStart,NE
+        ADDEQ   LR,R10,#ALowReadCodeSize ; R10 = start + len
+        ADDNE   LR,R10,#ALowWriteCodeSize
+ [ Debug21
+        
+        DREG    R9,"Code source "
+        DREG    r10,"Code destination "
+        DREG    LR,"Destination end "
+ ]
+
+; copy the code
+10
+        LDMIA   R9!,{R1-R8}
+        STMIA   R10!,{R1-R8}
+        CMPS    R10,LR
+        BLO     %BT10
+
+; note what we've copied
+
+        STRB    R0,WinIDERAMOp
+
+ [ StrongARM
+        ;synchronise with respect to modified code
+        MOV     R0,#1                    ;means range specified in R1,R2
+        ADR     R1,LowCodeLocation       ;start virtual address
+        SUB     R2,R10,#4                ;end virtual address (inclusive)
+        SWI     XOS_SynchroniseCodeAreas ;do the necessary for extant ARM variant
+ ]
+
+; invalidate WinnieRamOp so ST506 driver doesn't get confused
+
+        MOV     R0,#&FF
+        STRB    R0,WinnieRamOp
+ [ Debug21
+        
+        DLINE   "Code copied successfully"
+ ]
+
+        Pull    "R1-R10,PC",,^
+
+;*********************************************************************
+
+WinIDEReadASector       ROUT
+;
+; Reads up to a sector of data from IDE to RAM.
+;
+; Entry:
+;    R0 = length to transfer > 0
+;    R1 -> buffer
+;    IDE -> IDE controller
+;    LR = return address
+;    Transfer code has been copied to LowCodeLocation
+;    MODE: SVC
+;    IRQ state: undefined
+;
+; Exit:
+;    R0 undefined
+;    R1 updated
+;    All other registers and flags preserved
+;    IRQ state preserved but IRQs are enabled during call.
+
+ [ Debug20 :LAND: {FALSE}
+        
+        DLINE   "r",cc
+ ]
+        Push    "R2-R8,R10,LR"
+
+; Enable interrupts to improve latency
+
+        TEQP    PC,#SVC_mode            ; enable IRQs
+ [ Debug22
+        
+        DREG    r0, "Read ",cc
+        DREG    r1, " bytes to "
+ ]
+
+        ASSERT  WinIDEBytesPerSector = 512
+        CMPS    R0,#&200                ; whole block?
+        BCC     %FT10
+
+; >= &200  bytes to transfer - use RAM-based code
+; load mask for RAM code - MOV+ORR faster than LDR
+
+        MOV     R10,    #&00FF0000
+        ORR     R10,R10,#&0000FF00
+
+; Make sure that HDC,HDCdataRead accesses the IDE data register
+; If not, must save HDC, change it, do xfer, restore HDC
+
+        ASSERT  IDE = HDC
+        ASSERT  IDERegData = HDCdataRead
+
+; Read &100 bytes
+; Don't need to worry about the R14 used by the transfer code being
+; corrupted by an IRQ as we are in SVC mode
+
+        STR     PC,RomReturn            ; set return address
+        ADR     PC,LowCodeLocation      ; i.e. B LowCodeLocation
+        NOP                             ; not executed
+
+; RAM code returns here
+; Read another &100 bytes
+
+        STR     PC,RomReturn
+        ADR     PC,LowCodeLocation
+        NOP                             ; not executed
+
+; RAM code returns here
+; all done
+ [ Debug22
+        
+        DLINE   "Read completed(1)"
+ ]
+
+        Pull    "R2-R8,R10,PC",,^       ; return, restoring IRQ state
+
+;****** Never fall through
+
+10
+; Less than one whole sector to read, move it the hard way
+; <<< This could be optimised to transfer the first &100 using the RAM code
+
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R3,#&200                ; must read whole sector to please HDC
+20
+        LDR     R2,IDERegData           ; get 2 bytes
+        SUBS    R0,R0,#1                ; if wanted...
+        STRPLB  R2,[R1],#1              ; ...store LSB
+        MOV     R2,R2,LSR #8            ; get other byte
+        SUBS    R0,R0,#1                ; if wanted...
+        STRPLB  R2,[R1],#1              ; ...store MSB
+        SUBS    R3,R3,#2                ; adjust bytes read so far
+        BGT     %BT20
+ [ Debug22
+        
+        DLINE   "Read completed(2)"
+ ]
+
+        Pull    "R2-R8,R10,PC",,^       ; return, restoring IRQ state
+
+;*********************************************************************
+
+WinIDEWriteASector      ROUT
+;
+; Writes up to a sector of data from RAM to IDE.
+;
+; Entry:
+;    R0 = length to transfer > 0
+;    R1 -> buffer
+;    IDE -> IDE controller
+;    LR = return address
+;    Transfer code has been copied to LowCodeLocation
+;    MODE: SVC
+;    IRQ state: undefined
+;
+; Exit:
+;    R0 undefined
+;    R1 updated
+;    All other registers and flags preserved
+;    IRQ state preserved but IRQs are enabled during call.
+
+ [ Debug20
+        
+        DLINE   "w",cc
+ ]
+
+        Push    "R2-R9,IDE,LR"
+
+; Enable interrupts to improve latency
+
+        TEQP    PC,#SVC_mode            ; enable IRQs
+ [ Debug22
+        
+        DREG    r0,"Write ",cc
+        DREG    r1," bytes from "
+ ]
+
+        ASSERT  WinIDEBytesPerSector = 512
+        CMPS    R0,#&200                ; whole block?
+        BCC     %FT10
+
+; >= &200  bytes to transfer - use RAM-based code
+
+; Make sure that HDC,HDCdataWrite accesses the IDE data register
+
+        ASSERT  IDE = HDC
+
+ [ IDERegData = HDCdataWrite
+        !       0,"WinIDEWriteASector: can optimise"
+ |
+   [ HDCdataWrite > IDERegData
+        SUB     IDE,IDE,#HDCdataWrite - IDERegData
+   |
+        ADD     IDE,IDE,#IDERegData - HDCdataWrite
+   ]
+ ]
+
+; Write &100 bytes
+
+        STR     PC,RomReturn            ; set return address
+        ADR     PC,LowCodeLocation      ; i.e. BCS LowCodeLocation
+        NOP                             ; not executed
+
+; RAM code returns here
+; Write another &100 bytes
+
+        STR     PC,RomReturn
+        ADR     PC,LowCodeLocation
+        NOP                             ; not executed
+
+; RAM code returns here
+; all done
+ [ Debug22
+        
+        DLINE   "Write completed(1)"
+ ]
+
+        Pull    "R2-R9,IDE,PC",,^       ; return, restoring IRQ state
+
+;****** Never fall through
+
+10
+; Less than one whole sector to write, move it the hard way
+; <<< This could be optimised to transfer the first &100 using the RAM code
+
+        ASSERT  WinIDEBytesPerSector = 512
+        MOV     R3,#&200                ; must write whole sector to please HDC
+20
+        SUBS    R0,R0,#1                ; adjust count. if out of data...
+        MOVMI   R2,#0                   ; ...fill sector with 0
+        LDRPLB  R2,[R1],#1              ; ...else get data
+ [ Top16Write
+        MOV     R2,R2,LSL #16           ; (writes are high 16 bits)
+ ]
+        SUBS    R0,R0,#1                ; adjust count. if out of data...
+        MOVMI   R8,#0                   ; ...fill sector with 0
+        LDRPLB  R8,[R1],#1              ; ...else get data
+ [ :LNOT: Top16Write
+        ORR     R2, R2, R8, LSL #8
+        ORR     R2, R2, R2, ASL #16
+ |
+        ORR     R2,R2,R8,LSL #24
+ ]
+        STR     R2,IDERegData           ; write the data
+        SUBS    R3,R3,#2                ; adjust bytes written so far
+        BGT     %BT20
+ [ Debug22
+        
+        DLINE   "Write completed(2)"
+ ]
+
+        Pull    "R2-R9,IDE,PC",,^       ; return, restoring IRQ state
+
+;*********************************************************************
+
+WinIDEPowerSetup        ROUT
+;
+; Entered every second to check whether IDE drives are ready to be
+; given their first power control command and issue it if so.
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: IRQ or SVC
+;
+; Exit:
+;    All registers and flags preserved
+
+        Push    "LR"
+
+; Check if we are still active - if not active, we have added callback
+; but it has not been called yet.
+
+        LDRB    LR,WinIDEPowerSetupActive
+        TEQS    LR,#0                           ; still active?
+        Pull    "PC",EQ,^                       ; return if not
+
+; Check if we have hardware to talk to
+
+        LDRB    LR,WinIDEIRQDevNo
+        TEQS    LR,#0                           ; got hardware?
+        Pull    "PC",EQ,^                       ; return if not
+
+; There is hardware to talk to.
+; Check if a command is in progress and quit if so
+
+        BL      LockIDEController
+        Pull    "PC",VS,^                       ; return if controller busy
+
+; No command in progress
+
+        Push    "R0-R2,IDE"
+
+; No need to check if any drives configured as this is never
+; entered if none configured.
+
+; For each drive, check if drive needs power command
+
+        LDRB    R0,WinIDEDrives                 ; R3 = configured drives
+        sbaddr  R1,WinIDEDriveState             ; R1 -> drive states
+        MOV     R2,#0                           ; drive 0
+10
+        LDRB    LR,[R1,R2]                      ; get drive state
+        TEQS    LR,#WinIDEDriveStateReset       ; still just reset?
+        ADDNE   R2,R2,#1                        ; if not, check next
+        TEQNES  R2,R0                           ; all done?
+        BNE     %BT10                           ; branch if more to do
+
+; Found drive that needs to be done or run out of drives
+
+        TEQS    R2,R0                           ; all done?
+        BEQ     %FT90                           ; branch if so
+
+        ADD     R1,R1,R2                        ; R1 -> drive state
+
+; Found drive that needs power command
+; R2 = drive number
+; R1 -> drive state
+
+; Check if controller busy
+
+        LDR     IDE,WinIDEPtr                   ; IDE -> controller
+        LDRB    LR,IDERegAltStatus              ; get status
+        TSTS    LR,#IDEStatusBSY                ; busy?
+        BLNE    UnlockIDEController
+        Pull    "R0-R2,IDE,PC",NE,^             ; quit if so
+
+; Controller not busy - select drive and check for drive ready
+
+        MOV     R0,R2,LSL #IDEDriveShift        ; put drive bit in position
+        ORR     R0,R0,#IDEDrvHeadMagicBits      ; include magic bits
+        STRB    R0,IDERegDrvHead                ; select drive
+        MOV     R0,#1*2                         ; wait for valid status
+        BL      DoMicroDelay
+        LDRB    LR,IDERegAltStatus              ; get status
+        ANDS    LR,LR,#IDEStatusBSY :OR: IDEStatusDRDY
+        TEQS    LR,#IDEStatusDRDY               ; ready?
+        BLNE    UnlockIDEController
+        Pull    "R0-R2,IDE,PC",NE,^             ; quit if not
+
+; Drive selected and not busy - command it
+
+ [ Debug21
+        Push    "R3"
+        MOV     R3,PC
+        TEQP    PC,#SVC_mode :OR: I_bit
+        NOP
+        Push    "LR"
+        BREG    R2,"TickIdle "
+        Pull    "LR"
+        TEQP    PC,R3
+        NOP
+        Pull    "R3"
+ ]
+        ADD     LR,SB,#:INDEX: WinIDEPowerState ; LR -> power states
+        LDRB    LR,[LR,R2]                      ; get value for this drive
+        STRB    LR,IDERegSecCount               ; write to controller
+        MOV     LR,#IDECmdIdle                  ; get command
+        STRB    LR,IDERegCommand                ; start command
+
+; Do not wait for command to complete but finish here
+; (nothing we can do if it fails anyway).
+
+        MOV     R0,#WinIDEDriveStateIdled       ; update state
+        STRB    R0,[R1]
+
+; No need to check if have done all drives as next time will do so
+
+        BL      UnlockIDEController
+        Pull    "R0-R2,IDE,PC",,^               ; return
+
+;****** Never fall through
+
+90
+; All drives done, either by us or in the foreground.
+; Set up CallBack to remove CallEvery handler - TDobson says not
+; safe to remove it from here.
+
+        ADR     R0,WinIDEKillPowerSetup         ; R0 -> callback routine
+        MOV     R1,SB                           ; R1 = value for R12
+        MOV     R2,PC                           ; save current mode
+        TEQP    PC,#SVC_mode :OR: I_bit         ; switch to SVC mode
+        NOP                                     ; prevent contention
+        Push    "LR"                            ; save r14_svc
+ [ Debug21
+        
+        DLINE   "AddCallback"
+ ]
+        SWI     XOS_AddCallBack
+
+; If AddCallBack succeeded, flag us as not active so don't add
+; another callback next time (may get entered again before callback)
+
+        MOVVC   R0,#0
+        STRVCB  R0,WinIDEPowerSetupActive
+
+        Pull    "LR"                            ; restore r14_svc
+        TEQP    PC,R2                           ; restore original mode
+        NOP                                     ; prevent contention
+
+        BL      UnlockIDEController
+
+        Pull    "R0-R2,IDE,PC",,^               ; return
+
+;*********************************************************************
+
+WinIDEKillPowerSetup    ROUT
+;
+; Callback routine to remove WinIDEPowerSetup from CallEvery.
+; Also called when module killed.
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: SVC
+;
+; Exit:
+;    All registers and flags preserved
+
+        Push    "R0-R2,LR"
+
+ [ Debug21
+        
+        DLINE   "KillPowerSetup"
+ ]
+        ADR     R0,WinIDEPowerSetup     ; R0 -> routine to remove
+        MOV     R1,SB                   ; R1 = R12 value
+        SWI     XOS_RemoveTickerEvent   ; remove the ticker routine
+
+        Pull    "R0-R2,PC",,^
+
+ [ IDEPower
+IDEPowerBits  * PortableControl_IDEEnable
+;*********************************************************************
+
+WinIDEPowerShutdown     ROUT
+;
+; Entered every ten seconds to check whether the IDE drive has spun down.
+; This ticker is only setup if we are running on a portable. It is safe, though
+; pointless, to have it setup on a non portable machine.
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: IRQ or SVC
+;
+; Exit:
+;    All registers and flags preserved
+
+        Push    "R0-R1,LR"
+;
+; Attempt to power-down the drive. WinIDEcontrol does nothing if not on a portable, or
+; if the drive is already powered down. If drive is powered up, WinIDEcontrol calls
+; Portable_Control to shut down the drive. This issues a service call which we (ADFS)
+; receive. The service code asks the drive if it has spun-down, and if so allows the
+; service call (a power-down request) to preceed. If the drive is spinning, the service
+; call bit mask is adjusted to stop the power-down.
+;
+; We don't touch the state machine here!. That is done on receipt of
+; Service_Portable (reason code PowerUp/PowerDown).
+;
+        MOV     R0, #0                          ; disable
+        BL      WinIDEcontrol                   ; in R0=required state (disabled), out R1=Portable_Flags
+
+        Pull    "R0-R1,PC",,^
+
+;*********************************************************************
+
+WinIDEKillPowerShutdown    ROUT
+;
+; Routine to remove WinIDEPowerShutdown from CallEvery.
+; Called when module killed.
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: SVC
+;
+; Exit:
+;    All registers and flags preserved
+
+        Push    "R0-R2,LR"
+
+  [ Debug21
+        DLINE   "KillPowerShutdown"
+  ]
+        ADR     R0,WinIDEPowerShutdown  ; R0 -> routine to remove
+        MOV     R1,SB                   ; R1 = R12 value
+        SWI     XOS_RemoveTickerEvent   ; remove the ticker routine
+
+        Pull    "R0-R2,PC",,^
+ ]
+
+;*********************************************************************
+
+WinIDEPollCommand       ROUT
+;
+; Start a command and poll for the IRQ that indicates completion.
+;
+; Entry:
+;    R0 = command
+;    R5 = timeout in centiseconds
+;    IDE -> IDE controller
+;    SB -> static workspace
+;    WinIDEParms valid
+;    MODE: SVC
+;    IRQ state: unknown
+;
+; Exit:
+;    VS => error
+;          R0 = error code
+;    VC => no error
+;          R0 undefined
+;    R5 undefined
+;    All other registers preserved
+;    IRQ state: preserved but IRQs enabled during call
+
+        Push    "R6,R7,LR"
+
+; Enable interrupts so that the timer works
+
+        TEQP    PC,#SVC_mode
+
+; Start the command
+
+        BL      WinIDECommandDisc               ; (R0,IDE->R0,V)
+        BVS     %FT90                           ; branch if error
+
+; Set up the counter for timing out the command
+
+        STR     R5,WinTickCount                 ; decremented under IRQ
+
+; IRQ is already enabled in controller.
+; Do not enable IRQ in IOC/podule as we will poll for it.
+
+; Wait for interrupt
+
+        ADR     R0,WinIDEPollPtr                ; R0 -> hardware details
+        LDMIA   R0,{R5,R6}                      ; get poll addr & bits
+10
+        LDRB    R0,[R5]                         ; get status
+        TSTS    R0,R6                           ; IRQ ?
+        BNE     %FT20
+
+; no IRQ yet - check for timeout
+
+        LDR     R7,WinTickCount                 ; get tick count
+        TEQS    R7,#0                           ; done ?
+        BNE     %BT10
+
+; timeout, EQ
+
+        MOV     R0,#WinIDEErrTimeout
+
+ [ IDEResetOnError
+; reset drives to switch access lights off
+; (don't need to do this if got IRQ as drive did respond)
+
+        BL      WinIDEResetDrives               ; preserves flags
+ ]
+
+20
+; EQ => timeout, R0 = ErrTimeout
+; NE => got an IRQ, need status
+
+        MOVNE   R0,#0                           ; if IRQ, stop timer...
+        STRNE   R0,WinTickCount                 ; ...to speed things up
+
+        LDRNEB  R0,IDERegStatus                 ; ...clear the IRQ...
+        BLNE    WinIDEDecodeDriveStatus         ; ...and sort out status
+
+90
+; R0 = completion code
+
+        Pull    "R6,R7,LR"
+        TEQP    PC,LR                           ; restore IRQ state
+        B       SetVOnR0                        ; set/clear V
+
+;*********************************************************************
+
+ [ IDEResetOnInit :LOR: IDEResetOnError
+
+WinIDEResetDrives       ROUT
+;
+; Resets the IDE drives and enables interrupts in the controller.
+;
+; Entry:
+;    SB -> static workspace
+;    WinIDEHardware onwards contains details of IDE hardware
+;
+; Exit:
+;    All registers and flags preserved
+
+        Push    "R0,IDE,LR"
+
+; Set IDE -> IDE controller
+
+        LDR     IDE,WinIDEPtr
+
+; Set SRST bit in digital output register
+
+        MOV     R0,#bit2                ; SRST
+        STRB    R0,IDERegDigOutput
+
+; Now wait for 50us before deasserting SRST.
+
+        MOV     R0,#50*2                ; delay in 1/2 us units
+        BL      DoMicroDelay
+
+; Release SRST and enable interrupts in controller
+
+        MOV     R0,#0
+        STRB    R0,IDERegDigOutput
+
+; Flag that the drives have been reset so they get initialised before use
+
+        ASSERT  WinIDEMaxDrives = 2
+        MOV     R0,#WinIDEDriveStateReset
+        STRB    R0,WinIDEDriveState+0
+        STRB    R0,WinIDEDriveState+1
+
+        Pull    "R0,IDE,PC",,^
+ ]
+
+;*********************************************************************
+
+WinIDEWaitReady ROUT
+;
+; Wait for an IDE drive to become ready
+;
+; Entry:
+;    R0 = drive 0 => master, 1 => slave
+;    R5 = timeout in centiseconds
+;    SB -> static workspace
+;    IRQ state: enabled
+;    TickerV has been claimed
+;    WinIDEHardware onwards contains details of IDE hardware
+;
+; Exit:
+;    VS => drive not ready
+;          R0 = error code
+;    VC => drive ready
+;          R0 undefined
+;    All other registers preserved
+
+        Push    "R0,R1,IDE,LR"
+
+ [ Debug21
+        
+        DLINE   "WinIDEWaitReady"
+ ]
+
+; Set up value to select drive
+
+        MOV     R0,R0,LSL #IDEDriveShift        ; put bit in position
+        ORR     R1,R0,#IDEDrvHeadMagicBits      ; include magic bits
+
+; Set IDE -> IDE controller
+
+        LDR     IDE,WinIDEPtr
+
+; Set tick count for timer
+
+        STR     R5,WinTickCount
+
+; Wait for controller to be not busy (or timeout)
+
+        BL      WinIDEWaitNotBusy       ; NE => busy
+        Pull    "R0,R1,IDE,LR",NE       ; if still busy, return...
+        MOVNE   R0,#WinIDEErrCmdBusy    ; ...error
+        ORRNES  PC,LR,#V_bit            ; ...VS
+
+; Controller not busy - select drive and check if ready
+
+20
+        STRB    R1,IDERegDrvHead
+
+; Wait for other bits in status to become valid
+
+        MOV     R0,#1*2                 ; 1/2 us units
+        BL      DoMicroDelay
+        LDRB    R0,IDERegAltStatus      ; check status
+        AND     R0,R0,#IDEStatusBSY :OR: IDEStatusDRDY
+        TEQS    R0,#IDEStatusDRDY       ; ready?
+        LDRNE   LR,WinTickCount         ; if not, check for timeout
+        TEQNES  LR,#0                   ; expired?
+        BNE     %BT20                   ; branch if not
+
+; EQ => drive ready or timeout expired
+
+        TSTS    R0,#IDEStatusDRDY       ; NE => drive ready
+        Pull    "R0,R1,IDE,LR"
+        MOVEQ   R0,#WinIDEErrCmdNotRdy  ; if not ready...return error
+        ORREQS  PC,LR,#V_bit
+        BICS    PC,LR,#V_bit
+
+;*********************************************************************
+
+WinIDEWaitNotBusy       ROUT
+;
+; Waits for the current drive to become not busy or for
+; the timeout to expire.
+;
+; Entry:
+;    IDE -> controller
+;    IRQ state: enabled
+;
+; Exit:
+;    NE => drive still busy
+;    All registers preserved
+
+        Push    "R0,LR"
+10
+        LDRB    R0,IDERegAltStatus
+        TSTS    R0,#IDEStatusBSY        ; busy?
+        LDRNE   LR,WinTickCount         ; check for timeout
+        TEQNES  LR,#0
+        BNE     %BT10
+
+; Drive not busy or timeout has expired
+
+        TSTS    R0,#IDEStatusBSY        ; still busy?
+        Pull    "R0,PC"
+
+;*********************************************************************
+
+WinIDECheckEscape       ROUT
+;
+; If it is allowed during this op, check if escape has been pressed
+; and return status accordingly.
+;
+; Entry:
+;    WinIDEFileCoreOp = op passed by FileCore
+;
+; Exit:
+;    VS => escape was enabled and has been pressed
+;       R0 = escape error
+;    VC => escape not enabled or enabled but not pressed
+;       R0 undefined
+;    All other registers preserved
+
+; check if escape is allowed during this op
+
+        LDR     R0,WinIDEFileCoreOp             ; get op
+        TSTS    R0,#NoEscape                    ; escape allowed?
+        BICNES  PC,LR,#V_bit                    ; return if not
+
+; escape is allowed during this op - check if pressed
+
+        MOV     R0,#0                           ; R0 -> low memory
+        LDRB    R0,[R0,#ESC_Status]             ; get escape flag
+        TSTS    R0,#EscapeBit                   ; escape?
+        BICEQS  PC,LR,#V_bit                    ; return if not
+
+; escape enabled and pressed
+
+        MOV     R0,#IntEscapeErr                ; FileCore escape error code
+        ORRS    PC,LR,#V_bit
+
+;*********************************************************************
+
+WinClaimIDEIRQs ROUT
+;
+; Claim IRQs for IDE hardware
+;
+; Entry:
+;    SB -> static workspace
+;    WinIDEHardware onwards describes IDE hardware
+;    MODE: SVC
+;    IRQ state: undefined
+;
+; Exit:
+;    VS => error
+;          R0 = error pointer
+;    VC => no error
+;          R0 undefined
+;    All other registers and flags preserved
+;    WinIDEIRQDevNo = device number for claim/release
+
+        Push    "R1-R4,LR"
+
+; disable IRQs
+
+        TEQP    PC,#SVC_mode :OR: I_bit
+
+; determine whether it's podule or motherboard
+
+        LDR     R0,WinIDEPtr                    ; get pointer to IDE
+        LDR     R1,=DefaultIDE                  ; check if motherboard
+        TEQS    R0,R1
+
+; NE => podule IDE
+; If podule, enable podule IRQs in IOC
+; (should really do this AFTER claiming the device vector but IRQs
+; are not enabled in the podule yet so all ok - this is same order
+; as ST506).
+
+        MOVNE   R0,#IOC
+        LDRNEB  R1,[R0,#IOCIRQMSKB]
+        ORRNE   R1,R1,#podule_IRQ_bit
+        STRNEB  R1,[R0,#IOCIRQMSKB]
+
+; set R0 = device number
+
+ [ IOMD
+        MOVEQ   R0,#IOMD_IDE_DevNo
+ |
+        MOVEQ   R0,#WinnieIRQ_DevNo
+ ]
+        MOVNE   R0,#Podule_DevNo
+
+; set R1 -> interrupt service routine
+;     R2 = value to pass in R12
+
+        baddr   R1,WinIDEIRQHandler
+        MOV     R2,SB
+
+; set R3 = address of interrupt status
+;     R4 = mask such that LDRB [R3] AND [R4] NE => IRQ
+
+        LDRNE   R3,WinIDEPollPtr
+        LDRNE   R4,WinIDEPollBits
+
+; claim the vector and store device number
+
+ [ Debug21
+        
+        DREG    R0,"ClaimDevice R0-R4: ",cc
+        DREG    R1,,cc
+        DREG    R2,,cc
+        DREG    R3,,cc
+        DREG    R4
+ ]
+
+        SWI     XOS_ClaimDeviceVector
+
+        MOVVS   R1,#0                           ; 0 if claim failed
+        MOVVC   R1,R0                           ; devno otherwise
+        STRB    R0,WinIDEIRQDevNo
+
+        Pull    "R1-R4,LR"                      ; restore regs
+
+; restore IRQ state and return
+
+        BICVCS  PC,LR,#V_bit
+        ORRS    PC,LR,#V_bit
+
+;*********************************************************************
+
+WinReleaseIDEIRQs       ROUT
+;
+; Release IRQ for the IDE hardware
+;
+; Entry:
+;    SB -> static workspace
+;    WinIDEHardware onwards describes IDE hardware
+;    WinIDEIRQDevNo = device number for claim/release
+;    MODE: SVC
+;    IRQ state: undefined
+;
+; Exit:
+;    VS => error
+;          R0 = error
+;    VC => all ok
+;          R0 undefined
+;    All other registers preserved
+
+        Push    "R1-R4,LR"
+
+; set up regs as for call to WinClaimIDEIRQs
+
+        LDRB    R0,WinIDEIRQDevNo               ; get dev no for call
+ [ IOMD
+        ASSERT  Podule_DevNo > IOMD_IDE_DevNo
+        CMPS    R0,#IOMD_IDE_DevNo             ; check for podule
+ |
+        ASSERT  Podule_DevNo > WinnieIRQ_DevNo
+        CMPS    R0,#WinnieIRQ_DevNo             ; check for podule
+ ]
+        Pull    "R1-R4,LR",CC                   ; return if not claimed
+        BICCCS  PC,LR,#V_bit
+
+; vector claimed
+; HI => podule, not motherboard
+
+        baddr   R1,WinIDEIRQHandler             ; get handler address
+        MOV     R2,SB                           ; and R12 value
+        LDRHI   R3,WinIDEPollPtr                ; if podule, get status addr
+        LDRHI   R4,WinIDEPollBits
+        SWI     XOS_ReleaseDeviceVector         ; release device
+
+        MOVVC   R1,#0                           ; flag device not claimed
+        STRVCB  R1,WinIDEIRQDevNo
+
+        Pull    "R1-R4,PC"
+
+;*********************************************************************
+
+WinTickerHandler        ROUT
+;
+; Called from TickerV to implement timers
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: IRQ or SVC
+;
+; Exit:
+;    All registers and flags preserved
+
+        Push    "R0,LR"
+
+; check not currently in IRQ routine
+
+        LDRB    R0,WinIDEIRQFlag        ; get flag
+        TEQS    R0,#0                   ; in IRQ?
+        Pull    "R0,PC",NE,^            ; NE => yes, so abort
+
+; not in IRQ routine: ok to continue
+; decrement tick count
+
+        LDR     R0,WinTickCount
+        TEQS    R0,#0                   ; already 0?
+        Pull    "R0,PC",EQ,^            ; return if so
+
+        SUBS    R0,R0,#1                ; decrement if not...
+        STR     R0,WinTickCount         ; ...and save
+        Pull    "R0,PC",NE,^            ; return if count != 0
+
+; count now zero - call routine if necessary
+
+        LDR     R0,WinTickCallAddress
+        TEQS    R0,#0
+        Pull    "R0,PC",EQ,^            ; return if address not initialised
+
+; call address HAS been initialised so call it
+
+        MOV     LR,PC                   ; set return address
+        MOV     PC,R0                   ; call handler
+
+; handler should return here
+
+        Pull    "R0,PC",,^
+
+;*********************************************************************
+
+WinClaimTickerV ROUT
+;
+; Claim TickerV
+;
+; Entry:
+;    SB -> static workspace
+;
+; Exit:
+;    VS => error
+;          R0 -> OS error block
+;    VC => all ok
+;          R0 undefined
+;    All other registers preserved
+;    WinHaveTickerV updated
+
+        Push    "R1-R2,LR"
+
+; initialise timer call address to prevent accidental call
+
+        MOV     R0,#0
+        STR     R0,WinTickCallAddress
+
+; claim the vector
+
+        MOV     R0,#TickerV
+        baddr   R1,WinTickerHandler
+        MOV     R2,SB
+        SWI     XOS_Claim
+
+        MOVVS   R1,#0                   ; if error, not claimed
+        MOVVC   R1,#&FF                 ; if error, say claimed
+        STRB    R1,WinHaveTickerV
+
+        Pull    "R1-R2,PC"
+
+;*********************************************************************
+
+WinReleaseTickerV       ROUT
+;
+; Release TickerV if claimed
+;
+; Entry:
+;    SB -> static workspace
+;    WinHaveTickerV valid
+;
+; Exit:
+;    VS => error
+;          R0 -> OS error block
+;    VC => all ok
+;          R0 undefined
+;    All other registers preserved
+;    WinHaveTickerV updated
+
+        Push    "R1-R2,LR"
+
+        LDRB    R0,WinHaveTickerV               ; got TickerV?
+        TEQS    R0,#0
+        Pull    "R1-R2,LR",EQ                   ; return if not
+        BICEQS  PC,LR,#V_bit
+
+; have got TickerV - release it
+
+        MOV     R0,#TickerV
+        baddr   R1,WinTickerHandler
+        MOV     R2,SB
+        SWI     XOS_Release
+
+        MOVVC   R1,#0                           ; if ok, flag have not...
+        STRVCB  R1,WinHaveTickerV               ; ...got TickerV
+
+        Pull    "R1-R2,PC"
+
+;*********************************************************************
+
+DoMicroDelay    ROUT
+;
+; Delay a specified number of 1/2 microsecond units.
+; Code courtesy of Tim Dobson.
+;
+; Entry:
+;   R0 = number of 1/2 microsecond units to wait
+;   MODE: SVC or IRQ
+;   IRQ state: undefined
+;
+; Exit:
+;   R0 undefined
+;   All other registers preserved
+
+        Push    "R1,R2,LR"
+
+        MOV     R2,#IOC                 ; R2 -> IOC
+        STRB    R0,[R2,#Timer0LR]       ; copies counter to output latch
+        LDRB    R1,[R2,#Timer0CL]       ; R1 = low output latch
+
+; loop waiting for counter to change (decremented at 2MHz)
+10
+        STRB    R0,[R2,#Timer0LR]       ; copies counter to output latch
+        LDRB    LR,[R2,#Timer0CL]       ; LR = low output latch
+        TEQS    R1,LR                   ; has counter changed?
+        BEQ     %BT10                   ; else wait for it to change
+
+; counter has changed, decrement our count of ticks
+
+        MOV     R1,LR                   ; update copy of counter
+        SUBS    R0,R0,#1                ; decrement ticks
+        BNE     %BT10                   ; ...and continue if not done
+
+; delay has expired
+
+        Pull    "R1,R2,PC",,^
+
+;*********************************************************************
+
+LockIDEController       ROUT
+;
+; Sets flag to lock IDE controller
+;
+; Entry:
+;    IRQ state: undefined
+;    MODE: undefined
+;
+; Exit:
+;    VS => already locked
+;    VC => now locked
+;    All registers preserved
+
+        Push    "LR"
+
+; disable IRQs
+
+        ORR     LR,LR,#I_bit
+        TEQP    PC,LR
+
+; lock controller if possible
+
+        LDRB    LR,WinIDECommandActive  ; get flag
+        TEQS    LR,#0                   ; unlocked?
+        MOVEQ   LR,#1                   ; if so, lock it
+        STREQB  LR,WinIDECommandActive
+
+; return status and restore IRQ state
+
+        Pull    "LR"
+        BICEQS  PC,LR,#V_bit            ; ...and return VC
+        ORRNES  PC,LR,#V_bit            ; if already locked, return VS
+
+;*********************************************************************
+
+UnlockIDEController     ROUT
+;
+; Clears flag to unlock IDE controller
+;
+; Entry:
+;    IRQ state: undefined
+;    MODE: undefined
+;
+; Exit:
+;    All registers and flags preserved
+
+        Push    "LR"
+
+        MOV     LR,#0
+        STRB    LR,WinIDECommandActive
+
+        Pull    "PC",,^
+
+;*********************************************************************
+
+        END

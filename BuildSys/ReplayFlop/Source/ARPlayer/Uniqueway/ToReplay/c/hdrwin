@@ -1,0 +1,1019 @@
+/* > hdrwin.c
+
+ * © SJ Middleton, 1993
+
+ * Alter the header of an armovie file
+
+ */
+
+#include "filetypes.h"
+
+#include "bbc.h"
+#include "coords.h"
+#include "dboxes.h"
+#include "dboxquery.h"
+#include "event.h"
+#include "help.h"
+#include "menu.h"
+#include "msgs.h"
+#include "screenmode.h"
+#include "swis.h"
+#include "visdelay.h"
+#include "werr.h"
+#include "wimpt.h"
+#include "wimpx.h"
+#include "win.h"
+#include "xferrecv.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "dboxinc.h"
+#include "fileract.h"
+#include "file.h"
+#include "iconmenu.h"
+#include "macros.h"
+#include "msgclaim.h"
+#include "plotsprite.h"
+#include "redraw.h"
+#include "strfn.h"
+#include "wmisc.h"
+
+#include "arline.h"
+#include "arinfo.h"
+
+#include "compress.h"
+
+#define HDR_IDENT       "edithdr"
+
+#define RESTART_FIELD   0
+#define JOIN_FIELD      1
+#define COMPRESS_FIELD  2
+
+#define MOVIE_FIELD     9
+#define DATE_FIELD      10
+#define AUTHOR_FIELD    11
+
+#define SPRITE_FIELD    21
+
+#define SINGLE_TASK_FIELD   12
+#define SCREEN_MODE_FIELD   14
+
+#define DELETE_FILES_FIELD  23
+
+#define DEFAULT_SECONDS_PER_CHUNK   2
+#define DIR_ALREADY_EXISTS          msgs_lookup("hdr0")
+#define HEADER_TITLE                msgs_lookup("hdr1")
+#define REALLY_DELETE_FILES         msgs_lookup("hdr2")
+#define SOUND_ONLY                  msgs_lookup("hdr3")
+#define BAD_SPRITE                  msgs_lookup("hdr4")
+#define BAD_SIZE                    msgs_lookup("hdr5")
+#define MOVIE_NOT_UNDERSTOOD        msgs_lookup("hdr6")  
+
+#define DISCARD                     msgs_lookup("discard")
+#define CANCEL                      msgs_lookup("cancel")
+
+#define HDR_MENU_PREFIX             "HHELP"
+#define HDRMENU                     msgs_lookup("hdrmenu")
+#define DELETE_MENUT                msgs_lookup("Tdelete")
+
+/*-------------------------------------------------------------------------------------------- */
+
+static dbox         hdr_d = NULL;
+
+static dbox_incstr  mode_inc =
+{
+    1, 10,
+    0, 127,
+    0, 0, 0,
+    dboxinc_NoValidateOnReturn | dboxinc_NoFullIcons
+};
+
+/*-------------------------------------------------------------------------------------------- */
+
+static void get_fields(dbox d, compress_str *cp);
+
+/*-------------------------------------------------------------------------------------------- */
+
+enum
+{
+    mmenu_SaveMovie = 1,
+    mmenu_OpenWork,
+    mmenu_DeleteFiles,
+    mmenu_OpenCvt,
+    mmenu_CompressOptions,
+    mmenu_Filters,
+    mmenu_OpenTracks
+};
+
+static menu hdrmenu = 0, delmenu = 0;
+static char *delmenu_string = NULL;
+
+static void set_submenu(menu submenuptr)
+{
+    wimp_menuhdr *mhp = menu_syshandle(hdrmenu);
+    wimp_menuitem *mip = &((wimp_menuitem *)(mhp+1))[mmenu_DeleteFiles-1];
+    mip->submenu = submenuptr ? (wimp_menuptr)menu_syshandle(submenuptr) : (wimp_menuptr)-1;
+}
+
+/*
+ * Return TRUE to continue with scan
+ * Return FALSE to abort scan.
+ */
+
+static int menuscanfn(const char *filename, int filetype, int size, void *handle)
+{
+    char **pmenu = handle;
+    if (filetype == filetype_Directory)
+    {
+        if (*pmenu)
+            strcatx(pmenu, ",");
+        strcatx(pmenu, file_leaf(filename, NULL));
+    }
+    return 1;
+    UNUSED(size);
+}
+
+static menu get_delete_menu(compress_str *cp)
+{
+    free(delmenu_string);
+    delmenu_string = NULL;
+
+    if (file_size(WORKROOT_DIR, NULL) != -1)
+    {
+        file_scandir(WORKROOT_DIR, FALSE, menuscanfn, &delmenu_string);
+        return delmenu_string == NULL ? NULL : menu_new(DELETE_MENUT, delmenu_string);
+    }
+    return NULL;
+}
+
+static void mmenuproc(void *handle, char *hit)
+{
+    compress_str *cp = handle;
+    switch (hit[0])
+    {
+        case mmenu_SaveMovie:
+            get_fields(hdr_d, cp);
+            cvtwin_saveandjoin(cp);
+            break;
+
+        case mmenu_OpenWork:
+            os_err(filer_OpenDir(cp->work_dir && file_size(cp->work_dir, NULL) != -1 ? cp->work_dir : WORKROOT_DIR));
+            break;
+
+        case mmenu_DeleteFiles:
+            if (hit[1])
+            {
+                char buffer[256];
+                int n = sprintf(buffer, "%s.", WORKROOT_DIR);
+                iconmenu_extractstring(buffer+n, delmenu_string, hit[1]-1);
+
+                delete_files(buffer);
+
+                menu_setflags(delmenu, hit[1], FALSE, TRUE);
+                hdr_refresh(cp);
+            }
+            break;
+
+        case mmenu_OpenCvt:
+            if (wimpt_last_event()->e != wimp_EMENU)
+                cvt_popup(cp);
+            break;
+
+        case mmenu_CompressOptions:
+            compress_open(cp);
+            break;
+
+        case mmenu_Filters:
+            filters_open(cp);
+            break;
+
+        case mmenu_OpenTracks:
+            tracks_open(cp);
+            break;
+    }
+    UNUSED(handle);
+}
+
+static menu makemenus(void *handle)
+{                
+    compress_str *cp = handle;
+
+    help_register_handler(help_simplehandler, HDR_MENU_PREFIX);
+
+    if (!event_is_menu_being_recreated())
+    {
+        if (delmenu)
+            menu_dispose(&delmenu, FALSE);
+        delmenu = get_delete_menu(cp);
+
+        set_submenu(delmenu);
+    }
+
+    menu_setflags(hdrmenu, mmenu_SaveMovie, FALSE, calldiffer_busy() || !can_join(cp));
+    menu_setflags(hdrmenu, mmenu_DeleteFiles, FALSE, delmenu == FALSE);
+    menu_setflags(hdrmenu, mmenu_CompressOptions, is_compress_open(), !is_compress_available(NULL));
+    menu_setflags(hdrmenu, mmenu_OpenTracks, is_tracks_open(), FALSE);
+    menu_setflags(hdrmenu, mmenu_OpenWork, FALSE, file_size(WORKROOT_DIR, NULL) == -1);
+    menu_setflags(hdrmenu, mmenu_Filters, is_filters_open(), !is_filters_available());
+
+    return hdrmenu;
+    UNUSED(handle);
+}
+
+static BOOL init_hdrwin_menu(wimp_w w, compress_str *cp)
+{
+    if (hdrmenu == NULL && (hdrmenu = menu_new(APP_TITLE, HDRMENU)) == NULL)
+        return FALSE;
+
+    if (!event_attachmenumaker(w, makemenus, mmenuproc, cp))
+        return FALSE;
+
+    return TRUE;
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+static BOOL fileraction_dying(msgclaim m, wimp_eventstr *e, void *handle)
+{
+    compress_str *cp = handle;
+
+    msgclaim_remove(&m);
+
+    if (calldiffer_start(cp))
+        hdr_open(cp);
+    return TRUE;
+    UNUSED(e);
+}
+
+static BOOL delete_images(compress_str *cp)
+{
+    BOOL leave_open = FALSE;
+    char buffer[256];
+    if (fileract_Interactive())
+    {
+        wimp_t task;
+        if (os_err(fileract_init(&task)) == NULL &&
+            os_err(fileract_senddir(task, cp->work_dir)) == NULL)
+        {
+            int chunk;
+            for (chunk = 0;; chunk++)
+            {
+                sprintf(buffer, "%s.%sImages%0d", cp->work_dir, index_string(cp), chunk);
+                if (file_size(buffer, NULL) != -1)
+                    os_err(fileract_sendfile(task, file_leaf(buffer, NULL)));
+                else
+                    break;
+            }
+            os_err(fileract_start(task, fileract_Delete, -1, NULL));
+    
+            msgclaim_add(wimp_MCLOSETASK, task, fileraction_dying, cp);
+        }
+    }
+    else
+    {
+        sprintf(buffer, "%s.%sImages*", cp->work_dir, index_string(cp));
+        os_err(file_wipe(buffer, FALSE, FALSE));
+
+        leave_open = calldiffer_start(cp);
+    }
+    return leave_open;
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+static void set_mode_fade(dbox d)
+{
+    dboxinc_fade(d, SCREEN_MODE_FIELD, !dbox_getnumeric(d, SINGLE_TASK_FIELD), FALSE);
+}
+
+static void set_flag_fields(dbox d, compress_str *cp)
+{
+    dbox_setfield(d, SCREEN_MODE_FIELD, (char *)cp->o.screen_mode);
+    dbox_setnumeric(d, SINGLE_TASK_FIELD, cp->o.flags & compress_SingleTask);
+
+    dbox_setnumeric(d, DELETE_FILES_FIELD, cp->o.flags & compress_DeleteFiles);
+}
+
+static void set_action_fades(dbox d, const compress_str *cp)
+{
+    BOOL busy = calldiffer_busy();
+
+    dbox_fadestate(d, RESTART_FIELD, busy || !is_differ_continuable(cp));
+    dbox_fadestate(d, COMPRESS_FIELD, busy || cp->input_file == NULL);
+    dbox_fadestate(d, JOIN_FIELD, busy || !can_join(cp));
+}
+
+static void set_fields(dbox d, const compress_str *cp)
+{
+    const armovie_hdr *hdr = cp->hdr;
+
+    dbox_setfield(d, MOVIE_FIELD, hdr ? (char *)strsafe(hdr->name) : "");
+    dbox_setfield(d, DATE_FIELD, hdr ? (char *)strsafe(hdr->date) : "");
+    dbox_setfield(d, AUTHOR_FIELD, hdr ? (char *)strsafe(hdr->author) : "");
+
+    no_err(wimp_set_icon_state(dbox_syshandle(d), SPRITE_FIELD, 0, 0));
+
+    win_settitle(dbox_syshandle(hdr_d), cp->input_file ? cp->input_file :
+                                        cp->work_dir ? cp->work_dir :
+                                        APP_TITLE);
+}
+
+static void get_flag_fields(dbox d, compress_str *cp)
+{
+    dbox_getfield(d, SCREEN_MODE_FIELD, cp->o.screen_mode, sizeof(cp->o.screen_mode));
+
+    cp->o.flags &= ~(compress_SingleTask | compress_DeleteFiles);
+    cp->o.flags |= (dbox_getnumeric(d, SINGLE_TASK_FIELD) ? compress_SingleTask : 0) |
+                (dbox_getnumeric(d, DELETE_FILES_FIELD) ? compress_DeleteFiles : 0);
+}
+
+static void get_fields(dbox d, compress_str *cp)
+{
+    armovie_hdr *hdr = cp->hdr;
+    if (hdr)
+    {
+        dbox_getxfield(d, MOVIE_FIELD, &hdr->name);
+        dbox_getxfield(d, DATE_FIELD, &hdr->date);
+        dbox_getxfield(d, AUTHOR_FIELD, &hdr->author);
+    }
+
+    get_flag_fields(d, cp);
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+static wimp_icon    ssprite_icon;
+static wimp_box     ssprite_box;
+
+static void display_redraw_setup(void *handle, wimp_redrawstr *r, BOOL local)
+{
+    compress_str *cp = handle;
+    no_err(wimp_get_icon_info(r->w, SPRITE_FIELD, &ssprite_icon));
+    
+    ssprite_box = ssprite_icon.box;
+    coords_box_toscreen(&ssprite_box, (coords_cvtstr *)&r->box);
+    
+    ssprite_icon.data.indirectsprite.spritearea = spr_area_Ptr(cp->sprite);
+    ssprite_icon.data.indirectsprite.name = spr_area_FirstSprite(cp->sprite);
+    ssprite_icon.data.indirectsprite.nameisname = FALSE;
+
+    UNUSED(local);
+}
+
+static void display_redraw(void *handle, wimp_redrawstr *r, BOOL local)
+{
+    if (ssprite_icon.data.indirectsprite.name)
+        if (coords_boxesoverlap(&r->g, &ssprite_box))
+            ploticon_spritescaled(&ssprite_icon, &r->box, TRUE);
+    UNUSED(local);
+    UNUSED(handle);
+}
+
+static BOOL display_raw_events(dbox d, void *event, void *handle)
+{
+    compress_str    *cp = handle;
+    wimp_eventstr   *e = event;
+    switch (e->e)
+    {
+        case wimp_EREDRAW:
+            redraw_window(e->data.o.w, display_redraw_setup, display_redraw, handle);
+            break;
+#if 0
+        case wimp_EKEY:
+            if (e->data.key.c.i != -1 && e->data.key.chcode == ctrl('V'))
+            {
+                static int filetypes[] = { 0xfff, -1 };
+                wimp_msgdatasave datasave;
+                datasave.w = e->data.key.c.w;
+                datasave.i = e->data.key.c.i;
+                datasave.x = e->data.key.c.x;
+                datasave.y = e->data.key.c.y;
+                clipboard_Paste(filetypes, &datasave);
+                return TRUE;
+            }
+            break;
+ #endif
+        case wimp_ESEND:
+        case wimp_ESENDWANTACK:
+        {
+            char    *filename;
+            int     estsize;
+            switch (xferrecv_checkinsert(&filename))
+            {
+                case filetype_Sprite:
+                    if (cp->hdr && check_import(cp))
+                    {
+                        int dummy, xsize, ysize;
+                        sprite_info info;
+                        spr_area newsprite = spr_area_Init(f_alloc, f_free, "default sprite");
+
+                        if (os_err(spr_area_Load(newsprite, filename)) != NULL ||
+                            os_err(spr_ReturnInfo(spr_area_FirstSprite(newsprite), &info)) != NULL ||
+                            !mode_var(info.mode, bbc_XEigFactor, &dummy))
+                        {
+                            werr(0, BAD_SPRITE);
+                            spr_area_Dispose(&newsprite);
+                            return FALSE;
+                        }
+
+                        xsize = cp->hdr->xsize*4;
+                        ysize = cp->hdr->ysize*4;
+                        if (((info.width << mode_xeig(info.mode)) != xsize ||
+                                (info.height << mode_yeig(info.mode)) != ysize) &&
+                            werr_question(NULL, BAD_SIZE, xsize, ysize) != 1)
+                        {
+                            spr_area_Dispose(&newsprite);
+                            return FALSE;
+                        }
+
+                        spr_area_Dispose(&cp->sprite);
+                        cp->sprite = newsprite;
+
+                        no_err(wimp_set_icon_state(dbox_syshandle(d), SPRITE_FIELD, 0, 0));
+                        xferrecv_insertfileok();
+                    }
+                    return TRUE;
+
+                case filetype_ARMovie:
+                case filetype_Directory:
+                    if (check_import(cp))
+                    {
+                        cvt_load(cp, filename);
+                        xferrecv_insertfileok();
+                    }
+                    return TRUE;
+#if 0
+                case filetype_Text:
+                    if (check_import(cp))
+                    {
+                        read_textfile(cp, filename);
+                    }
+                    return TRUE;
+#endif
+                case -1:
+                    if (check_import(cp)) switch (xferrecv_checkimport(&estsize))
+                    {
+                        case filetype_Sprite:
+                        case filetype_Text:
+                            xferrecv_sendsaveok();
+                            return TRUE;
+
+                        case filetype_ARMovie:
+                            cvt_import(cp);
+                            return TRUE;
+                    }
+                    break;
+            }
+            break;
+        }
+    }
+    return FALSE;
+    UNUSED(d);
+}
+
+static void display_events(dbox d, void *handle)
+{
+    compress_str    *cp = handle;
+    dbox_field      action = dbox_get(d);
+    switch (action)
+    {
+        case dbox_CLOSE:
+            get_fields(d, cp);
+            hdr_dispose();
+            break;
+
+        case COMPRESS_FIELD:
+            get_fields(d, cp);
+            compress_readoptions(cp);
+            if (is_compress_available(cp))
+            {
+                if (has_differ_started(cp))
+                {
+                    BOOL persist = dbox_persist();
+                    if (dbox3wayf(CANCEL, DISCARD, NULL, REALLY_DELETE_FILES) == dbox3way_Answer2)
+                    {
+                        if (!delete_images(cp) && !persist)
+                            hdr_dispose();
+                    }
+                }
+                else if (!calldiffer_start(cp) && !dbox_persist())
+                    hdr_dispose();
+                else
+                    hdr_refresh(cp);
+            }
+            break;
+
+        case RESTART_FIELD:
+            get_fields(d, cp);
+            if (!calldiffer_restart(cp) && !dbox_persist())
+                hdr_dispose();
+            else
+                hdr_refresh(cp);
+            break;
+
+        case JOIN_FIELD:
+            get_fields(d, cp);
+            if (!calljoiner_start(cp, NULL) && !dbox_persist())
+                hdr_dispose();
+            else
+                hdr_refresh(cp);
+            break;
+
+        case SINGLE_TASK_FIELD:
+            set_mode_fade(d);
+            break;
+
+        case DELETE_FILES_FIELD:
+            get_flag_fields(d, cp);
+            break;
+
+        default:
+            (void) dboxinc_processinc(d, SCREEN_MODE_FIELD, action, &mode_inc, cp);
+            break;
+    }
+    UNUSED(handle);
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+void hdr_readoptions(compress_str *cp)
+{
+    if (hdr_d)
+        get_fields(hdr_d, cp);
+}
+
+void hdr_refresh(const compress_str *cp)
+{
+    if (hdr_d)
+        set_action_fades(hdr_d, cp);
+}
+
+void hdr_open(compress_str *cp)
+{
+    dbox d = hdr_d;
+
+    if (d)
+        bring_to_front(dbox_syshandle(d));
+
+    else if ((d = dbox_new(HDR_IDENT)) != NULL)
+    {
+        hdr_d = d;
+
+        dbox_eventhandler(d, display_events, cp);
+        dbox_raw_eventhandler(d, display_raw_events, cp);
+
+        dbox_showstatic(d);
+
+        init_hdrwin_menu(dbox_syshandle(d), cp);
+
+        set_flag_fields(d, cp);
+        set_mode_fade(d);
+    }
+
+    if (d)
+    {
+        set_fields(d, cp);
+        set_action_fades(d, cp);
+    }
+}
+
+void hdr_dispose(void)
+{
+    if (hdr_d)
+    {
+        set_submenu(NULL);
+        if (delmenu)
+        {
+            menu_dispose(&delmenu, FALSE);
+            delmenu = NULL;
+        }
+
+        if (hdrmenu)
+        {
+            menu_dispose(&hdrmenu, TRUE);
+            hdrmenu = NULL;
+        }
+
+        dbox_savepos(hdr_d);
+        dbox_dispose(&hdr_d);
+        hdr_d = NULL;
+    }
+}
+
+BOOL is_hdr_open(void)
+{
+    return hdr_d != NULL;
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+static int count_scanfn1(const char *filename, int filetype, int size, void *handle)
+{
+    if (filetype == filetype_Directory)
+    {
+        int *current = handle;
+        int index = atoi(file_leaf(filename, NULL) + sizeof("Images")-1);
+        if (*current < index)
+            *current = index;
+    }
+    return 1;
+    UNUSED(size);
+}
+
+static int count_scanfn2(const char *filename, int filetype, int size, void *handle)
+{
+    int *count = handle;
+    (*count)++;
+    return 1;
+    UNUSED(size);
+    UNUSED(filetype);
+    UNUSED(filename);
+}
+
+static int count_frames(const compress_str *cp, const char *work_dir)
+{
+    char buffer[256];
+    int count1, count2;
+
+    count1 = 0;
+    sprintf(buffer, "%sImages*", index_string(cp));
+    file_scandirfor(work_dir, buffer, FALSE, count_scanfn1, &count1);
+
+    sprintf(buffer, "%s.%sImages%d", work_dir, index_string(cp), count1);
+    count2 = 0;
+    file_scandir(buffer, FALSE, count_scanfn2, &count2);
+
+    return (count1*FILES_PER_IMAGEDIR + count2)*cp->o.frames_per_chunk;
+}
+
+static int calc_nframes(const armovie_hdr *hdr)
+{
+    int         nframes = hdr->nframes;
+    arinfo_str  *ip = arinfo_info(arinfo_formattoindex(hdr->video_format));
+
+    if (ip && ip->bpp)
+    {
+        nframes = (hdr->nchunks - 1)*hdr->frames_per_chunk;
+        nframes += hdr->video_chunks[hdr->nchunks-1].size / (hdr->xsize*hdr->ysize*ip->bpp/8);
+    }
+    return nframes;
+}
+
+/* clear off stuff from last loaded file */
+
+static void cvt_clear(compress_str *cp)
+{
+    armovie_freehdr(cp->hdr);
+    cp->hdr = NULL;
+
+    srcfile_deleteall(cp->srcfile);
+    cp->nsoundtracks = 0;
+
+    c_free((mem_ptr)&cp->input_file);
+    c_free((mem_ptr)&cp->work_dir);
+    c_free((mem_ptr)&cp->output_file);
+
+    spr_area_Reinit(cp->sprite);
+}
+
+static void check_state_file(compress_str *cp, armovie_hdr *hdr)
+{
+/* delete current track list */
+    srcfile_deleteall(cp->srcfile);
+    cp->nsoundtracks = 0;
+    cp->o.flags &= ~compress_CompressAudio;
+
+/* read from file and scan for adpcm */
+    if (hdr->sound && srcfile_insert(cp->srcfile, 0, 1))
+        cp->nsoundtracks += srcfile_copy(cp->srcfile, 0, NULL, hdr->sound, hdr->nsoundtracks);
+
+    if (srcfile_scanforcompression(cp->srcfile))
+        cp->o.flags |= compress_CompressAudio;
+
+/* then load track and filters state from file */
+    state_read(cp);
+}
+
+/*
+ * We have dropped a movie in (or changed the index)
+ * See if there is a Header created already.
+ * If so read values to use out of it.
+ */
+
+static BOOL check_header_m(compress_str *cp)
+{
+    armovie_hdr *hdr;
+    char        s[256];
+    sprintf(s, "%s.%sHeader", cp->work_dir, index_string(cp));
+    if (file_size(s, NULL) != -1 &&
+        (hdr = armovie_readhdrto(s, arline_FramesPerChunk)) != NULL)
+    {
+        cp->o.compressor = hdr->video_format;
+        cp->o.frames_per_chunk = hdr->frames_per_chunk;
+        cp->o.frame_rate_divisor = (int)(cp->hdr->fps / hdr->fps + 0.5);
+
+        if (hdr->name || hdr->date || hdr->author)
+        {
+            strrplc(&cp->hdr->name, hdr->name);
+            strrplc(&cp->hdr->date, hdr->date);
+            strrplc(&cp->hdr->author, hdr->author);
+        }
+
+        check_state_file(cp, hdr);
+
+        armovie_freehdr(hdr);
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * We have dropped in a directory (or changed the index).
+ * Check the header file and read values from it
+ */
+
+static BOOL check_header_d(compress_str *cp)
+{
+    char s[256];
+    sprintf(s, "%s.%sHeader", cp->work_dir, index_string(cp));
+
+    if (cp->hdr)
+    {
+        armovie_freehdr(cp->hdr);
+        cp->hdr = NULL;
+    }
+
+    if ((cp->hdr = armovie_readhdrto(s, arline_FramesPerChunk)) != NULL)
+    {
+        armovie_hdr *hdr = cp->hdr;
+
+        cp->o.compressor = hdr->video_format;
+        cp->o.frames_per_chunk = hdr->frames_per_chunk;
+
+        check_state_file(cp, cp->hdr);
+
+        if (hdr->video_format)
+            hdr->nframes = count_frames(cp, cp->work_dir);
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * Create the appropriate output file name
+ */
+
+static void update_outputfile(compress_str *cp)
+{
+    c_free((mem_ptr)&cp->output_file);
+    if (cp->hdr)
+        cp->output_file = strcombine(NULL, cp->work_dir, ".", cp->input_leaf, index_string(cp), 0);
+}
+
+/*
+ * This is called from cvtwin.c when the index value changes
+ * so that the work dir can be re-scanned
+ */
+
+void cvt_scan(compress_str *cp)
+{
+    switch (cp->input_filetype)
+    {
+        case filetype_ARMovie:
+            if (!check_header_m(cp))
+            {
+                armovie_hdr *hdr;
+                if (armovie_identify(cp->input_file, &hdr))
+                {
+                    strrplc(&cp->hdr->name, hdr->name);
+                    strrplc(&cp->hdr->date, hdr->date);
+                    strrplc(&cp->hdr->author, hdr->author);
+
+                    check_state_file(cp, hdr);
+
+                    armovie_freehdr(hdr);
+                }
+            }
+            break;
+
+        case filetype_Directory:
+            check_header_d(cp);
+            break;
+    }
+    update_outputfile(cp);
+}
+
+/*
+ * DATALOAD to icon or window
+ */
+
+static BOOL cvt__load(compress_str *cp, const char *filename)
+{
+    visdelay_begin();
+
+    cvt_clear(cp);
+
+    file_size(filename, &cp->input_filetype);
+
+    switch (cp->input_filetype)
+    {
+        case filetype_ARMovie:
+            if (armovie_identify(filename, &cp->hdr))
+            {
+                char *s;
+                armovie_hdr *hdr = cp->hdr;
+                armovie_soundstr *sound = hdr->sound;
+
+                cp->input_file = strdup(filename);
+                cp->input_leaf = file_leaf(cp->input_file, NULL);
+        
+/* check there is video */
+                if (hdr->video_format == 0)
+                {
+                    werr(0, SOUND_ONLY, cp->input_file);
+                    return FALSE;
+                }
+
+/* check we understand this video type */
+                if (arinfo_formattoindex(hdr->video_format) == -1)
+                {
+                    werr(0, MOVIE_NOT_UNDERSTOOD, hdr->video_format);
+                    return FALSE;
+                }
+
+                hdr->nframes = calc_nframes(hdr);
+
+                cp->work_dir = strcombine(NULL, getenv(WORKROOT_DIRVAR), ".", cp->input_leaf, 0);
+
+/* get saved sprite or helpful sprite from source movie */
+                s = stradd(cp->work_dir, ".Sprite");
+                if (spr_area_Load(cp->sprite, s) != NULL)
+                {
+                    os_err(spr_area_Reinit_noshrink(cp->sprite));
+                    os_err(spr_ReadSpriteFromFile(cp->sprite, cp->input_file, hdr->sprite_offset+12, hdr->sprite_size-12));
+                }
+                free(s);
+
+                cp->o.start_at = 0;
+                cp->o.flags &= ~compress_StartAt;
+
+/* start with soundtrack details of source file */
+                if (sound && sound->format)
+                    if (srcfile_insert(cp->srcfile, 0, 1))
+                        cp->nsoundtracks += srcfile_copy(cp->srcfile, 0, cp->input_file, sound, hdr->nsoundtracks);
+
+/* check for saved header */
+                if (!check_header_m(cp))
+                {
+/* check current compressor exists at all and actually has a BatchComp */
+                    arinfo_str *ip = arinfo_info(arinfo_formattoindex(cp->o.compressor));
+                    if (ip == NULL || (ip->flags & arinfo_BatchComp) == 0)
+                    {
+                        ip = arinfo_info(arinfo_findindex(arinfo_BatchComp, arinfo_BatchComp, 0));
+                        if (ip)
+                            cp->o.compressor = ip->format;
+                    }
+
+/*                  cp->o.frame_rate_divisor = 1; */
+                    cp->o.frames_per_chunk = (int)(DEFAULT_SECONDS_PER_CHUNK*hdr->fps/cp->o.frame_rate_divisor + 0.5);
+                }
+            }
+            break;
+
+        case filetype_Directory:
+            cp->work_dir = strdup(filename);
+            cp->input_leaf = file_leaf(cp->work_dir, NULL);
+
+            cp->o.frame_rate_divisor = 1;
+            cp->o.start_at = 0;
+            cp->o.flags &= ~compress_StartAt;
+
+            {
+                char *s = stradd(cp->work_dir, ".Sprite");
+                spr_area_Load(cp->sprite, s);
+                free(s);
+            }
+
+            check_header_d(cp);
+            break;
+    }
+
+/* init inuse variables */
+    cp->inuse.video_format = cp->o.compressor;
+    cp->inuse.fps = cp->hdr->fps/cp->o.frame_rate_divisor;
+    cp->inuse.frames_per_chunk = cp->o.frames_per_chunk;
+
+/* check sprite is OK */
+    {
+        sprite_ptr sptr = spr_area_FirstSprite(cp->sprite);
+        sprite_info info;
+        int dummy;
+        
+        if (sptr == NULL || os_err(spr_ReturnInfo(sptr, &info)) != NULL ||
+            !mode_var(info.mode, bbc_XEigFactor, &dummy))
+        {
+            werr(0, BAD_SPRITE);
+            os_err(spr_area_Load(cp->sprite, ARMOVIE_DEFAULT_SPRITE));
+        }
+    }
+
+    if (cp->nsoundtracks == 0)
+        srcfile_insert(cp->srcfile, 0, 1);
+
+    hdr_open(cp);
+
+    visdelay_end();
+    return TRUE;
+}
+
+void cvt_load(compress_str *cp, const char *filename)
+{
+    if (!cvt__load(cp, filename))
+        cvt_clear(cp);
+
+    update_outputfile(cp);
+
+    tracks_refresh(cp);
+
+    if (hdr_d)
+    {
+        set_fields(hdr_d, cp);
+        set_action_fades(hdr_d, cp);
+    }
+}
+
+
+/*
+ * DATASAVE sent to icon or window
+ */
+
+void cvt_import(compress_str *cp)
+{
+    char *dir = strcombine(NULL, getenv(WORKROOT_DIRVAR), ".", xferrecv_import_leafname(), 0);
+    if (file_size(dir, NULL) != -1)
+        werr(0, DIR_ALREADY_EXISTS, xferrecv_import_leafname());
+    else
+    {
+        if (os_err(cdir(WORKROOT_DIR)) == NULL &&
+            os_err(cdir(WORKROOT_DIR".+Source")) == NULL)
+        {
+            free(dir);
+            dir = strcombine(NULL, getenv(WORKROOT_DIRVAR), ".+Source.", xferrecv_import_leafname(), 0);
+            xferrecv_sendsaveto(dir, TRUE);
+        }
+    }
+    free(dir);
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+#if 0
+
+static char *batch_list = NULL;
+
+static void read_textfile(compress_str *cp, const char *filename)
+{
+    int size = file_size(filename, NULL);
+    if (c_alloc((mem_ptr)&batch_list, size+1))
+    {
+        char *replay_file;
+
+        os_err(file_load(filename, batch_list));
+        batch_list[size] = '\0';
+
+        replay_file = strtok(batch_list, "\n\r");
+
+        if (replay_file)
+        {
+            cp->o.flags |= compress_Batch;
+
+            cvt_load(cp, replay_file);
+            calldiffer_start(cp);
+        }
+    }
+}
+
+BOOL batch_process(compress_str *cp)
+{
+    char *replay_file = strtok(NULL, "\n\r");
+    if (replay_file)
+    {
+        cvt_load(cp, replay_file);
+        calldiffer_start(cp);
+        return TRUE;
+    }
+
+    cp->o.flags &= ~compress_Batch;
+    c_free((mem_ptr)&batch_list);
+    return FALSE;
+}
+
+#endif
+
+/*-------------------------------------------------------------------------------------------- */
+
+/* eof hdrwin.c */

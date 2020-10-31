@@ -1,0 +1,674 @@
+#include "stdio.h"
+/*
+
+    Sprite plotting library by Merlyn Kline, 1993
+
+:NOTES
+    This library provides high performance mode independent sprite plotting.
+    It does this by caching its calculated pixel translation tables and
+    re-using them when appropriate, rather than re-calculating a translation
+    table for each sprite plotted.
+
+    The cache size is determined by PLOTSPR__TRANSCACHESIZE and requires
+    around 1282 bytes per cache entry. In most applications a cache of four
+    or five entries will be sufficient. If an application may use a wide
+    range of different mode sprites with different palettes then the cache
+    should be larger.
+
+    A 4bpp sprite with no palette is treated as though it has the default
+    wimp palette (as per RO3.10). Palettes are ignored on >8bpp.
+
+    To use this library you must call plotspr_init() in your initialisation
+    code and plotspr_invalidate_cache() every time the screen mode or
+    wimp palette changes. You can then call plotspr_plot() and/or
+    plotspr_get_factors to use the facilities provided.
+
+    plotspr_plot()
+    This routine plots a sprite updating and/or using the translation
+    cache as appropriate. The parameters are as follows:
+      sprite_area    *area        Pointer to sprite area containing sprite.
+                                   If sprite_id refers to the sprite by its
+                                   address this area pointer is not used and
+                                   may be NULL.
+      sprite_id      *sprite      Sprite identifier. Remember that sprites
+                                   plot faster if referred to by address
+                                   rather than name.
+      int            action       The gcol action to use.
+      int            x,y          Screen co-ords of LLCorner (OS Units).
+      sprite_factors *factors     The scale factors to use. These are in
+                                  the usual format but refer to OS units
+                                  and will be corrected automatically to
+                                  cater for pixel size/aspect ratio. Use
+                                  NULL for a 1:1 plot.
+
+    plotspr_get_factors()
+    Returns the scale factors and pixel translation table that the above
+    routine would use to plot a particular sprite. Parameters are:
+      sprite_area     *area          As above.
+      sprite_id       *sprite        As above.
+      sprite_factors  *factors       As above.
+      sprite_factors  **outfactors   Pointer to a location which will be
+                                      updated to point to the modified
+                                      scale factors. These are stored in
+                                      static variables and can be relied on
+                                      until the next call to this routine
+                                      (or the one above). A result of NULL
+                                      indicates that scale factors are
+                                      unnecessary for this circumstance.
+                                      If you don't want to calculate the
+                                      factors (ie you only want the pixel
+                                      translation) then pass NULL here.
+      sprite_pixtrans **outpixtrans  Pointer to a location which will be
+                                      updated to point to an appropriate
+                                      pixel translation table. This is in
+                                      a static variable and can be relied on
+                                      until the next call to this routine
+                                      (or the one above). A result of NULL
+                                      indicates that pixel translation is
+                                      unnecessary for this circumstance.
+    Note that if this routine returns two NULLs it indicates that the sprite
+    may be plotted using PutSprite rather than PutSpriteScaled, resulting
+    in significantly better performance.
+
+    plotspr_box_factors()
+    Calculate the scale factors needed to fit the sprite into a given box
+    on the screen in the current mode. The box is a wimp box, ie the
+    bottom left is inclusive, top right exclusive. Parameters are:
+      sprite_area     *area          As above.
+      sprite_id       *sprite        As above.
+      wimp_box        *box           The box to fit the sprite in.
+      sprite_factors  *factors       Pointer to sprite factors to store
+                                      returned value in.
+    plotspr_plot_box()
+    Plots a sprite into a given screen box. The box is a wimp box, ie the
+    bottom left is inclusive, top right exclusive. Parameters are:
+      sprite_area     *area          As above.
+      sprite_id       *sprite        As above.
+      int             action         The gcol action to use.
+      wimp_box        *box           The box to fit the sprite in.
+
+    plotspr_locate_sprite()
+    Ensures the sprite is referenced by address (not name). Parameters:
+      sprite_area     *area          As above.
+      sprite_id       *sprite        Sprite id, converted to address ref
+                                      if necessary.
+
+    plotspr_plot_mask()
+    As plotspr_plot() but plots mask outline in current background colour.
+
+    plotspr_plot_mask_box()
+    As plotspr_plot_box() but plots mask outline in current background colour.
+
+
+:END
+
+:HISTORY
+    13/08/93  MK   First draught
+    20/08/93  MK   Fixed plotspr__palpointer() for RO2
+    20/08/93  MK   Added plotspr_box_factors()
+    20/08/93  MK   Added plotspr_plot_box()
+    20/08/93  MK   Added plotspr_locate_sprite();
+    20/08/93  MK   Removed dependency on sprite area pointer.
+    20/08/93  MK   Allowed NULL for outfactors in plotspr_get_factors()
+    18/10/93  MK   Fixed for <4bpp
+    21/10/93  MK   Added plotspr_plot_mask() and plotspr_plot_mask_box()
+    04/08/94  MK   Fixed for 8bpp sprites with palettes
+    08/08/94  MK   Added plotspr_display_box()
+    22/08/94  MK   Fixed for >8bpp sprites in <=8bpp modes on RO3.5
+    24/01/95  MK   Exported plotspr_NULLAREA
+    24/01/95  MK   Added plotspr_force_mode()
+    14/02/95  MK   Added plotspr_display_box_factors()
+:END
+
+:MESSAGES
+:END
+
+*/
+
+#include "stddef.h"
+#include "string.h"
+
+#include "swis.h"
+/*----------------------------------------------------------------------*/
+#include "wimp.h"
+#include "wimpt.h"
+#include "os.h"
+/*----------------------------------------------------------------------*/
+#include "sprite.h"
+#include "colourtran.h"
+#include "bbc.h"
+
+#include "errorgen.h"
+
+#define PLOTSPR__TRANSCACHESIZE 5
+#define PLOTSPR__PALMASK (0xffffff00)  /* change to 0xf0f0f000 for faster, less accurate performance */
+
+/*----------------------------------------------------------------------*/
+#define plotspr_NULLAREA ((sprite_area*)0xff)
+/*----------------------------------------------------------------------*/
+#define plotspr_WIMPAREA ((sprite_area*)1)
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int             plotspr__palstore[PLOTSPR__TRANSCACHESIZE][256];
+static char            plotspr__bppstore[PLOTSPR__TRANSCACHESIZE];
+static sprite_pixtrans plotspr__transstore[PLOTSPR__TRANSCACHESIZE][256];
+static char            plotspr__flags[PLOTSPR__TRANSCACHESIZE];
+static int             plotspr__scrpal[256];
+static int             plotspr__forced_mode=-1;
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_locate_sprite(sprite_area *area,sprite_id *sprite)
+{
+if (area==plotspr_WIMPAREA) return(NULL);
+if(sprite->tag==sprite_id_name)
+  {
+  ERROUT(sprite_select_rp(area,sprite,&sprite->s.addr));
+  sprite->tag=sprite_id_addr;
+  }
+return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int plotspr__okpal(int *pal,int bpp)
+{
+return(!pal || !memcmp(plotspr__scrpal,pal,4<<bpp));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int *plotspr__palpointer(sprite_id *spr)
+{
+int       *p;
+
+p=(int*)spr->s.addr;
+p+=8;
+if(*p==0x2c) return(NULL);
+return(p+3);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_invalidate_cache(void)
+{
+int       i;
+os_regset r;
+
+wimpt_checkmode();
+for(i=0;i<PLOTSPR__TRANSCACHESIZE;i++) plotspr__flags[i]=0;
+if((1<<bbc_modevar(plotspr__forced_mode,bbc_Log2BPP))<=8)
+  for(i=0;i<1<<(1<<bbc_modevar(plotspr__forced_mode,bbc_Log2BPP));i++)
+    {
+    os_swix(OS_ReadPalette|XOS_Bit,&r);
+    plotspr__scrpal[i]=r.r[2]&PLOTSPR__PALMASK;
+    }
+return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_force_mode(int mode)
+{ /* Forces plotspr library to behave as though the screen is in the specified
+     mode. This is because get current screen mode doesn't work if the output
+     is redirected to a sprite. Therefore use this when plotting sprites into
+     other sprites which are not necessarily in the same mode as the screen.
+     Pass -1 to restore to using current screen settings.
+     NB: This assumes that the output sprite uses the default palette for
+     its mode */
+plotspr__forced_mode=mode;
+return(plotspr_invalidate_cache());
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_init(void)
+{
+plotspr_invalidate_cache();
+return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+os_error *plotspr__wimpsize(sprite_id *sprite,sprite_info *info)
+{
+  os_error  *oe=NULL;
+  os_regset r;
+
+  r.r[0]=40;
+  r.r[2]=(int)sprite->s.name;
+  oe=os_swix(XOS_Bit|Wimp_SpriteOp,&r);
+  info->width=r.r[3];
+  info->height=r.r[4];
+  info->mask=r.r[5];
+  info->mode=r.r[6];
+  return(oe);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_get_factors(sprite_area *area,sprite_id *sprite,sprite_factors *factors,
+                              sprite_factors **outfactors,sprite_pixtrans **outpixtrans)
+{
+/* Calculate factors and pixeltranslation needed to plot the given sprite on the current
+   screen at a scale dictated by the given sprite factors.
+   Set up the two pointers pointed at by outfactors and outpixtrans to point to static
+   variables containing the appropriate info (or NULL if none is needed). */
+int             s_dx,s_dy,s_bpp;
+sprite_id       spr;
+sprite_info     info;
+int             localpal[256];
+sprite_factors  *currentfactors;
+sprite_pixtrans *currentpixtrans;
+int             *currentpal;
+int             *palpointer;
+
+static sprite_factors  localfactors;
+static int             defaultpal4[] = {0xffffff00,0xdddddd00,0xbbbbbb00,0x99999900,
+                                        0x77777700,0x55555500,0x33333300,0x00000000,
+                                        0x99440000,0x00eeee00,0x00cc0000,0x0000dd00,
+                                        0xbbeeee00,0x00885500,0x00bbff00,0xffbb0000};
+static int             defaultpal2[] = {0xffffff00,0xaaaaaa00,0x55555500,0x00000000};
+static int             defaultpal1[] = {0xffffff00,0x00000000};
+
+spr=*sprite;
+ERROUT(plotspr_locate_sprite(area,&spr));
+if (area==plotspr_WIMPAREA) ERROUT(plotspr__wimpsize(&spr,&info))
+else ERROUT(sprite_readsize(plotspr_NULLAREA,&spr,&info));
+s_bpp=1<<bbc_modevar(info.mode,bbc_Log2BPP);
+if(outfactors)
+  {
+  s_dx=1<<bbc_modevar(info.mode,bbc_XEigFactor);
+  s_dy=1<<bbc_modevar(info.mode,bbc_YEigFactor);
+  if(s_dx==(1<<bbc_modevar(plotspr__forced_mode,bbc_XEigFactor)) &&
+     s_dy==(1<<bbc_modevar(plotspr__forced_mode,bbc_YEigFactor)) &&
+     s_bpp==(1<<bbc_modevar(plotspr__forced_mode,bbc_Log2BPP)) &&
+     (!factors || (factors->xmag==factors->xdiv && factors->ymag==factors->ydiv)))
+    currentfactors=NULL; /* everything matches: we don't need scale factors */
+  else
+    {
+    currentfactors=&localfactors;                         /* mismatch: we need scale factors */
+    if(factors)
+      memcpy(&localfactors,factors,sizeof(localfactors)); /*   based on values passed in and */
+    else
+      localfactors.xmag=localfactors.xdiv=localfactors.ymag=localfactors.ydiv=1;
+    localfactors.xmag*=s_dx;                              /*   modified to match sprite mode to */
+    localfactors.xdiv*=(1<<bbc_modevar(plotspr__forced_mode,bbc_XEigFactor)); /*   screen mode */
+    localfactors.ymag*=s_dy;
+    localfactors.ydiv*=(1<<bbc_modevar(plotspr__forced_mode,bbc_YEigFactor));
+    if(localfactors.xmag==localfactors.xdiv && localfactors.ymag==localfactors.ydiv)
+      currentfactors=NULL; /* if resultant factor is 1:1, discard */
+    }
+  *outfactors=currentfactors;
+  }
+if (area==plotspr_WIMPAREA) palpointer=NULL;
+else palpointer=s_bpp>8?NULL:plotspr__palpointer(&spr);
+if(palpointer)
+  { /* if there's a palette we can use, convert to appropriate format in local variable */
+  int i;
+
+  for(i=0;i<(1<<s_bpp);i++) localpal[i]=palpointer[i<<1]&PLOTSPR__PALMASK;
+  currentpal=localpal;
+  }
+else
+  switch(s_bpp)
+    {
+    case 4:  currentpal=defaultpal4; break;
+    case 2:  currentpal=defaultpal2; break;
+    case 1:  currentpal=defaultpal1; break;
+    default: currentpal=NULL;        break;
+    }
+if(s_bpp<=8 && (1<<bbc_modevar(plotspr__forced_mode,bbc_Log2BPP))==s_bpp && plotspr__okpal(currentpal,s_bpp))
+  /* if the bpp<=8 and palette is OK  or bpp>8 */
+  currentpixtrans=NULL; /* if we have a matching bpp and palette we don't need a pixtrans table */
+else
+  {                     /*  ... otherwise we do so get it */
+  int entry,i,empty,search;
+
+  empty=entry=-1;
+  search=s_bpp%PLOTSPR__TRANSCACHESIZE;
+  for(i=0;i<PLOTSPR__TRANSCACHESIZE && entry<0;i++)       /* first search cache */
+    {
+    if(plotspr__flags[search])                            /*  for valid entries */
+      {
+      if(plotspr__bppstore[search]==s_bpp &&                   /*  with the right bpp */
+         ((!currentpal && plotspr__palstore[search][0]==-1) || /*  and the right palette */
+          !memcmp(currentpal,plotspr__palstore[search],4<<s_bpp)))
+        entry=search;
+      }
+    else
+      if(empty<0) empty=search; /* record first empty slot in case we need it */
+    search++;
+    if(search>=PLOTSPR__TRANSCACHESIZE) search=0;
+    }
+  if(entry<0) /* if there was no suitable entry in the cache */
+    {
+    os_regset r;
+
+    entry=empty;
+    if(entry<0) entry=s_bpp%PLOTSPR__TRANSCACHESIZE;   /* if still no luck, select one to overwrite */
+    r.r[0]=256; r.r[1]=(int)spr.s.addr; /* registers for call to colourtrans using actual sprite as source */
+    r.r[2]=plotspr__forced_mode;
+    r.r[3]=plotspr__forced_mode<0?-1:0;
+    r.r[4]=(int)plotspr__transstore[entry];
+    r.r[5]=1;
+    if(s_bpp<8 || os_swix(XOS_Bit|ColourTrans_SelectTable,&r))
+      ERROUT(colourtran_select_table(info.mode,(wimp_paletteword*)currentpal,
+                                     plotspr__forced_mode,
+                                     (wimp_paletteword*)(plotspr__forced_mode<0?-1:0),
+                                     plotspr__transstore[entry])); /* create the pixtrans table in the buffer */
+    if(currentpal) /* update the palette store to show what this pixtrans is for */
+      {
+      memcpy(plotspr__palstore[entry],currentpal,4<<s_bpp);
+      for(i=0;i<(1<<s_bpp);i++) plotspr__palstore[entry][i]&=PLOTSPR__PALMASK;
+      }
+    else
+      plotspr__palstore[entry][0]=-1;
+    plotspr__bppstore[entry]=s_bpp;  /* ... and the bpp store */
+    plotspr__flags[entry]=1; /* and mark the cache entry as valid */
+    }
+  currentpixtrans=plotspr__transstore[entry]; /* finally pick up the address of the found/created table */
+  }
+*outpixtrans=currentpixtrans;
+return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+os_error *plotspr_put_mask_scaled(sprite_area *area,sprite_id *sprite,int x,int y,sprite_factors *factors)
+{
+  if (area==plotspr_WIMPAREA)
+  {
+    os_regset r;
+
+    r.r[0]=50;
+    r.r[2]=(int)sprite->s.name;
+    r.r[3]=x;
+    r.r[4]=y;
+    r.r[6]=(int)factors;
+    return(os_swix(XOS_Bit|Wimp_SpriteOp,&r));
+  }
+  else return(sprite_put_mask_scaled(area,sprite,x,y,factors));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+os_error *plotspr_put_scaled(sprite_area *area,sprite_id *sprite,int action,int x,int y,sprite_factors *factors,sprite_pixtrans *pixtrans)
+{
+  if (area==plotspr_WIMPAREA)
+  {
+    os_regset r;
+
+    r.r[0]=52;
+    r.r[2]=(int)sprite->s.name;
+    r.r[3]=x;
+    r.r[4]=y;
+    r.r[5]=action;
+    r.r[6]=(int)factors;
+    r.r[7]=(int)pixtrans;
+    return(os_swix(XOS_Bit|Wimp_SpriteOp,&r));
+  }
+  else return(sprite_put_scaled(area,sprite,action,x,y,factors,pixtrans));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+os_error *plotspr_put_mask_given(sprite_area *area,sprite_id *sprite,int x,int y)
+{
+  if (area==plotspr_WIMPAREA)
+  {
+    os_regset r;
+
+    r.r[0]=49;
+    r.r[2]=(int)sprite->s.name;
+    r.r[3]=x;
+    r.r[4]=y;
+    return(os_swix(XOS_Bit|Wimp_SpriteOp,&r));
+  }
+  else return(sprite_put_mask_given(area,sprite,x,y));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+os_error *plotspr_put_given(sprite_area *area,sprite_id *sprite,int action,int x,int y)
+{
+  if (area==plotspr_WIMPAREA)
+  {
+    os_regset r;
+
+    r.r[0]=34;
+    r.r[2]=(int)sprite->s.name;
+    r.r[3]=x;
+    r.r[4]=y;
+    r.r[5]=action;
+    return(os_swix(XOS_Bit|Wimp_SpriteOp,&r));
+  }
+  else return(sprite_put_given(area,sprite,action,x,y));
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+os_error *plotspr__plot(sprite_area *area,sprite_id *sprite,int action,
+                        int x,int y,sprite_factors *factors,BOOL mask)
+{
+sprite_factors  *currentfactors;
+sprite_pixtrans *currentpixtrans;
+sprite_id       spr;
+
+spr=*sprite;
+ERROUT(plotspr_locate_sprite(area,&spr));
+plotspr_get_factors(area,&spr,factors,&currentfactors,&currentpixtrans);
+if(currentpixtrans || currentfactors) /* don't use put_scaled() unless absolutely necessary */
+  {
+  if(mask)
+    return(plotspr_put_mask_scaled(area,&spr,x,y,currentfactors));
+  else
+    return(plotspr_put_scaled(area,&spr,action,x,y,currentfactors,currentpixtrans));
+  }
+if(mask)
+  return(plotspr_put_mask_given(area,&spr,x,y));
+else
+  return(plotspr_put_given(area,&spr,action,x,y));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_plot(sprite_area *area,sprite_id *sprite,int action,
+                       int x,int y,sprite_factors *factors)
+{
+return(plotspr__plot(area,sprite,action,x,y,factors,FALSE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_plot_mask(sprite_area *area,sprite_id *sprite,int action,
+                            int x,int y,sprite_factors *factors)
+{
+return(plotspr__plot(area,sprite,action,x,y,factors,TRUE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_box_factors(sprite_area *area,sprite_id *sprite,
+                              wimp_box *box,sprite_factors *factors)
+{
+sprite_info     info;
+sprite_id       spr;
+
+spr=*sprite;
+ERROUT(plotspr_locate_sprite(area,&spr));
+if (area==plotspr_WIMPAREA) ERROUT(plotspr__wimpsize(&spr,&info))
+else ERROUT(sprite_readsize(plotspr_NULLAREA,&spr,&info));
+factors->xdiv=info.width<<bbc_modevar(info.mode,bbc_XEigFactor);
+factors->xmag=box->x1-box->x0;
+factors->ydiv=info.height<<bbc_modevar(info.mode,bbc_YEigFactor);
+factors->ymag=box->y1-box->y0;
+return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+os_error *plotspr__plot_box(sprite_area *area,sprite_id *sprite,int action,
+                            wimp_box *box,BOOL mask)
+{
+sprite_factors  factors;
+sprite_id       spr;
+
+spr=*sprite;
+ERROUT(plotspr_locate_sprite(area,&spr));
+if (area!=plotspr_WIMPAREA)  area=plotspr_NULLAREA;
+ERROUT(plotspr_box_factors(area,&spr,box,&factors));
+return(plotspr__plot(area,&spr,action,box->x0,box->y0,&factors,mask));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_plot_box(sprite_area *area,sprite_id *sprite,int action,
+                           wimp_box *box)
+{
+return(plotspr__plot_box(area,sprite,action,box,FALSE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_plot_mask_box(sprite_area *area,sprite_id *sprite,int action,
+                                wimp_box *box)
+{
+return(plotspr__plot_box(area,sprite,action,box,TRUE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_display_box_factors(sprite_area *area,sprite_id *sprite,
+                                      wimp_box *box,BOOL allowmag,sprite_factors *factors,
+                                      int *xoff,int *yoff)
+{
+/* Calculate the factors and offsets for displaying a sprite in a box.
+   This routine is a special case for sprite previews. It displays the
+   sprite in the given box without affecting its aspect ratio and without
+   magnifying it. The sprite is centred in the box when it doesn't fill it.
+   The x and y offsets are returned for the bottom left corner of the
+   sprite relative to the bottom left corner of the box. */
+sprite_id       spr;
+sprite_info     info;
+int             mag,div,x,y;
+
+spr=*sprite;
+ERROUT(plotspr_locate_sprite(area,&spr));
+if(area!=plotspr_WIMPAREA)
+  {
+  area=plotspr_NULLAREA;
+  ERROUT(sprite_readsize(plotspr_NULLAREA,&spr,&info));
+  }
+else
+  ERROUT(plotspr__wimpsize(&spr,&info));
+/* set up x and y ratios to fit sprite into box exactly */
+factors->xdiv=info.width<<bbc_modevar(info.mode,bbc_XEigFactor);
+factors->xmag=box->x1-box->x0;
+factors->ydiv=info.height<<bbc_modevar(info.mode,bbc_YEigFactor);
+factors->ymag=box->y1-box->y0;
+/* now pick the smaller of the two ratios - this is based on the idea that
+    a/b<c/d ===  a/b+c/d<2*c/d === (a*d/(b*d))+(b*c/(b*d))<(2*b*c)/(b*d) === d*a+b*c<2*b*c  */
+if(factors->ydiv*factors->xmag+factors->xdiv*factors->ymag<2*factors->xdiv*factors->ymag)
+  {mag=factors->xmag; div=factors->xdiv;}
+else
+  {mag=factors->ymag; div=factors->ydiv;}
+/* if a magnification results, set the ratio to 1:1 */
+if(!allowmag && mag>div) mag=div=1;
+/* centre the sprite in the box */
+x=(factors->xmag-factors->xdiv*mag/div+1)/2;
+y=(factors->ymag-factors->ydiv*mag/div+1)/2;
+*xoff=x;
+*yoff=y;
+factors->xmag=factors->ymag=mag;
+factors->xdiv=factors->ydiv=div;
+return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr__display_box(sprite_area *area,sprite_id *sprite,int action,
+                               wimp_box *box,BOOL mask,BOOL allowmag)
+{
+/* this routine is a special case for sprite previews. It displays the
+   sprite in the given box without affecting its aspect ratio and without
+   magnifying it. The sprite is centred in the box when it doesn't fill it. */
+sprite_factors  factors;
+sprite_id       spr;
+int             x,y;
+
+
+spr=*sprite;
+ERROUT(plotspr_locate_sprite(area,&spr));
+if(area!=plotspr_WIMPAREA) area=plotspr_NULLAREA;
+ERROUT(plotspr_display_box_factors(area,&spr,box,allowmag,&factors,&x,&y));
+return(plotspr__plot(area,&spr,action,box->x0+x,box->y0+y,&factors,mask));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_display_box(sprite_area *area,sprite_id *sprite,int action,
+                              wimp_box *box)
+{
+/* this routine is a special case for sprite previews. It displays the
+   sprite in the given box without affecting its aspect ratio and without
+   magnifying it. The sprite is centred in the box when it doesn't fill it. */
+return(plotspr__display_box(area,sprite,action,box,FALSE,FALSE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_display_mask_box(sprite_area *area,sprite_id *sprite,int action,
+                                   wimp_box *box)
+{
+/* this routine is a special case for sprite previews. It displays the
+   mask in the given box without affecting its aspect ratio and without
+   magnifying it. The sprite is centred in the box when it doesn't fill it. */
+return(plotspr__display_box(area,sprite,action,box,TRUE,FALSE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *plotspr_plot_box_locked(sprite_area *area,sprite_id *sprite,int action,
+                                  wimp_box *box,BOOL mask)
+{
+/* Displays the sprite or mask in the given box without affecting its aspect ratio. */
+return(plotspr__display_box(area,sprite,action,box,mask,TRUE));
+}
+
+
+/*=============================================================================*/
+#if 0
+
+  /* Test code follows. Change the 0 (above) to a 1 to compile this
+     code. It needs a sprite file called :4.Sprites containing a mode
+     15 sprite and a mode 12 sprite with non-standard palette. These
+     should be 30x15 pixels and be called col16 and col256. Hold down
+     SHIFT (to get both), SHIFT-ALT to get col16 only or neither to get
+     col256 only. The test alternates the two sprites to demonstrate
+     that a multi-entry cache is better than a single-entry cache (as
+     used by inferior software :-). */
+
+#include "resspr.h"
+#include "alarm.h"
+#include "stdio.h"
+
+int main(void)
+{
+int         sprites[20000];
+sprite_area *area;
+sprite_id   sprite;
+int         x,y,time;
+wimp_box    box={0,0,256,256};
+
+wimpt_checkmode();
+plotspr_init();
+area=(sprite_area*)sprites;
+sprite_area_initialise(area,sizeof(sprites));
+wimpt_noerr(sprite_area_reinit(area));
+wimpt_noerr(sprite_area_load(area,":4.Sprites"));
+time=alarm_timenow();
+bbc_vdu(26); bbc_vdu(12);
+for(x=0;x<1280;x+=128)
+  for(y=0;y<1023;y+=128)
+    {
+    if(!bbc_inkey(-3))
+      {
+      sprite.tag=sprite_id_name;
+      sprite.s.name="col256";
+      plotspr_plot(area,&sprite,8,x,y,NULL);
+      plotspr_locate_sprite(area,&sprite);
+      plotspr_plot(NULL,&sprite,8,x+64,y+64,NULL);
+      }
+    if(bbc_inkey(-1))
+      {
+      sprite.tag=sprite_id_name;
+      sprite.s.name="col16";
+      plotspr_plot(area,&sprite,8,x+64,y,NULL);
+      plotspr_locate_sprite(area,&sprite);
+      plotspr_plot(NULL,&sprite,8,x,y+64,NULL);
+      }
+    }
+wimp_setcolour(11);
+bbc_rectanglefill(box.x0,box.y0,box.x1-box.x0,box.y1-box.y0); /* intentionally 1 too big! */
+plotspr_plot_box(area,&sprite,8,&box);
+bbc_vdu(26); printf("\n\n   %dcs to complete.",alarm_timenow()-time);
+}
+
+#endif

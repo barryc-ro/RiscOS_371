@@ -1,0 +1,1714 @@
+/*
+  Title:        alloc - Storage management (dynamic allocation/deallocation)
+  $Revision: 1.6 $  LDS 31-Jul-87 $ BJK 23-Oct-1987
+  $Revision: 1.6 $  LH 22-Dec-1987
+  $Revision: 1.6 $  LH 03-Feb-1988
+
+  Copyright (C) Acorn Computers Ltd., 1988
+*/
+
+/* ***** IMPORTANT ** IMPORTANT ** IMPORTANT ** IMPORTANT ** IMPORTANT *****
+ * The #defines which control a large part of this source file are decribed
+ * in the header file.
+ */
+
+/*
+ * NOTES:
+ *  Non-implemented (possible) functionality is described under ASSUMPTIONS
+ *   and marked with a '!'.
+ *  Heap extensions inside the current heap (in a previous heap hole) has not
+ *   been tested, but the code is there.
+ *  A certain percentage (FRACTION_OF_HEAP_NEEDED_FREE) of the heap is always
+ *   kept free, this is a bit wasteful but the number of coalesces and garbage
+ *   collections goes down as this percentage rises. It has been found by
+ *   experimentation that this fraction should be approximately between 1/8 and
+ *   1/4 (currently at 1/6). Large blocks are allocated from the start of the
+ *   overflow list ie the low memory addresses and small and medium sized
+ *   blocks are allocated from the end of the overflow list. For this reason
+ *   the overflow list is a doubly linked list with a head at both ends. A
+ *   pointer to the last free block on the heap is also kept so that when the
+ *   heap is extended and the old bitmap is returned to the free list (and
+ *   merged with any adjacent free block), the last heap block, if it is free,
+ *   can be merged with it also.
+ * ASSUMPTIONS:
+ *  Address units are in bytes.
+ *  There are an exact number of address units (bytes) per word.
+ *  All target machines are either word aligned or run slower with non word
+ *   alignment (so word aligning is a good and right thing to do).
+ *  The heap can not grow downwards (all heap extensions must be above the
+ *   heap base determined by the first block claimed from OSStorage), and if
+ *   two consecutive (in time) blocks are doled out by OSStorage they are only
+ *   assumed to be contiguous if the lower limit (arithmetically) of the second
+ *   block is equal to the higher limit (arithmetically) of the first block
+ *   plus one.
+ *  Blocks may be doled out in unspecified address order (but note that
+ *   every time a heap extension, which is inside my heap bounds, is given out
+ *   the heap has to be scanned in order to find and modify the heap hole in
+ *   which the extension has been given.
+!*  The range of address units to be found in a single bin can only be the
+ *   number of address units in a word, extra code will have to be written to
+ *   manage bin ranges other than this size (more trouble than its worth, if
+ *   its worth anything at all).
+ *  MAXCARD is the largest number representable in a word (ie all bits set).
+ * ALLOCATE:
+ *  An array of lists of free blocks of similar sizes (bins) is kept so that
+ *   when an ALLOCATE of size n is requested the list starting at array entry
+ *   n DIV BINRANGE will automatically have as the first element of the list
+ *   a block of the correct size (plus the OVERHEADWORDS) or no block at all
+ *   (or the block requested may be too big to be in the allocate bins). if
+ *   there is no block available in the bin, then bins containing lists of
+ *   larger blocks are checked and the block allocated from one of these (if
+ *   the bin block is big enough, it is split). if there is still no block
+ *   available then the overflow list is checked and if available, the block
+ *   is cut from here (the block required is cut from the end of the larger
+ *   block if the size required is not large (size < LARGEBLOCK) otherwise it
+ *   is taken from the start of the large block). if the remainder of the block
+ *   is greater than the largest bin block then it remains in the overflow
+ *   list, otherwise it is removed to the correct bin. if the overflow list
+ *   does not have a block large enough then the heap is either extended (more
+ *   memory claimed from OSStorage), coalesced or garbage collected, depending
+ *   on the state of the heap etc and whether garbage collection is enabled.
+ *   After coalescing or garbage collection the allocate algorithm is executed
+ *   again in order to allocate the block.
+ * COALESCE:
+ *  if the overflow list does not contain a block large enough and a
+ *   reasonable amount of storage has been deallocated since the last coalesce,
+ *   (reasonable is difficult to define and is only deducable by
+ *   experimentation) then all allocatable blocks (by storage) and all blocks
+ *   on the overflow deallocate list are marked free, the heap is scanned and
+ *   the blocks scattered into bins and overflow list in increasing address
+ *   order.
+ * DEALLOCATE:
+ *  When a block is DEALLOCATED, if it will fit in a bin then it is put at
+ *   the start of the relevant bin list otherwise it is conceptually released
+ *   to the overflow deallocate list (there is no need for a list, set the
+ *   block's header bits to indicate it is free and it will automatically be
+ *   sucked in at the next coalesce).
+ * HEAP EXTENSIONS:
+ *  Whenever the heap is extended, a certain amount (if available) is allocated
+ *   for the garbage collection bit maps (even if garbage collection has not
+ *   been enabled.
+ */
+
+#ifdef CAMEL
+#include "alloc.h"
+#ifndef __stddef__h
+#include "stddef.h"
+#endif
+#include "mcsuppt.h"            /* for memset(...), memcpy */
+#include "m2core.h"             /* for locks, etc.         */
+#include "m2raise.h"            /* for AEM-2 Exceptions    */
+#include "OSLLIO.h"             /* used only by _alloc_die */
+#include "exit.h"               /* used only by _alloc_die */
+#include "swis.h"               /* used only by free */
+#else
+#include "h.hostsys"
+#include "h.alloc"
+#include "h.kernel"             /* for _alloc_chunk   */
+#include <stddef.h>
+/* #include "reinit.h"  */
+#include <string.h>             /* for memset(...), memcpy(...) */
+/* #include "brazstd.h.m2core"  / * for locks, etc.    */
+#include "h.swis"               /* used only by free */
+#endif
+
+#if defined(VERBOSE)||defined(DEBUG)||defined(STACKCHECK)||defined(ANALYSIS)
+#ifdef CAMEL
+#include "h.printf"
+#else
+#include <stdio.h>
+#endif
+#endif
+
+#if defined(VERBOSE)||defined(DEBUG)||defined(STACKCHECK)||defined(ANALYSIS)
+static int n, d, last, iw;
+#define dbmsg(f, a, b, c, d) {char v[128]; sprintf(v, f, a, b, c, d); last = 0;\
+        for(iw=0;v[iw];_kernel_oswrch(last=v[iw++])); \
+        if (last == 10)_kernel_oswrch(13);}
+#define LOW_OVERHEAD_F0(v) {last = 0; \
+        for(iw=0;v[iw];_kernel_oswrch(last=v[iw++])); \
+        if (last == 10)_kernel_oswrch(13);}
+#define LOW_OVERHEAD_FD(i, b) {n = i; d = 1; \
+        while (n >= b) {d *= b; n /= b;} n = i; \
+        while(d) {if ((n/d) > 9) _kernel_oswrch(n/d+'A'-10); \
+                  else _kernel_oswrch(n/d+'0'); \
+                  n = n-(n/d)*d; d /= b;}}
+#else
+#define dbmsg(f, a, b, c, d)
+#define LOW_OVERHEAD_F0(v)
+#define LOW_OVERHEAD_FD(i, b)
+#endif
+/* put this here too */
+#ifdef VERBOSE
+#define F0(f)             LOW_OVERHEAD_F0(f)
+#define FD(i, b)          LOW_OVERHEAD_FD(i, b)
+#else
+#define F0(f)
+#define FD(i, b)
+#endif
+#ifdef DEBUG
+#define D0(f)             LOW_OVERHEAD_F0(f)
+#define DD(i, b)          LOW_OVERHEAD_FD(i, b)
+#define D1(f, a)          dbmsg(f, a, 0, 0, 0)
+#define D2(f, a, b)       dbmsg(f, a, b, 0, 0)
+#define D3(f, a, b, c)    dbmsg(f, a, b, c, 0)
+#define D4(f, a, b, c, d) dbmsg(f, a, b, c, d)
+#else
+#define D0(f)
+#define DD(i, b)
+#define D1(f, a)
+#define D2(f, a, b)
+#define D3(f, a, b, c)
+#define D4(f, a, b, c, d)
+#endif
+
+#define IGNORE(param) param = param
+
+#define FALSE 0
+#define TRUE  1
+
+#ifndef __m2core__h
+#define BITSIZE(bytes) ((bytes)<<3)
+#endif
+#define BITSPERWORD  BITSIZE(sizeof(int))
+#define BITSPERBYTE  (BITSPERWORD/BYTESPERWORD)
+/*
+ * The following constants are all in address units
+ */
+/* MAXBYTES should be something outrageously big */
+#define MAXBYTES     0x01C00000
+#define OVERHEAD     (FIRSTUSERWORD * BYTESPERWORD)
+#define HOLEOVERHEAD OVERHEAD
+#define MINBLOCKSIZE (OVERHEAD + BYTESPERWORD)
+#define HOLEBITS     (DATA | HEAPHOLEBIT)
+
+/* the following constants are tunable */
+/* multiple of required block size needing to be free before coalesce done */
+#define BINRANGE     (BYTESPERWORD * 1) /* see assumptions */
+#define NBINS        16
+#define MAXBINSIZE   (BINRANGE*(NBINS)-1)
+#define LARGEBLOCK   512
+/*
+ * FRACTION_OF_HEAP_NEEDED_FREE is used when deciding whether to coalesce, GC
+ * or extend the heap. An attempt is made to keep this amount free, if it is
+ * not free then the heap is extended. The amount of free space is the total of
+ * all free blocks (without overheads). if there is a bitmap at the end of the
+ * heap, it is not included in the heap size.
+ */
+#define FRACTION_OF_HEAP_NEEDED_FREE 6
+/* initialisation for blocks on allocation */
+
+typedef void *VoidStar;
+
+static BlockP heapLow;  /* address of the base of the heap */
+static BlockP heapHigh; /* address of heap hole guard at the top of heap */
+static BlockP sys_heap_top; /* address of top of system heap, should = heapLow
+                               after _init_user_alloc is called          */
+static int RMABase;     /* base address of RMA */
+static int RMAEnd;      /* end address of RMA */
+/*
+ * amount of heap that user can actually write to, does not include bitmaps
+ * and block overheads
+ */
+static size_t totalFree;
+static size_t userHeap;  /* size of heap (bytes) excluding gc bitmaps */
+static size_t totalHeap; /* size of heap (bytes) including gc bitmaps */
+/*
+ * The overflow list is a chain of large blocks ready for use, the chain is a
+ * doubly linked list of blocks in increasing address order.
+ * bin[0] is the start of the overflow list.
+ * bin[NBINS+1] is end of the overflow list.
+ *
+ * bin is an array of pointers to lists of free small blocks ( <= MAXBINSIZE)
+ * of the same size. Last deallocated block is at the start of the list.
+ */
+static BlockP bin[NBINS+2];
+
+static BlockP endOfLastExtension;
+
+static int checkDeallocates;
+static int checkAllocates;
+
+static int lookInBins;
+
+static BlockP lastFreeBlockOnHeap;
+static int garbageCollecting;
+static int enoughMemoryForGC;
+static GCProc garbageCollect;
+static BlockP gcLimit;  /* upper limit of the user heap */
+static char *mapForExistingHeap;
+static char *mapForNewHeap;
+static BlockP endOfExistingHeap;
+static BlockP startOfNewHeap;
+
+#define MAXEVENTS 64 /* remember the last MAXEVENTS events */
+
+typedef struct StatsStruct {
+  StorageInfo stats;
+  EventInfo events[MAXEVENTS];
+  int nextEvent;
+  /* ShowStats variables */
+  unsigned guard;
+  size_t size;
+  unsigned firstWord;
+  BlockP elementBase;
+  BlockP nextBase;
+  int freeBlk;
+  int heapHole;
+  int bitmap;
+  unsigned totFree;
+  unsigned totUsed;
+  unsigned totMaps;
+  unsigned holeBlocks;
+  unsigned totHole;
+  unsigned freeBlocks;
+  unsigned usedBlocks;
+  unsigned mapsBlocks;
+  unsigned largestFreeBlock;
+  StorageInfo stat;
+  EventInfo eventInfo;
+  int eventNo;
+} StatsRec, *StatsPtr;
+
+/* static StatsPtr statsP; */
+
+static char sys_message[60];
+
+/*
+ * Code macros.
+ */
+#define SIZE(block) ((size_t)((block)->size & SIZEMASK))
+#define BITSTOWORDS(bits) ((bits+(BITSPERWORD-1))/BITSPERWORD)
+#define BYTESTOWORDS(bytes) ((bytes+(BYTESPERWORD-1))/BYTESPERWORD)
+#define ADDBYTES(bp, bytes) (BlockP)((char *)bp + (bytes))
+#define ADDBYTESTO(bp, bytes) bp = (BlockP)((char *)bp + (bytes))
+#define PTRDIFF(hi, lo) ((char *)hi - (char *)lo)
+#define FREE(block) (FREEBIT & ((BlockP)block)->size)
+#define HEAPHOLE(block) (HEAPHOLEBIT & block->size)
+#ifdef BLOCKS_GUARDED
+#define INVALID(block) (((BlockP)block)->guard != GUARDCONSTANT)
+#else
+#define INVALID(block) (0)
+#endif
+#define BADUSERBLOCK(block) (INVALID(ADDBYTES(block,-OVERHEAD)) \
+                            || FREE(ADDBYTES(block,-OVERHEAD)))
+
+#if defined(MULTITHREADED) && defined(CAMEL)
+static Mutex storage = 0;
+#define INITMUTEX LLThreads_InitMutex(&storage)
+#define ACQUIREMUTEX int sl = OSSYSTEM_PreventStackExtension();\
+                      LLThreads_Acquire(&storage);
+#define RELEASEMUTEX {if (sl) OSSYSTEM_AllowStackExtension();\
+                      LLThreads_Release(&storage);}
+#else
+#if defined(MULTITHREADED)
+#define INITMUTEX 
+#define ACQUIREMUTEX _interrupts_off = 1;
+#define RELEASEMUTEX {_raise_stacked_interrupts();}
+#else
+#define INITMUTEX
+#define ACQUIREMUTEX
+#define RELEASEMUTEX {}
+#endif
+#endif
+#define RELEASEANDRETURN(value) {RELEASEMUTEX return (value);}
+
+/*
+ * This code will use a maximum of 32 words of stack excluding any used by
+ * the system storage wholesaler.
+ *
+ * Turn off stack overflow checking.
+ */
+#pragma -s1
+
+#if defined(VERBOSE) || defined(STACKCHECK)
+static int *stackOnEntryToAlloc;
+#define ENTRYTOALLOC(local) stackOnEntryToAlloc = (int *)(&local)
+#define STACKDEPTH(local, depth) \
+        {if (stackOnEntryToAlloc-(int *)(&local) > (depth))\
+         {LOW_OVERHEAD_F0("!! stack ") \
+          LOW_OVERHEAD_FD(stackOnEntryToAlloc-(int *)(&local), 10) \
+          LOW_OVERHEAD_F0(" words\n")}}
+#else
+#define ENTRYTOALLOC(local)
+#define STACKDEPTH(local, depth)
+#endif
+
+static void _alloc_die(message, rc)
+char *message;
+int rc;
+{
+  char *cs, *ct;
+
+  /* nb rc is here so that it can be examined - otherwise the C compiler
+   * tends to lose a useful value.
+   */
+  IGNORE(rc);
+#ifdef CAMEL
+  _m2raise(_EALLOC, (int)message);
+  OSLLIO_NewLine();
+  OSLLIO_PutS("alloc: ");
+  OSLLIO_PutS(message);
+  if (rc = CORRUPT) OSLLIO_PutS(", (heap corrupt)");
+  OSLLIO_NewLine();
+  exit(1);               /* bad exit */
+#else
+  cs = sys_message;
+  ct = message;
+  while ((*cs++ = *ct++) >= ' ');
+  if (rc == CORRUPT) {
+    cs--;
+    ct = _kernel_getmessage(", (heap corrupt)", "C10");
+    while ((*cs++ = *ct++) >= ' ');
+  }
+  _sysdie(sys_message);
+#endif
+}
+
+static void bad_size(size)
+size_t size;
+{
+  IGNORE(size);
+  _alloc_die(_kernel_getmessage("Over-large or -ve size request", "C11"), FAILED);
+}
+
+#ifdef STATS
+void print_event(event)
+int event;
+{
+  switch (event) {
+    case GARBAGE_COLLECT:               D0("Garbage Collect :"); break;
+    case COALESCE:                      D0("Coalesce success:"); break;
+    case EXTENSION:                     D0("Heap Extension  :"); break;
+    case COALESCE_AND_EXTENSION:        D0("Coalesce-Extend :"); break;
+    case GC_AND_EXTENSION:              D0("GC-Extend       :"); break;      
+    case COALESCE_AND_GC_AND_EXTENSION: D0("Coalesce-GC-Ext :"); break;
+    case COALESCE_AND_GC:               D0("Coalesce-GC     :"); break;
+  }
+}
+
+static void MakeEventRec(thisEvent, type, size)
+int thisEvent;
+Events type;
+size_t size;
+{
+  statsP->nextEvent = thisEvent + 1;
+  thisEvent %= MAXEVENTS;
+  statsP->events[thisEvent].event = type;
+  statsP->events[thisEvent].blockThatCausedEvent = size;
+  statsP->events[thisEvent].userHeap = statsP->stats.userHeap;
+  statsP->events[thisEvent].totalFree = totalFree;
+  statsP->events[thisEvent].allocates = statsP->stats.blocksAllocated;
+  statsP->events[thisEvent].deallocates = statsP->stats.blocksDeallocated;
+  statsP->events[thisEvent].bytesAllocated = statsP->stats.bytesAllocated;
+  statsP->events[thisEvent].bytesDeallocated = statsP->stats.bytesDeallocated;
+  statsP->events[thisEvent].bytesGCd = statsP->stats.totalGCBytes;
+  statsP->events[thisEvent].blocksGCd = statsP->stats.totalGCBlocks;
+  D0("!!MakeEventRec ");
+  print_event(statsP->events[thisEvent].event);
+  D1(" blockThatCausedEvent %u\n",
+                               statsP->events[thisEvent].blockThatCausedEvent);
+  D1("  userHeap %u, ", statsP->events[thisEvent].userHeap);
+  D1("totalFree %u, ", statsP->events[thisEvent].totalFree);
+  D1("allocates %u, ", statsP->events[thisEvent].allocates);
+  D1("deallocates %u\n", statsP->events[thisEvent].deallocates);
+  D1("  bytesAllocated %u, ", statsP->events[thisEvent].bytesAllocated);
+  D1("bytesDeallocated %u, ", statsP->events[thisEvent].bytesDeallocated);
+  D1("bytesGCd %u, ", statsP->events[thisEvent].bytesGCd);
+  D1("blocksGCd %u\n", statsP->events[thisEvent].blocksGCd);
+}
+
+/* ------------------------- Statistics reporting --------------------------*/
+
+extern void _GetStorageInfo(info)
+StorageInfoP info;
+{
+  statsP->stats.currentHeapRequirement = totalHeap - totalFree;
+  *info = statsP->stats;
+}
+
+extern void _NextHeapElement(
+                      nextBase, guard, size, free, heapHole, bitmap, firstWord)
+BlockP *nextBase;
+unsigned int *guard;
+size_t *size;
+int *free;
+int *heapHole;
+int *bitmap;
+unsigned int *firstWord;
+{ BlockP junkBlock;
+  if (*nextBase == NULL) {junkBlock = heapLow;} else {junkBlock = *nextBase;}
+#ifdef BLOCKS_GUARDED
+  *guard = junkBlock->guard;
+#else
+  *guard = 0;
+#endif
+  *firstWord = (unsigned int) junkBlock->next;
+  *free = FREE(junkBlock);
+  if (!*free) {
+    if (HEAPHOLEBIT & junkBlock->size) {
+      *bitmap = ((DATA & junkBlock->size) == DATA);
+      *heapHole = !*bitmap;
+    } else {
+      *heapHole = FALSE; *bitmap = FALSE;
+    }
+  }
+  *size = SIZE(junkBlock);
+  ADDBYTESTO(junkBlock, OVERHEAD + *size);
+  *nextBase = junkBlock;
+  if (*nextBase > heapHigh) *nextBase = NULL;
+}
+
+extern int _GetEventData(event, info)
+int event;
+EventInfoP info;
+{ int index;
+  int previous;
+   if ((event >= statsP->nextEvent) || (event < statsP->nextEvent-MAXEVENTS)
+                                                              || (event < 1))
+     return FALSE;
+   index = event % MAXEVENTS;
+   previous = (event-1) % MAXEVENTS;
+   *info = statsP->events[index];
+   info->allocates -= statsP->events[previous].allocates;
+   info->deallocates -= statsP->events[previous].deallocates;
+   info->bytesAllocated -= statsP->events[previous].bytesAllocated;
+   info->bytesDeallocated -= statsP->events[previous].bytesDeallocated;
+   info->bytesGCd -= statsP->events[previous].bytesGCd;
+   info->blocksGCd -= statsP->events[previous].blocksGCd;
+  
+   return TRUE;
+}
+
+extern int _GetLastEvent(void)
+{
+  return (statsP->nextEvent-1);
+}
+
+static void ShowStats(void)
+{
+  _GetStorageInfo(&statsP->stat);
+
+  statsP->nextBase = NULL;
+  statsP->totFree = 0; statsP->totUsed = 0;
+  statsP->totHole = 0; statsP->totMaps = 0;
+  statsP->holeBlocks = 0; statsP->freeBlocks = 0;
+  statsP->usedBlocks = 0; statsP->mapsBlocks = 0;
+  statsP->largestFreeBlock = 0;
+  D0("Storage description. (All sizes in bytes)\n");
+  D0("Current storage analysis (by traversing heap):");
+  do {
+    statsP->elementBase = statsP->nextBase;
+    _NextHeapElement(&statsP->nextBase, &statsP->guard, &statsP->size,
+                    &statsP->freeBlk, &statsP->heapHole, &statsP->bitmap,
+                                                       &statsP->firstWord);
+    if (statsP->heapHole)
+      { statsP->holeBlocks++; statsP->totHole += statsP->size; }
+    else if (statsP->freeBlk) {
+      if (statsP->size > statsP->largestFreeBlock)
+        statsP->largestFreeBlock = statsP->size;
+      statsP->freeBlocks++; statsP->totFree += statsP->size;
+    } else if (statsP->bitmap)
+        {statsP->mapsBlocks++; statsP->totMaps += statsP->size;}
+    else {statsP->usedBlocks++; statsP->totUsed += statsP->size;}
+  } while (statsP->nextBase != NULL);
+
+  D0("\n");
+  D4("Free memory of %d in %d blocks + overhead of %d = %d\n",
+     statsP->totFree, statsP->freeBlocks, statsP->freeBlocks*OVERHEAD,
+                           statsP->totFree+statsP->freeBlocks*OVERHEAD);
+  D1("Largest free block = %d\n", statsP->largestFreeBlock);
+  D4("Used memory of %d in %d blocks + overhead of %d = %d\n",
+     statsP->totUsed, statsP->usedBlocks, statsP->usedBlocks*OVERHEAD,
+                           statsP->totUsed+statsP->usedBlocks*OVERHEAD);
+  D4("Memory taken by heap holes = %d in %d blocks + overhead of %d = %d\n",
+     statsP->totHole, statsP->holeBlocks, statsP->holeBlocks*OVERHEAD,
+                         statsP->totHole + statsP->holeBlocks*OVERHEAD);
+  D4("Memory taken by GC bitmaps = %d in %d blocks + overhead of %d = %d\n",
+     statsP->totMaps, statsP->mapsBlocks, statsP->mapsBlocks*OVERHEAD,
+                         statsP->totMaps + statsP->mapsBlocks*OVERHEAD);
+  D1("Current heap requirement (all except user free blocks) = %d\n",
+                      (statsP->totHole+statsP->holeBlocks*OVERHEAD) +
+                      (statsP->totUsed+statsP->usedBlocks*OVERHEAD) +
+                      (statsP->totMaps+statsP->mapsBlocks*OVERHEAD) +
+                             (statsP->freeBlocks*OVERHEAD) - OVERHEAD);
+  D1("total heap usage = %d\n",
+      (statsP->totHole+statsP->holeBlocks*OVERHEAD) +
+      (statsP->totUsed+statsP->usedBlocks*OVERHEAD) +
+      (statsP->totMaps+statsP->mapsBlocks*OVERHEAD) +
+      (statsP->totFree+statsP->freeBlocks*OVERHEAD) - OVERHEAD);
+  D0("\n");
+  D0("Current storage statistics:\n");
+  D3("%d coalesces, %d heap extensions, %d garbage collects\n", 
+      statsP->stat.coalesces, statsP->stat.heapExtensions,
+                                   statsP->stat.garbageCollects);
+  D3("Heap base = &%X, heap top = &%X, size of user heap = %d\n",
+      (unsigned) statsP->stat.heapLow, (unsigned) statsP->stat.heapHigh,
+                                                   statsP->stat.userHeap);
+  D2("Maximum storage requested = %d, current storage requested = %d\n",
+      statsP->stat.maxHeapRequirement, statsP->stat.currentHeapRequirement);
+  D4("total allocated = %d in %d blocks, deallocated = %d in %d\n",
+      statsP->stat.bytesAllocated, statsP->stat.blocksAllocated,
+      statsP->stat.bytesDeallocated, statsP->stat.blocksDeallocated);
+  D2("total garbage collected = %d in %d blocks\n",
+      statsP->stat.totalGCBytes, statsP->stat.totalGCBlocks);
+  D0("\n");
+
+  statsP->eventNo = _GetLastEvent();
+  D0("Description of past events in storage (most recent first):\n");
+  while (_GetEventData(statsP->eventNo, &statsP->eventInfo)) {
+    print_event(statsP->eventInfo.event);
+    D3(" block size = %d, user heap size %d, %d usable\n",
+       statsP->eventInfo.blockThatCausedEvent, statsP->eventInfo.userHeap,
+                                               statsP->eventInfo.totalFree);
+    D4("   allocated %d in %d, deallocated %d in %d since last event\n",
+       statsP->eventInfo.bytesAllocated, statsP->eventInfo.allocates,
+       statsP->eventInfo.bytesDeallocated, statsP->eventInfo.deallocates);
+    if (statsP->eventInfo.bytesGCd > 0)
+      D2("   garbage collected %d in %d blocks since last event\n",
+          statsP->eventInfo.bytesGCd, statsP->eventInfo.blocksGCd);
+    statsP->eventNo--;
+  }
+}
+#endif
+
+#ifdef GC
+static void SetBlockFree(block)
+BlockP block;
+{
+  D1("!!SetBlockFree &%X\n", (unsigned) block);
+  block->size |= FREEBIT;
+#ifdef STATS
+  statsP->stats.totalGCBlocks++;
+  statsP->stats.totalGCBytes += SIZE(block);
+#endif
+}
+
+static void init_bitmaps(void)
+{
+  memset(mapForExistingHeap, ~0, SIZE(ADDBYTES(mapForExistingHeap,-OVERHEAD)));
+}
+
+extern int __register_gc_proc(proc)
+GCProc proc;
+{
+  ACQUIREMUTEX;
+  F0("!!__register_gc_proc\n");
+  if (enoughMemoryForGC) {
+    garbageCollecting = TRUE; garbageCollect = proc;
+    if (userHeap > 0) init_bitmaps();
+    RELEASEMUTEX;
+    return OK;
+  } else {
+    RELEASEMUTEX;
+    return FAILED;
+  }
+}
+#endif
+
+#ifdef BLOCKS_GUARDED
+extern void __heap_checking_on_all_deallocates(on)
+int on;
+{
+  checkDeallocates = on;
+}
+
+extern void __heap_checking_on_all_allocates(on)
+int on;
+{
+  checkAllocates = on;
+}
+#endif
+
+static int internal_coalesce(void)
+{ BlockP block;
+  BlockP previous;
+  BlockP tail;
+#ifndef BLOCKS_GUARDED
+  BlockP bin_copy[NBINS+2];
+#endif
+  size_t size;
+  /* where size is used to specify an element of an array it should really be
+   * called index, but to generate better code I got rid of the index variable
+   */
+
+  F0("!!internal_coalesce...");
+#ifdef STATS
+  statsP->stats.coalesces++;
+#endif
+
+  lookInBins = FALSE;
+  totalFree = 0;
+  /* set bins and overflow lists to empty */
+  for (size = 0; size <= NBINS+1; size++)
+  { bin[size] = NULL;
+#ifndef BLOCKS_GUARDED
+    bin_copy[size] = NULL;
+#endif
+  }
+
+  block = heapLow;
+
+  /* NULL indicates previous doesn't point to start of free block */
+  previous = NULL; tail = NULL;
+
+  while (block <= heapHigh) {
+    if (INVALID(block)) return CORRUPT;
+    if (FREE(block)) { /* free block */
+      if (previous == NULL) previous = block;
+    } else if (previous != NULL) {
+      size = PTRDIFF(block, previous) - OVERHEAD;
+      /* set flags to GCAble, Free, and not PureData */
+      totalFree += size;
+      previous->size = (size | FREEBIT);
+      if (size <= MAXBINSIZE) { /* return to bin */
+        size /= BINRANGE;
+        if (bin[size] == NULL) bin[size] = previous;
+        else {
+          /* if not BLOCKS_GUARDED use guard word of first block in bin to hold
+           * a pointer to the last block in the list for this bin otherwise
+           * use the bin_copy array. This allows me to keep the list in
+           * ascending address order. Remember to put back the guard words at
+           * the end of coalescing if BLOCKS_GUARDED.
+           */
+#ifdef BLOCKS_GUARDED
+          ((BlockP) bin[size]->guard)->next = previous;
+#else
+          (bin_copy[size])->next = previous;
+#endif
+        }
+#ifdef BLOCKS_GUARDED
+        bin[size]->guard = (int) previous;
+#else
+        bin_copy[size] = previous;
+#endif
+      } else { /* put block on overflow list */
+        if (bin[0] == NULL)
+          {bin[0] = previous; previous->previous = NULL;}
+        else
+          {tail->next = previous; previous->previous = tail;}
+        tail = previous;
+      }
+      previous = NULL;
+    }
+    ADDBYTESTO(block, SIZE(block) + OVERHEAD);
+  }
+
+  /* replace the guard words at the start of the bins lists */
+  for (size = 1; size <= NBINS; size++) {
+    if (bin[size] != NULL) {
+      lookInBins = TRUE;
+#ifdef BLOCKS_GUARDED
+      ((BlockP) bin[size]->guard)->next = NULL;
+      bin[size]->guard = GUARDCONSTANT;
+#else
+      (bin_copy[size])->next = NULL;
+#endif
+    }
+  }
+
+  /* do both ends of overflow list */
+  if (bin[0] != NULL) {
+    tail->next = NULL;
+    bin[NBINS+1] = tail;
+  } else { bin[NBINS+1] = NULL; }
+  lastFreeBlockOnHeap = bin[NBINS+1];
+
+  F0(" ... complete\n");
+  return OK;
+}
+
+static int InsertBlockInOverflowList(block)
+BlockP block;
+{
+#if HEAP_ALLOCATED_IN_ASCENDING_ADDRESS_ORDER
+  F0("!!InsertBlockInOverflowList &")
+  FD((unsigned)block, 16)
+  F0(" at end of list\n")
+  /* OK to add remainder of block to tail of overflow list */
+  if (bin[0] == NULL) {bin[0] = block; block->previous = NULL;}
+  else {bin[NBINS+1]->next = block; block->previous = bin[NBINS+1];}
+  bin[NBINS+1] = block; block->next = NULL;
+#else
+  BlockP previous;
+  BlockP tail;
+  F0("!!InsertBlockInOverflowList &")
+  FD((unsigned)block, 16);
+  if (bin[0] == NULL) {
+    F0(" at end of list\n");
+    /* OK to add remainder of block to tail of overflow list */
+    if (bin[0] == NULL) {bin[0] = block; block->previous = NULL;}
+    else {bin[NBINS+1]->next = block; block->previous = bin[NBINS+1];}
+    bin[NBINS+1] = block; block->next = NULL;
+  } else {
+    /* insert remainder block at right position in overflow list */
+    F0(" walk chain to determine where\n");
+    tail = bin[0];
+    while (tail != NULL && tail < block) {
+      if (INVALID(tail)) return CORRUPT;
+      previous = tail; tail = tail->next;
+    }
+    if (tail == bin[0]) {
+      block->next = bin[0]; block->previous = NULL;
+      bin[0]->previous = block; bin[0] = block;
+    } else {
+      block->next = previous->next; block->previous = previous;
+      previous->next = block;
+      if (tail == NULL) bin[NBINS+1] = block; else tail->previous = block;
+    }
+  }
+#endif
+  return OK;
+}
+
+static int GetMoreOSHeap(minSize, base_ptr, size_ptr)
+size_t minSize;
+BlockP *base_ptr;
+size_t *size_ptr;
+{ size_t size = *size_ptr;
+  BlockP base = *base_ptr;
+#ifdef GC
+  BlockP tempBlock;
+#else
+#if !HEAP_ALLOCATED_IN_ASCENDING_ADDRESS_ORDER
+  BlockP tempBlock;
+#endif
+#endif
+  BlockP bitmap;
+#ifdef GC
+  char *oldMap;
+  size_t mapSizeForExistingHeap;
+  size_t totalMapSize;
+#endif
+  int gotWhatWasWanted;
+#ifdef STACKCHECK
+  LOW_OVERHEAD_F0("stack on entry to GetMoreOSHeap = &")
+  LOW_OVERHEAD_FD((unsigned) &gotWhatWasWanted, 16)
+  LOW_OVERHEAD_F0("\n");
+  STACKDEPTH(gotWhatWasWanted, 20);
+#endif
+
+#ifdef STATS
+  if (statsP != NULL) statsP->stats.heapExtensions++;
+#endif
+  minSize += OVERHEAD + HOLEOVERHEAD;
+  if (userHeap/FRACTION_OF_HEAP_NEEDED_FREE > totalFree)
+    minSize += userHeap / FRACTION_OF_HEAP_NEEDED_FREE - totalFree;
+  F0("!!GetMoreOSHeap: ") FD(minSize, 10)
+  F0(" bytes, old heap top ")
+  FD((unsigned)endOfLastExtension, 16) F0("\n")
+
+#ifdef GC
+  if (enoughMemoryForGC || garbageCollecting) {
+    minSize = (minSize + OVERHEAD + BITSPERWORD-1) / BITSPERWORD * BITSPERWORD;
+    minSize = (((totalHeap + BITSPERWORD-1) / BITSPERWORD * BITSPERWORD
+                + (BITSPERWORD * minSize + minSize)) + BITSPERWORD-1)
+                                                              / BITSPERWORD;
+  }
+#endif
+
+  base = endOfLastExtension;
+
+#ifdef CAMEL
+  if (endOfLastExtension == NULL) size = 0;
+  else size = HOLEOVERHEAD * BITSPERBYTE;
+  gotWhatWasWanted = OSStorage_HeapAllocate(minSize*BITSPERBYTE,
+                                            (VoidStar *)&base, &size);
+  
+  size /= BITSPERBYTE;
+#else
+  size = _kernel_alloc(BYTESTOWORDS(minSize),(VoidStar *)&base) * BYTESPERWORD;
+  F0("!!size = ") FD(size, 10)
+  F0(" bytes, base = ")
+  FD((unsigned)base, 16) F0("\n")
+  if (base == ADDBYTES(endOfLastExtension, HOLEOVERHEAD)) {
+    base = endOfLastExtension;
+    size += HOLEOVERHEAD;
+  }
+  gotWhatWasWanted = (size >= minSize);
+#endif
+  if (size <= HOLEOVERHEAD) {size = 0; base = NULL;}
+  else size -= HOLEOVERHEAD;
+  F0("  got ") FD(size, 10)
+  F0(" at &")
+  FD((unsigned)base, 16) F0("\n")
+
+#ifdef GC
+  /* GC BITMAP */
+  oldMap = mapForExistingHeap;
+  if (gotWhatWasWanted && enoughMemoryForGC) {
+    /* take out garbage collection bitmap */
+    F0("  make GC bitmap");
+    totalMapSize = size;
+    mapSizeForExistingHeap =
+                   (totalHeap + BITSPERWORD-1) / BITSPERWORD + OVERHEAD;
+    /* reduce size by amount needed for map for existing heap */
+    size -= mapSizeForExistingHeap;
+    if (base >= endOfLastExtension) {
+      /* extension not in a heap hole */
+      /* take out 1/33 of remainder for map for new bit of heap */
+      size = (size - (size+BITSPERWORD) / (BITSPERWORD+1))
+                  / BYTESPERWORD * BYTESPERWORD - OVERHEAD;
+    }
+    totalMapSize -= size;
+    tempBlock = ADDBYTES(base, size);
+#ifdef BLOCKS_GUARDED
+    tempBlock->guard = GUARDCONSTANT;
+#endif
+    /* set flags to NOT GCAble, and PureData */
+    tempBlock->size = (totalMapSize-OVERHEAD) | HOLEBITS;
+    mapForExistingHeap = (char *) ADDBYTES(tempBlock, OVERHEAD);
+    if ((endOfLastExtension != NULL) && (base != endOfLastExtension)) {
+      /* not contiguous */
+      if (base > endOfLastExtension) {
+        /* extension not in a heap hole */
+        mapForNewHeap = (char *) ADDBYTES(tempBlock, mapSizeForExistingHeap);
+        gcLimit = tempBlock;
+        startOfNewHeap = base;
+      } else gcLimit = heapHigh;
+      endOfExistingHeap = endOfLastExtension;
+    } else {
+      endOfExistingHeap = tempBlock;
+      gcLimit = tempBlock;
+    }
+  } else {
+    F0("  not enough memory for GC bitmaps");
+    totalMapSize = 0;
+    mapForExistingHeap = NULL; tempBlock = NULL;
+  }
+
+  /* INCORPORATE THE OLD GC BITMAP BACK INTO HEAP, AND THE FREE LARGE BLOCK
+     IMMEDIATLY BEFORE THE BITMAP (IF THERE IS ONE). */
+  bitmap = base;
+  if (gotWhatWasWanted || (!garbageCollecting && enoughMemoryForGC)) {
+    if (oldMap != NULL) {
+      /* yes, we have a bitmap to incorporate back into the heap */
+      F0(", give back old one");
+      bitmap = ADDBYTES(oldMap, -OVERHEAD);
+      bitmap->size &= SIZEMASK;
+      if (base == endOfLastExtension) {
+        /* extension contiguous with bitmap, so merge them. */
+        /* is there a large free block just before bitmap to merge as well */
+        if (lastFreeBlockOnHeap != NULL &&
+            ADDBYTES(lastFreeBlockOnHeap,
+                          SIZE(lastFreeBlockOnHeap)+OVERHEAD) == bitmap) {
+          /* yes, so do the merge */
+          lastFreeBlockOnHeap->size = SIZE(lastFreeBlockOnHeap) + OVERHEAD;
+          totalFree -= lastFreeBlockOnHeap->size;
+          lastFreeBlockOnHeap->size += bitmap->size;
+
+          bitmap = lastFreeBlockOnHeap;
+          if (lastFreeBlockOnHeap == bin[NBINS+1]) {
+            /* remove block from end of overflow list */
+            if (lastFreeBlockOnHeap->previous == NULL) bin[0] = NULL;
+            else lastFreeBlockOnHeap->previous->next = NULL;
+            bin[NBINS+1] = lastFreeBlockOnHeap->previous;
+          } /* else it is not in any list ie waiting for coalesce */
+        }
+        size += bitmap->size + OVERHEAD;
+      } else {
+        /* extension not contiguous with bitmap, add bitmap to overflow list */
+        totalFree += bitmap->size;
+        bitmap->size |= FREEBIT;
+        if (InsertBlockInOverflowList(bitmap) != OK) return CORRUPT;
+        bitmap = base;
+      }
+    }
+  }
+#else
+  bitmap = base;
+  if (base == endOfLastExtension) {
+    /* extension contiguous with last block on heap. */
+    if (lastFreeBlockOnHeap != NULL &&
+            ADDBYTES(lastFreeBlockOnHeap,
+                          SIZE(lastFreeBlockOnHeap)+OVERHEAD) == bitmap) {
+      /* so do the merge of the extension and last block on the heap */
+      lastFreeBlockOnHeap->size = SIZE(lastFreeBlockOnHeap) + OVERHEAD;
+      totalFree -= lastFreeBlockOnHeap->size;
+      size += lastFreeBlockOnHeap->size;
+
+      bitmap = lastFreeBlockOnHeap;
+      if (lastFreeBlockOnHeap == bin[NBINS+1]) {
+        /* remove block from end of overflow list */
+        if (lastFreeBlockOnHeap->previous == NULL) bin[0] = NULL;
+        else lastFreeBlockOnHeap->previous->next = NULL;
+        bin[NBINS+1] = lastFreeBlockOnHeap->previous;
+      } /* else it is not in any list ie waiting for coalesce */
+    }
+  }
+#endif
+
+  /* SEE WHAT TO DO WITH NEW BLOCK (IF THERE IS ONE) */
+  if (size > MAXBINSIZE+OVERHEAD) {
+    F0("\n");
+    /* block is big enough to do something with */
+    /* HANDLE BEING DROPPED INTO A HEAP HOLE, AND CREATING THE HEAP HOLE
+       MARKER AT THE END OF THE NEW EXTENSION BLOCK. */
+    if (base >= heapHigh) {
+      if (endOfLastExtension != NULL && base != endOfLastExtension) {
+        /* heap hole, mark it as allocated */
+        F0("  extension not contiguous with heap, heap hole created\n");
+        endOfLastExtension->size =
+                 (PTRDIFF(base, endOfLastExtension) - HOLEOVERHEAD) | HOLEBITS;
+      } else F0("  extension contiguous with heap\n");
+#ifdef GC
+      endOfLastExtension = ADDBYTES(bitmap, size+totalMapSize);
+#else
+      endOfLastExtension = ADDBYTES(bitmap, size);
+#endif
+#ifdef BLOCKS_GUARDED
+      endOfLastExtension->guard = GUARDCONSTANT;
+#endif
+      endOfLastExtension->size = 0; /* as an end marker for Coalesce */
+    }
+#if !HEAP_ALLOCATED_IN_ASCENDING_ADDRESS_ORDER
+      else { /* find the heap hole I've been dropped in and modify it */
+      BlockP holeStart;
+      BlockP hole;
+      F0("  extension is in a heap hole\n");
+      hole = heapLow; holeStart = NULL;
+      while (hole <= base) {
+        if (HEAPHOLE(hole)) holeStart = hole;
+        ADDBYTESTO(hole, SIZE(hole)+OVERHEAD);
+      }
+      if (holeStart != base) /* extension is NOT at start of heap hole */
+        holeStart->size = PTRDIFF(base, holeStart) - HOLEOVERHEAD | HOLEBITS;
+      else if (ADDBYTES(holeStart, HOLEOVERHEAD) == base) {
+        base = holeStart;
+        size += HOLEOVERHEAD;
+      }
+#ifdef GC
+      if (ADDBYTES(base, size+totalMapSize+HOLEOVERHEAD) == hole)
+        if (gotWhatWasWanted && enoughMemoryForGC)
+          tempBlock->size += HOLEOVERHEAD | HOLEBITS;
+        else size += HOLEOVERHEAD;
+      else { /* create a new hole at the end of the extension */
+        tempBlock = ADDBYTES(base ,size+totalMapSize);
+#else
+      if (ADDBYTES(base, size+HOLEOVERHEAD) == hole) size += HOLEOVERHEAD;
+      else { /* create a new hole at the end of the extension */
+        tempBlock = ADDBYTES(base ,size);
+#endif
+#ifdef BLOCKS_GUARDED
+        tempBlock->guard = GUARDCONSTANT;
+#endif
+        tempBlock->size = (PTRDIFF(hole, tempBlock) - HOLEOVERHEAD) | HOLEBITS;
+      }
+    }
+#endif /* EXTENSIONS_IN_HEAP_HOLES */
+
+    /* INITIALISE HEADER OF NEW BLOCK */
+    base = bitmap;
+    if (base > lastFreeBlockOnHeap) lastFreeBlockOnHeap = base;
+    size -= OVERHEAD;
+#ifdef BLOCKS_GUARDED
+    base->guard = GUARDCONSTANT;
+#endif
+    /* set flags to GCAble, Free, and not PureData */
+    base->size = size | FREEBIT;
+    totalFree += size;
+    if (!gotWhatWasWanted) {
+      F0("  extension too small, ");
+      if (InsertBlockInOverflowList(base) != OK) return FAILED;
+    }
+  } else /* block is not big enough to worry about, throw it away */
+    F0(", no heap extension\n");
+
+  /* endOfLastExtension is the address of the storage after the end of the
+     block (used to handle heap holes) */
+  if (endOfLastExtension > heapHigh) heapHigh = endOfLastExtension;
+  if (base < heapLow && base != NULL) heapLow = base;
+  totalHeap = PTRDIFF(heapHigh, heapLow);
+#ifdef GC
+  userHeap = totalHeap - totalMapSize;
+#else
+  userHeap = totalHeap;
+#endif
+#ifdef STATS
+  if (statsP != NULL) {
+    statsP->stats.userHeap = userHeap;
+    statsP->stats.heapLow = heapLow;
+    statsP->stats.heapHigh = heapHigh;
+  }
+#endif
+
+  *size_ptr = size;
+  *base_ptr = base;
+  if (gotWhatWasWanted) return OK; else return FAILED;
+}
+
+#ifdef BLOCKS_GUARDED
+static int check_heap(void)
+{ BlockP block;
+  if (userHeap > 0) {
+    for (block = heapLow; ; ) {
+      if (block >= heapHigh) {
+        if (block > ADDBYTES(heapHigh,OVERHEAD)) return CORRUPT;
+        else return OK;
+      }
+      if (INVALID(block)) return CORRUPT;
+      ADDBYTESTO(block, SIZE(block)+OVERHEAD);
+    }
+  }
+  return OK;
+}
+#endif
+
+#define COALESCED     (1<<31)
+#define DONEGC        (1<<30)
+#define FORCECOALESCE (1<<29)
+
+static int primitive_alloc(gcBits, size/*words*/)
+int gcBits;
+size_t size;
+{ BlockP block;
+  size_t actualSize;
+  register int index;
+  int fromHighMemory;
+  int status = 0;
+
+  ACQUIREMUTEX;
+#ifdef BLOCKS_GUARDED
+  if (checkAllocates && check_heap() != OK) RELEASEANDRETURN(CORRUPT)
+#endif
+  /* convert size from words to addresss units */
+  size *= BYTESPERWORD;
+  F0("!!primitive_alloc: size ")
+  FD(size, 10)
+  F0(" bytes")
+  if (size >= MAXBYTES) RELEASEANDRETURN(FAILED)
+  else if (size == 0) size = BYTESPERWORD;
+
+  index = 0;
+  fromHighMemory = ((size <= LARGEBLOCK) && sys_heap_top);
+  for (;;) {
+    if (size <= MAXBINSIZE && lookInBins) { /* get from bin (if not empty) */
+      F0("  looking in bins");
+      index = size / BINRANGE;
+      do {
+        block = bin[index];
+        if (block != NULL) { /* got a block */
+          if (INVALID(block)) RELEASEANDRETURN(CORRUPT)
+          bin[index] = block->next;
+          actualSize = SIZE(block);
+          F0(" ");
+          FD(index, 10);
+          goto got_block;
+        } /* else try other bins */
+      } while (++index <= NBINS);
+    }
+
+    /* block bigger than largest bin / bin is empty, check overflow list */
+    /* if large block required, take it from high memory otherwise from low */
+get_from_overflow:
+    F0("  looking in overflow ");
+    if (fromHighMemory) {block = bin[NBINS+1]; F0("<");}
+    else {block = bin[0]; F0(">");}
+
+    while (block != NULL) {
+      if (INVALID(block)) RELEASEANDRETURN(CORRUPT)
+      actualSize = SIZE(block);
+      if (actualSize >= size) {
+        /* got a block big enough, now see if it needs splitting */
+        if (actualSize-size <= MAXBINSIZE+OVERHEAD) {
+          /* remove all of block from overflow list */
+          if (block == lastFreeBlockOnHeap) lastFreeBlockOnHeap = NULL;
+          if (block->previous == NULL) bin[0] = block->next;
+          else block->previous->next = block->next;
+          if (block->next == NULL) bin[NBINS+1] = block->previous;
+          else block->next->previous = block->previous;
+          goto got_block;
+        } else { /* split and leave unwanted part of the block in list */
+          goto split_block;
+        }
+      } else {
+          if (fromHighMemory) {block = block->previous; F0("<");}
+          else {block = block->next; F0(">");}
+      }
+    }
+    F0("\n");
+
+    /* no block in bin or overflow list, try coalesce if desirable */
+    if (!(COALESCED & status) &&
+         ((totalFree > (size + 4096) &&
+           totalFree > userHeap/FRACTION_OF_HEAP_NEEDED_FREE)
+         || FORCECOALESCE & status)) {
+#ifdef STATS
+      MakeEventRec(statsP->nextEvent, COALESCE, size);
+#endif
+      if (internal_coalesce() != OK) RELEASEANDRETURN(CORRUPT)
+      status |= COALESCED;
+      continue; /* try the allocation again */
+#ifdef GC
+    } else if (garbageCollecting && !(DONEGC & status)) {
+        if (garbageCollect(heapLow, gcLimit, mapForExistingHeap, mapForNewHeap,
+                     endOfExistingHeap, startOfNewHeap, SetBlockFree) != OK)
+          RELEASEANDRETURN(CORRUPT)
+#ifdef STATS
+        if (COALESCED & status)
+          MakeEventRec(statsP->nextEvent-1, COALESCE_AND_GC, size);
+        else MakeEventRec(statsP->nextEvent, GARBAGE_COLLECT, size);
+        statsP->stats.garbageCollects++;
+#endif
+        status |= DONEGC;
+        if (internal_coalesce() != OK) RELEASEANDRETURN(CORRUPT)
+        if (totalFree >= (userHeap / FRACTION_OF_HEAP_NEEDED_FREE))
+          continue; /* try the allocation again */
+#endif /* GC */
+    } else 
+      /* no block available in Storage, must go to OSStorage to get one */
+
+#ifdef STATS
+    if (COALESCED & status || DONEGC & status) {
+#ifdef GC
+      if (COALESCED & status) {
+        if (DONEGC & status)
+          MakeEventRec(statsP->nextEvent-1,COALESCE_AND_GC_AND_EXTENSION,size);
+        else
+          MakeEventRec(statsP->nextEvent-1, COALESCE_AND_EXTENSION, size);
+      } else MakeEventRec(statsP->nextEvent-1, GC_AND_EXTENSION, size);
+#else
+      MakeEventRec(statsP->nextEvent-1, COALESCE_AND_EXTENSION, size);
+#endif
+    } else if (heapHigh > heapLow)
+        MakeEventRec(statsP->nextEvent, EXTENSION, size);
+#endif
+
+    { BlockP blockCopy;
+      size_t actual;
+      /* now we have to get more heap */
+      switch (GetMoreOSHeap(size, &blockCopy, &actual)) {
+        case OK:
+          block = blockCopy; actualSize = actual;
+          if (InsertBlockInOverflowList(block) != OK) RELEASEANDRETURN(CORRUPT)
+#ifdef GC
+          if (garbageCollecting) init_bitmaps();
+#endif
+          goto get_from_overflow;
+        case FAILED:
+          block = blockCopy; actualSize = actual;
+#ifdef GC
+          if (garbageCollecting || !enoughMemoryForGC) {
+#else
+          if (!enoughMemoryForGC) {
+#endif
+            if (FORCECOALESCE & status) RELEASEANDRETURN(FAILED)
+            else status |= FORCECOALESCE;
+          }
+          enoughMemoryForGC = FALSE;
+          break;
+        case CORRUPT:
+          D0("**Heap CORRUPT getting more OS heap\n");
+          return CORRUPT;
+#ifdef DEBUG
+        default: _alloc_die("internal error: bad switch selector", FAILED);
+#endif
+      }
+    }
+  }
+
+got_block:
+  if (fromHighMemory && (actualSize > size+MINBLOCKSIZE)) {
+    /* split and put unwanted part of block into a bin or on overflow list*/
+split_block:
+    F0(", got block ")
+    FD((unsigned)block, 16)
+    F0(" to split, ")
+    { BlockP tempBlock = block;
+      totalFree -= OVERHEAD;
+      /* large block taken from bottom of this block */
+      /* medium and small blocks (and bitmaps) taken off top of this block */
+      if ((size > LARGEBLOCK) || (!sys_heap_top)) ADDBYTESTO(tempBlock, size+OVERHEAD);
+      else ADDBYTESTO(block, actualSize-size);
+      block->size = size;
+      /* set flags on block to GCAble, Free, and not PureData */
+      size = actualSize - (size + OVERHEAD);
+      tempBlock->size = size | FREEBIT;
+
+      if (!fromHighMemory) {
+      /* The block has been cut from the start of the overflow block.
+         This means that the large block that was in the overflow list
+         has to be replaced with new one (tempBlock).
+       */
+        tempBlock->previous = block->previous;
+        tempBlock->next = block->next;
+        if (tempBlock->previous == NULL) bin[0] = tempBlock;
+        else tempBlock->previous->next = tempBlock;
+        if (tempBlock->next == NULL) bin[NBINS+1] = tempBlock;
+        else tempBlock->next->previous = tempBlock;
+      }
+#ifdef BLOCKS_GUARDED
+      tempBlock->guard = GUARDCONSTANT;
+#endif
+
+      if (size <= MAXBINSIZE) {
+        /* work out the bin number */
+        lookInBins = TRUE;
+        index = size / BINRANGE;
+        F0("remainder --> bin ") FD(index, 10)
+        F0("\n")
+        tempBlock->next = bin[index]; bin[index] = tempBlock;
+      } else
+        F0("remainder --> overflow list\n");
+    }
+  } else  /* no split, take the whole block */
+    F0("no split, take the lot\n");
+
+  size = SIZE(block);
+#ifdef ANALYSIS
+  LOW_OVERHEAD_F0("+") LOW_OVERHEAD_FD(size, 10) LOW_OVERHEAD_F0("\n")
+#endif  
+  F0("  new allocated block at &") FD((unsigned) block, 16)
+  F0(", size ") FD(size, 10) F0("\n")
+  /* set flags to not Free, and gcbits */
+  block->size = size | (gcBits & DATA);
+#ifdef BLOCKS_GUARDED
+  block->guard = GUARDCONSTANT;
+#endif
+  totalFree -= size;
+  if (bin[NBINS+1] > lastFreeBlockOnHeap) lastFreeBlockOnHeap = bin[NBINS+1];
+#ifdef STATS
+  if (statsP != NULL) {
+    statsP->stats.blocksAllocated++;
+    statsP->stats.bytesAllocated += size;
+    if (totalHeap-totalFree > statsP->stats.maxHeapRequirement)
+      statsP->stats.maxHeapRequirement = totalHeap-totalFree;
+  }
+#endif
+  ADDBYTESTO(block, OVERHEAD);
+#ifdef GC
+  if (garbageCollecting) /* zero intialise the block */ memset(block, 0, size);
+#endif
+  RELEASEANDRETURN((int)block)
+}
+
+static int primitive_dealloc(block)
+BlockP block;
+{ int size;
+  ACQUIREMUTEX;
+  F0("!!primitive_dealloc: block ")
+  FD((unsigned)block, 16);  F0("\n")
+  
+  if ((block <= heapLow) || (block >= heapHigh)) {
+    if (block == NULL) RELEASEANDRETURN(OK)
+    else RELEASEANDRETURN(FAILED)
+  }
+  ADDBYTESTO(block, -OVERHEAD);
+
+#ifdef BLOCKS_GUARDED
+  if (checkDeallocates) {
+    BlockP searchBlock = heapLow;
+    for (; searchBlock != block; ) {
+      if (searchBlock >= heapHigh) RELEASEANDRETURN(FAILED)
+      if (INVALID(searchBlock)) RELEASEANDRETURN(CORRUPT)
+      ADDBYTESTO(searchBlock, OVERHEAD + SIZE(searchBlock));
+    }
+  }
+
+  if (INVALID(block)) RELEASEANDRETURN(CORRUPT)
+#endif
+  size = block->size;
+  if (FREEBIT & size) RELEASEANDRETURN(FAILED)
+  /* set flags to GCAble, Free, and not PureData */
+  size &= SIZEMASK;
+#ifdef ANALYSIS
+  LOW_OVERHEAD_F0("-") LOW_OVERHEAD_FD(size, 10) LOW_OVERHEAD_F0("\n")
+#endif  
+  block->size = size | FREEBIT;
+#ifdef STATS
+  statsP->stats.blocksDeallocated++;
+  statsP->stats.bytesDeallocated += size;
+#endif
+  totalFree += size;
+
+  if (size <= MAXBINSIZE) { /* return to bin */
+    lookInBins = TRUE; size /= BINRANGE;
+    block->next = bin[size]; bin[size] = block;
+  } else {
+    /* put block on deallocate overflow list, for reuse after coalesce */
+    if (block > lastFreeBlockOnHeap) lastFreeBlockOnHeap = block;
+  }
+
+  RELEASEANDRETURN(OK)
+}
+
+/*
+ * Put the veneer functions here for now: don't really need all these.
+ */
+extern size_t _byte_size(p)
+VoidStar p;
+{ BlockP block = (BlockP)p;
+  if (block != NULL) {
+    /* decrement the pointer (block) by the number of overhead bytes */
+    ADDBYTESTO(block, -OVERHEAD);
+    if (!INVALID(block)) return (SIZE(block));
+  }
+  return 0;
+}
+
+extern VoidStar malloc(size)
+size_t size;
+{ VoidStar ptr;
+  if (_kernel_processor_mode() != 0)
+      return _kernel_RMAalloc(size);
+
+  ENTRYTOALLOC(ptr);
+  ptr = (VoidStar) primitive_alloc(NOTGCABLEBIT, BYTESTOWORDS(size));
+  if ((int)ptr < OK) {
+#ifdef STATS
+    ShowStats();
+#endif
+    if ((int)ptr == CORRUPT)
+      _alloc_die(_kernel_getmessage("malloc failed", "C12"), CORRUPT);
+    else return NULL;
+  }
+  return ptr;
+}
+
+extern VoidStar realloc(p, size)
+VoidStar p;
+size_t size;
+{ int rc;
+  size_t old;
+  VoidStar new = NULL;
+  if (_kernel_processor_mode() != 0)
+      return _kernel_RMAextend(p, size);
+
+  F0("!!realloc\n");
+  size = BYTESTOWORDS(size)*BYTESPERWORD;
+  if (p == NULL) return malloc(size);
+  if (BADUSERBLOCK(p))
+    _alloc_die(_kernel_getmessage("realloc failed, (bad user block)", "C13"), FAILED);
+
+  old = _byte_size(p);
+  if (old < size) {
+    new = malloc(size);
+    if (new == NULL) return NULL;
+    memcpy(new, p, old);        /* copies 0 words for bad p! */
+  }
+  if ((old < size) || (size == 0) || (old > size+MINBLOCKSIZE+BYTESPERWORD)) {
+    if ((old > size+MINBLOCKSIZE+BYTESPERWORD) && (size != 0)) {
+      BlockP b = ADDBYTES(p, -OVERHEAD);
+      b->size = size+BYTESPERWORD | (b->size&(!SIZEMASK));
+      new = p;
+      ADDBYTESTO(b, size+BYTESPERWORD+OVERHEAD);
+#ifdef BLOCKS_GUARDED
+      b->guard = GUARDCONSTANT;
+#endif
+      b->size = (old-OVERHEAD-BYTESPERWORD-size) | DATA;
+      p = ADDBYTES(b, OVERHEAD);
+    }
+    rc = primitive_dealloc((BlockP) p);
+    if (rc != OK) {
+#ifdef STATS
+      ShowStats();
+#endif
+      _alloc_die(_kernel_getmessage("deallocate of old block in realloc failed", "C14"), rc);
+    }
+    return new;
+  } else
+    return p;
+}
+
+extern VoidStar calloc(count, size)
+size_t count;
+size_t size;
+{ VoidStar r;
+/*
+ * This miserable code computes a full 64-bit product for count & size
+ * just so that it can verify that the said product really is in range
+ * for handing to malloc.
+ */
+  unsigned h = (count>>16)*(size>>16);
+  unsigned m1 = (count>>16)*(size&0xffff);
+  unsigned m2 = (count&0xffff)*(size>>16);
+  unsigned l = (count&0xffff)*(size&0xffff);
+  h += (m1>>16) + (m2>>16);
+  m1 = (m1&0xffff) + (m2&0xffff) + (l>>16);
+  l = (l&0xffff) | (m1<<16);
+  h += m1>>16;
+  if (h) l = (unsigned)(-1);
+  if (l >= MAXBYTES) bad_size(l);
+  r = malloc(l);
+#ifdef GC
+  /* if garbage collecting, the block will already have been zeroed */
+  if ((r != NULL) && (!garbageCollecting)) memset(r, 0, l);
+#else
+  if (r != NULL) memset(r, 0, l);
+#endif
+  return r;
+}
+
+extern void free(p)
+VoidStar p;
+{ int rc;
+  /* free(0) now allowed!!! ECN - 21 09 93 */
+  if (!p) return;
+  if ((int)p >= RMABase && (int)p < RMAEnd) {
+    _kernel_RMAfree(p); return;
+  }
+  rc = primitive_dealloc((BlockP)p);
+  /* following line may not be correct ANSI - but for the moment we
+   * have problems if we don't detect invalid free's.
+   */
+  if (rc != OK) {
+#ifdef STATS
+    ShowStats();
+#endif
+    _alloc_die(_kernel_getmessage("free failed", "C15"), rc);
+  }
+}
+
+#ifdef CAMEL
+static void _allocate(a, bitlen)
+VoidStar *a;
+size_t bitlen;
+/* Default storage allocator */
+{ int local;
+  if (bitlen > 0) {
+    IGNORE(local); ENTRYTOALLOC(local);
+    *a = (VoidStar) primitive_alloc(NOTGCABLEBIT, BITSTOWORDS(bitlen));
+    if ((int) *a <= 0) {
+#ifdef STATS
+      ShowStats();
+#endif
+      _alloc_die(_kernel_getmessage("allocate failed", "C64"), (int)*a);
+    }
+  } else *a = NULL;
+}
+#endif
+
+extern void _deallocate(a, bitlen)
+VoidStar *a;
+size_t bitlen;
+/* Default storage deallocator */
+{ VoidStar p = *a;
+  int  rc;
+  IGNORE(bitlen);
+  *a = NULL;
+  rc = primitive_dealloc((BlockP) p);
+  if (rc != OK) {
+#ifdef STATS
+    ShowStats();
+#endif
+    _alloc_die(_kernel_getmessage("deallocate failed", "C16"), rc);
+  }
+}
+
+extern VoidStar _sys_alloc(n)
+size_t n;
+{ VoidStar a = malloc(n);
+  if (a == NULL)
+    _alloc_die(_kernel_getmessage("No store left for I/O buffer or the like", "C17"), FAILED);
+  return a;
+}
+
+#ifdef GC
+extern VoidStar _gc_malloc(gcbits, size)
+int gcbits;
+size_t size;
+{ VoidStar ptr;
+  ptr = (VoidStar) primitive_alloc(gcbits, BYTESTOWORDS(size));
+  if ((int)ptr == FAILED || (int)ptr == CORRUPT) {
+#ifdef STATS
+    ShowStats();
+#endif
+    if ((int)ptr == CORRUPT) _alloc_die("gc_malloc failed", CORRUPT);
+    else return NULL;
+  }
+  return ptr;
+}
+
+extern void _gcallocate(a, bitlen, gcbits)
+VoidStar *a;
+size_t bitlen;
+int gcbits;
+/* The M2 ALLOCATE function */
+{ int local;
+  if (bitlen > 0) {
+    IGNORE(local); ENTRYTOALLOC(local);
+    *a = (VoidStar) primitive_alloc(gcbits, BITSTOWORDS(bitlen));
+    if ((int)*a == FAILED || (int)*a == CORRUPT) {
+#ifdef STATS
+      ShowStats();
+#endif
+      _alloc_die("gcallocate failed", (int) *a);
+    }
+  } else *a = NULL;
+}
+
+extern void _set_gcbits(a, gcbits)
+VoidStar *a;
+int gcbits;
+{ BlockP p = (BlockP)*a;
+  /*
+   * Must acquire the storage lock:- else we cannot change the word (which
+   * contains the size remember) atomically.
+   */
+  ACQUIREMUTEX;
+  if (BADUSERBLOCK(p)) {
+    RELEASEMUTEX;
+#ifdef STATS
+      ShowStats();
+#endif
+    _alloc_die("_set_gcbits failed (bad user block)", FAILED);
+  }
+  ADDBYTESTO(p, -OVERHEAD);
+  /*    clear bits  then    set bits */
+  p->size = (p->size & ~DATA) | (gcbits & DATA);
+  RELEASEMUTEX;
+}
+#endif /* GC */
+
+/*
+ * End of veneer functions
+ *
+ * Garbage collection interface.
+ */
+
+extern int __coalesce(void)
+{ int rc;
+  ACQUIREMUTEX;
+  rc = internal_coalesce();
+  RELEASEMUTEX;
+  if (rc != OK) {
+#ifdef STATS
+    ShowStats();
+#endif
+    _alloc_die(_kernel_getmessage("heap coalesce failed", "C18"), rc);
+  }
+  return rc;
+}
+
+#ifdef STATS
+static void init_stats(void)
+{
+  /* grab stats record from heap */
+  statsP = (StatsPtr) primitive_alloc(NOTGCABLEBIT,
+                                      BYTESTOWORDS(sizeof(StatsRec)));
+  statsP->stats.totalGCBlocks = 0; statsP->stats.totalGCBytes = 0;
+  statsP->stats.coalesces = 0; statsP->stats.heapExtensions = 0;
+  statsP->stats.garbageCollects = 0;
+  statsP->stats.heapHigh = heapHigh; statsP->stats.heapLow = heapLow; 
+  statsP->stats.userHeap = userHeap; statsP->stats.maxHeapRequirement = 0;
+  statsP->stats.blocksAllocated = 0; statsP->stats.bytesAllocated = 0;
+  statsP->stats.blocksDeallocated = 0; statsP->stats.bytesDeallocated = 0;
+  statsP->events[0].allocates = 0; statsP->events[0].deallocates = 0;
+  statsP->events[0].bytesAllocated = 0; statsP->events[0].bytesDeallocated = 0;
+  statsP->events[0].bytesGCd = 0; statsP->events[0].blocksGCd = 0;
+  statsP->nextEvent = 1;
+}
+#endif
+
+extern void _terminate_user_alloc(void)
+{
+  heapLow = sys_heap_top;
+}
+
+extern void _init_user_alloc(void)
+{
+  sys_heap_top = heapLow;
+  heapLow = bin[0];
+  totalHeap = PTRDIFF(heapHigh, heapLow);
+#ifdef GC
+  userHeap = totalHeap - totalMapSize;
+#else
+  userHeap = totalHeap;
+#endif
+}
+
+static int _allocated_by_me(BlockP block)
+{
+  BlockP searchBlock = heapLow;
+  if (block < heapLow) return 0;
+  ADDBYTESTO(block, -OVERHEAD);
+  while (searchBlock < heapHigh) {
+    if (INVALID(block)) return 0;
+    if (block == searchBlock) return 1;
+    ADDBYTESTO(searchBlock, OVERHEAD + SIZE(searchBlock));
+  }
+  return 0;
+}
+
+extern int _alloc_reinit()
+{
+  _kernel_stack_chunk *prev = _kernel_current_stack_chunk();
+  _kernel_stack_chunk *chunk = prev->sc_next;
+  BlockP block = heapLow;
+  ACQUIREMUTEX;
+F0("reinitialisation... ")
+  
+  if ((prev->sc_mark != 0xf60690ff) || (prev->sc_prev != NULL))
+    RELEASEANDRETURN(0);
+F0("follow chunks... ");
+  while (chunk != NULL) {
+F0("next chunk");
+    if (_allocated_by_me((BlockP) chunk)) {
+      prev->sc_next = chunk->sc_next;
+F0(" mine\n");
+      if (chunk->sc_next != NULL) chunk->sc_next->sc_prev = prev;
+    } else {
+F0(" not mine\n");
+      prev = chunk;
+    }
+    chunk = chunk->sc_next;
+  }
+
+  while (block < heapHigh) {
+    if (INVALID(block)) return 0;
+    if (HEAPHOLE(block)); /* skip */
+    else {
+F0("free ") FD((unsigned) block, 16) F0("\n")
+      block->size = SIZE(block) | FREEBIT;
+    }
+    ADDBYTESTO(block, OVERHEAD + SIZE(block));
+  }
+  (void) internal_coalesce();
+  RELEASEANDRETURN(1);
+}
+
+extern void _init_alloc(void)
+{ int j;
+  _kernel_swi_regs r;
+  INITMUTEX;
+  lastFreeBlockOnHeap = NULL;
+  mapForExistingHeap = NULL;
+  garbageCollecting = FALSE;
+  checkDeallocates = FALSE;
+  checkAllocates = FALSE;
+  enoughMemoryForGC = TRUE;
+  /* to get rid of warnings */
+  garbageCollect = (GCProc) NULL;
+  gcLimit = NULL;
+  mapForExistingHeap = NULL;
+  mapForNewHeap = NULL;
+  endOfExistingHeap = NULL;
+  startOfNewHeap = NULL;
+  lookInBins = FALSE;
+  totalFree = 0;
+  endOfLastExtension = NULL;
+  /* set allocate bins to empty */
+  for (j=0; j <= NBINS; ++j) { bin[j] = NULL; }
+  /* set overflow lists to empty */
+  bin[0] = NULL; bin[NBINS+1] = NULL;
+  totalHeap = 0; userHeap = 0;
+  /* get base and end of RMA */
+  r.r[0] = 0x81;
+  if (!_kernel_swi(OS_ReadDynamicArea,&r,&r)) {
+    RMABase = r.r[0];
+    RMAEnd = r.r[0] + r.r[2];
+  } else {
+    RMABase = 0x01800000;
+    RMAEnd = 0x01C00000;
+  }
+#ifdef STATS
+  statsP = NULL;
+  init_stats();
+#endif
+  sys_heap_top = heapHigh = 0; heapLow = (BlockP) 0x7fffffff;
+#ifdef CAMEL
+  OSSYSTEM_SetAllocProcs(_allocate, _deallocate);
+#else
+  _kernel_register_allocs(&malloc, &free);
+#endif
+}

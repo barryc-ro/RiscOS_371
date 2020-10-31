@@ -1,0 +1,2285 @@
+/*  released */
+/*=======================================================================*/
+/*                                                                       */
+/*  FILE :     extract                                                   */
+/*  VERSION:   2.19                                                      */
+/*  DATE:      29 April, 1994.                                           */
+/*                                                                       */
+/*-----------------------------------------------------------------------*/
+/*  Differences between this version (2.19) and version 2.18:            */
+/*-----------------------------------------------------------------------*/
+/*  Multi-track movies - extract wasn't checking to see if the LAST      */
+/*  track was stereo or mono.  Fix is at the end of if (i == 11) in      */
+/*  OpenSourceFile() beginning at if (j == tracks) and going up to       */
+/*  if (i == 17).                                                        */
+/*=======================================================================*/
+
+#define MAX_LINE 195
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include "kernel.h"
+#include "extract.h"
+
+#include "<extract$dir>.oslib.h.osgbpb"
+#include "<extract$dir>.oslib.h.osfind"
+#include "<extract$dir>.oslib.h.osfile"
+#include "<extract$dir>.oslib.h.osargs"
+#include "<extract$dir>.oslib.h.os"
+
+struct source_info source_info[10]; 
+char *dest;
+int *bits_per_sample;
+int all_tracks_exist = YES;
+os_f sprite_file_handle;
+os_f image_file_handle;
+FILE *header_file_handle;
+os_f keys_file_handle;
+os_error *error;
+os_f source_file_handle = 0, sound_file_handle;
+int extract_everything = NO;
+int state_info[10];
+int stereo[10];
+/*----------------------------------------------------------------------*/
+int main(int argc,char *argv[])
+{
+ int extract_header = NO; int extract_keys = NO;  int extract_images = NO;
+ int extract_sprite = NO; int extract_sound = NO; int sound_files = 0;
+ struct cat_info ci, *head; int i; int tracks; struct video images, *ihead;
+ int keys_offset,sprite_offset,spritesize,cat_offset,chunks,no_image_data;  
+ int numbering_of_sound_files = 1; int numbering_of_sample_files = 1;
+ int numbering_of_adpcm_files = 1;
+
+   atexit(close_files);
+   
+   for (i = 1; i < 10; state_info[i] = NO, i++);
+   for (i = 1; i < 10; stereo[i] = NO,i++);
+   for (i = 1; i < 10; source_info[i].track_no = 0,i++);
+  
+   ProcessCommandLineArgs(argc,argv,&sound_files,&extract_header,
+                          &extract_keys,&extract_sprite,&extract_images,
+                          &extract_sound);
+
+   tracks = OpenSourceFile(&keys_offset,&sprite_offset,&spritesize,
+                              &cat_offset, &chunks,extract_header,
+                              &no_image_data,extract_images,
+                              extract_sprite,extract_keys,&sound_files); 
+                            
+                            
+   if (extract_everything)
+   {
+       for (i = 1; i <= tracks; source_info[i].track_no = i, i++);
+       sound_files = tracks;
+   }                              
+
+   if (extract_sprite) 
+   {
+       ExtractSprite(sprite_offset,spritesize); 
+   }
+  
+   
+   if (extract_images == YES && no_image_data == FALSE)
+   {  
+       ihead = BuildImageList(&images,ihead,chunks);
+       CreateImageFiles(ihead);
+   } 
+   else 
+   {     if (extract_images && no_image_data)
+         {  
+            PROG_ID;  
+            printf("Warning: -ignoring extraction of image data.\n");
+            printf("         -source does not contain images.\n");
+         }
+   }
+ 
+   
+   if (extract_keys)
+   {   
+       keys_offset = CheckValidKeysOffset(keys_offset,sprite_offset,spritesize);                 
+       if (keys_offset != 0) 
+       {                  
+           ExtractKeys(keys_offset,cat_offset,chunks);
+       }
+       else
+       {
+           PROG_ID;
+           printf("Warning: - ignoring keys extraction.\n");
+           printf("         - no keys found in source file.\n");
+       }                   
+   }    
+   
+   
+   if (extract_sound)
+   {  
+       CheckAllTracksExist(tracks,sound_files);
+       
+       if (all_tracks_exist)
+       {   
+           for (i = 1; i <= sound_files; i++)
+           {    
+                if (source_info[i].track_no != 0)
+                {   
+                    head = BuildList(&ci,head,source_info[i].track_no,chunks);
+                    CreateSoundFile(head,i,chunks,&numbering_of_sound_files,
+                            &numbering_of_sample_files,&numbering_of_adpcm_files);
+                    FreeList(head);
+                }   
+           }              
+       }        
+   }
+ 
+  
+}
+/*-----------------------------------------------------------------------------*/
+void ProcessCommandLineArgs(int argc, char *argv[],int *sound_files,
+                            int *extract_header, int *extract_keys,
+                            int *extract_sprite, int *extract_images,
+                            int *extract_sound)                           
+{int i,j;
+ int clargs_buffer_size=0, source_len = 0;
+ char *clargs_buffer, *extra_args, *all_args, *arg_ptr, *arg_address;
+ char digits[20];
+ 
+    for (i = 1; i <= argc; i++)
+    {
+         clargs_buffer_size = clargs_buffer_size + strlen(argv[i-1]);
+         clargs_buffer_size++; /* Allow for insertion of space later on. */
+    }
+    
+    clargs_buffer_size++;  /* Add extra byte for null terminating character. */
+    
+    clargs_buffer = calloc(clargs_buffer_size,sizeof(char));  /* here*/
+   
+    if (clargs_buffer == NULL)
+    {
+        PROG_ID;
+        printf("Fatal Error: - insufficient memory.\n");
+        printf("             - %d more bytes required.\n",clargs_buffer_size);
+        exit(0);
+    }
+    
+    for (i = 0; i < clargs_buffer_size; clargs_buffer[i] = '\0',i++);
+    
+    for (i = 1; i <= argc; i++)
+    {
+        
+         strcat(clargs_buffer,argv[i-1]);
+         strcat(clargs_buffer," ");
+    }
+   
+    if (strlen(clargs_buffer) > 0)
+    {
+         clargs_buffer[strlen(clargs_buffer)-1] = '\0';    
+    }
+  
+    /* Command line args are in clargs_buffer.  Now need to add on anything in */
+    /* the environment variable extract$ExtraArgs.                             */
+    
+       extra_args = getenv("extract$ExtraArgs");
+       
+       if (extra_args == NULL)
+       {                                                                         
+           all_args = calloc(clargs_buffer_size+3,sizeof(char));  /* here */
+           for (i =0; i < clargs_buffer_size+3; all_args[i] = '\0',i++);
+       }
+       else
+       {  
+           all_args = calloc(clargs_buffer_size + strlen(extra_args) + 3, /* here */
+                             sizeof(char));
+           for (i =0; i < clargs_buffer_size+strlen(extra_args)+3; all_args[i] = '\0',i++);
+       }
+       /* +3 just to be safe. */
+       
+     
+       if (all_args == NULL)
+       {
+           PROG_ID;
+           printf("Fatal Error: - insufficient memory.\n");
+           if (extra_args == NULL)
+           {
+               printf("             %d more bytes required.\n",clargs_buffer_size+3);
+           }
+           else
+           {
+               printf("             %d more bytes required.\n",clargs_buffer_size+3
+                                     +strlen(extra_args));
+           }                          
+           exit(0);
+       }
+     
+       sprintf(all_args,"%s",clargs_buffer);
+       
+       if (extra_args != NULL)
+       {
+           strcat(all_args,extra_args);
+       }
+      
+      
+       /* Can now start processing commands. */
+       
+          if (((arg_ptr = strstr(all_args,"-help"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-HELP"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Help"))!=NULL))
+          {
+               Help(); exit(0);
+          }
+       
+          if (((arg_ptr = strstr(all_args,"-source"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-SOURCE"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Source"))!=NULL))
+          {
+               /* Skip past -source. */
+                  arg_ptr = arg_ptr + 7;
+                  
+                  if (*arg_ptr == '\0')
+                  {
+                       PROG_ID;
+                       printf("Fatal Error: Source (ARMovie) not specified.\n");
+                       printf("             Syntax: -source name_of_source_Armovie\n");
+                       exit(0); 
+                  }
+                  
+               /* Bypass space/s. */
+                  while (*arg_ptr != '\0' && *arg_ptr == ' ')
+                  {
+                          arg_ptr++;
+                  }
+                  
+                  if (*arg_ptr == '\0')
+                  {
+                       PROG_ID;
+                       printf("Fatal Error: Source (ARMovie) not specified.\n");
+                       printf("             Syntax: -source name_of_source_Armovie\n");
+                       exit(0);
+                  }
+                  
+               /* Read in source. */
+                  source_len = 1;
+                  arg_address = arg_ptr;
+                  while (*arg_ptr != ' ' && *arg_ptr != '\0')
+                  {
+                          source_len++;
+                          arg_ptr++;
+                  }
+                  source_info[1].source_file = calloc(source_len+3,sizeof(char));  /* here */
+                
+                  if (source_info[1].source_file == NULL)
+                  {
+                      PROG_ID;
+                      printf("Fatal Error: - insufficient memory.\n");
+                      printf("             - %d more bytes required.\n",source_len+3);
+                      exit(0);
+                  }     
+                  
+                  i = 0; arg_ptr = arg_address;
+                  while (*arg_ptr != ' ' && *arg_ptr != '\0')
+                  {
+                          source_info[1].source_file[i] = *arg_ptr;
+                          arg_ptr++;
+                          i++;
+                  }
+                  
+                  source_info[1].source_file[i] = '\0'; 
+          }               
+          else
+          {
+               PROG_ID;
+               printf("Fatal Error: Source (ARMovie) not specified.\n");
+               printf("             Syntax: -source name_of_source_Armovie\n");
+               exit(0);
+          }     
+       
+          
+          
+          
+          if (((arg_ptr = strstr(all_args,"-header"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-HEADER"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Header"))!=NULL))
+          {
+               *extract_header = YES;
+          }                   
+         
+          if (((arg_ptr = strstr(all_args,"-sprite"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Sprite"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-SPRITE"))!=NULL))
+          {
+               *extract_sprite = YES;
+          }     
+
+          if (((arg_ptr = strstr(all_args,"-keys"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-KEYS"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Keys"))!=NULL))
+          {
+               *extract_keys = YES;
+          }     
+                                       
+          if (((arg_ptr = strstr(all_args,"-images"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Images"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-IMAGES"))!=NULL))
+          {
+               
+               *extract_images = YES;
+          }        
+  
+          if (((arg_ptr = strstr(all_args,"-sound"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Sound"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-SOUND"))!=NULL))
+          {     
+               *extract_sound = YES;
+               
+             /* Skip past -sound. */
+                arg_ptr = arg_ptr + 6;
+                
+                if (*arg_ptr == '\0')
+                {                                      
+                     /* No soundtracks specified.  Default */
+                     /* to soundtrack 1 (only).            */
+                        
+                        *sound_files = 1;
+                         source_info[1].track_no = 1;
+                }
+             /* Skip past spaces. */
+                while (*arg_ptr != '\0' && *arg_ptr == ' ')
+                {
+                        arg_ptr++;
+                }
+                if (*arg_ptr == '\0' || *arg_ptr == '-')
+                {
+                     /* No soundtracks specified.  Default */
+                     /* to soundtrack 1 (only).            */
+                        *sound_files = 1;
+                         source_info[1].track_no = 1;                    
+                }
+           
+             /* Read soundtrack no.s specified by user. */
+                j = 1;   
+                while (*arg_ptr != '\0' && *arg_ptr != '-')
+                { 
+                        i = 0;
+                        while (isdigit(*arg_ptr))
+                        {
+                            digits[i] = *arg_ptr++; i++;
+                        } 
+                        
+                        digits[i] = '\0';
+                      
+                        source_info[j].track_no = atoi(digits);
+                        *sound_files= *sound_files + 1;
+                        j++; 
+                        while (*arg_ptr != '\0' && *arg_ptr == ' ')
+                        {       
+                                arg_ptr++;
+                        }     
+                }  
+          }            
+       
+          
+          if (((arg_ptr = strstr(all_args,"-dest"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-DEST"))!=NULL) ||
+              ((arg_ptr = strstr(all_args,"-Dest"))!=NULL))
+          {
+               /* Skip past -dest. */
+                  arg_ptr = arg_ptr + 5;
+                  
+                  if (*arg_ptr == '\0')
+                  {
+                       PROG_ID;
+                       printf("Fatal Error: Destination directory not specified.\n");
+                       printf("             Syntax: -dest name_of_destination_directory\n");
+                       exit(0);
+                  }
+                  
+               /* Bypass space/s. */
+                  while (*arg_ptr != '\0' && *arg_ptr == ' ')
+                  {
+                          arg_ptr++;
+                  }
+                  
+                  if (*arg_ptr == '\0')
+                  {
+                       PROG_ID;
+                       printf("Fatal Error: Destination directory not specified.\n");
+                       printf("             Syntax: -dest name_of_destination_directory\n");
+                       exit(0);
+                  }
+                  
+               /* Read in destination directory. */
+                  i = 1; arg_address = arg_ptr;
+                  while (*arg_ptr != ' ' && *arg_ptr != '\0')
+                  {
+                          arg_ptr++;
+                          i++;
+                  }
+                
+                  dest = calloc(i+3,sizeof(char)); 
+                  if (dest == NULL)
+                  {
+                      PROG_ID;
+                      printf("Fatal Error: - insufficient memory.\n");
+                      printf("             - %d more bytes required.\n",i+3);
+                      exit(0);
+                  }
+                  arg_ptr = arg_address; i = 0;
+                  while (*arg_ptr != ' ' && *arg_ptr != '\0')
+                  {
+                          dest[i] = *arg_ptr++; 
+                          i++;
+                  }                  
+                  dest[i] = '\0';    
+                
+          }
+          else
+          {
+                 PROG_ID;
+                 printf("Fatal Error: Destination directory not specified.\n");
+                 printf("             Syntax: -dest name_of_destination_directory\n");
+                 exit(0);
+          }                       
+          
+          
+          if (*extract_header == NO && *extract_sprite == NO && *extract_keys == NO &&
+              *extract_images == NO && *extract_sound == NO)
+          { 
+          
+              *extract_header = *extract_sprite = *extract_keys =
+              *extract_images = *extract_sound = YES;
+               extract_everything = YES;
+          }     
+          
+          /* The following code removes the restriction of having to use the */
+          /* -source parameter before the -sound parameter.                  */
+             if (*extract_sound)
+             {
+                  for (i = 1; i <= *sound_files; i++)
+                  {
+                       if (i != 1)
+                       {
+                          
+                           source_info[i].source_file = calloc(source_len+3,sizeof(char));/* here */
+                       
+                           if (source_info[i].source_file == NULL)
+                           {
+                               printf("Fatal Error: - insufficient memory.\n");
+                               printf("             - %d more bytes required.\n",source_len+3);
+                               exit(0);
+                           }    
+                           sprintf(source_info[i].source_file,"%s\0",source_info[1].source_file);
+                        }
+                  }
+             }          
+}
+/*----------------------------------------------------------------------------------*/
+int OpenSourceFile(int *keys_offset,int *sprite_offset,int *spritesize,
+                    int *cat_offset, int *chunks, int extract_header,
+                    int *no_image_data, int extract_images, int extract_sprite,
+                    int extract_keys, int *sound_files)
+
+{int i,j; char buffer[MAX_LINE]; char *buffer1; char buffer2[MAX_LINE];
+ char str_keys_offset[15],str_sprite_offset[15],str_spritesize[15];
+ char str_cat_offset[15],str_chunks[15]; int jj;
+ int tracks = 0;  int st = 0;  char str_bps[15]; 
+ FILE *infile, *file_handle; 
+ int icnt = 0, icnt2 = 0;
+ char *buffer_chk;
+ int found2 = NO;
+ int found_adpcm = NO;
+ int icnt3;
+ int keys_exist = 1;
+ 
+     if ((error = xosfind_openin(osfind_ERROR_IF_ABSENT |
+                                 osfind_ERROR_IF_DIR,
+                                 source_info[1].source_file,
+                                 &source_file_handle)) != NULL)
+     {
+         PROG_ID;
+         printf("Fatal Error: Unable to open ARMovie %s\n",source_info[1].source_file);
+         exit(0);
+     }    
+
+     infile = fopen(source_info[1].source_file,"r");
+     if (infile == NULL)
+     {
+         PROG_ID;
+         printf("Fatal Error: Unable to open ARMovie %s\n",source_info[1].source_file);
+         exit(0);
+     }    
+    
+     if (source_file_handle == 0)
+     {
+         PROG_ID;
+         printf("Fatal Error: Unable to open ARMovie %s\n",source_info[1].source_file);
+         exit(0);   
+     }
+    
+     if (extract_header == YES)
+     {
+         buffer1 = calloc(strlen(dest)+10,sizeof(char)); 
+         if (buffer1 == NULL)
+         {
+             printf("Fatal Error: - insufficient memory.\n");
+             printf("             - %d more bytes required.\n",strlen(dest)+10);
+             exit(0);
+         }    
+         for (i = 0; i < strlen(dest)+10;buffer[i] = '\0',i++);
+         sprintf(buffer1,"%s.Header",dest);
+         if ((header_file_handle = fopen(buffer1,"w"))==NULL)
+         {
+             PROG_ID;
+             printf("Fatal Error:  Unable to create %s\n",buffer1);
+             printf("              (Check specified directory/s exist).\n");
+             exit(0);
+         }
+         free(buffer1);    
+     }    
+    
+     if (extract_sprite == YES)
+     {
+       
+         buffer1 = calloc(strlen(dest)+10,sizeof(char));
+         if (buffer1 == NULL)
+         {
+             printf("Fatal Error: - insufficient memory.\n");
+             printf("             - %d more bytes required.\n",strlen(dest)+10);
+             exit(0);
+         }   
+         for (i = 0; i < strlen(dest)+10; buffer[i] = '\0',i++);
+         sprintf(buffer1,"%s.Sprite",dest);
+       
+         if ((file_handle = fopen(buffer1,"w"))==NULL)
+         {
+              PROG_ID;
+              printf("Fatal Error: Unable to create %s\n",buffer1);
+              printf("              (Check specified directory/s exist).\n");
+              exit(0);
+         }
+         fclose(file_handle);  free(buffer1);
+       
+         
+     }         
+    
+     /* sound gets checked in sound function further below. */
+     /* Same with keys and images. */
+
+     /* Record header information for possible extraction of other */
+     /* components later on.                                       */
+     
+     for (i = 0; i <= 20; i++)    
+     {      
+            for (icnt3 = 0; icnt3 < MAX_LINE; buffer[icnt3] = '\0',icnt3++); 
+            buffer_chk = fgets(buffer,MAX_LINE,infile);
+            
+         /* n.b. below: the check strlen(buffer) == 0, if the line has */
+         /* no characters except for a newline then strlen will be 1.  */
+         /* This allows e.g. line 2 to have nothing on it.             */
+         /* The following sprite starts all get interpreted as sprites.*/
+         /* i.e. in none of these cases does extract think it's looking*/
+         /* at a keys offset.                                          */         
+         /*    55567 then a red zero then a newline character.         */ 
+         /*    55567 then a newline character then the rest of the     */
+         /*    sprite.  (This gets caught by the second check in       */
+         /*    CheckValidKeysOffset().                                 */
+         /*    etc.                                                    */
+           
+            if ((strstr(buffer,"\n")) == NULL || strlen(buffer) > MAX_LINE-3 ||
+                 strlen(buffer) == 0)
+            { 
+              if (i != 20)
+              {
+                 PROG_ID;
+                 printf("Fatal Error: - line too long in header or header is incomplete.\n");
+                 printf("             - reading line %d\n",i+1);
+                 printf("             - max. length allowed: %d characters (including spaces).\n",
+                                        MAX_LINE-3);
+                 printf("             - current length of this line is %d.\n",strlen(buffer));
+                 exit(0);
+               }
+               else
+               {  
+                  keys_exist = 0;
+                 *keys_offset = 0;
+               }    
+            } 
+            
+            
+            if (buffer_chk == NULL)
+            {
+                PROG_ID;
+                printf("Fatal Error: - extracting header information.\n");
+                printf("             - data transfer error (from source ARMovie into memory)\n");
+                printf("             - line %d\n",i+1);
+                exit(0);  
+            } 
+           
+            if (extract_header == YES && i <= 13 && keys_exist)
+            {
+               fputs(buffer,header_file_handle);
+            }    
+           
+              if (i == 18)
+              {
+                     *sprite_offset = j = 0;
+                      while (isdigit(buffer[j]))
+                      {
+                             str_sprite_offset[j] = buffer[j];
+                             j++;
+                      }
+                      str_sprite_offset[j] = '\0';
+                     *sprite_offset = atoi(str_sprite_offset);
+              }
+              else
+              if (i == 4)
+              {
+               /* See if the movie contains any image data. */
+               /* (used to prevent accidental generation of */
+               /*  empty image files by the user).          */
+                   if (buffer[0] == '0')
+                   {
+                       *no_image_data = TRUE;
+                   }
+                   else
+                   {
+                       *no_image_data = FALSE; 
+                   }       
+              }
+              if (i == 19)
+              {
+                   
+                 /* Read size of sprite */
+                    *spritesize = j = 0;
+                    while (isdigit(buffer[j]))
+                    {
+                           str_spritesize[j] = buffer[j];
+                           j++;
+                    }
+                    str_spritesize[j] = '\0';
+                    *spritesize = atoi(str_spritesize);
+             }                             
+             else
+             if (i == 11)
+             {
+                 icnt = 0;
+                 while (buffer[icnt] != '|' && buffer[icnt] != '\0' && buffer[icnt] != '\n')
+                 {
+                        if (buffer[icnt] == '1')
+                            stereo[1] = NO;
+                        else if (buffer[icnt] == '2')
+                                 stereo[1] = YES;  
+                        icnt++;  
+                                 
+                 }
+                
+                 j = 2;  /* j is the track no. currently working on. */
+                 
+                 while (buffer[icnt] != '\n' && buffer[icnt] != '\0' && j != tracks)
+                 {        
+                        /* Look for "| (space/s) j", e.g. |2 or |3 or | 2 etc. */
+                        /* Should already be at "|".                           */
+                           
+                           while (!isdigit(buffer[icnt]))
+                           {
+                                   icnt++;
+                           }                
+                          
+                        /* Next digit identifies whether stereo or mono. */
+                           icnt++;
+                           while (!isdigit(buffer[icnt]))
+                           {
+                                   icnt++;
+                           }
+                           
+                           if (buffer[icnt] == '1')
+                               stereo[j] = NO;
+                           else
+                           if (buffer[icnt] == '2')
+                               stereo[j] = YES;
+                           j++;
+                           
+                           icnt++;
+                           while (buffer[icnt] == ' ')
+                           {
+                                  icnt++;
+                           }     
+                 }
+                 
+                 if (j == tracks)
+                 {
+                        /* Look for "| (space/s) j", e.g. |2 or |3 or | 2 etc. */
+                        /* Should already be at "|".                           */
+                           
+                           while (!isdigit(buffer[icnt]))
+                           {
+                                   icnt++;
+                           }                
+                          
+                        /* Next digit identifies whether stereo or mono. */
+                           icnt++;
+                           while (!isdigit(buffer[icnt]))
+                           {
+                                   icnt++;
+                           }
+                           
+                           if (buffer[icnt] == '1')
+                               stereo[j] = NO;
+                           else
+                           if (buffer[icnt] == '2')
+                               stereo[j] = YES;
+                 }    
+                
+             }
+             if (i == 17)
+             {
+                 /* Read catalogue offset (used for extracting keys later) */
+                    *cat_offset = j = 0;
+                    while (isdigit(buffer[j]))
+                    {
+                           str_cat_offset[j] = buffer[j];
+                           j++;
+                    }
+                    str_cat_offset[j] = '\0';
+                    *cat_offset = atoi(str_cat_offset);
+             }
+             else
+             if (i == 14)
+             {
+                /* Read no. of chunks (used for extracting keys later). */
+                   *chunks = 0;
+                   j = 0;
+                   while (isdigit(buffer[j]))
+                   {
+                          str_chunks[j] = buffer[j];
+                          j++;              
+                   }
+                   if (j > 10)
+                   {
+                       printf("Fatal Error: - reading number of chunks in ARMovie.\n");
+                       printf("             - number of chunks exceeds 11 digits.\n");
+                       printf("             - array bounds exceeded.\n");
+                       exit(0);
+                   }    
+                   str_chunks[j] = '\0';
+                   *chunks = atoi(str_chunks);
+             }
+             else
+             if (i == 9)
+             {      
+                 /* Count no. of tracks in source file. This enables  */
+                 /* check to see if user wants to extract soundtracks */
+                 /* that aren't there.                                */
+                    tracks = 0;
+                    
+                    
+                         if (buffer[0] != '0')
+                         {
+                             tracks = 1;
+                             icnt = 0;
+                             for (icnt3 = 0; icnt3 < MAX_LINE; buffer2[icnt3] = '\0',icnt3++);
+                             while (buffer[icnt] != '|' && buffer[icnt] != '\n' && buffer[icnt] != '\0')
+                             {
+                                    buffer2[icnt] = buffer[icnt];
+                                    if (buffer2[icnt] == '2')
+                                        found2 = YES;
+                                    icnt++;
+                             }
+                            
+                             
+                             if (((strstr(buffer2,"Adpcm"))!=NULL) ||
+                                 ((strstr(buffer2,"adpcm"))!=NULL) ||
+                                 ((strstr(buffer2,"ADPCM"))!=NULL))
+                             {
+                                   found_adpcm = YES; 
+                             }    
+                     /*    }   */ 
+                         if (found_adpcm && found2)
+                         {
+                             state_info[1] = YES;
+                         }    
+                      /*   17/3/94 found_adpcm = NO; found2 = NO;   */
+                           for (icnt2 = 0; icnt2 < MAX_LINE; buffer2[icnt2] = '\0',icnt2++);
+                      /*   17/3/94 icnt2 = 0;   */
+                     while(buffer[icnt] != '\n' && buffer[icnt] != '\0')
+                     {   
+                         /* 17/3/94 */ found_adpcm = NO; found2 = NO; icnt2 = 0;
+                         
+                         if (buffer[icnt] == '|')
+                         {
+                             tracks++;
+                             icnt++;
+                         
+                             for (icnt3 = 0; icnt3 < MAX_LINE; buffer2[icnt3] = '\0',icnt3++);
+                             while (buffer[icnt] != '|' && buffer[icnt] != '\n' && buffer[icnt] != '\0')
+                             {
+                                    buffer2[icnt2] = buffer[icnt];
+                                    if (buffer2[icnt2] == '2')
+                                    {
+                                        found2 = YES;
+                                    }    
+                                    icnt++; icnt2++;
+                             }
+                         /*  17/3/94  buffer2[strlen(buffer2)] = '\0'; */
+                           
+                             if (((strstr(buffer2,"Adpcm"))!=NULL) ||
+                                 ((strstr(buffer2,"adpcm"))!=NULL) ||
+                                 ((strstr(buffer2,"ADPCM"))!=NULL))
+                             {
+                                   found_adpcm = YES; 
+                             }    
+                             
+                         }
+                         if (found_adpcm && found2)
+                         {
+                             state_info[tracks] = YES;
+                         }        
+                    }
+                    
+                 } /* end of if buffer[0] != '0' */   
+                  
+                    if (extract_everything)
+                    {   
+                        *sound_files = tracks;
+                         for (j = 1; j <= tracks; source_info[j].track_no=j,j++);
+                    }     
+             } 
+             else
+             if (i == 12)
+             {
+                 bits_per_sample=calloc(tracks+10,4); 
+                 if (bits_per_sample == NULL)
+                 {
+                     PROG_ID;
+                     printf("Fatal Error: insufficient memory.\n");
+                     printf("             %d more bytes required.\n",(tracks+1)*4);
+                     exit(0);
+                 }
+                 for (j = 0; j < 15; str_bps[j] = '\0', j++);
+                 j = 0; st = 0; jj = 0;
+                
+                 while (isdigit(buffer[j]))
+                 {      
+                        str_bps[j] = buffer[j]; j++;
+                 }
+                 str_bps[j] = '\0';  
+                 bits_per_sample[st] = atoi(str_bps); st++;
+                 
+                 while (st < tracks)
+                 {
+                        jj = 0;
+                        while (buffer[j] != '|') 
+                        {      
+                               j++; 
+                        }       
+                        j++;
+                        while (isdigit(buffer[j])) 
+                        {
+                               j++;
+                        }       
+                        while (!isdigit(buffer[j])) 
+                        { 
+                               j++;
+                        }       
+                       
+                        while (isdigit(buffer[j]))
+                        {
+                               str_bps[jj] = buffer[j];
+                               j++; jj++;
+                        }
+                        str_bps[jj] = '\0';
+                        bits_per_sample[st] = atoi(str_bps); st++;
+                 }                           
+             }
+             else
+             if (i == 20 && keys_exist)
+             {
+                 *keys_offset = j = 0;
+                 while (isdigit(buffer[j]))
+                 {
+                        str_keys_offset[j] = buffer[j];
+                        j++;
+                 }
+                 str_keys_offset[j] = '\0';
+   
+                 if (j != 0)
+                 {
+                     *keys_offset = atoi(str_keys_offset);
+                 }
+                 
+                 /* If there are no keys, keys_offset is zero. */       
+                    
+             }
+            
+   }    
+   
+   fclose(infile);
+   return tracks;           
+}
+/*-----------------------------------------------------------------------------*/
+void CheckAllTracksExist(int tracks, int sound_files)
+{int j;
+
+ 
+   for (j = 1; j <= sound_files; j++)
+   {
+        if (source_info[j].track_no > tracks)
+        {   
+            PROG_ID;
+            printf("Fatal Error: %s does not have a track %d.\n",
+                         source_info[1].source_file, source_info[j].track_no);
+            printf("              Number of soundtracks in ARMovie (source) file: %d\n",tracks); 
+            all_tracks_exist = NO;               
+            exit(0);
+        }
+        else
+        if (source_info[j].track_no == 0)
+        {
+            PROG_ID;
+            printf("Fatal Error: Sound tracks are numbered 1 to n.\n");
+            printf("             The first sound track will be 1, not zero.\n");
+            all_tracks_exist = NO;
+            exit(0);
+        }    
+        else
+            all_tracks_exist = YES;
+   }
+  
+}                         
+/*------------------------------------------------------------------------------*/
+void ExtractSprite(int sprite_offset,int spritesize)
+{
+ byte *sprite_buffer; char *spritefile;  
+ int unread = 0;
+ int unwritten;   
+ int i;
+       
+       /* Move Armovie file pointer */
+       /* to sprite offset.         */
+          if ((error = xosargs_set_ptr(source_file_handle,sprite_offset)) != NULL)
+          {
+               PROG_ID;
+               printf("Fatal Error: cannot movie file pointer to sprite offset ");
+               printf("             %d\n",sprite_offset);
+               exit(0);
+          }      
+    
+          
+        sprite_buffer = malloc(spritesize);      /* Create sprite buffer in   */
+        if (sprite_buffer == NULL)               /* memory.                   */
+        {
+            PROG_ID;
+            printf("Fatal Error:  insufficient memory.\n");
+            printf("              %d more bytes required.\n",spritesize);
+            exit(0);
+        } 
+     
+        /* Read sprite from ARmovie into sprite buffer. */
+           if ((error = xosgbpb_read(source_file_handle,sprite_buffer,
+                                     spritesize,&unread)) != NULL)
+           {
+                PROG_ID;
+                printf("Fatal Error: - reading sprite from ARMovie into memory.\n");
+                printf("             - memory allocation was successful.\n");
+                printf("             - using xosgbpb_read().\n");
+                exit(0);
+           }                               
+           if (unread != 0)
+           {
+               PROG_ID;
+               printf("Fatal Error: - reading sprite from ARMovie into memory.\n");
+               printf("             - memory allocation was successful.\n");
+               printf("             - using xosgbpb_read().\n");
+               printf("             - size of sprite = %d bytes.\n",spritesize);
+               printf("             - %d bytes not transferred.\n",unread);
+               exit(0);
+           }    
+           
+          
+        /* Create a new sprite file. */ 
+           spritefile = calloc(strlen(dest)+10,sizeof(char));
+           if (spritefile == NULL)
+           {
+               PROG_ID;
+               printf("Fatal Error: - insufficient memory.\n");
+               printf("             - extracting sprite.\n");
+               printf("             - %d more bytes required.\n",strlen(dest)+10);
+               exit(0);
+           }      
+           for (i = 0; i < strlen(dest)+10;spritefile[i] = '\0',i++);
+           sprintf(spritefile,"%s.Sprite",dest);    
+           if ((error = xosfind_openout(0x7, spritefile,
+                                        &sprite_file_handle)) != NULL)
+           {
+                PROG_ID;
+                printf("Fatal Error: cannot create %s.\n",spritefile);
+                exit(0);
+           }        
+           
+        /* Transfer sprite from sprite buffer to the new sprite file. */
+           if ((error = xosgbpb_write(sprite_file_handle,
+                                      sprite_buffer,
+                                      spritesize,&unwritten)) != NULL)
+           {
+                PROG_ID;
+                printf("Disk Full\n");
+                exit(0);
+           }     
+           if (unwritten != 0)
+           {
+               PROG_ID;
+               printf("Disk Full\n");
+               exit(0);
+           } 
+     
+        if ((error = xosfile_set_type(spritefile,0xFF9)) != NULL)
+        {
+             PROG_ID;
+             printf("Fatal Error: - unable to set sprite file type.\n");
+             printf("             - using xosfile_set_type().\n");
+             exit(0);
+        }     
+      
+        free(spritefile); 
+        
+        /* No need to close any files at this point.  File closure is handled */
+        /* by an exception handler set up at the beginning of main().         */
+        
+}        
+/*----------------------------------------------------------------------------*/  
+void ExtractKeys(int keys_offset, int cat_offset,int chunks)
+{int finish = FALSE, i,j; 
+ char *create_keys_dir,*buffer,*filename;
+ FILE *fptr, *file_handle;
+ byte *keys_buffer;
+ int next_keys_offset;      
+ int directory = 0;
+ int unread = 0;
+ int unwritten;
+ int i2;
+ 
+   /* Create a Keys directory. */
+   /* If this directory already exists, the call will be ignored and contents */
+   /* of the Keys directory left untouched.                                   */
+   
+      create_keys_dir = calloc(strlen(dest)+25,sizeof(char));
+      if (create_keys_dir == NULL)
+      {
+          PROG_ID;
+          printf("Fatal Error: - insufficient memory.\n");
+          printf("             - extracting keys.\n");
+          printf("             - %d more bytes required.\n",strlen(dest)+25);
+          exit(0);
+      } 
+      for (i = 0; i < strlen(dest)+25; create_keys_dir[i] = '\0',i++);   
+      sprintf(create_keys_dir,"%s.Keys%d",dest,directory);
+  
+      if ((error = xosfile_create_dir(create_keys_dir,0)) != NULL)
+      {
+           PROG_ID;
+           printf("Fatal Error: - attempting to create keys directory.\n");
+           printf("             - %s\n",create_keys_dir);
+           printf("             - if directory already exists this would not cause an error.");
+           exit(0);
+      }     
+
+  
+      free(create_keys_dir);
+      
+     buffer = calloc(strlen(dest)+25,sizeof(char));
+     if (buffer == NULL)
+     {
+         PROG_ID;
+         printf("Fatal Error: - insufficient memory.\n");
+         printf("             - extracting keys.\n");
+         printf("             - %d more bytes required.\n",strlen(dest)+25);
+         exit(0);
+     }     
+     for (i = 0; i < strlen(dest)+25;buffer[i] = '\0',i++);
+     sprintf(buffer,"%s.Keys0.00",dest);
+     if ((file_handle = fopen(buffer,"w"))==NULL)
+     {
+          PROG_ID;
+          printf("Fatal Error: Unable to create %s\n",buffer);
+          printf("              (Check specified path exists).\n");
+          exit(0);
+      }
+      fclose(file_handle);    free(buffer);
+     
+      /* Get rid of currently existing keys files. */
+    
+         j = 0;
+         for (i = 0; finish == FALSE; i++)
+         {   
+              if (j == 77)
+              {
+                  directory++;
+                  j = 0;
+                  /* Create another directory */
+                  create_keys_dir = calloc(strlen(dest)+25,sizeof(char));
+                  if (create_keys_dir == NULL)
+                  {
+                      PROG_ID;
+                      printf("Fatal Error: - insufficient memory.\n");
+                      printf("             - extracting keys.\n");
+                      printf("             - %d more bytes required.\n",strlen(dest)+25);
+                      exit(0);
+                  }    
+                  
+                  for (i2 = 0; i2 < strlen(dest)+25;create_keys_dir[i2] = '\0',i2++);
+                  sprintf(create_keys_dir,"%s.Keys%d",dest,directory);
+  
+                  if ((error = xosfile_create_dir(create_keys_dir,0)) != NULL)
+                  {
+                       PROG_ID;
+                       printf("Fatal Error:  - attempting to create keys directory.\n");
+                       printf("              - %s\n",create_keys_dir);
+                       printf("              - if directory already exists this would not ");
+                       printf("cause an error.\n");
+                       exit(0);
+                  }     
+                  
+                  
+                  free(create_keys_dir);
+              }    
+              buffer = calloc(strlen(dest)+35,sizeof(char));
+              if (buffer == NULL)
+              {
+                  PROG_ID;
+                  printf("Fatal Error: - insufficient memory.\n");
+                  printf("             - extracting keys.\n");
+                  printf("             - %d more bytes required.\n",strlen(dest)+35);
+                  exit(0);
+              }     
+              for (i2 = 0; i2 < strlen(dest)+35; buffer[i2] = '\0',i2++);
+              sprintf(buffer,"%s.Keys%d.%02i",dest,directory,j);
+             
+              if ((fptr = fopen(buffer,"r")) != NULL)
+              {
+                /* Delete keys file */
+                   fclose(fptr);
+                   
+                   if ((error = xosfile_delete(buffer,NULL,NULL,NULL,NULL,NULL)) != NULL)
+                   {
+                        PROG_ID;
+                        printf("Fatal Error: - extracting keys.\n");
+                        printf("             - cannot delete old keys file.\n");
+                        printf("             - file: %s\n",buffer);
+                        exit(0);
+                   }     
+                   j++;
+              }
+              else
+              {
+                   finish = TRUE;
+              }
+              free(buffer);     
+         }                
+         
+      /* Generate new key files. */
+      
+            /* Move pointer to keys offset. */
+               if ((error = xosargs_set_ptr(source_file_handle,keys_offset)) != NULL)
+               {
+                    PROG_ID;
+                    printf("Fatal Error: - extracting keys.\n");
+                    printf("             - cannot move file pointer to keys offset %d\n",
+                                           keys_offset);
+                    printf("             - keys offset is %d\n",keys_offset);
+                    printf("             - using xosargs_set_ptr().\n");                       
+                    exit(0);
+               }
+               next_keys_offset = keys_offset;     
+         
+            
+            directory = j = 0;
+            
+            for (i = 0; i <= chunks-1; i++)
+            {
+                 if (j == 77)
+                 {
+                     directory++;
+                     j = 0;
+                     /* Create another directory */
+                     create_keys_dir = calloc(strlen(dest)+25,sizeof(char));
+                     if (create_keys_dir == NULL)
+                     {
+                         PROG_ID;
+                         printf("Fatal Error: - insufficient memory.\n");
+                         printf("             - extracting keys.\n");
+                         printf("             - %d more bytes required.\n",strlen(dest)+25);
+                         exit(0);
+                     }    
+                     for (i2 = 0; i2 < strlen(dest) + 25; create_keys_dir[i2] = '\0',i2++);
+                     sprintf(create_keys_dir,"%s.Keys%d",dest,directory);
+  
+                     if ((error = xosfile_create_dir(create_keys_dir,0)) != NULL)
+                     {
+                          PROG_ID;
+                          printf("Fatal Error: - attempting to create keys directory.\n");
+                          printf("             - %s\n",create_keys_dir);
+                          printf("             - if directory already exists this would not ");
+                          printf("cause an error.\n");
+                          exit(0);
+                     }     
+                     
+                     
+                     free(create_keys_dir);
+                 }   
+                 filename = calloc(strlen(dest)+25,sizeof(char));
+                 if (filename == NULL)
+                 {
+                     PROG_ID;
+                     printf("Fatal Error: - insufficient memory.\n");
+                     printf("             - extracting keys.\n");
+                     printf("             - %d more bytes required.\n",strlen(dest)+25);
+                     exit(0);
+                 }     
+                 for (i2 = 0; i2 < strlen(dest) + 25; filename[i2] = '\0',i2++);
+                 sprintf(filename,"%s.Keys%d.%02i",dest,directory,j);
+                 
+                 
+                 /* Create keys file. */
+                    if ((error = xosfind_openout(osfind_ERROR_IF_ABSENT |osfind_ERROR_IF_DIR,
+                                                filename,
+                                                &keys_file_handle)) != NULL)
+                    {
+                         PROG_ID;
+                         printf("Fatal Error:  - cannot create %s\n",filename);
+                         printf("              - check specified path exists.\n");
+                         exit(0);
+                    }                                    
+                
+                 
+                    
+                 /* Create a keys buffer in memory. */
+                    keys_buffer = (void *)malloc((cat_offset - keys_offset)/chunks);
+                    if (keys_buffer == NULL)
+                    {
+                        PROG_ID;
+                        printf("Fatal Error:  - extracting keys.\n");
+                        printf("              - insufficient memory.\n");
+                        printf("              - %d more bytes required.\n",
+                                    (cat_offset - keys_offset)/chunks);
+                        exit(0);
+                    }    
+                    
+                  /* Transfer keys from source file into keys buffer. */
+                     if ((error = xosgbpb_read(source_file_handle,
+                                               keys_buffer,
+                                               (cat_offset-keys_offset)/chunks,
+                                               &unread)) != NULL)
+                     {    
+                          PROG_ID;
+                          printf("Fatal Error: - reading keys from ARMovie into memory.\n");
+                          printf("             - memory allocation was successful.\n");
+                          printf("             - using xosgbpb_read().\n");
+                          printf("             - size of keys file = %d bytes.\n",
+                                                 (cat_offset-keys_offset)/chunks);
+                          exit(0);
+                     }                        
+                     if (unread != 0)
+                     {
+                         PROG_ID;
+                         printf("Fatal Error: - reading keys from ARMovie into memory.\n");
+                         printf("             - memory allocation was successful.\n");
+                         printf("             - using xosgbpb_read().\n");
+                         printf("             - size of keys file = %d bytes.\n",
+                                                 (cat_offset-keys_offset)/chunks);
+                         printf("             - %d bytes not transferred.\n",unread);                         
+                         exit(0);
+                     }      
+                  
+                    
+                    
+                 /* Write keys info. from keys buffer out to keys file. */
+                    if ((error = xosgbpb_write(keys_file_handle,
+                                               keys_buffer,
+                                               (cat_offset-keys_offset)/chunks,
+                                               &unwritten)) != NULL)
+                    {
+                         PROG_ID;
+                         printf("Disk Full\n");
+                         exit(0);
+                    }                            
+                    if (unread != 0)
+                    {
+                        PROG_ID;
+                        puts("Disk Full");
+                        exit(0);
+                    } 
+                                                        
+                    
+                 /* Close keys file. If user interrupts program execution, */
+                 /* file closure will be handled by exception handler.     */
+                    if ((error = xosfind_close(keys_file_handle)) != NULL)
+                    {
+                         PROG_ID;
+                         printf("Warning: - extracting keys.\n");
+                         printf("         - cannot close new keys file.\n");
+                    }     
+                    keys_file_handle = 0;                              
+                    
+                    j++;
+                    
+                 /* Move source file keys ptr to next keys chunk */ 
+                    next_keys_offset = next_keys_offset + ((cat_offset-keys_offset)/chunks);
+                    if ((error = xosargs_set_ptr(source_file_handle,
+                                                 next_keys_offset)) != NULL)
+                    {
+                         PROG_ID;
+                         printf("Fatal Error: - extracting keys.\n");
+                         printf("             - cannot movie source file pointer ");
+                         printf("to next keys chunk at offset %d\n",next_keys_offset);
+                         printf("             - using xosargs_set_ptr().\n");
+                         exit(0);
+                    }
+                    free(keys_buffer);  free(filename);                                  
+                    
+            }
+}                        
+/*--------------------------------------------------------------------------------*/
+int CheckValidKeysOffset(int keys_offset,int sprite_offset, int spritesize)
+{FILE *cat_fptr; 
+ int j, i2;
+ char buffer[MAX_LINE];
+ int image_start_pos;
+ int cat_offset;
+    
+    if ((cat_fptr = fopen(source_info[1].source_file,"r")) == NULL)
+    {
+         PROG_ID;
+         printf("Fatal Error: - could not open ARMovie %s\n",
+                                source_info[1].source_file);
+         exit(0);
+    }
+    
+    for (j = 1; j <= 17; j++)
+    {
+         for (i2 = 0; i2 < MAX_LINE; buffer[i2] = '\0',i2++);
+         fgets(buffer,MAX_LINE,cat_fptr);
+         if ((strstr(buffer,"\n")) == NULL ||  
+              strlen(buffer) == 0 || 
+              strlen(buffer) > MAX_LINE - 3)
+         {
+              PROG_ID;
+              printf("Fatal Error: - line too long in header or header is incomplete.\n");
+              printf("             - expecting new line character.\n");
+              printf("             - max. length allowed (including spaces): %d characters.\n",
+                                     MAX_LINE - 3);
+              printf("             - line length is currently %d\n",strlen(buffer));
+              printf("             - reading line %d\n",j);
+              exit(0);
+         }
+     }    
+     fscanf(cat_fptr,"%ld",&cat_offset);
+     fseek(cat_fptr,cat_offset,SEEK_SET);
+     fscanf(cat_fptr,"%ld",&image_start_pos);                                                             
+
+     /* Now have all the info. necessary to do the check. */
+     
+        if (keys_offset < image_start_pos && 
+            keys_offset >= sprite_offset + spritesize)
+        {
+            /* Let it through - it's extremely unlikely to be invalid. */
+            /* n.b. at this stage it has also been thru. other checks  */
+            /* made in OpenSourceFile().                               */
+            /* n.b. also see comments at top of program.               */
+            
+               return keys_offset;
+        }
+        else
+        {
+            /* Keys offset is at a stupid position.  Therefore assume */
+            /* that it's not the keys offset but is actually the      */
+            /* start of the friendly sprite.                          */
+                   
+               return 0;  /* gets returned into keys_offset. */
+        }           
+}
+/*--------------------------------------------------------------------------------*/
+struct cat_info * BuildList(struct cat_info *ci,
+                             struct cat_info *head,int i,int chunks)
+{FILE *cat_fptr; struct video *vc; struct sound_chunk_sizes *sc;
+ char buffer[MAX_LINE]; int cat_offset; int j; char ch; int track = 1;
+ int j2;
+ 
+   if ((cat_fptr = fopen(source_info[1].source_file,"r"))==NULL)
+   {
+        PROG_ID;
+        printf("Fatal Error: - building sound info list.\n");
+        printf("             - Unable to read ARMovie %s\n",source_info[i].source_file);
+        exit(0);
+   }
+ 
+   /* Get no. of chunks in movie file (so know when to */
+   /* stop reading cat. info).                         */
+   
+  
+   for (j = 1; j <= 14; j++)
+   {
+        for (j2 = 0; j2 < MAX_LINE; buffer[j2] = '\0',j2++);
+        fgets(buffer,MAX_LINE,cat_fptr);
+        if ((strstr(buffer,"\n")) == NULL ||
+             strlen(buffer) == 0 ||
+             strlen(buffer) > MAX_LINE - 3)
+        {
+             PROG_ID;
+             printf("Fatal Error: - line too long in header.\n");
+             printf("             - max length allowed: %d characters (including spaces).\n",
+                                    MAX_LINE - 3);
+             printf("             - or else incomplete header.\n");
+             exit(0);
+        }                            
+   }
+   fscanf(cat_fptr,"%ld",&chunks); chunks++;
+   
+   /* Get cat. offset. */
+   
+   rewind(cat_fptr);
+   for (j = 1; j <= 17; fgets(buffer,MAX_LINE,cat_fptr),j++);
+  
+   fscanf(cat_fptr,"%ld",&cat_offset);
+   fseek(cat_fptr,cat_offset,SEEK_SET);
+   
+   /* cat_fptr now ready to start reading cat info */
+       
+   head = (struct cat_info *)malloc(sizeof(struct cat_info));
+   if (head == NULL)
+   {
+       PROG_ID;
+       printf("Fatal Error: - building sound info list.\n");
+       printf("             - insufficient memory.\n");
+       printf("             - %d more bytes required.\n",sizeof(struct cat_info));
+       exit(0);
+   }    
+   head->v = (struct video *)malloc(sizeof(struct video));
+   if (head->v == NULL)
+   {
+       PROG_ID;
+       printf("Fatal Error: - building sound info. list.\n");
+       printf("             - insufficient memory.\n");
+       printf("             - %d more bytes required.\n",sizeof(struct cat_info));
+       exit(0);
+   }    
+   head->v->vlink = NULL;
+   head->scs = (struct sound_chunk_sizes *)
+                malloc(sizeof(struct sound_chunk_sizes));
+   if (head->scs == NULL)
+   {
+       PROG_ID;
+       printf("Fatal Error: - building sound info list.\n");
+       printf("             - insufficient memory.\n");
+       printf("             - %d more bytes required.\n",sizeof(struct sound_chunk_sizes));
+       exit(0);
+   }                 
+   head->scs->slink = NULL;
+   
+   vc = head->v;  sc = head->scs;
+   
+   fscanf(cat_fptr,"%ld",&vc->isp);
+   
+   ch = fgetc(cat_fptr); 
+   fscanf(cat_fptr,"%ld",&vc->vds);
+   
+   ch = fgetc(cat_fptr);
+   
+   fscanf(cat_fptr,"%ld",&sc->size);
+   sc->track = track;
+   
+   ch = fgetc(cat_fptr);
+  
+   while (ch != '\n')
+   {
+   
+          if (ch == '|')
+          {
+              track++;
+              while (ch != ' ')
+              {
+                     ch = fgetc(cat_fptr);
+              }       
+          }
+   
+          sc->slink = (struct sound_chunk_sizes *)malloc(sizeof(struct sound_chunk_sizes));
+          if (sc->slink == NULL)
+          {
+              PROG_ID;
+              printf("Fatal Error: - building sound info list.\n");
+              printf("             - insufficient memory.\n");
+              printf("             - %d more bytes required.\n",sizeof(struct sound_chunk_sizes));
+              exit(0);
+          }    
+          sc = sc->slink;
+          sc->track = track;
+          fscanf(cat_fptr,"%ld",&sc->size);
+          sc->slink = NULL;
+          ch = fgetc(cat_fptr);
+   }       
+       
+   for (j = 2; j <= chunks; j++)
+   {
+        vc->vlink = (struct video *)malloc(sizeof(struct video));
+        if (vc->vlink == NULL)
+        {
+            PROG_ID;
+            printf("Fatal Error: - building sound info list.\n");
+            printf("             - insufficient memory.\n");
+            printf("             - %d more bytes required.\n",sizeof(struct video));
+            exit(0);
+        }    
+        vc = vc->vlink;
+        fscanf(cat_fptr,"%ld",&vc->isp);
+        ch = fgetc(cat_fptr);
+        fscanf(cat_fptr,"%ld",&vc->vds);
+        ch = fgetc(cat_fptr);
+        vc->vlink = NULL;
+      
+        track = 1;
+        
+        while (ch != '\n')
+        {
+               if (ch == '|')
+               {
+                   track++;
+                   while (ch != ' ')
+                   {
+                          ch = fgetc(cat_fptr);
+                   }       
+               }
+       
+               sc->slink = (struct sound_chunk_sizes *)
+                            malloc(sizeof(struct sound_chunk_sizes));
+               if (sc->slink == NULL)
+               {
+                   PROG_ID;
+                   printf("Fatal Error: - building sound info list.\n");
+                   printf("             - insufficient memory.\n");
+                   printf("             - %d more bytes required.\n",
+                                         sizeof(struct sound_chunk_sizes));
+                   exit(0);
+               }                 
+               sc = sc->slink;
+               sc->track = track;
+               fscanf(cat_fptr,"%ld",&sc->size);
+               sc->slink = NULL;
+               ch = fgetc(cat_fptr);
+         }
+                 
+   }            
+  
+
+   fclose(cat_fptr);
+   return head;
+}
+/*--------------------------------------------------------------------*/  
+void CreateSoundFile(struct cat_info *head,int i,int chunks,
+          int *numbering_of_sound_files, int *numbering_of_sample_files,
+          int *numbering_of_adpcm_files)
+
+{char *buffer;
+ char str_i[5];
+ struct video *vc;
+ struct sound_chunk_sizes *sc;
+ int start_pos;
+ int j;     
+ byte *sound_buffer;
+ FILE *file_handle;
+ char *ptr;
+ int unread = 0;
+ int unwritten;
+    
+    
+    buffer = calloc(strlen(dest)+25,sizeof(char));
+    if (buffer == NULL)
+    {
+        PROG_ID;
+        printf("Fatal Error: - insufficient memory.\n");
+        printf("             - creating sound file.\n");
+        printf("             - %d more bytes required.\n",strlen(dest)+25);
+        exit(0);
+    }    
+    
+    for (j = 0; j < strlen(dest)+25;buffer[j] = '\0',j++);
+    
+    if (bits_per_sample[source_info[i].track_no-1] == 8)
+    {
+        sprintf(buffer,"%s.Sound",dest);
+        if (*numbering_of_sound_files > 1)
+        {
+            for (j = 0; j < 5; str_i[j] = '\0',j++);
+            sprintf(str_i,"%d",*numbering_of_sound_files);
+            strcat(buffer,str_i);
+        }    
+        (*numbering_of_sound_files)++;
+    }    
+    else if (bits_per_sample[source_info[i].track_no-1] == 16)
+         {
+             sprintf(buffer,"%s.Samples",dest);
+             if (*numbering_of_sample_files > 1)
+             {
+                 for (j = 0; j < 5; str_i[j] = '\0',j++);
+                 sprintf(str_i,"%d",*numbering_of_sample_files);
+                 strcat(buffer,str_i);
+             }
+             (*numbering_of_sample_files)++;
+         }    
+         else if (bits_per_sample[source_info[i].track_no-1] == 4)
+              {
+                  for (j = 0; j < 5; str_i[j] = '\0',j++);
+                  sprintf(buffer,"%s.Adpcm",dest);
+                  if (*numbering_of_adpcm_files > 1)
+                  {
+                      sprintf(str_i,"%d\0",*numbering_of_adpcm_files);
+                      strcat(buffer,str_i);
+                  } 
+                  (*numbering_of_adpcm_files)++;
+              }   
+              else
+                  {
+                    PROG_ID;
+                    printf("Fatal Error: - invalid number of bits per sample in source\n");
+                    printf("               ARMovie (header section).\n");
+                    printf("             - bits per sample read as %d\n",bits_per_sample[i-1]);
+                    printf("             - bits per sample should be 4, 8, or 16\n");
+                    exit(0);
+                  } 
+                                
+  
+       if ((file_handle = fopen(buffer,"w"))==NULL)
+       {
+            PROG_ID;
+            printf("Fatal Error: - unable to create sound file %s\n",buffer);
+            printf("               (check specified path exists).\n");
+            exit(0);
+       }
+       fclose(file_handle);
+  
+    /* Create new sound file. */
+       if ((error = xosfind_openout(osfind_ERROR_IF_ABSENT |
+                                    osfind_ERROR_IF_DIR,
+                                    buffer,
+                                    &sound_file_handle)) != NULL)
+       {
+            PROG_ID;
+            printf("Fatal Error: - unable to create sound file %s\n",buffer);
+            exit(0);
+       }     
+       
+       if (sound_file_handle == 0)
+       {
+           PROG_ID;
+           printf("Fatal Error: Unable to create sound file %s\n",buffer);
+           exit(0);
+       } 
+       
+       
+    /* Write out a single (dummy) character to the sound file. */
+    /* (This is because join discards the first character when */
+    /* reading in the original data. If this is not done,      */
+    /* bincomp complains - the difference being at the first   */
+    /* character which exists in the original but not in the   */
+    /* extracted data because join discarded it.               */
+    /* Also, if this is not done, after each extract, if the   */
+    /* extracted data is used by join again, more and more     */
+    /* sound data will end up being lost).                     */
+       
+       if (((ptr = strstr(buffer,"Samples")) == NULL )  &&
+          ((ptr = strstr(buffer,"Adpcm")) == NULL))
+       {
+            if ((error = xos_bput(0,sound_file_handle)) != NULL)
+            {
+                 PROG_ID;
+                 printf("Fatal Error: - extracting sound.\n");
+                 printf("             - unable to write leading zero out to ");
+                 printf("new sound file.\n");
+                 printf("             - using xos_bput()\n");
+                 exit(0);
+            } 
+                 
+       }
+       
+    vc = head->v;
+    sc = head->scs;
+                                
+    for (j = 1; j <= chunks+1; j++)
+    {     
+         start_pos = vc->isp + vc->vds;
+       
+         vc = vc->vlink;
+         
+         while (source_info[i].track_no != sc->track)
+         {    
+                if (sc->track < source_info[i].track_no)
+                {
+                    start_pos = start_pos + sc->size;
+                   
+                }    
+                sc = sc->slink;
+         }       
+         
+         if (state_info[source_info[i].track_no] && !stereo[source_info[i].track_no] 
+             && sc->size != 0)      /* bug fix */
+         {
+          /* Want to discard first 4 bytes of 'sound' info. */
+          
+             start_pos = start_pos + 4;
+            
+             sc->size = sc->size - 4;
+         }  
+         else
+         if (state_info[source_info[i].track_no] && stereo[source_info[i].track_no] 
+             && sc->size != 0)       /* bug fix */
+         {
+             start_pos = start_pos + 8;
+             sc->size = sc->size - 8;  /* 18/4/94 */
+         }                 
+        
+         
+         /* Move file pointer to sound track starting position. */
+            if ((error = xosargs_set_ptr(source_file_handle,
+                                         start_pos)) != NULL)
+            {
+                 PROG_ID;
+                 printf("Fatal Error: - extracting sound.\n");
+                 printf("             - cannot move source file pointer to sound\n");
+                 printf("               track start position at offset %d.\n",start_pos);
+                 exit(0);
+            }                                     
+         
+         /* Read sc->size amount of sound data into memory.  n.b. it's    */
+         /* possible that sc->size may be zero if there was insufficient  */
+         /* sound in a video movie.  This must be allowed for otw malloc  */
+         /* returns as an error saying 0 bytes more required.             */
+         
+      if (sc->size != 0)
+      {     
+           sound_buffer = malloc(sc->size);
+           if (sound_buffer == NULL)
+           {
+               PROG_ID;
+               printf("Fatal Error: - extracting sound.\n");
+               printf("             - insufficient memory.\n");
+               printf("             - %d more bytes required.\n",sc->size);
+               exit(0);
+           }    
+           
+           if ((error = xosgbpb_read(source_file_handle,
+                                     sound_buffer,
+                                     sc->size,
+                                     &unread)) != NULL)
+           {
+                PROG_ID;
+                printf("Fatal Error: - reading sound data into memory.\n"); 
+                printf("             - xosgbpb_read().\n");
+                printf("             - allocation of memory was successful.\n");
+                exit(0);
+           }                              
+           if (unread != 0)
+           {
+               PROG_ID;
+               printf("Fatal Error: - reading sound data into memory.\n"); 
+               printf("             - xosgbpb_read().\n");
+               printf("             - allocation of memory was successful.\n");
+               printf("             - %d bytes not transferred.\n",unread);
+               exit(0);
+           }    
+ 
+        
+           
+         /* Write sound data in memory out to sound file. */
+            if ((error = xosgbpb_write((int)sound_file_handle,
+                                       sound_buffer,
+                                       sc->size,
+                                       &unwritten)) != NULL)
+            {
+                 PROG_ID;
+                 puts("Disk Full.");
+                 exit(0);
+            }                                
+            if (unwritten != 0)
+            {
+                PROG_ID;
+                puts("Disk Full\n");
+                exit(0);
+            }    
+       
+         free(sound_buffer);
+      
+      } /* End of if sc->size is zero. */
+         
+      sc = sc->slink; 
+        
+    } 
+    
+         
+    
+    /* Close sound file.  If user interrupts program execution, any */
+    /* open sound files are closed by exception handler.            */
+       if ((error = xosfind_close(sound_file_handle)) != NULL)
+       {
+            PROG_ID;
+            printf("Warning: unable to close new sound file.\n");
+            exit(0);
+       }     
+       sound_file_handle = 0;
+    
+    /* 0xFFD = DATA */
+    if ((error = xosfile_set_type(buffer,0xFFD)) != NULL)
+    {
+         PROG_ID;
+         printf("Fatal Error: - unable to set sound file type.");
+         exit(0);
+    }     
+    
+    free(buffer); 
+}
+/*--------------------------------------------------------------------*/
+void FreeList(struct cat_info *head)
+{struct video *vc, *vtemp; struct sound_chunk_sizes *sc, *stemp;
+ 
+   vc = head->v;  sc = head->scs;
+   
+   while (vc != NULL)
+   {
+          vtemp = vc; vc = vc->vlink; 
+          free(vtemp);
+   }
+   
+   while (sc != NULL)
+   {
+          stemp = sc;   sc = sc->slink;    
+          free(stemp);
+   }              
+}
+/*---------------------------------------------------------------------------*/  
+
+struct video * BuildImageList(struct video *images, 
+                                struct video *ihead,int chunks)
+                               
+{FILE *cat_fptr; struct video *vc; int cat_offset; char ch;
+ char buffer[MAX_LINE];
+ int i2;
+ int j;
+ 
+      if ((cat_fptr = fopen(source_info[1].source_file,"r")) == NULL)
+      { 
+           PROG_ID;
+           printf("Fatal Error: - building image list.\n");
+           printf("             - unable to read ARMovie %s\n",source_info[1].source_file);
+           exit(0);
+      }
+      
+      /* Get no. of chunks in movie file (so know when to stop 
+         cat info).                                            */
+                                               
+       for (j = 1; j <= 18;j++)
+       {
+            for (i2 = 0; i2 < MAX_LINE;buffer[i2] = '\0',i2++);
+            fgets(buffer,MAX_LINE,cat_fptr);
+            if ((strstr(buffer,"\n"))==NULL)
+            {
+                 PROG_ID;
+                 printf("Fatal Error: - line too long in header.\n");
+                 printf("              - or incomplete header.\n");
+                 printf("              - expecting new line character.\n");
+                 printf("              - max. length allowed: %d characters.\n",MAX_LINE-3);
+                 printf("              - (including spaces).\n");
+                 exit(0);
+            }     
+            if (j == 14)
+            {
+                fscanf(cat_fptr,"%ld",&chunks); 
+                chunks++; 
+            } 
+            if (j == 17)
+            {
+                fscanf(cat_fptr,"%ld",&cat_offset);
+            }        
+       }
+       
+       fseek(cat_fptr,cat_offset,SEEK_SET);
+     
+   
+       /* cat_fptr now ready to start reading cat info */
+       
+       ihead = (struct video *)malloc(sizeof(struct video));
+       if (ihead == NULL)
+       {
+           PROG_ID;
+           printf("Fatal Error: - building image info. list.\n");
+           printf("             - insufficient memory.\n");
+           printf("             - %d more bytes required.\n",sizeof(struct video));
+           exit(0);
+       }    
+       fscanf(cat_fptr,"%ld",&ihead->isp);
+      
+       ch = fgetc(cat_fptr);
+       fscanf(cat_fptr,"%ld",&ihead->vds);
+       ch = fgetc(cat_fptr);
+       ihead->vlink = NULL;
+       
+       while (ch != '\n') 
+       {     
+              ch = fgetc(cat_fptr);
+       }       
+              
+       vc = ihead;
+     
+       for (j = 2; j <= chunks; j++)
+       {
+            vc->vlink = (struct video *)malloc(sizeof(struct video));
+            if (vc->vlink == NULL)
+            {
+                PROG_ID;
+                printf("Fatal Error: - building image info list.\n");
+                printf("             - insufficient memory.\n");
+                printf("             - %d more bytes required.\n",sizeof(struct video));
+                exit(0);
+            }    
+            vc = vc->vlink; fscanf(cat_fptr,"%ld",&vc->isp);
+            ch = fgetc(cat_fptr); fscanf(cat_fptr,"%ld",&vc->vds);
+            ch = fgetc(cat_fptr); vc->vlink = NULL;
+            while (ch != '\n' && j != chunks) 
+            { 
+                   ch = fgetc(cat_fptr);
+            }       
+       }
+       fclose(cat_fptr);
+       return ihead;
+}
+/*----------------------------------------------------------------------------*/
+void CreateImageFiles(struct video *head)
+{int finish=FALSE,i,j,directory=0;
+ void *image_buffer;
+ char *buffer,*create_images_dir;
+ struct video *vc; FILE *fptr;
+ FILE *file_handle;
+ int unread = 0;
+ int ctr;
+ 
+    vc = head;
+    
+    /* Create an Images directory.  If this directory already exists, the */
+    /* call will be ignored and contents of the Images directory left     */
+    /* untouched.                                                         */
+      
+     
+       create_images_dir = calloc(strlen(dest)+25,sizeof(char));
+       
+       if (create_images_dir == NULL)
+       {   
+           PROG_ID;
+           printf("Fatal Error: - insufficient memory.\n");
+           printf("             - creating new image file.\n");
+           printf("             - %d more bytes required.\n",strlen(dest)+25);
+           exit(0);
+       }    
+     
+     
+       for (ctr = 0; ctr < strlen(dest)+25;create_images_dir[ctr] = '\0',ctr++);
+       sprintf(create_images_dir,"%s.Images%d",dest,directory);
+       if ((error = xosfile_create_dir(create_images_dir,0)) != NULL)
+       {
+            PROG_ID;
+            printf("Fatal Error: - attempting to create images directory.\n");
+            printf("             - %s\n",create_images_dir);
+            printf("             - if directory already exists this would not ");
+            printf("cause an error.\n");
+            exit(0);
+       }          
+     
+       free(create_images_dir);  
+      
+       buffer = calloc(strlen(dest)+25,sizeof(char));
+      
+       if (buffer == NULL)
+       {
+           PROG_ID;
+           printf("Fatal Error: - insufficient memory.\n");
+           printf("             - creating new image file.\n");
+           printf("             - %d more bytes required.\n",strlen(dest) + 25);
+           exit(0);
+       }    
+       for (ctr = 0; ctr < strlen(dest)+25; buffer[ctr] = '\0',ctr++);
+       sprintf(buffer,"%s.Images0.00",dest);
+       if ((file_handle = fopen(buffer,"w"))==NULL)
+       {
+            PROG_ID;
+            printf("Fatal Error: - unable to create new image file.\n");
+            printf("             - file: %s\n",buffer);
+            printf("             - check specified path exists).\n");
+            exit(0);
+       }
+      
+       fclose(file_handle); 
+       free(buffer);
+       directory = 0;
+       j = 0;
+       
+       /* Get rid of currently existing image files. */
+          for (i = 0; finish == FALSE; i++)
+          {
+               if (j == 77)
+               {
+                   directory++;
+                   j = 0;
+               }    
+               buffer = calloc(strlen(dest) + 25,sizeof(char));
+               if (buffer == NULL)
+               {
+                   PROG_ID;
+                   printf("Fatal Error: - insufficient memory.\n");
+                   printf("             - creating new image file.\n");
+                   printf("             - %d more bytes required.\n",strlen(dest)+25);
+                   exit(0);
+               }    
+               for (ctr = 0; ctr < strlen(dest)+25; buffer[ctr] = '\0',ctr++);
+               sprintf(buffer,"%s.Images%d.%02i",dest,directory,j);
+               
+               if ((fptr = fopen(buffer,"r")) != NULL)
+               {
+                   /* Delete images file. */
+                      fclose(fptr);
+                      if ((error = xosfile_delete(buffer,NULL,NULL,NULL,
+                                                  NULL,NULL)) != NULL)
+                      {
+                           PROG_ID;
+                           printf("Fatal Error: - extracting images.\n");
+                           printf("             - unable to delete old image file\n");
+                           exit(0);
+                      }                                 
+                      
+               }
+               else
+               {
+                      finish = TRUE;
+               }
+               free(buffer);       
+          }                   
+          
+    directory = 0;
+    j = 0;      
+    while (vc != NULL)
+    {   
+           if (j == 77)
+           {
+               directory++;
+               j = 0;
+               /* Create another directory. */
+               create_images_dir = calloc(strlen(dest)+25,sizeof(char));
+               if (create_images_dir == NULL)
+               {
+                   PROG_ID;
+                   printf("Fatal Error: - insufficient memory.\n");
+                   printf("             - creating new image file.\n");
+                   printf("             - %d more bytes required.\n",strlen(dest)+25);
+                   exit(0);
+               }    
+               for (ctr = 0; ctr < strlen(dest)+25; create_images_dir[ctr] = '\0',ctr++);
+               sprintf(create_images_dir,"%s.Images%d",dest,directory);
+               if ((error = xosfile_create_dir(create_images_dir,0)) != NULL)
+               {
+                    PROG_ID;
+                    printf("Fatal Error: - attempting to create images directory.\n");
+                    printf("             - %s\n",create_images_dir);
+                    printf("             - if directory already exists this");
+                    printf(" would not cause an error.\n");
+                    printf("             - using xosfile_create_dir().\n");
+                    exit(0);
+               }     
+            
+               free(create_images_dir);
+           }    
+           buffer = calloc(strlen(dest)+25,sizeof(char));
+           if (buffer == NULL)
+           {
+               PROG_ID;
+               printf("Fatal Error: - insufficient memory.\n");
+               printf("             - creating new image file.\n");
+               printf("             - %d more bytes required.\n",strlen(dest)+25);
+               exit(0);
+           }    
+           for (ctr = 0; ctr < strlen(dest)+25; buffer[ctr] = '\0',ctr++);
+           sprintf(buffer,"%s.Images%d.%02i",dest,directory,j);
+           j++;
+          
+           /* Create new image file (write access). */
+              if ((error = xosfind_openout(0x7,buffer,&image_file_handle)) != NULL)
+              {
+                   PROG_ID;
+                   printf("Fatal Error: - cannot create new image file.\n");
+                   printf("             - file: %s\n",buffer);
+                   exit(0);
+              } 
+                
+              
+              if (image_file_handle == 0)
+              {
+                  PROG_ID;
+                  printf("Fatal Error: Unable to create image file (%s)\n",buffer);
+                  exit(0);
+              }    
+                     
+           /* Move file pointer to image start pos. */
+              if ((error = xosargs_set_ptr(source_file_handle,vc->isp)) != NULL)
+              {
+                   PROG_ID;
+                   printf("Fatal Error: - extracting images.\n");
+                   printf("             - cannot move source file pointer to image\n");
+                   printf("               start pos at offset %d.\n",vc->isp);
+                   printf("             - using xosargs_set_ptr()\n");  
+                   exit(0);
+              }     
+              
+           /* Read vc->vds amount of image data into memory. */
+              image_buffer = malloc(vc->vds);
+              if (image_buffer == NULL)
+              {
+                  PROG_ID;
+                  printf("Fatal Error:  - extracting images.\n");
+                  printf("              - insufficient memory.\n");
+                  printf("              - %d more bytes required.\n",vc->vds);
+                  exit(0);
+              }    
+              
+              if ((error = xosgbpb_read(source_file_handle,
+                                         image_buffer,
+                                         vc->vds,
+                                         &unread)) != NULL)
+              {                           
+                   PROG_ID;
+                   printf("Fatal Error: - reading image data into memory.\n");
+                   printf("             - using xosgbpb_read()\n");
+                   printf("             - allocation of memory was successful.\n");
+                   exit(0);
+              }     
+                   
+              if (unread != 0)
+              {
+                  PROG_ID;
+                  printf("Fatal Error: - reading image data into memory.\n");
+                  printf("             - using xosgbpb_read()\n");
+                  printf("             - allocation of memory was successful.\n");
+                  exit(0);
+              }    
+              
+             
+           /* Write image data in memory out to image file. */
+              if ((error = xosgbpb_write(image_file_handle,
+                                         image_buffer,
+                                         vc->vds,
+                                         &unread)) != NULL)
+              {
+                   PROG_ID;
+                   puts("Disk Full");
+                   exit(0);
+              }                                
+              if (unread != NULL)
+              {
+                  PROG_ID;
+                  puts("Disk Full");
+                  exit(0);
+              }    
+             
+              free(image_buffer);
+            
+          
+           /* Close image file. If user interrupts program execution,*/
+           /* file closure is handled by exception handler.          */
+              if ((error = xosfind_close(image_file_handle)) != NULL)
+              {
+                   PROG_ID;
+                   printf("Warning: - cannot close new image file.\n");     
+              }     
+              
+              image_file_handle = 0;
+             
+           
+           if ((error = xosfile_set_type(buffer,0xFFD)) != NULL)
+           {
+                PROG_ID;
+                printf("Fatal Error: - unable to set image file type.\n");
+                printf("             - using xosfile_set_type().\n");
+                exit(0);
+           }     
+        
+           vc = vc->vlink;
+           free(buffer); 
+       }	
+}
+/*----------------------------------------------------------------------------------*/
+void Help(void)
+{
+     printf("Extract: Version : 2.19\n");
+     printf("29 April, 1994.\n");
+     printf("This program extracts one or more components of an ARMovie file.\n");
+     printf("i.e. -header.\n");
+     printf("     -sprite.\n");
+     printf("     -keys (if there are any).\n");
+     printf("     -images.\n");
+     printf("     -sound track/s.\n\n");
+     printf("The following example will extract images and the sprite from the Armovie\n");
+     printf("called $.MyArmovie and will put the extracts into the $.Extracts directory.\n\n");
+     printf("Example: extract -source $.MyArmovie -dest $.Extracts -images -sprite\n\n");
+     printf("If the -sound parameter is used, by default only the first sound track\n");
+     printf("will be extracted.  -sound 3 5 will extract soundtracks 3 and 5. -sound\n");
+     printf("2 3 4 will extract sound tracks 2, 3, and 4 and so on.\n\n");
+     printf("Further (more detailed) information is provided in the accompanying user \n");
+     printf("guide document.\n");
+}
+/*---------------------------------------------------------------------------------*/
+void close_files(void)
+{
+   /* Exception handler function.  Ensures that any open files are closed both    */
+   /* on normal program termination and if user terminates program prematurely    */
+   /* by pressing escape.                                                         */
+         
+         fclose(header_file_handle);   
+         
+         if (source_file_handle != 0)
+         { 
+             
+             if ((error = xosfind_close(source_file_handle)) != NULL)
+             {
+                  PROG_ID;
+                  printf("Warning: cannot close source file.\n");  
+             }     
+         }   
+        
+         if (sprite_file_handle != 0)
+         {                                                                     
+             if ((error = xosfind_close(sprite_file_handle)) != NULL)
+             {
+                  PROG_ID;
+                  printf("Warning: cannot close source file.\n");
+             }     
+         }
+        
+         if (keys_file_handle != 0)
+         {     
+             if ((error = xosfind_close(keys_file_handle)) != NULL)
+             {
+                  PROG_ID;
+                  printf("Warning: cannot close source file.\n");
+             }     
+         }
+         
+         if (image_file_handle != 0)
+         {                                                        
+             if ((error = xosfind_close(image_file_handle)) != NULL)
+             {
+                  PROG_ID;
+                  printf("Warning: cannot close source file.\n");
+             }     
+         }
+         
+         if (sound_file_handle != 0)
+         {      
+             if ((error = xosfind_close(sound_file_handle)) != NULL)
+             {
+                  PROG_ID;
+                  printf("Warning: cannot close source file.\n");
+             }                                                         
+         }
+        
+      /* N.B. There will only ever be one key, image, or sound file open at any   */
+      /* one time.                                                                */                                                                                                
+}
+/*==================================================================================*/

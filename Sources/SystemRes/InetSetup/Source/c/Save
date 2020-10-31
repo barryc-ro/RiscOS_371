@@ -1,0 +1,658 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "osbyte.h"
+#include "osfile.h"
+#include "osfscontrol.h"
+#include "wimp.h"
+#include "hourglass.h"
+
+#include "ModUtils.h"
+#include "Save.h"
+#include "Main.h"
+#include "Load.h"
+#include "AUN.h"
+#include "Versions.h"
+#include "Gadgets.h"
+#include "IfsDbox.h"
+#include "Diagnose.h"
+
+#include "netdb.h"
+
+#define MIN_RMASIZE (256*1024)
+#define MIN_SYSTEMSIZE (8*1024)
+
+static FILE *BootFile, *ConfigureFile;
+
+static void SaveInterface(int);
+static void SaveResolve(void);
+static void SaveResConf(void);
+
+extern void os_reset_old_machine(void);
+
+static os_error *SetupAccess()
+{
+    if (AccessEnabled)
+    {
+        if (InternetEnabled)
+        {
+            fprintf(ConfigureFile,
+                    "|\n"
+            	    "| Access\n"
+            	    "|\n"
+            	    "IF \"<ShareFS$Path>\" = \"\" THEN "
+            	    	    	    	    "Run Resources:$.Resources.ShareFS.!Boot\n"
+            	    "RMFind Freeway %s System:Modules.Network.Freeway\n",
+            	    VersionToString(v_Freeway));
+            fprintf(ConfigureFile,
+            	    "RMFind ShareFS %s System:Modules.Network.Share+\n",
+            	    VersionToString(v_ShareFS));
+    	    RMInsert("Freeway", v_Freeway);
+    	    RMInsert("ShareFS", v_ShareFS);
+        }
+        else
+        {
+            bool got_f, got_s;
+
+            got_f=RMInsert("Freeway", v_Freeway);
+            got_s=RMInsert("ShareFS", v_ShareFS);
+            if (!got_f || !got_s)
+            {
+            	fprintf(BootFile,
+                    	"|\n"
+            	    	"| Access\n"
+            	    	"|\n"
+            	    	"IF \"<ShareFS$Path>\" = \"\" THEN "
+            	    	    	    	    	"Run Resources:$.Resources.ShareFS.!Boot\n"
+            	    	"RMEnsure Freeway %s RMLoad System:Modules.Network.Freeway\n",
+            	    	VersionToString(v_Freeway));
+            	fprintf(BootFile,
+            	    	"RMEnsure ShareFS %s RMLoad System:Modules.Network.Share+\n",
+            	    	VersionToString(v_ShareFS));
+            }
+        }
+        // The next two are necessary to run Resources:$.Resources.ShareFS.!Boot
+        RMInsert("BootNet", 0);
+        RMInsert("AUNMsgs", 0);
+    }
+    else
+    {
+        Unplug("ShareFS");
+        Unplug("Freeway");
+    }
+
+    return 0;
+}
+
+static os_error *SetupAUN()
+{
+    int temp;
+    extern toolbox_o AUNObject;
+
+    if (AUNObject && (AUNEnabled || HaveEconet))
+    	UpdateAUNCMOS();
+
+    if (AUNEnabled)
+    {
+        if (InternetEnabled)
+        {
+            fprintf(ConfigureFile,
+                    "|\n"
+                    "| AUN\n"
+                    "|\n"
+                    "RMFind NetI %s System:Modules.Network.NetI\n"
+                    "Run InetDBase:AUNMap\n"
+                    "RMEnsure BBCEconet 0 RMReInit BBCEconet\n"
+                    "RMEnsure NetFS 0 RMReInit NetFS\n"
+                    "RMEnsure NetFS 5.79 RMEnsure NetUtils 0.99 "
+                                    "Run System:Modules.Network.NetUtils\n"
+                    "RMEnsure NetPrint 0 RMReInit NetPrint\n"
+                    "RMEnsure NetFiler 0 RMReInit NetFiler\n",
+                    VersionToString(v_NetI));
+            temp = readCMOS(osbyte_CONFIGURE_BOOT_NET);
+            temp &= ~osbyte_CONFIGURE_BOOT_NET_MASK;
+            writeCMOS(osbyte_CONFIGURE_BOOT_NET, temp);
+        }
+        else
+        {
+            bool got_n;
+            got_n=RMInsert("Net", v_Net);
+            temp = readCMOS(osbyte_CONFIGURE_BOOT_NET);
+            if (got_n)
+            	temp |= osbyte_CONFIGURE_BOOT_NET_MASK;
+            else
+            	temp &= ~osbyte_CONFIGURE_BOOT_NET_MASK;
+            writeCMOS(osbyte_CONFIGURE_BOOT_NET, temp);
+            if (!got_n)
+            {
+            	fprintf(BootFile,
+            	        "|\n"
+                        "| AUN\n"
+                        "|\n"
+                        "Set Net$Device %s\n"
+                        "Run BootResources:!Internet.utils.BootNet\n",
+                        "\"\"");
+            }
+        }
+        RMInsert("BootNet", 0);
+        RMInsert("NetFS", 0);
+        RMInsert("NetPrint", 0);
+        RMInsert("NetFiler", 0);
+        RMInsert("NetStatus", 0);
+        RMInsert("NetUtils", 0);
+        RMInsert("BBCEconet", 0);
+    }
+    else
+    {
+        temp = readCMOS(osbyte_CONFIGURE_BOOT_NET);
+        temp &= ~osbyte_CONFIGURE_BOOT_NET_MASK;
+        writeCMOS(osbyte_CONFIGURE_BOOT_NET, temp);
+    }
+
+    return 0;
+}
+
+static os_error *SetupInternet()
+{
+    int i;
+
+    if (InternetEnabled)
+    {
+        fputs("|================================================================|\n"
+              "| Startup file for !Internet V5.00 (21st May 1996)               |\n"
+              "|                                                                |\n"
+              "| This file was automatically generated by !InetSetup. Do not    |\n"
+              "| edit it by hand unless you really, REALLY, know what you're    |\n"
+              "| doing. Comments and spacing are significant to !InetSetup.     |\n"
+              "|                                                                |\n"
+              "| If you want to add extra configuration options, place them in  |\n"
+              "| the User file.                                                 |\n"
+              "|================================================================|\n"
+              "\n",
+              ConfigureFile);
+
+        fprintf(ConfigureFile, "|\n"
+                               "| Host name\n"
+                               "|\n"
+                               "Set Inet$HostName %s\n", HostName);
+        if (Set(LocalDomain))
+            fprintf(ConfigureFile, "Set Inet$LocalDomain %s\n", LocalDomain);
+
+    	if (primary_interface != -1)
+    	{
+    	    if (interface_filename[primary_interface][0] != '\0')
+               fprintf(ConfigureFile, "Set Inet$EtherDevice %s\n",
+                                       interface_filename[primary_interface]);
+            if (interface_addrtype[primary_interface] == if_Manual ||
+                interface_addrtype[primary_interface] == if_FromHostname)
+            {
+                fprintf(ConfigureFile, "Set Inet$EtherIPAddr %s\n"
+                                       "Set Inet$EtherIPMask %s\n",
+                                       interface_address[primary_interface],
+                                       interface_netmask[primary_interface]);
+            }
+            else if (interface_addrtype[primary_interface] == if_FromCMOS)
+            {
+                fprintf(ConfigureFile, "SetMacro Inet$EtherIPAddr <Inet$CMOSIPAddr>\n"
+                                       "Set Inet$EtherIPMask %s\n",
+                                       interface_netmask[primary_interface]);
+            }
+            else
+            {
+                fprintf(ConfigureFile, "Set Inet$EtherIPAddr %s\n"
+                                       "Set Inet$EtherIPMask %s\n",
+                                       interface_addrtype[primary_interface] == if_RevARP ? "revarp" : "bootp",
+                                       "default");
+            }
+            if (interface_is_pp[primary_interface])
+                fprintf(ConfigureFile, "Set Inet$LinkIPAddr %s\n",
+                                       interface_linkaddr[primary_interface]);
+
+            SaveInterface(primary_interface);
+        }
+        fprintf(ConfigureFile, "Set Inet$EtherTypeA <Inet$EtherType>\n");
+
+        for (i=0; i<interfaces; i++)
+        {
+            if (i==primary_interface)
+                continue;
+
+            SaveInterface(i);
+        }
+
+        fputs("|\n"
+              "| Loopback\n"
+              "|\n"
+              "IfConfig -e lo0 127.0.0.1\n"
+              "CheckError\n"
+              "Set Inet$EtherType <Inet$EtherTypeA>\n"
+              "Unset Inet$EtherTypeA\n",
+              ConfigureFile);
+
+    	if (UseResolver)
+    	{
+    	    int i;
+    	    struct { char *mod, *fname; int *version; } rmods[4] =
+    	                    { "Resolver",    "Resolver",   &v_Resolver,
+    	                      "Resolve",     "Resolve",    &v_Resolve,
+    	                      "InetDB",      "InetDB",     &v_InetDB,
+    	                      "DNSResolver", "DNSResolve", &v_DNSResolver };
+
+    	    fprintf(ConfigureFile, "|\n"
+    	    	    	    	   "| Name resolver\n"
+    	    	    	    	   "|\n");
+
+            if (ResolverType == RT_Resolver)
+            {
+                fprintf(ConfigureFile, "Set Inet$Resolvers");
+
+    	        for (i=0; i<3; i++)
+    	        {
+    	            if (Set(Resolver[i]))
+    	                fprintf(ConfigureFile, " %s", Resolver[i]);
+    	        }
+    	        fprintf(ConfigureFile, "\n");
+    	    }
+
+    	    fprintf(ConfigureFile,
+    	            "RMEnsure %s %s RMLoad System:Modules.Network.%s\n",
+    	            rmods[ResolverType].mod,
+    	            VersionToString(*rmods[ResolverType].version),
+    	            rmods[ResolverType].fname);
+
+    	    if (ResolverType == RT_InetDB || ResolverType == RT_DNSResolver)
+    	        SaveResConf();
+    	    else if (ResolverType == RT_Resolve)
+    	        SaveResolve();
+    	}
+
+    	fprintf(ConfigureFile, "|\n"
+    	    	    	       "| Routing\n"
+    	    	    	       "|\n");
+    	if (Set(Gateway))
+    	    fprintf(ConfigureFile, "Route -e add default %s\n"
+    	                           "CheckError\n",
+    	                           Gateway);
+
+    	fprintf(ConfigureFile, "Run " CONFIGDIR_READ "Routes\n"
+    	                       "CheckError\n"
+    	                       "Set Inet$IsGateway %s\n"
+    	                       "Set Inet$RouteDOptions %s\n",
+    	                       AmRouter ? "Yes" : "\"\"",
+    	                       UseRouteD ? RouteDoptions : "\"\"");
+
+    	RMInsert("AUNMsgs", v_AUNMsgs);
+    	RMInsert("MbufManager", v_MbufManager);
+    	RMInsert("Internet", v_Internet);
+
+    	fprintf(BootFile, "Run BootResources:!Internet\n");
+    }
+    else if (AUNEnabled || AccessEnabled)
+    {
+        bool got_a, got_m, got_i, got_d = FALSE;
+        int temp;
+    	got_a=RMInsert("AUNMsgs", v_AUNMsgs);
+    	got_m=RMInsert("MbufManager", v_MbufManager);
+    	got_i=RMInsert("Internet", v_Internet);
+        for (temp = 0; temp < interfaces; temp++)
+        {
+            bool t = RMInsert(interface_module[temp], interface_version[temp]);
+            if (!got_d)
+                got_d = t;
+        }
+
+        if (!got_a || !got_m || !got_i || !got_d)
+            fprintf(BootFile,
+                    "|\n"
+              	    "| Internet\n"
+              	    "|\n"
+              	    "IF \"<BootResources$Path>\" = \"\" THEN Set BootResources$Path <Boot$Dir>.Resources.\n"
+                    "IF \"<System$Path>\" = \"\" THEN Run BootResources:!System\n");
+        if (!got_a)
+            fprintf(BootFile,
+              	    "RMEnsure AUNMsgs %s RMLoad System:Modules.Network.AUNMsgs\n",
+              	    VersionToString(v_AUNMsgs));
+        if (!got_m)
+            fprintf(BootFile,
+              	    "RMEnsure MbufManager %s RMLoad System:Modules.Network.MManager\n",
+              	    VersionToString(v_MbufManager));
+        if (!got_i)
+            fprintf(BootFile,
+              	    "RMEnsure Internet %s RMLoad System:Modules.Network.Internet\n",
+              	    VersionToString(v_Internet));
+
+    	if (!got_d)
+    	    fprintf(BootFile,
+    	            "RMEnsure %s %s RMLoad System:Modules.Network.%s\n",
+                    interface_module[0],
+                    VersionToString(interface_version[0]),
+                    interface_filename[0]);
+
+        if (!got_a || !got_m || !got_i || !got_d)
+            fprintf(BootFile,
+            	    "Run BootResources:!Internet.utils.TriggerCBs\n");
+    }
+
+    if (!InternetEnabled && !AUNEnabled && !AccessEnabled)
+    {
+        Unplug("Internet");
+        Unplug("AUNMsgs");
+        Unplug("MbufManager");
+        Unplug("BootNet");
+        Unplug("Net");
+    }
+
+    return 0;
+}
+
+void SaveSetup(void)
+{
+    int pagesize, size;
+    int rmasize, systemsize;
+    os_error e, *ep;
+    char buts[64];
+    int i;
+    int osversion;
+
+    if (!Diagnose())
+    	return;
+
+    Unplug("InternetA");
+    Unplug("Netmsgs");
+    Unplug("Accmsgs");
+
+    if (InternetEnabled)
+    {
+        osfile_create_dir(CONFIGDIR_STEM, 0);
+
+        if (!Exists(CONFIGDIR_READ "User"))
+            osfscontrol_copy("<InetSetup$Dir>.Blanks.User",
+                             CONFIGDIR_WRITE "User",
+                             0, 0, 0, 0, 0, 0);
+
+        if (!Exists(CONFIGDIR_READ "Routes"))
+            osfscontrol_copy("<InetSetup$Dir>.Blanks.Routes",
+                             CONFIGDIR_WRITE "Routes",
+                             0, 0, 0, 0, 0, 0);
+
+    	ConfigureFile = fopen(CONFIGDIR_WRITE "Startup", "w");
+        if (ConfigureFile == 0)
+        {
+            ep = (os_error *) _kernel_last_oserror();
+            if (ep)
+                report_error(ep);
+            else
+                make_error("CantSaveSetup");
+            return;
+        }
+    }
+    BootFile = fopen("<Boot$ToBeLoaded>.SetUpNet", "w");
+    if (BootFile == 0)
+    {
+        if (InternetEnabled)
+            fclose(ConfigureFile);
+        ep = (os_error *) _kernel_last_oserror();
+        if (ep)
+            report_error(ep);
+        else
+            make_error("CantSaveSetup");
+        return;
+    }
+    SetupInternet();
+    SetupAUN();
+    SetupAccess();
+    if (InternetEnabled && (AccessEnabled || AUNEnabled))
+        fputs("SetEval Inet$KickFiler 1\n", ConfigureFile);
+    if (InternetEnabled)
+    {
+    	fclose(ConfigureFile);
+    	osfile_set_type(CONFIGDIR_WRITE "Startup", osfile_TYPE_OBEY);
+
+        /*
+         * Sort out memory configurations
+         */
+        os_read_mem_map_info(&pagesize, 0);
+
+        rmasize = readCMOS(osbyte_CONFIGURE_RMA_SIZE) * pagesize;
+        systemsize = readCMOS(osbyte_CONFIGURE_SYSTEM_SIZE) * pagesize;
+
+        if (rmasize < MIN_RMASIZE)
+            writeCMOS(osbyte_CONFIGURE_RMA_SIZE, MIN_RMASIZE / pagesize);
+
+        if (systemsize < MIN_SYSTEMSIZE)
+            writeCMOS(osbyte_CONFIGURE_SYSTEM_SIZE, MIN_SYSTEMSIZE / pagesize);
+    }
+
+    fclose(BootFile);
+    osfile_set_type("<Boot$ToBeLoaded>.SetUpNet", osfile_TYPE_OBEY);
+    osfile_read_stamped("<Boot$ToBeLoaded>.SetUpNet", 0, 0, &size, 0, 0);
+    if (size == 0)
+    {
+    	remove("<Boot$ToBeLoaded>.SetUpNet");
+        if (!InternetEnabled && !AccessEnabled && !AUNEnabled)
+        {
+            /* No networking - so put a blank SetUpNet in */
+            osfscontrol_copy("<InetSetup$Dir>.Blanks.SetUpNet",
+                             "<Boot$ToBeLoaded>.SetUpNet",
+                             0, 0, 0, 0, 0, 0);
+        }
+    }
+
+    e.errnum = 0;
+    strcpy(e.errmess, msgs_lookup("ResetPrompt"));
+    strcpy(buts, msgs_lookup("ResetButs"));
+
+    if (WimpVersion >= 322)
+        i=wimp_report_error_by_category(&e,
+           wimp_ERROR_BOX_CATEGORY_QUESTION << wimp_ERROR_BOX_CATEGORY_SHIFT,
+           msgs_lookup("_TaskName"),
+           "!inetsetup",
+           (osspriteop_area *) 1,
+           buts);
+    else
+        i=wimp_report_error(&e,
+             wimp_ERROR_BOX_OK_ICON | wimp_ERROR_BOX_CANCEL_ICON,
+             msgs_lookup("_TaskName")) + 2;
+
+    if (i==3)
+#if 0
+    	wimp_process_key(wimp_KEY_SHIFT|wimp_KEY_CONTROL|wimp_KEY_F12);
+#else
+    {
+        xhourglass_on();
+        osfscontrol_shutdown();
+        xhourglass_off(); /* Not sure why I bother doing this :-) */
+        osversion = osbyte1(osbyte_IN_KEY, 0, 255);
+        if (osversion >= 0xA5) /* If we're on RISC OS 3.50 or later... */
+    	    os_reset();
+    	else
+    	    os_reset_old_machine();
+    }
+#endif
+    else
+    	exit(0);
+}
+
+static void SaveInterface(int i)
+{
+    bool DynamicNetmask;
+    char buffer[200];
+    char buffer2[32];
+
+    if (interface_address[i][0] == '\0')
+    {
+#if 0
+    	/* Can't do this - another protocol might need the driver! */
+        Unplug(interface_module[i]);
+#endif
+        return;
+    }
+
+    RMInsert(interface_module[i], interface_version[i]);
+
+    fprintf(ConfigureFile, "|\n"
+                           "| Interface: %s\n"
+                           "|\n"
+                           "RMEnsure %s %s RMLoad System:Modules.Network.%s\n",
+                           interface_name[i],
+                           interface_module[i],
+                           VersionToString(interface_version[i]),
+                           interface_filename[i]);
+
+    if (strcmp(interface_unit[i], "ec0") == 0)
+    {
+        if (interface_addrtype[i] == if_Manual || interface_addrtype[i] == if_FromHostname)
+            fprintf(ConfigureFile, "Set Inet$EcoIPAddr %s\n"
+                               	   "Set Inet$EcoIPMask %s\n",
+                                   interface_address[i],
+                                   interface_netmask[i]);
+        else
+            fprintf(ConfigureFile, "Set Inet$EcoIPAddr %s\n"
+                               	   "Set Inet$EcoIPMask %s\n",
+                                   interface_addrtype[i] == if_RevARP ? "revarp" : "bootp",
+                                   "default");
+    }
+
+    // Yucko!
+    DynamicNetmask = strcmp(interface_netmask[i], msgs_lookup("ICMPReq")) == 0;
+
+    switch (interface_addrtype[i])
+    {
+      case if_FromHostname:
+      case if_Manual:
+        if (!interface_is_pp[i])
+        {
+            fprintf(ConfigureFile, "IfConfig -e %s %s netmask %s\n"
+                                    "CheckError\n",
+                                    interface_unit[i],
+                                    interface_address[i],
+                                    interface_netmask[i]);
+        }
+        else
+        {
+            fprintf(ConfigureFile, "IfConfig -e %s %s %s netmask %s\n"
+                                    "CheckError\n",
+                                    interface_unit[i],
+                                    interface_address[i],
+                                    interface_linkaddr[i],
+                                    interface_netmask[i]);
+        }
+        break;
+
+      case if_FromCMOS:
+        fprintf(ConfigureFile, "Run Inet:utils.ReadCMOSIP\n"
+                               "IfConfig -e %s <Inet$CMOSIPAddr> netmask %s\n",
+                               interface_unit[i],
+                               interface_netmask[i]);
+        break;
+
+      case if_RevARP:
+      case if_BOOTP:
+        strcpy(buffer2, msgs_lookup(interface_addrtype[i] == if_RevARP?"RevARP":"BOOTP"));
+        sprintf(buffer, msgs_lookup("Contacting"), buffer2, interface_name[i]);
+        fprintf(ConfigureFile, "IF \"<Wimp$State>\" = \"commands\" THEN Echo %s\n"
+                               "IfRConfig -e %s %s%s\n"
+                               "CheckError\n"
+                               "IF \"<Wimp$State>\" = \"commands\" THEN "
+                                        "Echo <11><23><8><5><6><0><0><0><0><0><0><11>\n",
+                               buffer,
+                               interface_unit[i],
+                               interface_addrtype[i] == if_RevARP ? "revarp" : "bootp",
+                               DynamicNetmask ? " netmask" : "");
+        if (!DynamicNetmask)
+            fprintf(ConfigureFile, "IfConfig -e %s netmask %s\n"
+                                   "CheckError\n",
+                                   interface_unit[i],
+                                   interface_netmask[i]);
+        break;
+    }
+}
+
+void SaveResolve(void)
+{
+    FILE *f=fopen("InetDBase:resolve", "w");
+    int i;
+
+    if (f)
+    {
+        fprintf(f, "domain %s\n", LocalDomain);
+        for (i = 0; i < 3; i++)
+        {
+            if (Resolver[i][0])
+                fprintf(f, "nameserver %s\n", Resolver[i]);
+        }
+        fclose(f);
+    }
+}
+
+void SaveResConf(void)
+{
+    FILE *f, *old;
+    char buffer[256];
+    char buf2[256];
+    int ns=0;
+
+    xosfile_delete("<Wimp$ScrapDir>.OldResConf", 0, 0, 0, 0, 0);
+    xosfscontrol_rename("InetDBase:resconf", "<Wimp$ScrapDir>.OldResConf");
+
+    f=fopen("InetDBase:resconf", "w");
+    if (!f)
+    {
+        xosfscontrol_rename("<Wimp$ScrapDir>.OldResConf", "InetDBase:resconf");
+        return;
+    }
+
+    old=fopen("<Wimp$ScrapDir>.OldResConf", "r");
+
+    if (old)
+    {
+        while (fgets(buffer, sizeof buffer, old))
+        {
+            if (sscanf(buffer, "domain %s", buf2) == 1)
+                fprintf(f, "domain     %s.\n", LocalDomain);
+            else if (sscanf(buffer, "nameserver %s", buf2) == 1)
+            {
+                if (ns < 3 && Resolver[ns][0])
+                    fprintf(f, "nameserver %s\n", Resolver[ns++]);
+            }
+            else
+                fprintf(f, "%s", buffer);
+        }
+        fclose(old);
+        xosfile_delete("<Wimp$ScrapDir>.OldResConf", 0, 0, 0, 0, 0);
+    }
+    else
+    {
+        fprintf(f, "domain     %s.\n", LocalDomain);
+        fprintf(f, "cachesize  16k\n"
+                   "cacheload  resboot rescache\n"
+                   "cachesave  rescache\n"
+                   "retry      3\n"
+                   "timeout    3 12\n"
+                   "lookup     file bind\n");
+    }
+
+    for (; ns < 3; ns++)
+        if (Resolver[ns][0])
+            fprintf(f, "nameserver %s\n", Resolver[ns]);
+
+    fclose(f);
+
+    f=fopen("InetDBase:resboot", "w");
+    if (f)
+    {
+        struct hostent *hp=gethostbyname(HostName);
+
+        fprintf(f, "$ORIGIN %s.\n", LocalDomain);
+        fprintf(f, "%-40.40sIN A     %d.%d.%d.%d\n", HostName, hp->h_addr[0],
+                                                               hp->h_addr[1],
+                                                               hp->h_addr[2],
+                                                               hp->h_addr[3]);
+        sprintf(buffer, "%d.%d.%d.%d.in-addr.arpa.", hp->h_addr[3], hp->h_addr[2],
+                                                     hp->h_addr[1], hp->h_addr[0]);
+        fprintf(f, "%-40.40sIN PTR   %s\n", buffer, HostName);
+        fclose(f);
+    }
+}

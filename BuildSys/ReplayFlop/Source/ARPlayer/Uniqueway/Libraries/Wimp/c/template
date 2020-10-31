@@ -1,0 +1,340 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/*
+ * Title:  template.c
+ * Purpose:  Template file management
+ * History: IDJ: 07-Feb-92: prepared for source release 
+ * SJM: 8/3/92: replace call to font_lose with os_swi(Font_FontLose) to avoid pulling in font
+ *              library code unnecessarily.
+ * SJM:21/7/92: replace all those silly CR's by proper NULLs when doing a template_copy().
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <string.h>
+#include "swis.h"
+
+#include "os.h"
+#include "wimpx.h"
+#include "res.h"
+#include "res_spr.h"
+#include "werr.h"
+#include "template.h"
+#include "msgs.h"
+
+#define TEMPLATE_ERROR      msgs_lookup("Etemplate0:Template load error %d (%s).")
+#define FONT_ARRAY          msgs_lookup("Etemplate1:template font array")
+
+/* 
+ * Templates held in private linked list
+ */
+
+static  template *template__list = 0;
+static  wimp_font_array *template__fontcounts = 0;
+
+static void template_error(int fatal, int number, const char *msg)
+{
+    werr(fatal, TEMPLATE_ERROR, number, msg);
+}
+
+static BOOL template__nameeq(char *s, char *s12)
+{
+   int i;
+   for (i=0; i<12; i++) 
+   {
+      if (s[i] == 0 || s12[i] < 32) {return((s[i]==0) == (s12[i]<32));}
+      if (s[i] != s12[i]) {return(0);}
+   }
+
+   return(s[12] == 0);
+}
+
+
+template *template_find(char *name)
+{
+   template *t = template__list;
+   while (t != 0 && template__nameeq(name, t->name) == 0) t=t->next;
+   if (t == 0) template_error(0, 0, name);
+/*
+   werr(0, msgs_lookup("template1:Template '%s' not found"), name);
+ */
+   return(t);
+}
+
+static void CRtoNULL(char *s)
+{
+/*
+    int c;
+    for (c = *s; c >= ' '; s++)
+        c = *s;
+    *s = '\0';
+  */
+}
+
+template *template_copy(template *from)
+{
+   template *to;
+   int j;
+   int size = sizeof(template) + from->window.nicons * sizeof(wimp_icon);
+
+   /* --- copy the template --- */
+   to = malloc(size);
+   if (to == 0) return 0;
+   (void) memcpy(to, from, size);
+
+   /* --- allocate and copy workspace --- */
+   if (to->workspacesize != 0)
+   {
+      to->workspace = malloc(to->workspacesize);
+      if (to->workspace == 0)
+      {
+         free(to);
+         return 0;
+      }
+      (void) memcpy(to->workspace, from->workspace, to->workspacesize);
+
+      /* - fix up indirect icon pointers - */
+      for (j=0; j<to->window.nicons; j++)
+      {
+         wimp_icon *i = ((wimp_icon *)(&to->window + 1)) + j;
+         if ((i->flags & wimp_INDIRECT) != 0)
+         {
+            CRtoNULL(i->data.indirecttext.buffer += to->workspace - from->workspace);
+            if ((i->flags & wimp_ITEXT) != 0 && ((int) i->data.indirecttext.validstring) > 0)
+              CRtoNULL(i->data.indirecttext.validstring += to->workspace - from->workspace);
+         }
+      }  
+
+      /* --- fix up relocated title pointer --- */
+      if ((to->window.titleflags & wimp_INDIRECT) != 0)
+        CRtoNULL(to->window.title.indirecttext.buffer += to->workspace - from->workspace);
+
+   }
+
+   to->next = 0;
+   return(to);
+}
+ 
+
+static BOOL template__readfile(char *name, BOOL give_error)
+{
+    char            namebuf[12];
+    wimp_template   tem1, tem2;
+    os_error        *e;
+
+    if (wimp_open_template(name) != NULL)
+    {
+        if (give_error)
+            template_error(1, 1, name);
+/*          werr(1, msgs_lookup("template6:Template file not found.")); */
+        else
+            return FALSE;
+    }
+
+    tem1.index = 0;
+    tem2.name = tem1.name = namebuf;
+
+    tem2.font = template__fontcounts;
+
+    do
+    {
+/* read template size */
+        strcpy(namebuf, "*");
+        tem1.buf = NULL;
+
+        if ((e = wimp_load_template(&tem1)) != NULL)
+            template_error(1, 2, e->errmess);
+/*          werr(1, msgs_lookup("template2:Template load failed (1): %s"), e->errmess); */
+
+        if (tem1.index)
+        {
+            template *t;
+
+/* allocate space as returned */
+            if ((t = calloc(sizeof(template) - sizeof(wimp_wind) + (int)tem1.buf, 1)) == NULL ||
+                (tem1.work_free != 0 && (t->workspace = malloc((int) tem1.work_free)) == NULL))
+                template_error(1, 3, name);
+/*              werr (1, msgs_lookup("template7:Not enough space to load templates")); */
+    
+/* setup load ptrs */
+            t->workspacesize = (int) tem1.work_free;
+            strcpy(t->name, tem1.name);
+            tem2.buf = &t->window;
+            tem2.work_free = t->workspace;
+            tem2.work_end = tem2.work_free + t->workspacesize;
+            tem2.index = 0;
+
+/* load for real */
+            if ((e = wimp_load_template(&tem2)) != NULL)
+                template_error(1, 4, e->errmess);
+/*              werr(1, msgs_lookup("template2:Template load failed (2): %s"), e->errmess); */
+
+/* shrink space down once indirected pointers have been allocated */
+            t = realloc(t, sizeof(template) + t->window.nicons*sizeof(wimp_icon));
+
+/* --- bind sprite area appropriately --- */
+            t->window.spritearea = resspr_Area();
+
+/* add to linked list */
+            t->next = template__list;
+            template__list = t;
+        }
+    }
+    while (tem1.index);
+
+    /* --- close the template file and free up temporary space --- */
+    no_err(wimp_close_template());
+
+    return TRUE;
+}
+
+BOOL  template_readfile(char *name)
+{
+    return template__readfile(name, TRUE);
+}
+
+
+BOOL template_loaded(void)
+{
+   return ((BOOL)template__list);
+}
+
+static void template__loseallfonts(void)
+{
+    int num, used;
+   if (template__fontcounts != 0)
+   {
+      for (num = 0; num < 256; num++)
+          for (used = 0; used < template__fontcounts->f[num]; used++)
+              no_err(os_swi1(os_X|Font_LoseFont, num));
+   }
+} 
+
+void template_use_fancyfonts(void)
+{
+   int i;
+  
+   if (template__fontcounts == 0) 
+      if((template__fontcounts = malloc(sizeof(wimp_font_array))) == 0)
+         template_error(1, 5, FONT_ARRAY);
+/*          werr(TRUE, msgs_lookup("template7:Not enough memory to load templates -- increase wimpslot")); */
+
+    for (i = 0; i < 256; i++)
+        template__fontcounts->f[i] = 0;
+
+    atexit(template__loseallfonts);
+}
+   
+   
+void template_init(void)
+{
+    char s[256];
+  
+    if (template_loaded())
+    {
+        int i;
+
+/* reinitialise font stuff */
+        template__loseallfonts();
+        for (i = 0; i < 256; i++)
+            template__fontcounts->f[i] = 0;
+
+/* remove all template memory allocations */
+        {
+            template *t = template__list;
+            while (t)
+            {
+                template *next = t->next;
+                if (t->workspacesize)
+                    free(t->workspace);
+                free(t);
+                t = next;
+            }
+            template__list = NULL;
+        }
+    }
+
+/* check desktop features bit for 3D templates */
+    {
+        BOOL loaded = FALSE;
+        int r1 = 140, r2;
+        os_byte(161, &r1, &r2);
+        if ((r2 & 1) == 0)
+        {
+            res_findname("Template2D", s);
+            loaded = template__readfile(s, FALSE);
+        }
+
+        if (!loaded)
+        {
+            res_findname("Templates", s);
+            template__readfile(s, TRUE);
+        }
+    }
+}
+
+
+wimp_wind *template_syshandle(char *name)
+{
+   template *tem;
+
+   /* find template in linked list */
+   if ((tem = template_find(name)) == 0)
+     return ((wimp_wind *)0);
+
+   /* return pointer to underlying window structure */
+   return (&(tem -> window));
+}
+
+void template_dispose(template **pt)
+{
+    template *t = *pt;
+    if (t)
+    {
+        if (t->workspacesize > 0)
+            free(t->workspace);
+        free(t);
+        *pt = NULL;
+    }
+}
+
+void template_fixupblock(wimp_wind *wp, wimp_i from, wimp_i to, wimp_i anchor_src, wimp_i anchor_dst)
+{
+    wimp_icon   *ip_base = (wimp_icon *)(wp+1),
+                *ip_src = &ip_base[anchor_src],
+                *ip_dst = &ip_base[anchor_dst];
+    int         dx = ip_dst->box.x0 - ip_src->box.x0,
+                dy = ip_dst->box.y1 - ip_src->box.y1;
+    wimp_i      i;
+    for (i = from; i <= to; i++)
+    {
+        wimp_icon *ip = &ip_base[i];
+        ip->box.x0 += dx;
+        ip->box.x1 += dx;
+        ip->box.y0 += dy;
+        ip->box.y1 += dy;
+    }
+}
+
+void template_adjustflags(wimp_wind *wp, wimp_i from, wimp_i to, int value, int mask)
+{
+    wimp_icon   *ip = &((wimp_icon *)(wp + 1))[from];
+    wimp_i      i;
+    for (i = from; i <= to; i++, ip++)
+        ip->flags = (ip->flags &~ mask) ^ value;
+}
+
+/* eof template.c */

@@ -1,0 +1,703 @@
+/* > armovie.c
+
+ * © SJ Middleton, 1994
+
+ * CHANGE LOG:
+ *	11/5/93:	armovie_claimsoundbuffers now called with number of samples rather than num bytes.
+ *  06/10/93:   load second buffer immediately if the first took a long time.
+ *				free system if movie fails to start playing.  
+ *  21/10/93:	load second buffer immediately if we start from an offset into first.
+ *  16/11/93:	change checking in armovie_modechange to new ARTools$Clockrate variable.
+ *  25/11/93:	change ARTools/arsnd_opt use to use arsnd_varval() (see arsnd.c)
+ *  03/12/93:   fix to prepmovie so that playing to the start of a chunk doesn't assume you want the whole chunk played.  
+ *  05/12/93:	added arplay_StartMute and arplay_StartPause to control flags at play start.
+ *				added pending feature to cue up compressed soundtracks.
+ *  07/12/93:	loop count was off by 1 (loop_for should be total number of plays).
+ *  10/12/93:	modified startplaying() for changes in arsndcode.c to handle type 2 audio.
+ *				used seekable flag rather than APDCM specific.
+ *  23/01/94:	made real_sample_rate a double.
+ *				changed armovie.h structures
+ */
+
+#include "alarm.h"
+#include "kernel.h"
+#include "msgs.h"
+#include "os.h"
+#include "swis.h"
+#include "werr.h"
+#include "wimp.h"
+
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "armovie.h"
+#include "arsound.h"
+#include "arutils.h"
+#include "utils.h"
+
+typedef struct armovie__str
+{
+	armovie		next_movie;					/* linked list of movies to play */
+
+/* data passed in */
+	char		*movie_file;				/* malloc'd copy */
+	int			reference;					/* movie reference code */
+
+	armovie_hdr	*hdr;						/* malloc'd decoded header data */
+
+	armovie_playflag	playflags;
+
+	int			soundtrack;					/* soundtrack index */
+
+	int			play_from,					/* when we started playing in cs */
+				play_to,
+				loop_for;
+
+	int			sndratio;					/* to pass to playback code */
+	double		real_sample_rate;			/* from hdr->sound_rate */
+
+	filehandle	file_handle;				/* movie file handle */
+
+	int			current_chunk,				/* chunk number to load up next */
+
+				start_chunk,				/* first chunk to be played */
+				end_chunk,					/* last chunk to be played */
+
+				start_offset,				/* offset in chunk into bytes */
+				end_offset;
+
+	int			csecs_per_chunk;			/* frames per chunk / fps */
+
+	int			loop_count;					/* how many times we've played this sound */
+
+	BOOL		dont_free_hdr;
+
+	armovie_loadchunk_fn	loadchunk_fn;
+	void					*loadchunk_handle;
+};
+
+#define OOMCHUNK_ERR		msgs_lookup("armov0:Out of memory allocating %u bytes for temporary store.")
+#define CANNOT_QUEUE_MOVIE	msgs_lookup("armov1:Cannot queue movie for sound playback (%s).")
+#define SOUND_TOO_LARGE		msgs_lookup("armov2:sound chunk too large")
+#define DIFF_SOUND_TYPE		msgs_lookup("armov3:differing type/rate")
+
+#define OSDynamicArea_RMA	1
+
+#define SAFETY_FACTOR		(1.1)
+
+/* ---------------------------------------------------------------------------------------- */
+/* Forward declarations */
+
+static armovie			movie_playing = NULL;		/* current movie playing - head of chain */
+
+static void				*tempchunk_ptr = NULL;		/* temporary store for sound chunk */
+static mem_allocfn		tempchunk_alloc = c_alloc;	/* functions to get and free this memory */
+static mem_freefn		tempchunk_free = c_free;
+static int				tempchunk_size = 0;			/* actual size of temp chunk allocated */
+
+static armovie_eventfn	event_fn = 0;
+static void				*event_handle;
+
+static int				pending_unmute = 0;			/* no. samples before mute should be disabled */
+
+/* ---------------------------------------------------------------------------------------- */
+
+static armovie_soundstr *soundtrack_ptr(armovie a)
+{
+	return a ? &a->hdr->sound[a->soundtrack] : NULL;
+}
+
+static BOOL movie_compatible(const armovie_soundstr *sp_old, const armovie_soundstr *sp_new)
+{
+	if (sp_old == NULL)
+		return TRUE;
+
+/* for a queued sound, check that the new movie is compatible with the old */
+	if (sp_new->max_soundsize > tempchunk_size)
+	{
+		werr(0, CANNOT_QUEUE_MOVIE, SOUND_TOO_LARGE);
+		return FALSE;
+	}
+
+	if (sp_new->channels != sp_old->channels		||
+		sp_new->precision != sp_old->precision		||
+		sp_new->rate != sp_old->rate				||
+		sp_new->sflags != sp_old->sflags)
+	{
+		werr(0, CANNOT_QUEUE_MOVIE, DIFF_SOUND_TYPE);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+
+static void armovie_freesystem(void)
+{
+	alarm_removeall(&movie_playing);
+
+/* stop playing to make sure */
+	arsound_stop();
+
+/* get rid of RMA buffers */
+	armovie_releasesoundbuffers();
+
+/* free sound device */
+	armovie_releasesounddevice();
+
+/* free temporary load space */
+	tempchunk_free(&tempchunk_ptr);
+
+/* shrink RMA */
+	if (arsnd_varval("NoShrinkRMA") == NULL)
+		_swix(OS_ChangeDynamicArea, _IN(0)|_IN(1), OSDynamicArea_RMA, -16*1024*1024);
+}
+
+static void armovie_dispose(armovie *pa)
+{
+	armovie a = *pa;
+	if (a)
+	{
+/* close file */
+		if (a->file_handle)
+			file_close(a->file_handle);
+
+/* free up various bits of memory */
+		free(a->movie_file);
+
+		if (!a->dont_free_hdr)
+			armovie_freehdr(a->hdr);
+
+		free(a);
+		*pa = NULL;
+	}
+}
+
+static void armovie_disposeall(armovie *head)
+{
+	armovie a = *head;
+	if (a)
+	{
+		do
+		{
+			armovie next = a->next_movie;
+
+			armovie_dispose(&a);
+			a = next;
+		}
+		while (a);
+		*head = NULL;
+	}
+}
+
+static armovie last_movie(void)
+{
+	armovie a = movie_playing;
+	if (a)
+		while (a->next_movie != NULL)
+			a = a->next_movie;
+	return a;
+}
+
+
+/* ---------------------------------------------------------------------------------------- */
+
+/* Loading data from file to internal buffer */
+
+static void notify(armovie a, armovie_returncode return_code)
+{
+	if (a && event_fn)
+		event_fn(a->reference, return_code, event_handle);
+}
+
+static os_error *armovie__loadchunk(int chunk, char **pptr, int *pnbytes, int reference, void *handle)
+{
+	armovie				a = handle;
+	armovie_soundstr	*sp = &a->hdr->sound[a->soundtrack];
+	armovie_catentry	*cat = &sp->chunks[chunk];
+
+	*pptr = tempchunk_ptr;
+	*pnbytes = cat->size;
+
+	return file_readfrom(a->file_handle, tempchunk_ptr, cat->size, cat->offset);
+	reference = reference;
+}
+
+/*
+ * load current chunk and increment index of current.
+ * Note that ptr passed to arsound_data must be SHORT-aligned !!
+ */
+
+static os_error *load_chunk(armovie a)
+{
+	os_error	*e = NULL;
+	char		*ptr;
+	int			nbytes;
+
+	if ((e = a->loadchunk_fn(a->current_chunk, &ptr, &nbytes, a->reference, a->loadchunk_handle)) == NULL)
+	{
+		int	start = a->current_chunk == a->start_chunk ? a->start_offset : 0,
+			end = a->current_chunk == a->end_chunk && a->end_offset ? a->end_offset : nbytes;
+
+		if (end > nbytes)
+			end = nbytes;
+
+		arsound_data((char *)ptr + start, end - start);
+		a->current_chunk ++;
+	}
+
+	return e;
+}
+
+/*
+ * load next chunk or loop or stop or do nothing as appropriate.
+ */
+
+static void armovie_loadnextsndchunk(armovie a)
+{
+	if (a)
+	{
+		os_error	*e = NULL;
+		int			buffers = arsound_bufferstatus();
+
+		if (pending_unmute &&
+			arsound_samplesplayed() >= pending_unmute)
+		{
+			arsound_setmute(arsound_readmute() &~ arsound_readmute());
+			pending_unmute = 0;
+		}
+
+/* are either of the buffers empty  */
+		if (buffers != 0)
+		{
+
+/* have we loaded the last chunk ? */
+			if (a->current_chunk > a->end_chunk)
+			{
+
+/* do we want to loop back to the beginning ? */
+				if (a->loop_count < a->loop_for)
+				{
+					a->current_chunk = a->start_chunk;
+					a->loop_count++;
+					e = load_chunk(a);
+				}
+
+/* is there a pending movie to start playing ? */
+				else if (a->next_movie)
+				{
+					armovie new = a->next_movie;
+
+/* tell client that one has finished */
+					notify(a, armovie_CompletedButMore);
+
+					armovie_dispose(&a);					/* dispose of old */
+
+					movie_playing = a = new;				/* move new to head of chain */
+
+/* allocate new tempchunk if necessary
+					sp = soundtrack_ptr(a);
+					if (sp->max_soundsize > tempchunk_size)
+					{
+						if (!tempchunk_alloc(&tempchunk_ptr, tempchunk_size = sp->max_soundsize))
+						{
+							notify(a, armovie_Aborted);
+							armovie_disposeall(&a);
+							movie_playing = NULL;
+						}
+					}
+ */
+					if (a)
+						e = load_chunk(a);						/* load first chunk */
+				}
+
+/* don't finish until both the buffers are empty */
+				else if (buffers == 3)
+				{
+					notify(a, armovie_Completed);
+
+					armovie_dispose(&a);
+					movie_playing = NULL;
+				}
+			}
+			else
+			{
+				e = load_chunk(a);
+
+                if (a->current_chunk > a->end_chunk)
+                	notify(a, armovie_LastChunk);
+			}
+
+			if (os_err(e))
+			{
+				notify(a, armovie_Error);
+
+				armovie_disposeall(&movie_playing);
+			}
+		}
+	}
+}
+
+static void alarm_fn(int called_at, void *handle)
+{
+/* load up next chunk, on error stop playing */
+	armovie_loadnextsndchunk(movie_playing);
+
+/* if still playing then schedule next one */
+	if (movie_playing)
+		alarm_set(alarm_timenow() + 20, alarm_fn, movie_playing);
+	else
+		armovie_freesystem();
+
+	called_at = called_at;
+	handle = handle;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+
+static int get_chunk(armovie a, int time, int *rem)
+{
+	int chunk = time / a->csecs_per_chunk;
+	if (rem)
+		*rem = time % a->csecs_per_chunk;
+	if (chunk > a->hdr->nchunks - 1)
+		chunk = a->hdr->nchunks - 1;
+	return chunk;
+}
+
+/* ------------------------------------------------------------------------------------------------- */
+
+static armovie armovie_prepmovie(const char *filename, armovie_hdr *hdr, int play_from, int play_to, int loop_for,
+									armovie_playflag playflags, int soundtrack)
+{
+	armovie a = NULL;
+	if ((a = calloc(sizeof(struct armovie__str), 1)) != NULL)
+	{
+		armovie_soundstr *sp;
+
+/* save off passed in values */
+		a->movie_file = strdup(filename);
+		a->playflags = playflags;
+		a->loop_for = playflags & arplay_Loop ? (playflags & arplay_LoopIndefinite ? INT_MAX : loop_for - 1) : 0;
+		a->soundtrack = soundtrack - 1;
+
+		if (hdr)
+		{
+			a->hdr = hdr;
+			a->dont_free_hdr = TRUE;
+		}
+		else
+			armovie_identify(filename, &a->hdr);
+
+		if (a->hdr == NULL || !armovie_validate_soundtrack(a->hdr, a->soundtrack))
+		{
+			armovie_dispose(&a);
+			return NULL;
+		}
+
+/* setup relevant sound structure pointer */
+		sp = soundtrack_ptr(a);
+
+/* get useful sample rate */
+		a->real_sample_rate = arsnd_realsamplerate(sp);
+
+/* calculate chunk size */
+		a->csecs_per_chunk = (int) (a->hdr->frames_per_chunk*100.0 / a->hdr->fps);
+
+/* check start pos */
+		if (playflags & arplay_PlayChunk && play_from != -1)
+		{
+			int rem_start;
+			a->start_chunk = get_chunk(a, play_from, &rem_start);
+
+			if (rem_start != 0 && (sp->sflags & armovie_Seekable) == 0)
+			{
+				pending_unmute = (int)(rem_start*a->real_sample_rate/100);
+				a->start_offset = 0;
+				a->play_from = a->start_chunk*a->csecs_per_chunk;
+			}
+			else
+			{
+				pending_unmute = 0;
+				a->start_offset = (rem_start*arsnd_bytes_per_sec(sp)/100) &~ 3;
+				a->play_from = play_from;
+			}
+		}
+		else
+		{
+			a->play_from = 0;
+			a->start_chunk = 0;
+			a->start_offset = 0;
+			pending_unmute = 0;
+		}
+		a->current_chunk = a->start_chunk;
+
+/* check end pos */
+		if (playflags & arplay_PlayChunk && play_to != -1)
+		{
+			int rem_end;
+			a->end_chunk = get_chunk(a, play_to, &rem_end);
+			if (sp->sflags & armovie_Seekable)
+			{
+				a->play_to = play_to;
+				if (rem_end == 0)
+					a->end_offset = 64;
+				else
+					a->end_offset = (rem_end*arsnd_bytes_per_sec(sp)/100) &~ 3;
+			}
+			else
+			{
+				a->play_to = (a->end_chunk + 1)*a->csecs_per_chunk - 1;
+				a->end_offset = 0;
+			}
+		}
+		else
+		{
+			a->play_to = a->hdr->nchunks*a->csecs_per_chunk-1;
+			a->end_chunk = a->hdr->nchunks - 1;
+			a->end_offset = 0;
+		}
+
+/* open file */
+		if ((a->playflags & arplay_ExternalData) == 0)
+			if (os_err(file_open(fopt_Read, filename, &a->file_handle)) != NULL)
+			{
+				armovie_dispose(&a);
+				return NULL;
+			}
+	}
+	return a;
+}
+
+/* ----------------------------------------------------------------------------------------- */
+
+/*
+ * Set up all the system bits according to the soundtrack to be played.
+ * Returns success but doesn't clear up its own mess.
+ */
+
+static BOOL armovie_startplaying(armovie a)
+{
+	const armovie_soundstr	*sp = soundtrack_ptr(a);
+
+	if (!armovie_claimsounddevice())
+		return FALSE;
+
+/* check correct sound code is loaded */
+	if (!armovie_getsoundcode(sp))
+		return FALSE;
+
+/* start timing sound card if necessary */
+	if (!armovie_checktiming())
+		return FALSE;
+
+/* allocate temporary memory */
+	tempchunk_size = (sp->max_soundsize + 3 + 32) &~ 3;
+	if ((a->playflags & arplay_ExternalData) == 0)
+		if (!tempchunk_alloc(&tempchunk_ptr, tempchunk_size))
+		{
+			werr(0, OOMCHUNK_ERR, tempchunk_size);
+			return FALSE;
+		}
+
+/* claim rma sound buffers */
+	if (!armovie_claimsoundbuffers(sp, (int)(a->real_sample_rate*sp->channels*SAFETY_FACTOR*a->hdr->frames_per_chunk/a->hdr->fps)))
+		return FALSE;
+
+	armovie_finishtiming();
+
+/* start playing - load up first chunk -
+ * if slow loading then load up second chunk also
+ * or if we are offset into first chunk
+ */
+	{
+		int		t1 = alarm_timenow();
+		BOOL	load_immediate;
+
+		if (os_err(load_chunk(a)) != NULL)
+			return FALSE;
+
+		load_immediate = a->start_offset != 0 ||
+				alarm_timedifference(t1, alarm_timenow()) >= a->csecs_per_chunk/2;
+
+		if (a->playflags & arplay_LoopFromStart)
+		{
+			a->start_chunk = 0;
+			a->start_offset = 0;
+		}
+
+		if (load_immediate)
+		   alarm_fn(0, &movie_playing);
+	}
+
+	arsound_setmute((pending_unmute || (a->playflags & arplay_StartMute) != 0 ? arsound_Mute : 0) |
+			(a->playflags & arplay_StartPause ? arsound_Pause : 0));
+
+	arsound_play(2);
+
+/* start alarm function - have it come straight back so that we can load up the second chunk */
+
+	alarm_set(alarm_timenow() + 1, alarm_fn, &movie_playing);
+
+	return TRUE;
+}
+
+/*
+ * Generic play movie function.
+ */
+
+armovie armovie_playfile(const char *filename, armovie_hdr *hdr, int play_from, int play_to, int loop_for,
+		armovie_playflag playflags, int soundtrack, int reference, armovie_loadchunk_fn fn, void *handle)
+{
+	armovie	new = NULL;
+	char	*file = strdup(filename);
+
+	if ((new = armovie_prepmovie(file, hdr, play_from, play_to, loop_for, playflags, soundtrack)) != NULL)
+	{
+		new->loadchunk_fn = fn ? fn : armovie__loadchunk;
+		new->loadchunk_handle = handle ? handle : new;
+
+		new->reference = reference;
+
+/* If we don't want to queue the sound, then kill off everything else first */
+		if ((playflags & arplay_QueueSound) == 0)
+		{
+			notify(movie_playing, armovie_Aborted);
+
+			armovie_freesystem();
+			armovie_disposeall(&movie_playing);
+		}
+
+/* If nothing is playing (or has just been killed) start playing */
+		if (movie_playing == NULL)
+		{
+			movie_playing = new;
+			if (armovie_startplaying(new) == FALSE)
+			{
+				armovie_freesystem();
+				armovie_dispose(&new);
+				movie_playing = NULL;
+			}
+		}
+/* otherwise add to end of queue if it is compatible */
+		else if (movie_compatible(soundtrack_ptr(movie_playing), soundtrack_ptr(new)))
+		{
+			last_movie()->next_movie = new;
+		}
+		else
+			armovie_dispose(&new);
+	}
+
+	free(file);
+
+	return new;
+}
+
+/*
+ * Main play movie function.
+ */
+
+armovie armovie_playsound(const char *filename, int play_from, int play_to, int loop_for,
+									armovie_playflag playflags, int soundtrack, int reference)
+{
+	return armovie_playfile(filename, NULL, play_from, play_to, loop_for, playflags, soundtrack,
+							reference, 0, NULL);
+}
+
+void armovie_stopsound(void)
+{
+	armovie_freesystem();
+	armovie_disposeall(&movie_playing);
+}
+
+int armovie_getpos(int *pt, int *pnloops)
+{
+	armovie a = movie_playing;
+	int		ref = -1;
+	if (a)
+	{
+		int cs_played = (int)(arsound_samplesplayed()/a->real_sample_rate * 100),
+			chunk_len_1 = a->play_to - a->play_from + 1;
+
+		int t, nloops;
+
+		if (cs_played < chunk_len_1)
+		{
+			nloops = 0;
+			t = a->play_from + cs_played;
+		}
+		else if (a->playflags & arplay_LoopFromStart)
+		{
+			int chunk_len = a->play_to + 1;
+
+			cs_played -= chunk_len_1;
+
+			nloops = cs_played / chunk_len + 1;
+			t = cs_played % chunk_len;
+		}
+		else
+		{
+			nloops = cs_played / chunk_len_1;
+			t = a->play_from + (cs_played % chunk_len_1);
+		}
+
+		if (pt)
+			*pt = t;
+		if (pnloops)
+			*pnloops = nloops;
+
+		ref = a->reference;
+	}
+	return ref;
+}
+
+void armovie_registermemfns(mem_allocfn alloc_fn, mem_freefn free_fn)
+{
+	tempchunk_alloc = alloc_fn;
+	tempchunk_free = free_fn;
+}
+
+void armovie_modechange(void)
+{
+	if (armovie_invalidateclockrate() && movie_playing)
+	{
+		notify(movie_playing, armovie_ModeChange);
+		armovie_freesystem();
+		armovie_disposeall(&movie_playing);
+	}
+}
+
+BOOL armovie_abort(const char *info, void *handle)
+{
+	if (movie_playing)
+	{
+		notify(movie_playing, armovie_Aborted);
+		armovie_freesystem();
+		armovie_disposeall(&movie_playing);
+	}
+	return TRUE;
+	info = info;
+	handle = handle;
+}
+
+void armovie_eventhandler(armovie_eventfn fn, void *handle)
+{
+	event_fn = fn;
+	event_handle = handle;
+}
+
+/*
+ * To be called by an exit handler.
+ */
+
+void armovie_cleanup(void)
+{
+	armovie_freesystem();
+	armovie_disposeall(&movie_playing);
+	armovie_unloadsoundcode();
+}
+
+/* eof armovie.c */

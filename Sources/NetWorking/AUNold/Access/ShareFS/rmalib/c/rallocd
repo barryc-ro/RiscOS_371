@@ -1,0 +1,307 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/rmalib/rallocd.c:networking  1.2  $
+ * $Source: /ax/networking:Starling/ShareFS/rmalib/rallocd.c: $
+ *
+ * Copyright(c) 1995 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	rallocd.c,v $
+ * Revision 1.2  95/01/09  13:45:22  kwelton
+ * The header file _swis.h no longer exists, it has been adsorbed into the
+ * (new) system version of swis.h.
+ * 
+ * Revision 1.1  95/01/04  09:57:21  kwelton
+ * Initial revision
+ * 
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#define DEBUG
+#define NORALLOCDEFINES
+
+#include "ralloc.h"
+
+extern char *caller(int n);
+
+#define SECRET 0x98765432
+#define SECRETE 0x01234567
+
+int do_not_mix_debugging_ralloc = 0;
+
+int rallocdebug = 0;
+
+#define DEBUGf if (rallocdebug>0) printf
+
+typedef struct block
+{
+    struct block *next;
+    struct block *last;
+    char *caller;
+    int size;			/* extra copy of size */
+    int secret;
+} *b;
+
+#define size(b) (((int *)b)[-1]-4)	/* Gives size of block */
+#define secrete(b) *(int *)((char *)b+size(b)-4)
+
+static struct
+{
+    b first, nil, last;
+} h =
+{
+     0, 0, 0
+};
+
+static void init(void)
+{
+     h.first = (b) & h.nil;
+    h.nil = 0;
+    h.last = (b) & h.first;
+    DEBUGf("ralloc initialised\n");
+}
+
+int rcheckall(void)
+{
+    b p, p1;
+    int n = 0, m = 0;
+    DEBUGf("rcheckall %p..", &h);
+    if (!h.first)
+	init();
+    for (p = h.first; p && 0 != (p1 = p->next); p = p1)
+    {
+	n++;
+	if (p->secret != SECRET)
+	{
+	    m++;
+	    printf("%.20s:%p start overwritten\n", p->caller, p + 1);
+	}
+	else
+	if (p->size != size(p))
+	{
+	    m++;
+	    printf("%.20s:%p size wrong\n", p->caller, p + 1);
+	}
+	else
+	if (secrete(p) != SECRETE)
+	{
+	    m++;
+	    printf("%.20s:%p end overwritten\n", p->caller, p + 1);
+	}
+	if (p != p1->last)
+	{
+	    printf("***rcheckall:Chain broken between %.20s:%p %p\n", p->caller, p, p1);
+	    break;
+	}
+    }
+    DEBUGf("Allocated %d Dead %d\n", n, m);
+    return m;
+}
+
+void rfreeall(void)
+{
+    b p, p1;
+#ifdef DEBUG
+    char buf[30];
+#endif
+    int n = 0, m = 0;
+    if (!h.first)
+	init();
+    DEBUGf("rfreeall %p %p %p\n", &h, h.first, h.last);
+    for (p = h.first; 0 != (p1 = p->next); p = p1)
+    {
+	if (p->secret == SECRET && secrete(p) == SECRETE)
+	{
+	    DEBUGf("Lost: %.20s:%p+%x\n", p->caller, p, size(p) - sizeof(*p) - 4);
+	    _swix(OS_Module, _IN(0) | _IN(2), 7, p);
+	    n++;
+	}
+	else
+	    m++;
+	if (p1->last != p)
+	{
+	    n += 1000000;
+	    DEBUGf("***Chain broken! at %p %p\n", p, p1);
+	    break;
+	}
+    }
+    h.first = (b) & h.nil;
+    h.nil = 0;
+    h.last = (b) & h.first;
+#ifdef DEBUG
+    sprintf(buf, "Lost %d Dead %d", n, m);
+    if (n || m)
+	_kernel_setenv("ralloc$stats", buf);
+    DEBUGf("%s\n", buf);
+#endif
+}
+
+void *rmalloc(size_t size)
+{
+    _kernel_oserror *err;
+    b p;
+    char *c = caller(1);
+    err = _swix(OS_Module, _IN(0) | _IN(3) | _OUT(2), 6, size + sizeof(*p) + 4, &p);
+    if (err)
+    {
+	DEBUGf("%s:rmalloc(%d) error %s\n", c, size, err->errmess);
+	return NULL;
+    }
+    if (!h.first)
+	init();
+    p->secret = SECRET;
+    secrete(p) = SECRETE;
+    p->next = h.first;
+    h.first->last = p;
+    p->last = (b) & h.first;
+    h.first = p;
+    p->caller = c;
+    p->size = size(p);
+    DEBUGf("%s:rmalloc(%d)=%p\n", c, size, p + 1);
+    return p + 1;
+}
+
+void *rcalloc(size_t n, size_t m)
+{
+    void *p;
+    char *c = caller(1);
+    DEBUGf("%s:rcalloc(%d,%d):", c, n, m);
+    p = rmalloc(n * m);
+    if (p)
+    {
+	memset(p, 0, (size_t) (n * m));
+	((b) p - 1)->caller = c;
+    }
+    return p;
+}
+
+void rfree(void *q)
+{
+    b p;
+    _kernel_oserror error;
+    char *c = caller(1);
+    if (!h.first)
+	init();
+    if (!q)
+    {
+	DEBUGf("%s:rfree(NULL)\n", c);
+	return;
+    }
+    p = (b) q - 1;
+    if (!p->secret)
+    {
+	sprintf(error.errmess, "%s:free(%.20s:%p) already freed\n",
+		c, p->caller, q);
+	roverwritten(&error);
+	return;
+    }
+    if (p->secret != SECRET)
+    {
+	sprintf(error.errmess, "%s:free(%.20s:%p) start overwritten\n",
+ c, p->caller, q);
+	roverwritten(&error);
+	return;
+    }
+    if (p->size != size(p))
+    {
+	sprintf(error.errmess, "%s:free(%.20s:%p) size wrong\n",
+		c, p->caller, q);
+	roverwritten(&error);
+	return;
+    }
+    if (secrete(p) != SECRETE)
+    {
+	sprintf(error.errmess, "%s:free(%.20s:%p) end overwritten\n",
+		c, p->caller, q);
+	roverwritten(&error);
+	return;
+    }
+    p->secret = 0;
+    secrete(p) = 0;
+    if (p != p->last->next || p != p->next->last)
+    {
+	sprintf(error.errmess, "***%s:free:Chain broken at %.20s:%p\n",
+		c, p->caller, p);
+	roverwritten(&error);
+	return;
+    }
+    p->last->next = p->next;
+    p->next->last = p->last;
+    p->next = p->last = (b) - 1;
+    _swix(OS_Module, _IN(0) | _IN(2), 7, p);
+    DEBUGf("%s:rfree(%p)\n", c, q);
+}
+
+void *rrealloc(void *q, size_t size)
+{
+    b p;
+    _kernel_oserror *err, error;
+    char *c = caller(1);
+    if (!h.first)
+	init();
+    p = (b) q - 1;
+    DEBUGf("%s:rrealloc(%.20s:%p,%d)", c, q ? p->caller : "NULL", q, size);
+    if (!q)
+	return rmalloc(size);
+    if (p->secret != SECRET)
+    {
+	sprintf(error.errmess,
+		"%s:realloc(%.20s:%p,%d) was %d start overwritten\n",
+		c, p->caller, q, size, size(p) - sizeof(*p) - 4);
+	roverwritten(&error);
+    }
+    if (p->size != size(p))
+    {
+	sprintf(error.errmess, "%s:realloc(%.20s:%p,%d) was %d size wrong\n",
+		c, p->caller, q, size, size(p) - sizeof(*p) - 4);
+	roverwritten(&error);
+    }
+    if (secrete(p) != SECRETE)
+    {
+	sprintf(error.errmess,
+		"%s:realloc(%.20s:%p,%d) was %d end overwritten\n",
+		c, p->caller, q, size, size(p) - sizeof(*p) - 4);
+	roverwritten(&error);
+    }
+    p->last->next = p->next;
+    p->next->last = p->last;
+    p->next = p->last = (b) - 1;
+    secrete(p) = 0;
+    err = _swix(OS_Module, _IN(0) | _IN(2) | _IN(3) | _OUT(2),
+		13, p, size + sizeof(*p) + 4 - size(p), &p);
+    p->next = h.first;
+    h.first->last = p;
+    p->last = (b) & h.first;
+    h.first = p;
+    secrete(p) = SECRETE;
+    p->size = size(p);
+    if (err)
+    {
+	DEBUGf("%s:rrealloc(%s:%p,%d) error %s\n",
+	       c, p->caller, q, size, err->errmess);
+	return NULL;
+    }
+    DEBUGf("=%p\n", p + 1);
+    return p + 1;
+}
+
+char *rstrdup(const char *s)
+{
+    char *p;
+    char *c = caller(1);
+    int l = strlen(s);
+    DEBUGf("%s:rstrdup(%s[%d]):", c, s, l);
+    p = rmalloc(l + 1);
+    if (p)
+    {
+	strcpy(p, s);
+	((b) p - 1)->caller = c;
+    }
+    return p;
+}
+
+/* EOF rallocd.c */

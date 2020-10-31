@@ -1,0 +1,444 @@
+/* > global.c
+
+ * © SJ Middleton, 1993
+
+ * This file contains the code to handle the global dialogue box.
+ * Everything is instant effect (except the writeable icons obviously).
+
+ */
+
+#include "msgs.h"
+#include "res.h"
+#include "werr.h"
+#include "wimpx.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "dboxes.h"
+#include "dboxinc.h"
+#include "dboxquery.h"
+#include "file.h"
+#include "macros.h"
+#include "memalloc.h"
+#include "screenmode.h"
+#include "strfn.h"
+#include "sys.h"
+#include "wmisc.h"
+
+#include "arsound.h"
+#include "artools.h"
+#include "replaytype.h"
+
+#define GLOBAL_IDENT        "global"
+
+#define CREATE_TABLES_FIELD 16
+#define CANCEL_FIELD        17
+#define OK_FIELD            24
+
+#define VERSION_FIELD       15
+
+#define INTERPOLATE_FIELD   4
+#define USE_4BITCOL_FIELD   5
+#define USE_PREFMODE_FIELD  6
+#define USE_BIGMODE_FIELD   10
+#define PREFMODE_FIELD      7
+#define BIGMODE_FIELD       11
+
+#ifdef USE_QUALITY
+#define SET_QUALITY_FIELD   19
+#define SOUND_QUALITY_FIELD 20
+
+#define ARPLAYER_QUALITY        "ARPlayer$SoundQuality"
+#define DEFAULT_QUALITY         1
+#endif
+
+#define CANT_CREATE_TABLES      msgs_lookup("glob0")
+#define REALLY_CREATE_TABLES    msgs_lookup("glob1")
+#define CREATE                  msgs_lookup("create")
+#define CANCEL                  msgs_lookup("cancel")
+
+#define CONFIGURE_FILE          "<ARPlayer$StateFile>"
+
+#define filetype_Obey           0xFEB
+
+static artool_globalstr global;
+
+/* -------------------------------------------------------------------------------- */
+
+static void read_vars(artool_globalstr *gp)
+{
+    artool_global   flags;
+    char            buffer[64], *s;
+
+    flags = (getenv(ARMOVIE_4COLOUR) ? artool_4BitColour : 0);
+
+    s = getenv(ARMOVIE_INTERPOLATE);
+    if (s && s[0])
+    {
+        flags |= artool_Interpolate;
+        if (s[1] != '\0')
+        {
+            gp->interp_rate1 = (int) strtoul(s, NULL, 10);
+            if ((s = strchr(s, ',')) != NULL)
+                gp->interp_rate2 = (int) strtoul(s+1, NULL, 10);
+            else
+                gp->interp_rate2 = 0;
+        }
+        else
+            gp->interp_rate1 = gp->interp_rate2 = -1;
+    }
+
+#ifdef USE_QUALITY
+    s = getenv(ARPLAYER_QUALITY);
+    if (s)
+    {
+        flags |= artool_SetQuality;
+        gp->sound_quality = (int) strtoul(s, NULL, 10);
+    }
+    else
+        gp->sound_quality = DEFAULT_QUALITY;
+#endif
+
+    mode_String(screen_ReturnSpecifier(), buffer);
+
+    s = getenv(ARMOVIE_MODE);
+    if (s)
+    {
+        flags |= artool_UsePrefMode;
+        strncpy(gp->pref_mode, s, sizeof(gp->pref_mode)-1);
+    }
+    else if (gp->pref_mode[0] == '\0')
+        strcpy(gp->pref_mode, buffer);
+
+    s = getenv(ARMOVIE_BIGMODE);
+    if (s)
+    {
+        flags |= artool_UseBigMode;
+        strrplc(&gp->pref_bigmode, s);
+    }
+    else if (gp->pref_bigmode == NULL)
+        gp->pref_bigmode = strdup(buffer);
+
+    gp->flags = flags;
+}
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * Run the table creation program from the MovingLines application directory.
+ */ 
+
+static void create_tables(void)
+{
+    if (screen_Vars.bpp != 4 && screen_Vars.bpp != 8)
+        werr(0, CANT_CREATE_TABLES, screen_Vars.bpp);
+    else if (dbox3wayf(CREATE, CANCEL, NULL, REALLY_CREATE_TABLES) == dbox3way_Answer1)
+    {
+        char buffer[64];
+        sprintf(buffer, "Run "ARMOVIE_DIR".MovingLine.Make%dcol11", screen_Vars.bpp);
+        os_err(wimp_starttask(buffer));
+    }
+}
+
+/* -------------------------------------------------------------------------------- */
+
+static void notify_fn(int val, void *handle)
+{
+    char *var = handle;
+    char buffer[12];
+    sprintf(buffer, "%d", val);
+    setenv(var, buffer, 0);
+}
+
+static dbox_incstr  change_inc =
+{
+    1, 10,
+    0, 127,
+    0, 0, notify_fn,
+    dboxinc_NoFullIcons | dboxinc_NoValidateOnReturn
+};
+
+#ifdef USE_QUALITY
+static dbox_incstr  quality_inc =
+{
+    1, 0,
+    1, 4,
+    0, 0, notify_fn
+};
+#endif
+
+/* -------------------------------------------------------------------------------- */
+
+static void set_switch(dbox d, dbox_field f, const char *var)
+{
+    BOOL on = dbox_getnumeric(d, f);
+    setenv(var, on ? "." : NULL, 0);
+}
+
+static void set_prefmode(dbox d)
+{
+    char buffer[32];
+    BOOL on = dbox_getnumeric(d, USE_PREFMODE_FIELD);
+
+    dbox_getfield(d, PREFMODE_FIELD, buffer, sizeof(buffer));
+    setenv(ARMOVIE_MODE, on ? buffer : NULL, 0);
+    dboxinc_fade(d, PREFMODE_FIELD, !on, FALSE);
+}
+
+static void set_prefbigmode(dbox d)
+{
+    char buffer[256];
+    BOOL on = dbox_getnumeric(d, USE_BIGMODE_FIELD);
+
+    dbox_getfield(d, BIGMODE_FIELD, buffer, sizeof(buffer));
+    setenv(ARMOVIE_BIGMODE, on ? buffer : NULL, 0);
+    dboxinc_fade(d, BIGMODE_FIELD, !on, FALSE);
+}
+
+static void set_interpolate(dbox d, int rate1, int rate2)
+{
+    if (dbox_getnumeric(d, INTERPOLATE_FIELD))
+    {
+        if (rate1 == -1)
+            setenv(ARMOVIE_INTERPOLATE, ".", 0);
+        else
+        {
+            char buffer[64];
+            sprintf(buffer, "%d,%d", rate1, rate2);
+            setenv(ARMOVIE_INTERPOLATE, buffer, 0);
+        }
+    }
+    else
+        setenv(ARMOVIE_INTERPOLATE, NULL, 0);
+}
+
+#ifdef USE_QUALITY
+static void set_quality(dbox d)
+{
+    char buffer[12];
+    BOOL set = dbox_getnumeric(d, SET_QUALITY_FIELD);
+
+    dbox_getfield(d, SOUND_QUALITY_FIELD, buffer, sizeof(buffer));
+    setenv(ARPLAYER_QUALITY, set ? buffer : NULL, 0);
+    dboxinc_fade(d, SOUND_QUALITY_FIELD, !set, FALSE);
+}
+#endif
+
+/*
+ * Set all the dbox fields on opening
+ */
+
+static void set_fields(dbox d, const artool_globalstr *gp)
+{
+    char            *s;
+    artool_global   flags = gp->flags;
+
+    s = getenv(ARMOVIE_VERSION);
+    dbox_setfield(d, VERSION_FIELD, s ? s : "");
+
+/* video */
+    dbox_setnumeric(d, INTERPOLATE_FIELD, flags & artool_Interpolate);
+    dbox_setnumeric(d, USE_4BITCOL_FIELD, flags & artool_4BitColour);
+
+    dbox_setnumeric(d, USE_PREFMODE_FIELD, flags & artool_UsePrefMode);
+    dbox_setfield(d, PREFMODE_FIELD, gp->pref_mode);
+    dboxinc_fade(d, PREFMODE_FIELD, (flags & artool_UsePrefMode) == 0, FALSE);
+
+    dbox_setnumeric(d, USE_BIGMODE_FIELD, flags & artool_UseBigMode);
+    dbox_setfield(d, BIGMODE_FIELD, strsafe(gp->pref_bigmode));
+    dboxinc_fade(d, BIGMODE_FIELD, (flags & artool_UseBigMode) == 0, FALSE);
+
+#ifdef USE_QUALITY
+    dbox_setnumeric(d, SET_QUALITY_FIELD, flags & artool_SetQuality);
+    dbox_setnumeric(d, SOUND_QUALITY_FIELD, gp->sound_quality);
+    dboxinc_fade(d, SOUND_QUALITY_FIELD, (flags & artool_SetQuality) == 0, FALSE);
+#endif
+}
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * Handle user events in the global window.
+ */
+
+static void global_events(dbox d, void *handle)
+{
+    dbox_field action = dbox_get(d);
+    switch (action)
+    {
+        case dbox_CLOSE:
+            artoolglobal_dispose();
+            break;
+
+        case INTERPOLATE_FIELD:
+            set_interpolate(d, options.interp_rate1, options.interp_rate2);
+            break;
+
+        case USE_4BITCOL_FIELD:
+            set_switch(d, USE_4BITCOL_FIELD, ARMOVIE_4COLOUR);
+            break;
+
+        case USE_PREFMODE_FIELD:
+        case PREFMODE_FIELD:
+            set_prefmode(d);
+            break;
+
+        case USE_BIGMODE_FIELD:
+        case BIGMODE_FIELD:
+            set_prefbigmode(d);
+            break;
+
+#ifdef USE_QUALITY
+        case SET_QUALITY_FIELD:
+        case SOUND_QUALITY_FIELD:
+            set_quality(d);
+            break;
+#endif
+        case CREATE_TABLES_FIELD:
+            artoolglobal_readoptions();
+            create_tables();
+            break;
+
+        case OK_FIELD:
+            artoolglobal_readoptions();
+            if (dbox_persist())
+                read_vars(&global);
+            else
+                artoolglobal_dispose();
+            break;
+
+        case CANCEL_FIELD:
+            set_fields(d, &global);
+            artoolglobal_readoptions();
+            set_interpolate(d, global.interp_rate1, global.interp_rate2);
+            set_switch(d, USE_4BITCOL_FIELD, ARMOVIE_4COLOUR);
+            if (!dbox_persist())
+                artoolglobal_dispose();
+            break;
+
+        default:
+            if (dboxinc_processinc(d, PREFMODE_FIELD, action, &change_inc, ARMOVIE_MODE)
+                || dboxinc_processinc(d, BIGMODE_FIELD, action, &change_inc, ARMOVIE_BIGMODE)
+#ifdef USE_QUALITY
+                || dboxinc_processinc(d, SOUND_QUALITY_FIELD, action, &quality_inc, ARPLAYER_QUALITY)
+#endif
+                )
+                    skip();
+            break;
+    }
+    UNUSED(handle);
+}
+
+/* -------------------------------------------------------------------------------- */
+
+/*
+ * External functions
+ */
+
+static dbox global_d = NULL;
+
+/*
+ * Dispose of the global window if it attached to the given structure
+ */
+
+void artoolglobal_dispose(void)
+{
+    if (global_d)
+    {
+        dbox_dispose(&global_d);
+        global_d = NULL;
+    }
+}
+
+/*
+ * Open (or update) the global window
+ */
+
+void artoolglobal_popup(void)
+{
+    dbox d = global_d;
+    if (d)
+        bring_to_front(dbox_syshandle(d));
+
+    else if ((d = dbox_new(GLOBAL_IDENT)) != NULL)
+    {
+        global_d = d;
+
+        dbox_showstatic(d);
+
+        read_vars(&global);
+        set_fields(d, &global);
+
+        dbox_eventhandler(d, global_events, NULL);
+    }
+}
+
+BOOL is_artoolglobal_open(void)
+{
+    return global_d != NULL;
+}
+
+void artoolglobal_readoptions(void)
+{
+    if (global_d)
+    {
+        set_prefmode(global_d);
+        set_prefbigmode(global_d);
+#ifdef USE_QUALITY
+        set_quality(global_d);
+#endif
+    }
+}
+
+/* -------------------------------------------------------------------------------- */
+
+static os_error *check_var(unsigned f, const char *varname)
+{
+    char *val = getenv(varname);
+    if (val)
+        return file_writef(f, "Set %s %s\n", varname, val);
+    return NULL;
+}
+
+static os_error *artoolglobal_writeoptions(unsigned f)
+{
+    os_error *e;
+
+    if ((e = check_var(f, ARMOVIE_MODE)) != NULL ||
+        (e = check_var(f, ARMOVIE_BIGMODE)) != NULL ||
+        (e = check_var(f, ARMOVIE_INTERPOLATE)) != NULL ||
+        (e = check_var(f, ARMOVIE_4COLOUR)) != NULL)
+#ifdef USE_QUALITY
+        (e = check_var(f, ARPLAYER_QUALITY)) != NULL ||
+#endif
+        return e;
+
+    return NULL;
+}
+
+/*
+ * Called from save choices option in iconbar menu.
+ * file to write is setup by the !Run file, either local or in Choices$Write
+ */
+
+void artoolglobal_savebootoptions(void)
+{
+    const char *filename = CONFIGURE_FILE;
+    filehandle f;
+
+    artoolglobal_readoptions();
+
+    if (os_err(file_open(fopt_Write, filename, &f)) == NULL)
+    {
+        os_err(file_writef(f, "| Setup ARMovie configuration variables\n"));
+        os_err(artoolglobal_writeoptions(f));
+
+        file_close(f);
+        file_settype(filename, filetype_Obey);
+    }
+}
+
+
+/* eof global.c */

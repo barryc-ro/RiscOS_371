@@ -1,0 +1,950 @@
+
+                                RISC OS Purple
+                                ==============
+                                
+                        How do we change black into purple?
+                        ===================================
+                        
+                        0.01    N Kelleher    15/10/95  started
+                        0.02    N Kelleher    27/10/95  added sections, 
+                                rewrote cleaning appendix
+                        
+Introduction
+------------
+
+RISC OS Purple can be thought of as addressing five aspects of RISC OS,
+these are:-
+        - integrating improved printing system
+        - addressing performance bottlenecks
+        - major overhaul of CD environment
+          [did not become part of RO 3.7 - mjs, 5-9-96]
+        - support for StrongARM processor (and possibly 810)
+          [810 is not supported by 3.7 - mjs, 5-9-96]
+        - fixing of certain bugs in 3.60
+        
+The CD and printing systems are covered in other documents, so this document
+concentrates on StrongARM support and performance issues (Bug fixing from 
+3.60 will be determined by the normal procedures, eg. FRM). StrongARM is known
+as an architecture 4 ARM processor. This means that it is architectually
+different from the existing processors (ARM 610,700,710) suppored by RISC OS.
+Thus, in spite of being instruction set compatible (with a few exceptions),
+it will behave differently in some circumstances. The biggest change is in 
+the area of memory management and this will require a significant overhaul.
+
+What must be done
+-----------------
+
+This section describes changes to RISC OS that must be carried out in order
+to support StrongARM. They fall into the following categories:-
+
+        * Low level Memory management
+        * Abort timing
+        * Storing R15 in memory
+        * Zero page accesses
+        * Code built at run time
+        * Processor awareness
+        * Power on self test & reset system
+        * Compatibility issues
+
+Low level memory management
+---------------------------
+
+See the appendix for a description of memory management under RISC OS.
+
+The act of remapping a page or flushing the cache in the ARM architecture is 
+carried out by using an MCR instruction. In other words, the MMU appears as
+a coprocessor to the system programmer. The cache & mmu on existing processors
+are fairly primitive as far as their control is concerned, supporting
+operations to flush the cache, purge the TLB or flush the TLB. The architecture
+4 cache & MMU are more complex allowing instructions to purge or flush a single
+entry in the cache. In addition, due to the StrongARM data cache being 'write-
+back' [1] and having a separate instruction cache, there needs to be more
+control to maintain cache coherency.
+
+An immediate consequence of these differences is that the interface to the cache
+and MMU has changed. Thus every part of the kernel which accesses these
+instructions must, at the very least, be updated. Unfortunately, simply changing
+the existing mechanisms to use the new operations will be insufficient, as
+there is 'increased cost' in their use. This would result in a system that
+would be significantly less useable than the current one.
+
+Currently, RISC OS flushes the cache & TLB after every page mapping. This is
+irrespective of whether the mapping is a wimp task being swapped in or out,
+RMA extending or the creation of a dynamic area. Thus, cache flushing must be
+reduced in the Purple RISC OS. This can generally be done by moving the cache
+flush outside of the inner loop and doing the flush at the end of the mapping
+operation. The down side of this is that whereas only one part of the kernel
+is currently concerned with cache flushing and mapping, this knowledge may have
+to be made available elsewhere. However, it is worth noting that the time
+taken by a function call is insignificant compared to the effects of a cache
+flush.
+        
+[1] A write back cache is one where memory writes which hit the cache DO NOT
+cause a write-back (hence its name) to main memory there and then. Instead
+the cache is marked as dirty and when the cache line is required or when the
+OS issues a 'Clean' instruction, only then does main memory get updated. The
+alternate variety (as used in ARM 6x0,7x0) is a write-thru cache, where main
+memory is always consistent with the cache (subject to data still in the write 
+buffer). It is debatable as to which system offers higher performance, since 
+this will depend on whether the same piece of memory is being updated, whether
+the write buffer stalls etc.
+
+  2nd level cache support
+  -----------------------
+  
+  It's possible that StrongARM cards will be made with a 2nd level cache. 
+  This would cache physical memory and make it available to the processor
+  somewhat faster than main memory. Since a 2nd level cache uses the addresses
+  from the chip, ie. physical addresses, it does not require flushing when
+  the address mappings are changed. In fact the only time it requires flushing
+  is when hardware has loaded data into an area it is caching, such as DMA
+  activity.
+  
+  Apart from this (which can be dealt with simply by marking the area as 
+  non cacheable) there does need to be some software support. Since the
+  cache has no knowledge of how memory is used, it is necessary to tell it
+  whether or not a particular address is cacheable. This could be done with
+  additional hardware, but this simplest method is to get the OS to set A31
+  of the physical address generated. Under RISC OS this is quite straight
+  forward as the MMU is always on (at least a while after reset) and only
+  29 bits of the address are relevant to IOMD as far as decoding is concerned.
+  
+  Thus the mapping routine(s) needs to be modified to set A31 of the physical
+  address in the L2PT when the area is cacheable. This is assuming that if
+  something is cacheable on chip, it is likely to be cacheable off chip. Of
+  course, the API could be extended to allow control over this. Apart from
+  cache control, the software support for a 2nd level cache should be minimal.
+  
+  By using cache RAMs currently available it might be possible to improve
+  accesses to 80 or 40 MHz (sequential vs non-sequential).
+
+Abort timing
+------------
+
+When an instruction accesses an address which has no physical mapping, a data
+abort happens. The state that the processor registers are left in obviously
+depends on the instruction in question, but also on the processor. In particular
+writes/loads (eg. LDR,STM etc.) where writeback is involved can behave
+differently.
+
+The kernel currently has an abort system that allows modules to register a
+function with an address range, so that the function is called when an abort
+happens within that range. The system also allows ROM routines running in 26
+bit modes to write to the exception vectors. All of the code relies on the
+processor working on 'late abort' [2] timing. StrongARM works with 'early abort'
+timing. Thus it will be necessary to modify this code to cope with both timing
+mechanisms or scrap it all together. The effect of this later approach will be
+two fold:-
+
+        1) Any code using the registration mechanism wont work - but then
+           there's nothing released which does.
+        2) Any ROM code which breaks the rules wont work[3]. Such ROM code ought
+           to be fixed - there is currently a side-effect in that BASIC allows
+           !8 = 0.
+           
+That said, this mechanism does allow prototypes to be 'hacked on' and so at
+least for development purposes is worth 'fixing', though this should be a lower
+priority. If it doesn't get fixed, then it should be removed before Purple
+is released. Another reason for fixing ROM code is that the mechanism only
+checks for a PC in the ROM, ie. if the 'broken' module is RAM-ed, then the
+mechanism will not intervene and the access will fail.
+
+It should be possible to fix the abort system before StrongARM as the 610 is
+programmable to use the same system. <<check this is true>>
+
+[2] See the ARM 7x0 data sheet for a description of this. Reference to the 
+StrongARM data sheet will identify the differences. The ARM 6x0 is configurable
+to either early or late, but since the 7x0 can only cope with late abort timing,
+the kernel always works in late timing mode.
+
+[3] It is not just page faults that result in a data abort, but also access
+violations, Eg. 26bit mode code writing to the exception vectors, accessing
+IO from user mode.
+
+Storing R15
+-----------
+
+Under current architectures, writing R15 to memory (eg. STR PC,[R0]) will store
+'address of current instruction +12' to memory, thus to call a function which
+returns with Pull 'PC', one might use:-
+
+        Push    'PC'
+        B       func
+        NOP
+return
+        ; code returns to here
+        
+Or one could take advantage of the +12, especially if the function takes a 
+parameter, so for example:-
+
+        Push    'PC'
+        MOV     R0,#4
+        B       func
+return
+
+Unfortunately this later case (though not the former) will break on StrongARM
+as due to the different pipelining, it is address+8 rather than +12 which is
+stored. In other words in this case it returns to 'B func' resulting in the 
+function being called again, only R0 is probably garbage and when func returns
+there is no (unless pushed somewhere else) valid return address on the stack.
+
+This type of arrangement is used by the kernel when making vectored calls
+(indeed, we publish such code fragments in the PRM as being 'the right way'
+to intercept vectored calls), so for instance OS_Write0 & OS_WriteN will return
+after printing the first character unless modified. In general code should be
+rewritten so that it will work happilly on both architectures as Purple should
+still run on 600/700 based systems. In addition a runtime check is probably
+overkill since the changes are minimal, eg.
+
+        MOV     R0,#4
+        Push    'PC'
+        B       func
+        NOP
+return
+
+Note that this may have the effect of increasing the size of the code. 
+
+Sometimes the PC is stacked, purely to save flag state. So long as carried
+out in a 26bit mode, this is still aceptable.
+
+Zero page accesses
+------------------
+
+Currenly strlen(NULL) or its assembler equivalent returns with a non-zero
+value. This is simply because locations zero onwards are generally non-zero
+(and therefore appear to be a non-empty string). The effect is that modules
+can have bugs in them without any serious side effects, as NULL is simply
+treated like any other pointer. However, on StrongARM, it is illegal to 
+read from locations 0 to 0x1c whilst in a 26bit mode. Any attempt to do so
+results in a data abort. The reasoning behind this could be thought of as
+bolting the stable door after the horse has gone, but the fact remains that
+this will happen. Therefore it will be necessary to track down all such
+occurances (eg. using the simulator[4]) and fix them. If the abort mechanism
+is fixed then this would produce a get-out for bugs which are missed.
+
+[4] See the section on testing. A Risc PC simulator is available to help 
+track down such problems.
+
+[It turns out that aborting in 26 bit mode for reading locations 0 to 0x1c is
+ optional in architecture 4, and StrongARM does _not_ abort - mjs 5-9-96]
+
+Run time generated code
+-----------------------
+
+This is probably one of the biggest areas of change for a StrongARM RISC OS.
+It affects both the OS and a large number of applications:-
+
+    OS:
+        BASIC SYS, CALL, assembler etc.
+        CLib _kernel_swi, swix
+        SpriteExtend
+        Loading code/modules
+        Poking vectors
+        Device, irq claiming
+        
+    Apps:
+        Squeezed images
+        RISCOSLib _swi?         
+        Overlays
+        Replay, ChangeFSI
+        SWI() based apps Eg. !ResEd
+        
+It is an issue as StrongARM has separate instruction and data caches. Thus 
+any code 'built' at run-time may still be in the data cache, and worse still
+the wrong code may be in the instruction cache and garbage may be in memory.
+It is therefore important that after building code in this way, the system
+should be synchronised. The kernel will be extended via a new SWI so that
+other parts of the OS in addition to applications may do this with minimal
+effort. However the fact remains that they will need changing.
+
+For the OS this is reasonably straight forward, a call to the new SWI should
+be inserted after the new code is built (it can actually go any where between
+the end of it being built and before it is called. The actual position should
+be thought about since clever positioning may lessen the affects of the
+cache flushing for instance). 
+
+For applications it is more complex as ideally they should work without the 
+user having to manually patch all the apps on their hard disc. ART can provide 
+fixed applications which appear on the hard disc, such as Replay. The remainder 
+will need to be patched at run time, though only two cases will be dealt with, 
+the other cases will require an upgrade from the manufacturer.
+
+The OS will deal with squeezed images since most apps are squeezed, and RISC 
+OSLib apps, since many of the apps users will have, may be in part at least,
+RISC OSLib based. Knowledge of an AIF (RISC OS Absolute Image File) is
+required to understand how this will be done. Most applications start with
+a header that looks something like:-
+
+        +0      NOP¹ or BL squeeze code
+        +4      NOP¹ or BL reloc code
+        +8      NOP¹ or BL zero init code
+        +12     BL to entry point
+
+        ¹ dependent on linker NOP will be BLNV +8 or MOV R0,R0
+        
+The OS will have loaded the image (and synched as required), but before
+jumping to &8000 (where AIFs are loaded) it will poke the second word of
+the header with a branch to the OS (obviously remembering the contents),
+so that after the unsqueezing it can synchronise again. Unfortunately,
+the first thing the unsqueeze code does is copy itself to further up in 
+the application space. We are left with two options. We can either run
+with caches (& maybe write buffer) off or, we can follow the code of
+the decompresser to where it branches to the copied code.
+
+This later option is not as complex as it may at first seem, since most
+applications will have been squeezed with an Acorn product and over the
+last five years, there have been at most two code signatures for the
+decompression code.
+
+To deal with RISC OSLib, It will be necessary to scan the image after
+unsqueezing. Again this shouldn't be a major problem as the _swi? code
+all lives in one object file and has not changed in about four years.
+On finding the code, it should be patched to use OS_CallASWI.
+
+Needless to say, both these operations will take time. What is more, all
+applications will be affected since the OS doesn't know which do and which
+do not require patching. An application based patcher will therefore be
+made available allowing patched applications to be saved back to disk.
+The AIF header will be marked so that the OS then knows the application
+is 'platform aware'. Such AIFs will not go through the above process.
+This patcher application must be seen as a lower priority though since 
+the OS will always be able to cope with affected applications.
+
+POST & Reset
+------------
+
+The POST code currently places the processor into a 26bit program
+configuration. This means that if any exception happens a 26bit mode
+will be entered, eg SVC_26 after a SWI call is made. This facility is
+unavailable on architecture 4 processors, the config is permanently
+32 bit. As a result exceptions result in a 32bit mode being entered.
+
+Although 32bit & 26bit modes use the same register banks (where common
+modes exist) and have the same instruction sets, R15 is interpreted 
+differently and as a result instructions like MOVS PC,LR will behave
+differently.
+
+The POST code must therefore be analysed so that 26bit mode features are
+not exploited. Since the POST code jumps into the kernel, it will be 
+necessary to check the kernel as well, up to the point where it goes into
+32bit config.
+
+Ideally, the same code should be used for existing processors, which may
+require the config to be 'poked' early on in the POST. The changes should
+be tested with and without the hardware test adapter connected.
+
+Another feature of reset is that the MMU is initially off. When turned
+on, a number of instructions are 'fetched flat', in words without going
+through the mmu translation. This number is two on current architectures
+and three on StrongARM. Since the untranslated ROM starts at location 0
+and the translated one at 56M, this difference is significant.
+
+Compatibility issues
+--------------------
+
+Assuming a stable OS is achieved, the next major goal is achieving a high 
+level of compatibility with applications which run under 3.50. Run-time
+patching of squeezed and/or RISCOSLib applications will go some way to 
+achieve this. Assuming the zero page fall-back system is implemented, this
+leaves issues relating to storing the PC and run time code generation.
+This will mainly affect games and relocatable modules, with most C based
+applications unaffected.
+
+Some Acorn applications will fall into the former category and it must be
+realised, that they will not work without modification. An example would
+be DDT.
+
+Applications which are 'protected', eg. by EORing the code or use their
+own squeeze mechanism can't really be made to work automatically, short
+of turning of the caches & only turning them on after the first (maybe 
+specific, eg. Wimp_initialise) SWI is made.
+
+What should be done
+-------------------
+
+This section describes areas of RISC OS which should be investigated. Although
+not essential, they are to be considered very important as they may affect
+the system performance, more so on a StrongARM processor perhaps when compared
+to a an architecture 3 processor:-
+        
+        * Wimp/DA Memory management
+        * Reducing code on the fly
+        * Cache alignment
+        * Making applications processor aware
+        * Latency issues
+
+Code on the fly reduction
+-------------------------
+
+Although it may seem fairly low cost to clean the D cache for a small range of
+addresses, when code is built on the fly, the entire I cache must be flushed.
+The time to complete this operation may be quite small, but the effect is that
+up to 16k of instructions will be lost from the cache and threfore require re-
+loading. The effect of this could be considerable (see the appendix on memory 
+timings), especially if this code generation is happening inside a loop or if
+the I cache wouldn't ordinarilly be flushed for some time, perhaps due to the
+task doing some intensive processing.
+
+As a result, it is often worth recoding run-time generated code to run-time
+parameterised code. In particular, SWI calling (which generally occurs a lot)
+should avoid the former method. In general it has to be considered whether the
+optimality of run time code out weight the side effects. This will be particularly
+true of code which is regularly poked. It is worth bearing in mind that StrongARM
+is a faster processor with a bigger cache and so some of the original reasoning
+behind run time generated code is less valid.
+
+For code generated at screen mode changes say, ie. less frequently, with possibly 
+system wide effect, it might still be viable. An example could be sprite extend,
+though this could be improved by 'hard coding' some of the common cases into
+static buffers in the ROM say.
+
+Cache alignment
+---------------
+
+The cache line length is eight words (32 bytes) on StrongARM (previous processors
+were four or eight words). This means that whenever data is loaded from a cacheable
+address (and it isn't already in the cache) eight words are actually loaded. These
+eight words coming from a location starting at a 32 byte boundary, such that the
+required word falls somewhere in this range. Eg. is location 16 is loaded, bytes 
+0-31 are loaded into a cache line. The reason for grouping data in this way is that
+it allows bigger caches to be made without making the design more complex (Eg.
+a 4k/4 word cache line can be turned into an 8k/8 word cache line more easilly
+than an 8k/4 word since the number of cache lines (and therefore te addressing
+logic) is the same.
+
+Furthermore with modern RAM (including that found on the Risc PC) loading twice
+as much data doesn't take twice as long. So assuming data is stored together or
+code doesn't keep jumping around, a longer cache line actually results in better
+performance. However there is a down side: if the data is sparce, say one byte
+per 32 addresses, 31 bytes of the cacheline are wasted and furthermore loading
+that one bytes requires 8 words to be loaded from memory.
+
+This could be viewed as an example of bad programming, but the following linked
+list type is even more disastrous:-
+
+typedef struct dummy {
+  struct dummy *next;
+  char name[32];
+  int tag;                      // tag is used by find routine
+  } Dummy;
+  
+When attempting to find an entry by tag, the 32 bytes containing tag are loaded
+into the cache. If this isn't the tag we're after then we move onto the next entry.
+Unfortunately, the next pointer is in a different cache line (as there are more 
+than 28 bytes between the two fields, this is always true) and so another 32 bytes
+are loaded. By simply swapping the name and tag, around half the number of cache 
+lines are used. Not only does this mean that the list can be traversed at around 
+twice the speed, but there is also a beneficial effect on the rest of the system
+due to less of the cache being used.
+
+The words 'around half' are used in the previous paragraph as it obviously depends
+on the alignment of structure as to whether the tag and next pointer are in the 
+same cache line. Even where RISC OS contains more sensible structure orderings,
+it is still possible that cache lines are being wasted, as blocks claimed in the
+system heap are only aligned to words and in the RMA alignment is to 16bytes +4,
+ie. it is only guaranteed that the first twelve bytes are in the same cache line
+or the next sixteen.
+
+The same applies to code. By aligning branch targets to the start of a cache line
+up to one cache line may be saved. Again this will benefit that routine as it will
+run faster in the event of a cache miss and it will have a beneficial effect on
+the rest of the system. Examples of where RISC OS could benefit are the exception
+vector targets some of which currently use more cache lines then they need due to
+this oversight and as a result may take longer to process then they should, eg.
+SWI dispatching & Irq handling.
+
+It is currently difficult to align code in anything but the kernel, due to the 
+modules being aligned to word boundaries. By modifying the ROM build to align
+all modules to 32 bytes boundaries, it would then be feasible. For instance, all
+SWI handlers (usually branch targets) could be 32 byte aligned. This is particuarly
+useful for imformation SWIs which typically have a small amount of code.
+
+One proviso to all this is that it may not be a very good idea spreading out bits
+of code to 32 bytes boundaries when much of the code is related, ie. likely to
+be in the cache at the same time. This may be reasonably obvious, eg. Having
+called Wimp_CreateWindow, one might expect calls to Wimp_CreateIcon or 
+Wimp_OpenWindow.
+
+Returning to Linked lists it's worth noting that they can have a particularly
+bad effect of both caches and TLBs. Being allocated separately thay can often be
+in relatively different parts of the data space and so can fill up (and cause
+misses to) the TLB quite quickly. Also, when searching, much of the data that
+the processor loads is redundant since for unwanted records it is only the tag
+and the next pointer which are required.
+
+Linked lists are generally used as they are flexible and simple to implement,
+but in a cached environment it is worth considering other data storage systems
+which may require more code to be run to find/add an entry, but result in less
+memory activity. Examples of this are binary trees, hash tables and arrays. To
+complicate matters, the choice also depends on on whether part or most of the
+data is accessed within short execution spans.
+
+In summary, code & data allocation is far more complex than many people realise.
+The answers are also very hard to find since many variables (including the user)
+are involved. However, some of the above priciples are easilly applied to RISC OS.
+
+Latency issues
+--------------
+
+When an interrupt occurs it is important that it is serviced quickly. There are
+some aspects of StrongARM which can have an effect on this delay or 'latency'.
+Due to the increased (from 610) cache line length, to access the irq or fiq vectors
+requires eight words to be loaded before anything can happen. This is particularly
+unfortunate for FIQ code as unless the routine is one word long, a second 32 byte
+chunk will need to be loaded. This is of course assuming cache misses, but since 
+irq/fiq code *has* to work every time, it is the worst case which requires
+consideration.
+
+The situation is made worse in the event of TLB misses and if a DMA operation (eg.
+sound/cursor or screen in non-VRAM system) is in progress all these memory loads
+may be delayed. With the write buffer, the latency issue is potentially worse
+still, since if the FIQ code loads data from a cacheable address, this may result
+in dirty data having to be written out to memory which will stall the processor if
+the write buffer is full. Similarly if the FIQ code is writing to uncached memory
+and the write buffer is full, it will have to wait.
+
+This is worse than the current system (even considering an 8 word cache line 710)
+in that loading data can stall due to the eviction of dirty data. However the 
+internal cycles are faster.
+
+What could be done
+------------------
+
+This section describes a few aspects of RISC OS which probably could be addressed
+at low cost whilst making other changes, though are not essential. These include :-
+
+        * Removal of NV instructions
+        * 32 bit code support
+        
+NV instructions
+---------------
+
+ARM have deprecated the use of the NV (never) instruction condition code. This is
+because they plan to reuse this set of instructions for other purposes. If seen,
+these should be converted into some other form of NOP (eg. MOV R0,R0) unless it
+is a requirement that the top nibble of that instruction is &F, perhaps due to
+the instruction also being data.
+
+32 bit code support
+-------------------
+
+Currently, whenever an exception (eg. SWI) occurs, the OS runs a small piece of
+code to drop into a 26 bit mode. This is because most code within RISC OS will
+not work in a 32 bit mode. The 'preveneer' assumes that when the exception happens,
+the processor is in a 26 bit mode and 'constructs' a return R14 accordingly.
+This prohibits the use of code running in any 32 bit mode (unless it doesn't issue
+SWIs and has interrupts turned off). One consequence of this that code can not be
+run in a dynamic area. It might be worth changing the preveneers so that this is
+possible as it would allow RISC OS to move towards a 32 bit environment. For 
+instance applications would run in different dynamic areas (rather than wimpslots)
+reducing cache flushing and there could be a 32 bit RMA.
+        
+API specification
+-----------------
+
+This section describes the changes and additions to the RISC OS API. These mainly
+fall inside the kernel.
+
+Service Calls
+-------------
+
+Service_DynamicAreaChanged (&xx)
+
+        Entry:
+                R0 = area number
+                R1 = Service_DynamicAreaChanged
+                
+        Exit:
+                all registers preserved
+                
+        Use:
+        
+        The kernel issues this service call to signal that a specific dynamic area
+        has (possibly) changed size. It allows clients such as the task manager to
+        determine which dynamic area has been affected by a call to ChangeDynamicArea.
+        previously it was necessary to scan all know dynamic areas after a 
+        Service_MemoryMoved.
+
+SWIs
+----
+
+SWI XOS_PlatformFeatures (&2006D)
+
+This SWI must always be called in the 'X' form.
+
+        Entry:
+                R0 = flags/reason code
+                        bits  0-15 = reason code
+                        bits 15-31 = flags (depend on reason code)
+                        
+                R1..R8 depend on reason code
+                
+        Exit:
+                V Set R0 -> error block
+                        if error block is 'SWI not known' then assume generic platform
+                        (ie. could be ARM2/3/6/7 on Risc PC, A5000 etc.)
+                        
+                V clear, R0-R9 depend on reason code
+                
+        Use:                    
+        
+        This SWI is used to determine various feaures of the platform that the
+        application or module is running on. If the reason code is unknown then
+        the service call Service_UnknownPlatformFeature is raised (after 
+        transfering R1-R8 into registers R2-R9). If the call is claimed then R2-29
+        are copied down to R1-R8 and the SWI returns to the caller otherwise 
+        the error 'Unknown platform feature' is returned.
+        
+        If the reason code is known, but reserved flags are set then the call
+        should not be claimed. This will result in the same error as above unless
+        there is another module which understands the reason code.
+        
+        Reason codes are allocated by Acorn.
+        
+        To help maintain code, it might be useful to use the following code fragment:-
+        
+                SWI     XOS_PlatformFeatures
+                MOVVSS  R0,#0
+                TST     R0,#1
+                ... etc.
+        
+Code Features (Reason code 0)
+
+        Entry:
+                R0 = 0  (ie. flags = zero)
+                
+        Exit:
+                R0 = bit mask of features:
+                        bit 0 set -> Must tell OS when code areas change
+                        bit 1 set -> Can't disable interrupts directly after
+                                enabling them.
+                        bit 2 set -> Must be in 32 bit mode before poking
+                                exception vectors       
+                        bit 3 set -> STM Rx,{pc} stores pc+8 rather than pc+12
+                        bit 4 set -> Data aborts occur with 'early' timing.
+                                
+                If bit 1 of R0 set then:-                               
+                R1 -> routine to insert between irq enable & disable.
+                
+        Use:
+        
+        This SWI call is generally made only once when initialising the application
+        or module. If bit 0 of R0 is set on exit then whenever the application changes
+        a code area Eg. generates code on the fly or modifies existing code by
+        'poking' it, then the SWI XOS_SynchroniseCodeAreas (described below) MUST
+        be called before branching to the code. If this does not happen then the
+        behaviour will be unpredictable.
+        
+        Note that such a code branch may be 'indirect'. In other words, poking processor
+        vectors such as the SWI or interrupt vectors would also require code areas
+        to be synchronised.
+        
+        If bit 1 is set then disabling interrupts directly after enabling them will
+        not result in an interrupt even if the Irq pin is active. Eg. for a piece of
+        code running with interrupts off, which ocassionaly reenables them to service
+        pending interrupts will not see any:-
+        
+                TSTP    PC,#:LNOT: IFLAG
+                TEQP    PC,#IFLAG
+                
+        To work, a delay must be introduced, for StrongARM this should be equivalent
+        to five NOP instructions, or a call can be made to the routine returned in R1.
+        
+        If bit 2 is set, then the exception vectors (such as SWI, data abort etc) can
+        only be written (and possibly read) in a privileged 32 bit mode.
+        
+        If bit 3 is set than any STM Rx,{pc} will store pc+8 rather than pc+12. This
+        also applies to STR PC.
+        
+        Bit 4 set implies early rather than late abort timing. Note that ARM 6x0 
+        processors support both, but RISC OS will always program them to late 
+        timing so this bit will be clear on ARM 6x0.
+        
+SWI XOS_SynchroniseCodeAreas (&2006E)
+
+This SWI must always be called in the 'X' form.
+
+        Entry:
+                R0 = flags
+                        bit 0 set -> R1,R2 specify range
+                R1 = start address (inclusive)
+                R2 = end address (inclusive)
+                
+        Exit:
+                flags (incl V) possibly scrambled, registers preseved (except R0)
+                
+        Use:
+        
+        This call is used before branching to a code area that has been modified
+        in some way. If flag bit zero is set then R1-R2 specify a range of addresses
+        that have changed, otherwise, all addresses are assumed to have been affected.
+        Note that both addresses should be on a word boundary.
+        
+        Note that the time taken to synchronise code areas is highly processor 
+        specific. On some processors, both variants of the call will take the same
+        time. On others, the Range variant may be substantially quicker. This should
+        be considered when deciding on which to use. For time critical code, it may
+        be inadvisable altogether and a more static approach should be adopted. 
+        In some cases (such as poking the exception vectors) its use is unavoidable.
+        
+        Note: This SWI is synonymous with IMB or instruction memory barrier. At one
+        point ARM were to define IMB and a SWI number for it. The description 
+        above is more in keeping with the RISC OS API.
+        
+Implementation note
+-------------------
+
+        Due to having separate caches, StrongARM could execute the wrong code if
+        a code area has been updated. For this reason it is necessary to 'clean'
+        the relevant part of the Data cache, drain the write buffer and then flush
+        the instruction cache. If the range is unspecified (or possibly large) then
+        it is probably more effective to clean the entire Data cache. Unfortunately,
+        there is no coprocessor operation to do this and so it is necessary to
+        take advantage of the fact that the StrongARM caches use a round-robin
+        replacement algorithm. This means that after having read 32k of data, it
+        is guaranteed that any dirty data in the cache is written out to memory.
+        This approach does have the side effect of effectively flushing the D cache
+        and resulting in many memory loads. This can be optimised though, assuming
+        that the kernel is 'in charge' - see the appendix.
+        
+        The write buffer must be drained before flushing the I cache, as I cache 
+        misses result in main memory being accessed. It is therefore very important
+        that the external memory is up to date before allowing any instruction
+        fetching. Note that it is only possible to flush the entire I cache, not
+        individual segments.
+        
+SWI OS_CallASWI (&6F)
+
+        Entry:
+                R0 = bits  0-23 SWI number
+                          24-31 flags (SBZ)
+                R1 -> input parameter block (R0-R9)
+                R2 -> output parameter block (R0-R9)
+        
+        Exit:
+                output block updated and
+                R0 = 0 if no error or pointer to error block
+                R1 = flags after calling SWI (usually only V/C relevant)
+                
+        Use:
+        
+        This call issues the given SWI with the given parameters. Note that the 
+        usual SWI dispatcher is called so that the X bit in the SWI number is
+        relevant as to whether the SWI returns with an error or calls the error
+        handler. OS_CallASWI is generally used to provide a platform independent
+        SWI calling mechanism.
+        
+Implementation note
+-------------------
+
+        Generating code on the stack is how applications would normally call a
+        SWI which is only known at run time (rather than compile time). However
+        on StrongARM this procedure will generally fail due to the separate I&D
+        caches. One could get round this by using the SynchroniseCodeAreas SWI,
+        but as already noted, this can have a major effect on system performance
+        and since SWI calls are made regularly by RISC OS applications, it is
+        undesirable to use that approach. Instead, we can use the following 
+        mechanism :-
+        
+        CallASWI
+                ...
+                BIC     R0,R0,#&ff000000
+                ORR     R0,R0,#&ef000000
+                STR     R0,[call_swi]
+                ...
+        call_swi
+                SWI     0
+                ...
+                
+        Note this must exist in RAM. At first sight this would seem to break on
+        StrongARM since it is poking code. However, at location [call_swi] there
+        is always a SWI instruction, meaning that every time it is executed a
+        SWI exception is taken. It is only the dispatch code which actually tries
+        to determine what the SWI was and since this is accessed as data, it 
+        doesn't matter that the 'instruction' might still be in the D cache.
+        
+        An alternative approach would be to call the SWI dispatcher directly, but
+        this has the side effect of not going through the SWI exception vector
+        which would mean that any SWI intercepters would not get called. This may
+        not be an issue though as the SWI interceptors could be modified to 
+        understand SWI OS_CallASWI. (They will probably need to be modified for
+        StrongARM any way)
+        
+Dynamic Area SWIs
+-----------------
+
+        For dynamic area flags (ie. whether area is cacheable etc.), a new flag
+        is added. If bit <> is set, it means that the area is invisible to the
+        task manager. This feature is generally used by the kernel as displaying
+        some system areas would be meaningless to the user.
+        
+Testing
+-------
+
+Apart from formal audit it will be necessary to test RISC OS during development,
+due to the shear number of areas which are affected. The situation is complicated
+further by much development being carried out before silicon arrives and the
+fact that some software just will not work on the new architecture.
+
+For this reason it is essential that every change must be accompanied by a test
+which will result in the modified code being exercised. There may already be such
+a test available on the MedusaB server, or one may have to be specifically written.
+It should verify that behaviour has not changed since 3.50, or in the case of a
+new API, that the behaviour matches the specification. This testing should be 
+documented so that audit resources are not wasted. In the case of a new test, a
+brief specification of what it does should be supplied.
+
+Any testing should be carried out on both an ARM 6x0 system and when available
+a StrongARM based system. Before StrongARM arrives, testing should be carried out
+on the Risc PC emulator.
+
+Appendices
+==========
+
+RISC OS memory management
+-------------------------
+
+See figure A.1 for details of the RISC OS memory map & A.2 for ARM MMU details.
+Figure A.3 shows the soft CAM layout (a hangover from MEMC based systems) and
+figure A.4 shows the physical address space.
+
+The RAM in a Risc PC is divided up by the OS into lots of 4k pages. These are
+numbered sequentially from zero. Thus, any physical RAM may be specified by its
+page number. The remainder of the address space is generally¹ divided into one
+megabyte sections. As a result the OS uses the ARM MMU's section mapping for
+ROM and IO, and page mapping for the RAM.
+
+Pages of memory are constantly being mapped in and out of the RISC OS address
+space. This might be due to a Wimp task polling or RMA growing. When this
+happens the OS has to do two things.
+
+It must update the soft CAM² (a page, ie. physical address, to logical mapping)
+map which helps the OS keep track of where pages are mapped to. It must also
+tell the ARM's MMU where to look and this is done by updating the level two
+page table (L2PT), which is a logical to physical mapping.
+
+The Level one page table (L1PT) is largely static under RISC OS. It is a block
+of memory 16k long (= 4k entries) with one entry per megabyte of the logical
+address space. For ROM and IO space this provides a 'one stop' mapping between
+the logical (sometimes called virtual) address and where it lives in the Risc PC
+architecture. This doesn't provide sufficient granularity for RAM though - It
+would be something of a waste if RAM could only be mapped in one megabyte chunks.
+
+Greater granularity is achieved by directing some areas of level one array to
+a second array (L2PT). In theory each megabyte requires a 1k array (= 256 entries)
+to break it up into 4k pages (The ARM MMU actually supports 64k or 'large' pages
+but this is impractical for RISC OS), but RISC OS bundles the first 192M of
+the virtual address space together, so that one contiguos 192k array is used.
+In this way, mapping any part of the first 192M is quite simple as the L2PT
+entry is easily deriveable from the address.
+
+Note that although the ROM is permanently¹ section mapped (ie. only uses the 
+L1PT), the relevant parts of the L2PT (ie. from 48M to 64M) aren't wasted -
+they are used to house the L1PT.
+
+To improve performance, these translations are cached in the Translation
+Look-aside Buffer or TLB. Thus when the L2PT (or L1PT) is modified, the 
+TLB must be purged of that virtual address, so that new accesses to it are
+directed to the new mapping.
+
+Whichever form of lookup is used the page table entry will also specify whether
+or not the memory is cacheable, bufferable or accesible from certain modes.
+These features are sometimes (slightly incorrectly) refered to as the PPL, or
+page protection level.
+
+One other factor of memory management is cache coherency. The on chip cache
+determines whether a memory access 'hits' by its virtual address. Thus if the
+virtual address space is remapped (eg. one task being swapped into application
+space in place of another) then the cache may contain data from locations whose
+physical mapping has chnaged. This is undesirable as accesses to these locations
+should refer to the data from the new mapping. It is therefore necessary to
+flush (& clean if dirty) the cache.
+
+For further information the ARM data sheets describe the MMU system, though note
+that RISC OS does not use all the features available, such as sub pages or multiple
+domains.
+
+¹ Generally the ROM is section (ie one lookup) mapped. However RISC OS supports
+a ROM 'patching' mechanism which allows 4K chunks of the ROM to be swapped
+with new ones. This is achieved by directing the relevant 1M of ROM to its 
+own L2PT (which is 1k long) with most of the entries pointing back to ROM,
+but the patched entry pointing to the new (RAM based) page. This does have
+the disadvantage of now requiring two lookups for ROM accesses which live in
+the same 1 megabyte region. It is for this reason (& saving 16k) that the 
+ROM is ordinarilly section mapped.
+
+² The soft CAM comes about from the previous hardware architecture which
+used one to four MEMC chips to map physical pages to logical addresses. A
+copy of the CAM map was kept in RAM as the hardware map was write only.
+
+Memory Access Times
+-------------------
+
+There is a great deal of attention within this document to cache alignment and
+management. The fact is that with processor speed increasing, but the memory 
+system unchanged it becomes far more important to avoid external memory acceses
+and reduces cache/TLB invalidations. With a 160MHz clock, StrongARM will 
+typically execute an instruction in 6.25ns.
+
+StrongARM has the following cache/mmu features:-
+
+        - 16K I cache (512 lines, 32 way set associative)
+        - 16K write-back D cache
+        - 32 entry I&D TLBs (ie. separate)
+        - 8 word (32 byte) cache line length
+        - write buffer
+        
+IOMD (ie the Risc PC) has the following memory system:-
+
+        - V/DRAM has 5 tick N cycle & 2 tick S cycle of 32MHz clock
+          (ie. StrongARM runs in asynchronous bus mode)
+          mclk will typically be 16MHz (this is significant for core synching)
+          so N = 156.25, S = 62.5ns
+        - ROM is programmable though assume 156.25ns access time, 93.75ns burst.
+          (This is about as fast as we can currently manage)
+        
+ROM lookup is usually one level of translation (ie ROM area section mapped)
+RAM lookup is always two levels of translation.
+
+So when memory is loaded from a cacheable area, (ie. an entire cache line is
+loaded) it takes 1N+7S = 0.594us. If the TLB misses, then this rises to 3N+7S
+= 0.906us. In addition, the core will have to synchronise to the memory clock
+at the start of the access and then to the core clock at the end of the access,
+this brings these times up to .5M+1(3)N+7S+.5I on average, ie. 0.628/0.940us,
+which is roughly the time to execute up to 140 instructions!
+
+Cache line fills can be reduced by more careful code and data alignment. Needless
+to say, if cache flushing is reduced, CLFs are reduced.
+
+TLB misses can be reduced by keeping code & data together, ie. don't branch all
+over the place, reduce linked list searching etc.
+
+Cache clean operation
+---------------------
+
+In MCR terms, StrongARM does not support a full cache clean operation. This is
+obviously significant when memory is remapped or a large code area has been
+modified. The StrongARM data sheet suggests the following code fragment to
+do a cache clean:-
+
+        ADR     R0,data_area
+        ADD     R1,R0,#32768
+loop
+        LDR     R2,[R0],#32                     ; 1 cycle
+        TEQ     R1,R0                           ; 1 cycle
+        BNE     loop                            ; 2/1 cycles
+        
+The reason a 32k area is needed (when the cache is only 16k) is that some of the
+data area may still be in the cache and as cache lines are only allocated on a 
+read miss, the load will read the cached data. This may be in spite of the fact
+that the 'victim line' (ie. the next one to be replaced) is somewhere else, perhaps
+behind the line with the cached data. In other words one read may access the cached
+data and a later read may 'evict' that line. The effect is that the cache can not
+possibly contain the 16k data area and by extension, may still contain dirty data.
+Taking the worst case into account therefore means a load of 32k is required.
+
+However, if the kernel maintains a 'private' area of memory which only it can
+access, then this data area can be reduced in size to 16k. This is because we
+can take advantage of the fact that cache lines are allocated on a round robin
+basis.
+

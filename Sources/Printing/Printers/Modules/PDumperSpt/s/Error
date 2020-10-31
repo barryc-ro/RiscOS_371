@@ -1,0 +1,373 @@
+; > Error
+; Error diffusion file...
+; Given:
+; abefore=R2    anow=R3    aafter=R4
+;  before=R5     now=R9
+; Use
+; now+(before*7+abefore*1+anow*5+aafter*3)/16 as the actual pixel
+; number of lines per strip must be even, so direction now known to be +1
+; NOTE: Colour error diffusion must use black for greys!
+; This implies a four-ribbon approach to diffusion...grey stored as 000000KK
+; Other colours as YYMMCCKK. however you like!
+; General 24-bit error diffuser should consider the amount of under-colour
+; removal, i.e. there could be yymmcckk=YYMMCCKK for different values
+; with cc+kk=CC+KK etc.
+; 100% removal (normal)=>KK is maximum (of CC MM YY)
+; 0% removal => KK=0
+; n% removal => KK=n*maximum/100, but care needs exercising!
+; Best to allow only 0% 25% 50% 75% and 100% for speed.
+; Done as macros to simplify reading/editing
+; NOTE: R11 is used for the random number (if compiled with userandom true)
+
+; MJS: this version (1.13+) has two optimisations which recover most of the cost of
+;      using random perturbations to avoid nasty patterning on regular colours (see
+;      my abortive attempt to disable randomisation over versions 1.11, 1.12)
+;      1) Randomise is skipped if the outcome of the final level test (set
+;         colour dot on/off) is certain whatever the random number
+;      2) If a black dot is set, the CMY dots are forced to zero (carrying through
+;         diffusion errors), rather than determining them as normal and then having
+;         to undo the results later.
+
+; errors are accumulated using 4 bits of fractional precision
+;
+        MACRO
+        DiffuseError $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+        ADD   $level,$abefore,$level,ASL #4  ;4 fractional bits for level, add 1/16 of abefore
+        ADD   $level,$level,$anow,ASL #2
+        ADD   $level,$level,$anow            ;add 5/16 of anow
+        ADD   $level,$level,$aafter,ASL #1
+        ADD   $level,$level,$aafter          ;add 3/16 of aafter
+        ADD   $level,$level,$before,ASL #3
+        SUB   $level,$level,$before          ;add 7/16 of before
+        ADD   $level,$level,#8               ;add 0.5 (rounding)
+        MOV   $level,$level,ASR #4           ;back to no fractional precision
+
+        MOV   $abefore,$anow                              ;shift registers on
+        MOV   $anow,$aafter
+
+;$before is free now (will use $level in a bit...)
+
+; allow randomised decision at 128 +-31 (recommended wobble is about 30%), but generate random
+; no. in range +-63 to make decision - this increases the chance of changing decision for
+; levels farther away from 128, and fixes MED-04348 (nasty patterning near 25% dot occupancy)
+
+  [ userandom
+        CMP   $level, #128-31
+        BLT   %FT00                 ; no point in generating random number if < 128-31
+        CMP   $level, #128+31
+        BGT   %FT00                 ; no point in generating random number if > 128+31
+        LDR   $before,RandomSeed
+        MUL   $before,R11,$before
+        STR   $before,RandomSeed
+        MOV   $before,$before,ASR #32-6                   ;+-63
+        ADD   $before,$before,#128
+        CMP   $level,$before                              ;check for bit-setting
+00
+  |
+        CMP $level,#128
+  ]
+
+        SUBGE $level,$level,#255                          ;and calculate error (will be $before next time)
+        STR   $level,[$abuffer],$direction,LSL #2         ;store this for next row
+        MEND
+
+
+; takes place of macro DiffuseError when it is known that component must be set to 0 (used for
+; C,M and Y when DiffuseError for K returned 1, since CMY cannot be set with K) 
+        MACRO
+        DiffuseErrorMustBe0 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+        ADD   $level,$abefore,$level,ASL #4  ;4 fractional bits for level, add 1/16 of abefore
+        ADD   $level,$level,$anow,ASL #2
+        ADD   $level,$level,$anow            ;add 5/16 of anow
+        ADD   $level,$level,$aafter,ASL #1
+        ADD   $level,$level,$aafter          ;add 3/16 of aafter
+        ADD   $level,$level,$before,ASL #3
+        SUB   $level,$level,$before          ;add 7/16 of before
+        ADD   $level,$level,#8               ;add 0.5 (rounding)
+        MOV   $level,$level,ASR #4           ;back to no fractional precision
+
+        MOV   $abefore,$anow                              ;shift registers on
+        MOV   $anow,$aafter
+
+        STR   $level,[$abuffer],$direction,LSL #2         ;store this for next row
+        MEND
+
+
+        MACRO
+        NewRow $abefore,$anow,$before
+        MOV   $before,#0                    ;before is 0 at start of line
+        EOR   $abefore,$abefore,$anow       ;swap directions for the new line
+        EOR   $anow,$abefore,$anow
+        EOR   $abefore,$abefore,$anow
+        MEND
+
+        MACRO
+        ColourDiffuseError $level,$abefore,$anow,$aafter,$before,$abuffer,$direction,$DiffuseInfo,$Value,$Bit,$pixel,$ptr
+        LDRB  $level,$Value                   ;load the test level
+        ADR   $ptr,$DiffuseInfo               ;address the diffusion errors
+        LDMIA $ptr,{$abefore,$anow,$before}   ;load them
+
+        LDR   $aafter,[$abuffer,$direction,LSL #4]         ;fetch aafter (rest are held)
+        DiffuseError $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+
+        STMIA $ptr,{$abefore,$anow,$level}    ;keep the new levels
+;N.B. $level must be higher register than $abefore/$anow
+        ORRGE $pixel,$pixel,#1 :SHL: $Bit     ;and set the relevant bit if required
+        MEND
+
+
+        MACRO
+        ColourDiffuseErrorMustBe0 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction,$DiffuseInfo,$Value,$Bit,$pixel,$ptr
+        LDRB  $level,$Value                   ;load the test level
+        ADR   $ptr,$DiffuseInfo               ;address the diffusion errors
+        LDMIA $ptr,{$abefore,$anow,$before}   ;load them
+
+        LDR   $aafter,[$abuffer,$direction,LSL #4]         ;fetch aafter (rest are held)
+        DiffuseErrorMustBe0 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+
+        STMIA $ptr,{$abefore,$anow,$level}    ;keep the new levels
+;N.B. $level must be higher register than $abefore/$anow
+        MEND
+
+
+        MACRO
+        ColourNewRow $abefore,$anow,$before,$DiffuseInfo,$ptr
+        ADR   $ptr,$DiffuseInfo
+        LDMIA $ptr,{$abefore,$anow}           ;pick up errors at end of last line
+        NewRow $abefore,$anow,$before
+        STMIA $ptr,{$abefore,$anow,$before}   ;and keep the errors for the next sweep
+;N.B. $before must be higher register than $abefore/$anow
+        MEND
+
+
+;The BlatK macro can be used to zap the K component, no longer used, was used in debugging
+        MACRO
+        BlatK   $all,$cyan,$magenta,$yellow,$key,$temp
+        STMFD   SP!,{$cyan,$magenta,$yellow,$key,$temp}
+        MOV     $temp,#&FF
+        AND     $key,$temp,$all
+        AND     $cyan,$temp,$all,LSR#8
+        AND     $magenta,$temp,$all,LSR#16
+        AND     $yellow,$temp,$all,LSR#24
+        ADD     $cyan,$cyan,$key
+        ADD     $magenta,$magenta,$key
+        ADD     $yellow,$yellow,$key
+        MOV     $all,$cyan,LSL#8
+        ADD     $all,$all,$magenta,LSL#16
+        ADD     $all,$all,$yellow,LSL#24
+        LDMFD   SP!,{$cyan,$magenta,$yellow,$key,$temp}
+        MEND
+
+randomnumber
+        & &A5C87C83
+
+Do_DitherColourSprite
+; Entry is R0=columncount
+;          R1=rowcount
+;          R10=sprite
+;          R12,errorbuffer=allocated buffer for between lines
+;          R12,KCMYTable=pointer to table for inverse calculations (8-bit only)
+;          R12,XXXDiffuse=anow etc. from end of last line
+; Exit with diffused sprite, all else scrambled!
+        STMFD SP!,{R0,R14}                           ;Keep columncount for later
+
+;if 32 bit colour (KCMYTable is 0), jump to new code
+        LDR     R14,KCMYTable
+  Debug mjs,"Do_DitherColourSprite, KCMYTable, strip at ",R14,R10
+        CMP     R14,#0
+        LDMEQFD SP!,{R0,R14}
+        BEQ     Do_DitherColourSprite32
+
+  [ userandom 
+        LDR   R11,randomnumber
+  ]
+
+        MOV   R8,#1                ;Set the direction to +1
+        LDR   R7,errorbuffer       ;start error buffer one back from start
+        ADD   R7,R7,#12            ;Put pointer as if just finished row on the way back
+;buffer is one too large at both ends, with 0 error at that point
+
+ec_rowloop
+;need to swap abefore,anow and clear before for direction change
+
+        ColourNewRow R2,R3,R5,KeyDiffuse,    R14
+        ColourNewRow R2,R3,R5,CyanDiffuse,   R14
+        ColourNewRow R2,R3,R5,MagentaDiffuse,R14
+        ColourNewRow R2,R3,R5,YellowDiffuse, R14
+
+        ADD   R7,R7,R8,LSL #2                     ;realign with sprite
+ec_columnloop
+;** Initialise pixel fetches
+        LDR   R14,KCMYTable
+        [ fullrgb
+        CMP   R14,#1
+  [ userandom 
+        MOV   R6,R11                              ;Pity, but I think I'm out of regs!
+  ]
+        LDRHIB  R11,[R10]                         ;Load the pixel
+        LDRHI R11,[R14,R11,LSL#2]
+        BLLS  FullRGB
+        STR   R11,KCMYValues
+  [ userandom 
+        MOV   R11,R6
+  ]
+        |
+        LDRB  R6,[R10]                            ;Load the pixel
+        LDR   R6,[R14,R6,LSL #2]                  ;Translate to compensated KCMY
+;        BlatK R6,R0,R1,R2,R3,R14
+        STR   R6,KCMYValues                       ;And keep
+        ]
+;**
+;N.B. counting goes K->Y bits go down, palette goes up...
+        MOV   R6,#0                            ;Clear final pixel
+
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,KeyDiffuse,    KeyValue,    3,R6,R14
+        BGE ec_columnloop_blackset1
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+        B ec_columnloop1
+
+ec_columnloop_blackset1
+        ColourDiffuseErrorMustBe0 R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+        ColourDiffuseErrorMustBe0 R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+        ColourDiffuseErrorMustBe0 R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+
+ec_columnloop1
+
+;You must not set Key and another bit
+;        TST    R6,#1 :SHL: 3
+;        TSTNE  R6,#2_111
+;        BLNE   keywithother
+
+        STRB  R6,[R10],R8                       ;Store and bump in right direction
+
+        SUBS  R0,R0,#1
+        BNE   ec_columnloop
+
+        RSB   R8,R8,#0                          ;reverse direction
+        LDR   R0,[SP]                           ;get the columncount back
+        ADD   R10,R10,R0                        ;get to right end (works both times!)
+        ADD   R10,R10,R8
+        [ fullrgb
+        LDR   R14,KCMYTable
+        CMP   R14,#1
+        BLLS  FullRGBSwitch
+        ]
+        SUBS  R1,R1,#1
+        BEQ   ec_bogup
+
+;THIS MUST BE A COMPLETE COPY OF THE ABOVE.....
+;EXCEPT THAT THE ORDER OF THE DIFFUSION CALCULATIONS IS REVERSED
+;(BECAUSE THE BUFFER IS REVERSED, DUMMY)
+;need to swap abefore,anow and clear before for direction change
+
+        ColourNewRow R2,R3,R5,KeyDiffuse,    R14
+        ColourNewRow R2,R3,R5,CyanDiffuse,   R14
+        ColourNewRow R2,R3,R5,MagentaDiffuse,R14
+        ColourNewRow R2,R3,R5,YellowDiffuse, R14
+
+        ADD   R7,R7,R8,LSL #2                           ;realign with sprite
+ec_columnloopb
+;***Following must match load above
+        LDR   R14,KCMYTable
+        [ fullrgb
+        CMP   R14,#1
+  [ userandom 
+        MOV   R6,R11                              ;Pity, but I think I'm out of regs!
+  ]
+        LDRHIB  R11,[R10]                         ;Load the pixel
+        LDRHI R11,[R14,R11,LSL#2]
+        BLLS  FullRGB
+        STR   R11,KCMYValues
+  [ userandom 
+        MOV   R11,R6
+  ]
+        |
+        LDRB  R6,[R10]                            ;Load the pixel
+        LDR   R6,[R14,R6,LSL #2]                  ;Translate to compensated KCMY
+;        BlatK R6,R0,R1,R2,R3,R14
+        STR   R6,KCMYValues                       ;And keep
+        ]
+;***
+;N.B. counting goes K->Y bits go down, palette goes up...
+        MOV   R6,#0                            ;Clear final pixel
+
+; it would be easier on this backward pass to process in the order YMCK, but we do K first
+; so that we can do the black-set optimisation (CMY must be not-set). Hence, the fooling
+; with the R7 buffer pointer
+        ADD R7,R7,R8,LSL #2
+        ADD R7,R7,R8,LSL #3
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,KeyDiffuse,    KeyValue,    3,R6,R14
+        SUB R7,R7,R8,LSL #4
+        BGE ec_columloop_blackset2
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+        ColourDiffuseError R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+        B ec_columnloop2
+
+ec_columloop_blackset2
+        ColourDiffuseErrorMustBe0 R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+        ColourDiffuseErrorMustBe0 R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+        ColourDiffuseErrorMustBe0 R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+
+ec_columnloop2
+        ADD R7,R7,R8,LSL #2
+       
+;You must not set Key and another bit
+;        TST    R6,#1 :SHL: 3
+;        TSTNE  R6,#2_111
+;        BLNE   keywithother
+
+        STRB  R6,[R10],R8                       ;Store and bump in right direction
+
+        SUBS  R0,R0,#1
+        BNE   ec_columnloopb
+
+        RSB   R8,R8,#0                          ;reverse direction
+        LDR   R0,[SP]                           ;get the columncount back
+        ADD   R10,R10,R0                        ;get to right end (works both times!)
+        ADD   R10,R10,R8
+        [ fullrgb
+        LDR   R14,KCMYTable
+        CMP   R14,#1
+        BLLS  FullRGBSwitch
+        ]
+        SUBS  R1,R1,#1
+        BNE   ec_rowloop
+
+ec_bogup
+        LDMFD SP!,{R0,PC}
+
+keywithother
+;This routine sorts out any key/colour overlaps
+;You need to clear all the other bits, by adding back 255
+;        CMP    R8,#0                          ;Alignments can be at Yellow or Key
+;        SUBGT  R7,R7,#20                      ;Adjust to be pointing at Yellow
+;        TST    R6,#1 :SHL: 2                  ;Test for bit
+;        BICNE  R6,R6,#1 :SHL: 2               ;Unset it
+;        LDRNE  R9,CyanDiffuse+diffuse_before  ;Get back error
+;        ADDNE  R9,R9,#255                     ;Reset it
+;        STRNE  R9,CyanDiffuse+diffuse_before  ;Put it back (before)
+;        STRNE  R9,[R7,#8]                     ;Put it back (next row)
+;        TST    R6,#1 :SHL: 1
+;        BICNE  R6,R6,#1 :SHL: 1
+;        LDRNE  R9,MagentaDiffuse+diffuse_before
+;        ADDNE  R9,R9,#255
+;        STRNE  R9,MagentaDiffuse+diffuse_before
+;        STRNE  R9,[R7,#12]
+;        TST    R6,#1 :SHL: 0
+;        BICNE  R6,R6,#1 :SHL: 0
+;        LDRNE  R9,YellowDiffuse+diffuse_before
+;        ADDNE  R9,R9,#255
+;        STRNE  R9,YellowDiffuse+diffuse_before
+;        STRNE  R9,[R7,#16]
+;        CMP    R8,#0                          ;Adjust back the damage on R7
+;        ADDGT  R7,R7,#20
+;        MOVS   PC,R14
+
+;this routine moved to s.Error32
+;Do_DitherGreySprite
+
+
+       END

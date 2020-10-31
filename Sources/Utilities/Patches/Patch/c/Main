@@ -1,0 +1,1326 @@
+#include "Patch.h"
+
+
+/* Global variable for restoring the wimp next slot size on exit(). */
+
+int                                     orig_next_slot = -1;
+
+/* Global variable of channel to close on exit(). */
+
+int                                     glob_channel = 0;
+
+/* Global variable of file to delete on exit(). */
+
+char const *                            glob_delete = NULL;
+
+
+
+/* Global variable for the main Messages file handle. */
+
+char *                                  msgs_file_desc;
+
+/* Global variable for the default message lookup buffer. */
+
+char                                    msg_lookup_buff[256];
+
+/* Global variable for the secondary message lookup buffer. */
+
+char                                    msg_lookup_aux_buff[256];
+
+
+
+/* Global structure for the icon bar menu. */
+
+static menu                             icon_bar_menu;
+
+
+/* Numbers for entries in the icon bar menu. */
+
+enum
+{
+    ICON_BAR_MENU_INFO = 1,
+    ICON_BAR_MENU_QUIT
+};
+
+
+
+/* Global structure for the target directory window. */
+
+static wimp_w                           target_window;
+
+/* Global structure for the target directory window menu. */
+
+static menu                             target_menu;
+
+/* Bottom (y0) of the last icon to go into the target window. */
+
+static int                              target_window_y0;
+
+/* Numbers for entries in the target directory window menu. */
+
+enum
+{
+    TARGET_MENU_SELECT_APPLY = 1,
+    TARGET_MENU_SELECT_REMOVE,
+    TARGET_MENU_CLEAR_SELECTION,
+    TARGET_MENU_PATCH_SELECTED
+};
+
+
+/* Global pointers to the prototype icons for the target directory. */
+
+static wimp_icon *                      proto_app_icon;
+static wimp_icon *                      proto_patch_icon;
+static wimp_icon *                      proto_select_icon;
+
+
+
+/* Global data - pointers to looked up "Apply" and "Remove" used for
+   indirect text in the select icons. */
+
+static char *                           target_apply_string = NULL;
+static int                              target_apply_string_len = 0;
+static char *                           target_remove_string = NULL;
+static int                              target_remove_string_len = 0;
+
+
+
+/* This function handles clicks on the icon bar menu. */
+
+static void icon_bar_menu_proc
+(
+    void *                              handle,
+    char *                              hit 
+)
+{
+    dbox                                info_box;
+
+    handle = handle;                    /* Stop compiler complaining */
+
+    switch (hit[0])
+    {
+    case ICON_BAR_MENU_INFO:
+        /* Info - put the info dialogue box up, but only if he slid off
+           rather than clicked. (Stoye hack code.) */
+
+        if (hit[1] != 0)
+        {
+            info_box = dbox_new("ProgInfo");
+            dbox_show(info_box);
+            dbox_fillin(info_box);
+            dbox_dispose(&info_box);
+        }
+        break;
+
+    case ICON_BAR_MENU_QUIT:
+        /* Quit - exit the application. */
+
+        exit(0);
+        break;
+    }
+}
+
+
+
+/* Function to create the menu for the target directory window. It
+   is responsible for working out which entries should be greyed. */
+
+static menu target_menu_creator
+(
+    void *                              handle
+)
+{                       
+    wimp_icon                           state;
+    APPLICATION *                       app;
+    TARGET_APP *                        targ_app;
+    TARGET_PATCH *                      targ_patch;
+    int                                 patch_num;
+    int                                 some_selected = FALSE;
+    int                                 some_apply = FALSE;
+    int                                 some_remove = FALSE;
+
+    handle = handle;                    /* Stop compiler complaining. */
+
+
+    /* Set all the menu options to grey, not ticked. */
+
+    menu_setflags(target_menu, TARGET_MENU_SELECT_APPLY, 0, 1);
+    menu_setflags(target_menu, TARGET_MENU_SELECT_REMOVE, 0, 1);
+    menu_setflags(target_menu, TARGET_MENU_CLEAR_SELECTION, 0, 1);
+    menu_setflags(target_menu, TARGET_MENU_PATCH_SELECTED, 0, 1);
+
+
+    /* Run down the targets, and for each one see if it means we
+       can un-grey any of the menu entries. */
+
+    for (app = apps_root; app != NULL; app = app->next)
+    {
+        /* Look at each potential location for the application. */ 
+
+        for (targ_app = app->targets;
+             targ_app != NULL;
+             targ_app = targ_app->next)
+        {
+            /* Look at each patch for each potential location. */
+
+            targ_patch = (TARGET_PATCH *) (targ_app + 1);
+
+            for (patch_num = 0;
+                 patch_num < targ_app->num_patches;
+                 patch_num++, targ_patch++)
+            {
+                /* If this patch is greyed out, it is of no interest. We
+                   can do nothing with it, so it has no effect on any
+                   of the menu entries. */
+
+                if (targ_patch->select_action == ACTION_NONE)
+                {
+                    /* Loop round for the next patch. */
+
+                    continue;
+                }
+
+
+                /* If we haven't seen any selected ones yet, see if this
+                   one is. */
+
+                if (!some_selected)
+                {
+                    NOERR(wimp_get_icon_info(target_window,
+                                             targ_patch->select_icon,
+                                             &state));
+
+                    if (state.flags & wimp_ISELECTED)
+                    {
+                        /* It is selected, so un-grey "Patch selected" and
+                           "Clear selection". */
+
+                        menu_setflags(target_menu,
+                                      TARGET_MENU_PATCH_SELECTED, 0,0);
+                        menu_setflags(target_menu,
+                                      TARGET_MENU_CLEAR_SELECTION, 0,0);
+
+
+                        /* See if we can give up yet. */
+
+                        if (some_apply && some_remove)
+                        {
+                            return target_menu;
+                        }
+                        some_selected = TRUE;
+                    }
+                }
+
+
+                /* See which of the actions we can perform is the one for
+                   this element. If we haven't seen this action before,
+                   un-grey the menu entry. */
+
+                switch (targ_patch->select_action)
+                {
+                case ACTION_APPLY:
+                    if (!some_apply)
+                    {
+                        menu_setflags(target_menu,
+                                      TARGET_MENU_SELECT_APPLY, 0,0);
+
+                        /* See if we can give up yet. */
+
+                        if (some_selected && some_remove)
+                        {
+                            return target_menu;
+                        }
+                        some_apply = TRUE;
+                    }
+                    break;
+
+                case ACTION_REMOVE:
+                    if (!some_remove)
+                    {
+                        menu_setflags(target_menu,
+                                      TARGET_MENU_SELECT_REMOVE, 0,0);
+
+                        /* See if we can give up yet. */
+
+                        if (some_selected && some_apply)
+                        {
+                            return target_menu;
+                        }
+                        some_remove = TRUE;
+                    }
+                    break;
+                }
+
+            } /* End for all patches for this location */
+
+        } /* End for all locations for this application */
+
+    } /* End for all applications */
+
+    return target_menu;
+}
+
+
+
+/* For all select icons in the target window with the action field(s)
+   specified, call wimp_set_icon_state() with the value and mask supplied.
+   The new flags are (old & ~mask) | value ie. in mask set the bit of any
+   flag you want to change, and in value specify what you want it changing
+   to. */
+
+static void target_menu_all_set_icon_state
+(
+    PATCH_ACTION                        actions,
+    wimp_iconflags const                value,
+    wimp_iconflags const                mask
+)
+{
+    APPLICATION *                       app;
+    TARGET_APP *                        targ_app;
+    TARGET_PATCH *                      targ_patch;
+    int                                 patch_num;
+
+    /* Run down the applications. */
+
+    for (app = apps_root; app != NULL; app = app->next)
+    {
+        /* Look at each potential location for the application. */ 
+
+        for (targ_app = app->targets;
+             targ_app != NULL;
+             targ_app = targ_app->next)
+        {
+            /* Look at each patch for each potential location. */
+
+            targ_patch = (TARGET_PATCH *) (targ_app + 1);
+
+            for (patch_num = 0;
+                 patch_num < targ_app->num_patches;
+                 patch_num++, targ_patch++)
+            {
+                /* See if the correct bits are set in the action. */
+
+                if (targ_patch->select_action & actions)
+                {
+                    /* It's one of the right types, so set its state. */
+
+                    NOERR(wimp_set_icon_state(target_window,
+                                              targ_patch->select_icon,
+                                              value, mask));
+                }
+            } /* End for all patches for this location */
+
+        } /* End for all locations for this application */
+
+    } /* End for all applications */
+}
+
+
+
+/* Checks the status of the patches for the application instance
+   passed, and updates the selection icons as appropriate. */
+
+static void check_target_app
+(
+    TARGET_APP const * const            targ_app
+)
+{
+    TARGET_PATCH *                      targ_patch;
+    PATCH_ACTION                        old_action;
+    int                                 patch_num;
+    wimp_icreate                        icon;
+    wimp_i                              icon_handle;
+
+
+    /* Loop down all the patches for the target, and check them. */
+
+    targ_patch = (TARGET_PATCH *) (targ_app + 1);
+
+    for (patch_num = 0;
+         patch_num < targ_app->num_patches;
+         patch_num++, targ_patch++)
+    {
+        /* See what the new status is. */
+
+        old_action = targ_patch->select_action;
+        targ_patch->select_action = check_patch(targ_app, targ_patch);
+
+
+        /* If there is no change, go round to the next patch. */
+
+        if (old_action == targ_patch->select_action)
+        {
+            continue;
+        }
+
+
+        /* If there was an icon then delete it as we need to change
+           things. Easiest way to delete it seems to be to set its
+           state to deleted and "needs help" - the needs help forces
+           the wimp to redraw it. */
+
+        if (old_action != ACTION_NONE)
+        {
+            NOERR(wimp_set_icon_state(target_window, targ_patch->select_icon,
+                                      (wimp_IREDRAW | wimp_IDELETED),
+                                      (wimp_IREDRAW | wimp_IDELETED)));
+        }
+
+
+        /* If there is to be no new icon, move on to the next one. */
+
+        if (targ_patch->select_action == ACTION_NONE)
+        {
+            continue;
+        }
+
+
+        /* Create the selection icon. */
+
+        icon.w = target_window;
+        icon.i.box.x0 = proto_select_icon->box.x0;
+        icon.i.box.x1 = proto_select_icon->box.x1;
+        icon.i.box.y1 = targ_patch->select_icon_y1;
+        icon.i.box.y0 = targ_patch->select_icon_y1 +
+                                            proto_select_icon->box.y0;
+        icon.i.flags = proto_select_icon->flags;
+
+        DEBUG_PRINTF(("Select x0, y0, x1, y1 = %d, %d, %d, %d\n",
+                      icon.i.box.x0, icon.i.box.y0,
+                      icon.i.box.x1, icon.i.box.y1));
+
+        switch (targ_patch->select_action)
+        {
+        case ACTION_APPLY:
+            icon.i.data.indirecttext.buffer = target_apply_string;
+            icon.i.data.indirecttext.bufflen = target_apply_string_len;
+            break;
+
+        case ACTION_REMOVE:
+            icon.i.data.indirecttext.buffer = target_remove_string;
+            icon.i.data.indirecttext.bufflen = target_remove_string_len;
+            break;
+        }
+        icon.i.data.indirecttext.validstring =
+                    proto_select_icon->data.indirecttext.validstring;
+
+        NOERR(wimp_create_icon(&icon, &icon_handle));
+        NOERR(wimp_set_icon_state(target_window, icon_handle, 0, 0));
+
+        targ_patch->select_icon = icon_handle;
+
+    } /* End for all patches for this target application. */
+}
+
+
+
+/* Run down all the selection icons, and for any that are selected
+   perform the appropriate action. */
+
+static void target_patch_selected
+(
+    void
+)
+{
+    APPLICATION *                       app;
+    TARGET_APP *                        targ_app;
+    TARGET_PATCH *                      targ_patch;
+    int                                 patch_num;
+    int                                 app_modified;
+    wimp_icon                           state;                            
+
+    os_swi0(XHourglass_On);
+
+    /* Run down the applications. */
+
+    for (app = apps_root; app != NULL; app = app->next)
+    {
+        /* Look at each potential location for the application. */ 
+
+        for (targ_app = app->targets;
+             targ_app != NULL;
+             targ_app = targ_app->next)
+        {
+            /* Look at each patch for each potential location. */
+
+            targ_patch = (TARGET_PATCH *) (targ_app + 1);
+            app_modified = FALSE;
+
+            for (patch_num = 0;
+                 patch_num < targ_app->num_patches;
+                 patch_num++, targ_patch++)
+            {
+                /* If this patch is un-doable, it has no select icon
+                   and hence cannot possibly be selected. */
+
+                if (targ_patch->select_action == ACTION_NONE)
+                {
+                    /* Loop round for the next patch. */
+
+                    continue;
+                }
+
+
+                /* Check if this one is selected. */
+
+                NOERR(wimp_get_icon_info(target_window,
+                                         targ_patch->select_icon, &state));
+
+                if (state.flags & wimp_ISELECTED)
+                {
+                    /* OK, dangerous bit coming up - patch it! */
+
+                    DEBUG_PRINTF(("Patching '%s' in '%s' for '%s'\n",
+                                  app->name, targ_app->outer_dir,
+                                  targ_patch->patch->desc));
+
+                    perform_patch(targ_app, targ_patch);
+                    app_modified = TRUE;
+                }
+
+            } /* End for all patches for this target locations */
+
+
+            /* Update the selection icons for this application, if
+               we did anything to it. */
+
+            if (app_modified)
+            {
+                check_target_app(targ_app);
+            }
+
+        } /* End for all locations for this application */
+
+    } /* End for all applications */
+
+    os_swi0(XHourglass_Off);
+}
+
+
+
+/* This function handles clicks on the target directory window menu. */
+
+static void target_menu_process
+(
+    void *                              handle,
+    char *                              hit
+)
+{               
+    handle = handle;                     /* Stop compiler complaining. */
+
+
+    /* Find which menu item was hit and take action as appropriate. */
+
+    switch (hit[0])
+    {
+    case TARGET_MENU_PATCH_SELECTED:
+        /* Run down the list of potential targets, and patch the
+           selected ones. */
+
+        target_patch_selected();
+        break;
+
+
+    case TARGET_MENU_SELECT_APPLY:
+        target_menu_all_set_icon_state(ACTION_APPLY,
+                                       wimp_ISELECTED, wimp_ISELECTED);
+        break;
+
+
+    case TARGET_MENU_SELECT_REMOVE:
+        target_menu_all_set_icon_state(ACTION_REMOVE,
+                                       wimp_ISELECTED, wimp_ISELECTED);
+        break;
+
+
+    case TARGET_MENU_CLEAR_SELECTION:
+        target_menu_all_set_icon_state((ACTION_APPLY | ACTION_REMOVE),
+                                        0, wimp_ISELECTED);
+        break;
+    }
+}
+
+
+
+/* Set up the target directory window. */
+
+static void target_setup_window
+(
+    void
+)
+{
+    int                                 redraw;
+    int                                 x;
+    int                                 y;
+    wimp_redrawstr                      state;
+    wimp_wstate                         wind;
+
+
+    /* Work out what extent we want based on the information in the
+       prototype icons and the number of icons in the window. */ 
+
+    state.w = target_window;
+    state.box.x1 = proto_app_icon->box.x1;
+    state.box.y1 = proto_app_icon->box.y1;
+    state.box.x0 = proto_app_icon->box.x0;
+
+    if (target_window_y0 == 0)
+    {
+        /* Window is empty. Get enough room for one application with
+           one patch. */
+
+        state.box.y0 = proto_app_icon->box.y0 + proto_patch_icon->box.y0;
+    }
+    else
+    {
+        state.box.y0 = target_window_y0;
+    }
+
+
+
+    /* Find the current state of the window, and if any of the new stuff
+       will not fit in the current visible area limits of the window, get
+       it redrawn. */
+
+    NOERR(wimp_get_wind_state(target_window, &wind));
+
+    x = wind.o.box.x0 - wind.o.x;
+    y = wind.o.box.y1 - wind.o.y;
+
+    redraw = FALSE;
+
+    if (wind.o.box.x0 - x < state.box.x0)
+    {
+        redraw = TRUE;
+        wind.o.box.x0 = x + state.box.x0;
+    }
+
+    if (wind.o.box.y0 - y < state.box.y0)
+    {
+        redraw = TRUE;
+        wind.o.box.y0 = y + state.box.y0;
+    }
+
+    if (wind.o.box.x1 - x > state.box.x1)
+    {
+        redraw = TRUE;
+        wind.o.box.x1 = x + state.box.x1;
+    }
+
+    if (wind.o.box.y1 - y > state.box.y1)
+    {
+        redraw = TRUE;
+        wind.o.box.y1 = y + state.box.y1;
+    }
+
+    if (redraw && (wind.flags & wimp_WOPEN))
+    {
+        /* If it needs redrawing, and it is open, then get it redrawn. */
+
+        wimp_open_wind(&(wind.o));
+    }
+
+
+    /* Set the new extent. */
+
+    NOERR(wimp_set_extent(&state));
+
+
+    /* If the window is supposed to be full size, then make it so. */
+
+    if ((wind.flags & wimp_WOPEN) && (wind.flags & wimp_WFULL))
+    {
+        wind.o.box.x0 = state.box.x0 + x;
+        wind.o.box.y0 = state.box.y0 + y;
+        wind.o.box.x1 = state.box.x1 + x;
+        wind.o.box.y1 = state.box.y1 + y;
+
+        NOERR(wimp_open_wind(&wind.o));
+    }
+}
+
+
+
+/* Function to initialise the target directory window. */
+
+static char                             proto_name[] = "TargetProto";
+
+static void target_window_init
+(
+    void
+)
+{
+    wimp_wind *                         proto_wind;
+    wimp_icon *                         proto_icons; 
+
+
+    /* Find template for the window with the icon prototypes in it. */
+
+    proto_wind = template_syshandle(proto_name);
+
+    if (proto_wind == 0)
+    {
+        report_error(msgtrans_error_lookup(ErrorBlock_NoTemplate,
+                                           proto_name, NULL, NULL, NULL),
+                     wimp_ECANCEL);
+    }
+
+
+    /* The array of prototype icons is tacked on the end of the
+       wimp_wind structure - adding 1 to a structure pointer actually
+       adds the size of the structure plus any packing gap. */
+
+    proto_icons = (wimp_icon *) (proto_wind + 1);
+
+    proto_app_icon = &proto_icons[0];
+    proto_patch_icon = &proto_icons[1];
+    proto_select_icon = &proto_icons[2];
+
+
+    /* Adjust y0 (bottom left) for icons 1 and 2 as they are below icon
+       0. We want y0 to simply be the size of these icons, not the actual
+       position. */
+
+    proto_patch_icon->box.y0 -= proto_app_icon->box.y0;
+    proto_select_icon->box.y0 -= proto_app_icon->box.y0;
+
+    DEBUG_PRINTF(("Select x0, y0, x1, y1 = %d, %d, %d, %d\n",
+                  proto_select_icon->box.x0, proto_select_icon->box.y0,
+                  proto_select_icon->box.x1, proto_select_icon->box.y1));
+
+    /* Set the bottom of the window to zero. */
+
+    target_window_y0 = 0;
+
+
+    /* Look up the "Apply" and "Remove" strings. */
+
+    free(target_apply_string);
+    MSG_LOOKUP0("Apply");
+    target_apply_string_len = strlen(msg_lookup_buff);
+    target_apply_string = malloc_noerr(target_apply_string_len + 1);
+    strcpy(target_apply_string, msg_lookup_buff);
+
+    free(target_remove_string);
+    MSG_LOOKUP0("Remove");
+    target_remove_string_len = strlen(msg_lookup_buff);
+    target_remove_string = malloc_noerr(target_remove_string_len + 1);
+    strcpy(target_remove_string, msg_lookup_buff);
+
+
+    /* Setup the window as usual from here. */
+
+    target_setup_window();
+}
+
+
+
+/* Adds the target file passed to the list of targets we can patch,
+   holding on to the information about which patch file etc. it is
+   for. */
+
+static void add_target
+(
+    char const * const                  outer_dir,
+    char const * const                  object,
+    APPLICATION *                       app
+)
+{
+    TARGET_APP *                        targ_app;
+    TARGET_PATCH *                      targ_patch;
+    PATCH_DATA *                        patch;
+    int                                 outer_len;
+    wimp_icreate                        icon;
+    wimp_i                              icon_handle;
+
+
+    /* Allocate enough memory for the application target instance and
+       the array of all patches for it. */
+
+    targ_app = calloc_noerr(sizeof(*targ_app) +
+                            sizeof(*targ_patch) * app->num_patches, 1);
+
+    /* Fill in the application target instance. */
+
+    outer_len = strlen(outer_dir);
+    targ_app->num_patches = app->num_patches;
+    targ_app->outer_dir = malloc_noerr(outer_len + 2);
+    strcpy(targ_app->outer_dir, outer_dir);
+    targ_app->outer_dir[outer_len++] = '.';
+    targ_app->outer_dir[outer_len] = '\0';
+    targ_app->outer_dir_len = outer_len;
+
+
+    /* I know that most of the display_path is a duplicate of the outer_dir,
+       but at some point I may have to put in some truncation code so
+       that the display_path is gaurunteed to fit in the window. So it
+       is sensible to have seperate memory and not try to get clever. */
+
+    targ_app->display_path = malloc_noerr(outer_len + app->name_len + 1);
+    strcpy(targ_app->display_path, targ_app->outer_dir);
+    strcpy(targ_app->display_path + outer_len, object);
+
+
+    /* Put it on the list for the application. */
+
+    targ_app->next = app->targets;
+    app->targets = targ_app;
+
+
+    /* The application icon position is determined from the information
+       in the prototype, plus where the current bottom of the window
+       is (which we update). */
+
+    icon.w = target_window;
+    icon.i.box.x0 = proto_app_icon->box.x0;
+    icon.i.box.x1 = proto_app_icon->box.x1;
+    icon.i.box.y1 = target_window_y0;
+    icon.i.box.y0 = (target_window_y0 += proto_app_icon->box.y0);
+    icon.i.flags = proto_app_icon->flags;
+    icon.i.data.indirecttext.buffer = app->desc;
+    icon.i.data.indirecttext.bufflen = app->desc_len;
+    icon.i.data.indirecttext.validstring = NULL;
+
+    NOERR(wimp_create_icon(&icon, &icon_handle));
+    NOERR(wimp_set_icon_state(target_window, icon_handle, 0, 0));
+
+
+    /* The file path icon position is determined from the information
+       in the prototype, plus where the current bottom of the window
+       is (which we update). We use the same prototype icon as for the
+       application descrition. I suppose strictly speaking I ought to
+       use another icon, but it just doesn't seem worth the effort. */
+
+    icon.w = target_window;
+    icon.i.box.x0 = proto_app_icon->box.x0;
+    icon.i.box.x1 = proto_app_icon->box.x1;
+    icon.i.box.y1 = target_window_y0;
+    icon.i.box.y0 = (target_window_y0 += proto_app_icon->box.y0);
+    icon.i.flags = proto_app_icon->flags;
+    icon.i.data.indirecttext.buffer = targ_app->display_path;
+    icon.i.data.indirecttext.bufflen = outer_len + app->name_len + 1;
+    icon.i.data.indirecttext.validstring = NULL;
+
+    NOERR(wimp_create_icon(&icon, &icon_handle));
+    NOERR(wimp_set_icon_state(target_window, icon_handle, 0, 0));
+
+
+    /* Fill in the array of patches for it. */
+
+    targ_patch = (TARGET_PATCH *) (targ_app + 1);
+
+    for (patch = app->patches;
+         patch != NULL;
+         patch = patch->next, targ_patch++)
+    {
+        /* The patch icon position is also determined from the information
+           in the prototype, plus the current window bottom. */
+
+        icon.w = target_window;
+        icon.i.box.x0 = proto_patch_icon->box.x0;
+        icon.i.box.x1 = proto_patch_icon->box.x1;
+        icon.i.box.y1 = target_window_y0;
+        icon.i.box.y0 = target_window_y0 + proto_patch_icon->box.y0;
+        icon.i.flags = proto_patch_icon->flags;
+        icon.i.data.indirecttext.buffer = patch->desc;
+        icon.i.data.indirecttext.bufflen = patch->desc_len;
+        icon.i.data.indirecttext.validstring = NULL;
+
+        NOERR(wimp_create_icon(&icon, &icon_handle));
+        NOERR(wimp_set_icon_state(target_window, icon_handle, 0, 0));
+
+
+        /* Get the icon y1 for the select icon and update the bottom
+           of the window. */
+
+        targ_patch->select_icon_y1 = target_window_y0;
+        target_window_y0 += proto_select_icon->box.y0;
+
+
+        /* Store pointer to patch data in array */
+
+        targ_patch->patch = patch;
+
+    } /* End for all patches for this application. */
+
+
+    /* Check which patches will apply and set up the selection icons. */
+
+    check_target_app(targ_app);
+
+
+    /* Update the window. */
+
+    target_setup_window();
+}
+
+
+
+/* Passed a directory (canonical), an object within it, and the object's
+   file type. Checks to see if we know of this object as an application,
+   and if so adds it to the list of things we think we can patch. */
+
+static void add_to_list_if_patchable
+(
+    char const * const                  path,
+    char const * const                  object,
+    int                                 file_type
+)
+{
+    APPLICATION *                       try_app;
+    int                                 object_len;
+
+    object_len = strlen(object);
+
+    for (try_app = apps_root;
+         try_app != NULL;
+         try_app = try_app->next)
+    {
+        /* Does this application match? */
+
+        if (try_app->name_len == object_len &&
+            (try_app->file_type == file_type ||
+             try_app->file_type == FileType_DontCare) &&
+            strcmp(try_app->name, object) == 0)
+        {
+            DEBUG_PRINTF(("App '%s' potentially patchable\n",
+                          object));
+
+            add_target(path, object, try_app);
+
+        }
+
+    } /* End for all applications we have patch data on. */
+}
+
+
+
+/* This function handles wimp events for the icon bar icon and for
+   the target directory window. */
+
+static void event_handler
+(
+    wimp_eventstr *                     e,
+    void *                              handle
+)
+{
+    wimp_wstate                         state;
+
+    handle = handle;                    /* Stop compiler warning. */
+
+    switch (e->e)
+    {
+    case wimp_EREDRAW:
+        break;
+
+    case wimp_EOPEN:
+        NOERR(wimp_open_wind(&e->data.o));
+        break;
+
+    case wimp_ECLOSE:
+        NOERR(wimp_close_wind(e->data.o.w));
+        break;
+
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+        switch (e->data.msg.hdr.action)
+        {
+        case wimp_MDATALOAD:
+            /* Only respond if it is from the Filer (check for
+               your_ref of zero). */
+
+            if (e->data.msg.hdr.your_ref == 0)
+            {
+                DEBUG_PRINTF(("Data load '%s'\n",
+                             e->data.msg.data.dataload.name));
+
+
+                /* Get the state of the target directory window, and open
+                   it at the front. */
+
+                NOERR(wimp_get_wind_state(target_window, &state));
+                state.o.behind = -1;
+                NOERR(wimp_open_wind(&state.o));
+
+
+                /* We actually get a full canonical path - amazing! */
+
+                os_swi0(XHourglass_On);
+                enumerate_files_in_object(e->data.msg.data.dataload.name,
+                                          (object_file | object_directory),
+                                          add_to_list_if_patchable);
+                os_swi0(XHourglass_Off);
+            }
+            break;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+
+
+/* This function handles unknown events, so that we can pick up double
+   clicks and filer_runs of Patch files. Returns TRUE if it handled the
+   event. */
+
+static BOOL unknown_events
+(
+    wimp_eventstr *                     e,
+    void *                              handle
+)
+{
+    handle = handle;                    /* Stop the compiler complaining. */
+
+
+    switch (e->e)
+    {
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+        switch (e->data.msg.hdr.action)
+        {
+        case wimp_MDATAOPEN:
+            /* Data open came in - check the file type. */
+
+            if (e->data.msg.data.dataopen.type == FileType_Patch)
+            {
+                DEBUG_PRINTF(("Data open '%s'\n",
+                             e->data.msg.data.dataopen.name));
+
+                os_swi0(XHourglass_On);
+
+                /* Tell the filer that we are going to load it. */
+
+                e->data.msg.hdr.action = wimp_MDATALOADOK;
+                e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+                NOERR(wimp_sendmessage(wimp_ESEND, &e->data.msg,
+                                       e->data.msg.hdr.task));
+
+
+                /* And load it. */
+
+                read_patch_file(NULL,                   /* No directory. */
+                                e->data.msg.data.dataopen.name,
+                                e->data.msg.data.dataopen.type);
+                os_swi0(XHourglass_Off); 
+
+
+                /* Flag that we have handled this event. */
+
+                return TRUE;
+            }
+            break;
+
+        } /* End switch (e->data.msg.hdr.action) */
+
+        break;
+
+    } /* End switch (e->e) */
+
+
+    /* If we get here, then we didn't handle the event. */
+
+    return FALSE;
+}
+
+
+
+/* This function handles clicks on the icon bar icon. At the moment this
+   just displays the directory window, or pulls it to the front if it
+   is already displayed. */
+
+static void icon_bar_click
+(
+    wimp_i                              icon
+)
+{
+    wimp_wstate                         state;
+
+    icon = icon;                        /* Stop compiler complaining. */
+
+
+    /* Make sure the window is set up properly. */
+
+    target_setup_window();
+
+
+    /* Get the state of the target directory window, and open it at
+       the front. */
+
+    NOERR(wimp_get_wind_state(target_window, &state));
+    state.o.behind = -1;
+    NOERR(wimp_open_wind(&state.o));
+}
+
+
+
+/* This function gets called when exit() is called. It restores the global
+   machine state eg. open files. Local application state (eg. malloc heap)
+   is left alone (although kept consistent) as it is about to be blown
+   away. */
+
+static void my_exit_handler
+(
+    void
+)
+{
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+    /* Restore the original wimp next slot size if necessary. */
+
+    if (orig_next_slot != -1)
+    {
+        regs.r[0] = -1;
+        regs.r[1] = orig_next_slot;
+
+        error = _kernel_swi(XWimp_SlotSize, &regs, &regs);
+        orig_next_slot = -1;
+
+        if (error != NULL)
+        {
+            /* OK button only, as we are already going down.
+               Do our own reporting, as report_error() calls
+               MessageTrans and might call exit() (which we
+               are already insided). */
+
+            regs.r[0] = (int) error;
+            regs.r[1] = wimp_EOK;
+            regs.r[2] = (int) "Patcher";
+
+            /* Ignore errors from Wimp_ReportError. */
+
+            _kernel_swi(XWimp_ReportError, &regs, &regs);
+        }
+    }
+
+
+    /* Close our open file if necessary. */
+
+    if (glob_channel != 0)
+    {
+        regs.r[0] = OS_FIND_CLOSE;
+        regs.r[1] = glob_channel;
+
+        error = _kernel_swi(XOS_Find, &regs, &regs);
+        glob_channel = 0;
+
+        if (error != NULL)
+        {
+            /* OK button only, as we are already going down.
+               Do our own reporting, as report_error() calls
+               MessageTrans and might call exit() (which we
+               are already insided). */
+
+            regs.r[0] = (int) error;
+            regs.r[1] = wimp_EOK;
+            regs.r[2] = (int) "Patcher";
+
+            /* Ignore errors from Wimp_ReportError. */
+
+            _kernel_swi(XWimp_ReportError, &regs, &regs);
+        }
+    }
+
+
+    /* Delete a random scrap file lying around if necessary. */
+
+    if (glob_delete != NULL)
+    {
+        regs.r[0] = OSFile_Delete;
+        regs.r[1] = (int) glob_delete;
+
+        error = _kernel_swi(XOS_File, &regs, &regs);
+        glob_delete = NULL;
+
+        if (error != NULL)
+        {
+            /* OK button only, as we are already going down.
+               Do our own reporting, as report_error() calls
+               MessageTrans and might call exit() (which we
+               are already insided). */
+
+            regs.r[0] = (int) error;
+            regs.r[1] = wimp_EOK;
+            regs.r[2] = (int) "Patcher";
+
+            /* Ignore errors from Wimp_ReportError. */
+
+            _kernel_swi(XWimp_ReportError, &regs, &regs);
+        }
+    }
+
+
+    /* Close all the MessageTrans files up. */
+
+    close_all_mgstrans_files();
+}
+
+
+
+/* It all starts here. This should be the only non "static" function
+   in this source file. */
+
+int main
+(
+    int                                 argc,
+    char *                              argv[]
+)
+{
+    int                                 argument;
+
+
+    /* Turn the hour glass on. */
+
+    os_swi0(XHourglass_On);
+
+
+    /* Set the locale. */
+
+    setlocale(LC_ALL, "");
+
+
+    /* So we can tell where the start of this run is among all the crap
+       on the host screen. */
+
+    DEBUG_PRINTF(("*** !Patch STARTUP *** - argc = %d\n", argc));
+
+
+    /* Attach our exit handler to close all the MessageTrans files up. */
+
+    atexit(my_exit_handler);
+
+
+    /* Read the Messages file. */
+
+    msgs_file_desc = open_msgtrans_file("Patch:Messages");
+
+
+
+    /* Pacify RISCOS 3.10 version of RISC_OSLib. */
+
+    res_init("Patch");
+
+
+    /* Perform a Wimp_Initialise. */
+
+    wimpt_init(MSG_LOOKUP0("TaskName"));
+
+
+
+    /* Flag that we aren't interested in pointer entering/leaving window
+       events (the default is just to ignore null events). This is about
+       all it is reasonable to disable without invoking event queuing,
+       which as far as I can make out is a bad thing to have happen. */
+
+    event_setmask(wimp_ENULL | wimp_EPTRLEAVE | wimp_EPTRENTER);
+
+
+    /* Flag that we don't use floating point, so it can be corrupted
+       on wimp poll (gains a bit of speed). */
+
+    wimp_corrupt_fp_state_on_poll();
+
+
+
+    /* Read in the Templates file. This actually results in a call to
+       template_init(); these days, as template_readfile() is a macro
+       which is why we need the res_init("Patch"); call above - my
+       perfectly good pathname below gets ignored and RISC_OSLib invents
+       the same thing for me. */
+
+    template_readfile("Patch:Templates");
+
+
+
+    /* Create the target directory window, and declare its event handler
+       to be event_handler(). */
+
+    create_window("TargetDir", &target_window);
+    win_register_event_handler(target_window, event_handler, 0);
+
+
+    /* Create the menu tree for the target directory window. Have to
+       avoid using the main global buffer for both lookups. */
+
+    msgtrans_lookup(msgs_file_desc, msg_lookup_aux_buff,
+                    msg_lookup_aux_buff_size, "TargtMEntr",
+                    NULL, NULL, NULL, NULL);
+    target_menu = menu_new(MSG_LOOKUP0("TargtMTitl"), msg_lookup_aux_buff);
+
+
+    /* Attach menu maker function for the directory window. */
+
+    event_attachmenumaker(target_window, target_menu_creator,
+                          target_menu_process, 0);
+
+
+
+    /* Put our icon on the icon bar, and declare its event handler
+       to be event_handler(). */
+
+    baricon(MSG_LOOKUP0("IcBarSprite"), 1, icon_bar_click);
+    win_register_event_handler(win_ICONBARLOAD, event_handler, 0);
+
+
+    /* Create the icon bar menu. Have to avoid using the global buffer
+       for both lookups. */
+
+    msgtrans_lookup(msgs_file_desc, msg_lookup_aux_buff,
+                    msg_lookup_aux_buff_size, "IcBarMEntr",
+                    NULL, NULL, NULL, NULL);
+    icon_bar_menu = menu_new(MSG_LOOKUP0("IcBarMTitl"), msg_lookup_aux_buff);
+
+
+    /* Attach icon_bar_menu_proc() to handle clicks on the icon
+       bar menu. */
+
+    event_attachmenu(win_ICONBAR, icon_bar_menu, icon_bar_menu_proc, 0);
+
+
+    /* Register an unknown event handler, to pick up double-clicks and
+       filer_runs of Patch type files. */
+
+    win_add_unknown_event_processor(unknown_events, 0);
+
+
+
+    /* Initialise the target directory window. */
+
+    target_window_init();
+
+
+
+    /* Enumerate and read all the patch files before we start polling,
+       as it is much easier this way. */
+
+    read_patch_file(NULL, "Patch:BootStrap", FileType_Patch);
+
+
+
+    /* Having read the BootStrap file, read any files specified on
+       the command line. */
+
+    for (argument = 1; argument < argc; argument++)
+    {
+        enumerate_files_in_object(argv[argument], object_file,
+                                  read_patch_file);
+    }
+
+
+
+    /* Turn the hour glass off and start polling the wimp. */
+
+    os_swi0(XHourglass_Off);
+
+    while (TRUE)
+    {
+        event_process();
+    }
+
+    /* We never get here, but this stops the compiler complaining. */
+
+    return 0;
+}

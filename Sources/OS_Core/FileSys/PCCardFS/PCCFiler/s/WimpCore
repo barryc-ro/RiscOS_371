@@ -1,0 +1,432 @@
+; > Wimpcore
+
+taskidentifier
+	DCB	"TASK"
+	ALIGN
+
+templateerrorabort
+	Push	"r0"
+	SWI     XWimp_CloseTemplate
+        Pull    "r0"
+
+errorabort
+	MOV	r1, #2_010		; Give 'em a cancel button to keep 'em happy
+	BL	reporterror
+abort
+	MOV	r2, r12					;R2 is address of ws
+	LDR	r12, private_word_address		;R12 is address of pw
+	MOV	r0, #ModHandReason_Free
+	SWI	XOS_Module				;Free the workspace
+	MOV	r0, #-1
+	STR	r0, [r12]		; ie marked as bad
+	SWI	OS_Exit			; Byeeee!!!
+
+reporterror
+	Push	"r1,r2,lr"
+	BL	ExpandTaskTitle
+	MOV	r1, #1
+	SWI	XWimp_ReportError
+	Pull	"r1,r2,pc"
+
+;------------------------------------------------------------------------------------
+;Module 'run' entry point - the start of the Wimp application...
+Start
+	ROUT
+	LDR	r12,[r12]		;R12 is now pw contents
+
+	CMP	r12, #0			;Any workspace?
+	BLLE	CantStart		;Erorr, no ws or couldn't initialise
+	SWIVS	OS_GenerateError
+
+	ADRL	sp, stacktop		;Set up our own stack (512bytes)
+
+	LDR	r0, my_taskhandle
+	CMP	r0, #0			;Are we to shut down first?
+	LDRGT	r1, taskidentifier
+	SWIGT	XWimp_CloseDown		;Ignore errors, 'cos we dont care
+
+	MOV	r0, #300		;Mutter mutter, grumble grumble (we'd rather have 350!)
+	LDR	r1, taskidentifier
+	BL	ExpandTaskTitle		;Expand the token into the string, setting V if failure (r0=errblock) else r2 points
+	ADDR	r3, MessagesList, VC
+	SWIVC	XWimp_Initialise	;Boing!
+;	STRVC	r0, wimp_version
+	STRVC	r1, my_taskhandle
+	BVS	errorabort
+
+	;Having got here, we can start (re?)initialising wimp-related workspace...
+	BL	InitialiseIconbar
+
+	BLVC	BuildMenus
+	BLVC	BuildWindows
+	BVS	errorabort
+
+;***********************************************************************
+;** Main Wimp Polling loop					     ***
+;***********************************************************************
+WimpPoll
+	MOVVS	r1, #2_001
+	BLVS	reporterror
+	BVS	errorabort
+
+	LDR	r0, =Wimp_Events
+	ADR	r1, miscdata
+	ADR	r3, slotupdate
+	SWI	XWimp_Poll
+	BVS	WimpPoll
+
+	CMP	r0, #Open_Window_Request
+	BNE     %FT01
+        SWI	XWimp_OpenWindow
+	B	WimpPoll
+
+01	CMP	r0, #Close_Window_Request
+	BNE	%FT01
+;	SWI	XWimp_CloseWindow
+	B	format_closewindow
+
+01	CMP	r0, #Mouse_Button_Change
+	BEQ	event_mouse
+
+        CMP     r0, #Key_Pressed
+        LDREQ   r0, [r1, #24]
+        SWIEQ   XWimp_ProcessKey
+        BEQ     WimpPoll
+
+	CMP	r0, #Menu_Select
+	BEQ     event_menu_select
+
+	CMP	r0, #PollWord_NonZero
+	BEQ	event_pollnotzero
+
+        CMP     r0, #User_Message
+        CMPNE   r0, #User_Message_Recorded
+        BEQ     event_user_message
+
+	B	WimpPoll
+
+	SWI	OS_Exit
+
+;--------------------------------------------------------------
+InitialiseIconbar	;Builds the icons in miscdata
+	Push	"r0-r9,lr"
+	Debug	wt,"Initialising the iconbar"
+
+	;first, blast the defaults into the workspace
+	ADR	r9, sloticondata
+	ADR	r8, DefaultSpriteInfo
+	LDMIA	r8, {r0-r7}
+	MOV	r8, #MaxNum_Slots
+01	RSB	r3, r8, #8
+	MOV	r3, r3, LSL #8		;in 2nd byte
+	ADD	r3, r3, #(48<<8)	;So we end up with '0' -> maxnum-1 in 2nd byte
+	ORR	r3, r3, #":"
+	STMIA   r9!, {r0-r7}
+	SUBS	r8, r8, #1
+	BNE	%BT01
+
+	LDRB	r7, num_slots
+	MOV	r6, #Iconbar_Priority
+02	ADR	r8, sloticondata
+	Debug	wt,"Sloticondata points to ",r8
+	SUBS	r7, r7, #1
+	ADD	r8, r8, r7, LSL #5
+	Debug	wt,"new poniter is ",r8
+	BL	FindIconInfo			;Determines the text/icon to use. USES MISCDATA!
+	Debug	wt,"Going to create icon ",r7
+	BL	CreateIcon
+	CMP	r7, #0
+	BNE	%BT02
+
+	Pull	"r0-r9,pc"
+
+;--------------------------------------------------------------
+DefaultSpriteInfo
+	DCB	"   Spcmciae",0		;Must be 12 chars long
+	DCB	":0",0,0
+	DCD	0,0			;12 chars for the icon name
+	DCD	32			;1 word for length of icon name (OS units)
+	DCD	-1			;Default sprite handle
+
+	ALIGN
+
+;--------------------------------------------------------------
+CreateIcon	;Builds a sprite block in miscdata, using the info in
+		;the indirected block, passed in r8, slotnumber (0->[max-1]) passed in r7
+		;It is placed to the right of the icon with the handle passed in r6
+	Push	"r0-r4,lr"
+	Push	"r6"
+	ADD	r2, r8, #4		;r2 points to sprite name
+	MOV	r0, #SpriteReason_ReadSpriteSize
+	Debug	wt,"Spritename pointer is ",r2
+	SWI	XWimp_SpriteOp		;returns r3, r4 as x,y sizes
+	SWIVS	OS_GenerateError
+	MOVVC	r0, r6
+	MOVVC	r1, #VduExt_XEigFactor
+	SWIVC	XOS_ReadModeVariable
+	MOVVC	r3, r3, LSL r2		;r3 is now OS units
+	DebugIf	VC,wt,"Sprite X (OS)",r3
+
+	MOVVC	r1, #VduExt_YEigFactor
+	SWIVC	XOS_ReadModeVariable
+	MOVVC	r4, r4, LSL r2		;r4 is now OS units
+	ADDVC   r4, r4, #20             ;Add the sprite baseline
+	DebugIf	VC,wt,"Sprite Y (OS)",r4
+
+	Pull	"r6"
+	ADRVC	r14, miscdata
+	CMPVC	r6, #Iconbar_Priority
+	MOVEQ	r0, #-5			;Scan from left
+	MOVNE	r0, #-4
+	MOVVC	r1, #0			;min x
+	MOVVC	r2, #-16		;min y
+	STMVCIA	r14!, {r0-r4}		;Store window handle,minx,miny,maxx,maxy
+
+	LDRVC	r0, iconbariconflags
+	ADDVC	r1, r8, #12		;text indir
+	ADDVC	r2, r8, #3			;sprite indir
+	MOVVC   r3, #16			;text length
+        STMVCIA r14!, {r0-r3}           ;Store iconflags & indirected pointers
+
+	MOVVC	r0, r6
+        ADRVC   r1, miscdata		;Icon block starts at start of miscdata
+	DebugIf VC,wt,"Creating icon",r0,r1
+
+        SWIVC   XWimp_CreateIcon
+	SWIVS	OS_GenerateError
+	DebugIf	VC,wt,"Well, we're still here"
+        STRVC   r0, [r8,#28]            ;Remember the handle
+	MOV	r6, r0			;and return it, so we can use it as the next priority
+
+	Pull	"r0-r4,pc",,^
+
+;--------------------------------------------------------------
+iconbariconflags
+	DCD	&1700310B		;text,sprite,hcent,indir,type3,fg7,bg1
+
+MessagesList
+	DCD	0
+
+tasktitle
+	DCB	"TaskTitle",0
+	ALIGN
+
+ExpandTaskTitle
+	Push	"r1,r3,lr"
+	ADR	r1, tasktitle
+	ADR	r2, miscdata
+	MOV	r3, #?miscdata
+	BL	msgtrans_lookuptoken
+	Pull	"r1,r3,pc"
+;--------------------------------------------------------------
+menustructures
+
+menu_main	Menu	"MT00"			;PCCardFS::n
+ment_namedisc	Item	"ME01",menu_namedisc
+ment_dismount	Item	"ME02"
+ment_format	Item	"ME03",menu_format
+ment_backup	Item	"ME04",,S
+ment_share	Item	"ME05",,S
+ment_verify	Item	"ME06",,S
+ment_free	Item	"ME07"
+
+menu_namedisc	Menu	"MT10"
+ment_newname	Item    "ME11",,W
+
+menu_format	Menu	"MT20"
+ment_current	Item	"ME21",,N
+ment_pccardfs	Item	"ME22"
+ment_dosfs	Item	"ME23"
+                DCB     0
+		ALIGN
+mv_namedisc	DCB     "A~$&%@\\^:.#*""| ", 0  ; disallow funny chars
+		ALIGN
+;--------------------------------------------------------------
+BuildMenus
+	Push	"r0-r3,lr"
+
+	Debug	wt,"Hello, I've come to make your menus"
+        ADR     r1, mb_namedisc                 ; fill in writeable fields before the SWI
+        ADR     r2, mv_namedisc
+        MOV     r3, #?mb_namedisc
+	Debug	wt,"r123 are ",r1,r2,r3
+	ADR	r14, menu_namedisc + m_headersize + mi_icondata
+        STMIA   r14, {r1-r3}
+
+	Debug	wt,"Well, best do the SWI..."
+	ADR	r0, message_file_block
+	ADR	r1, menustructures
+	ADR	r2, menustart
+	MOV	r3, #menuend-menustart
+	SWI	XMessageTrans_MakeMenus
+	SWIVS	OS_GenerateError
+	Pull	"r0-r3,pc",VS
+
+	Debug	wt,"Did the makemenu call ok"
+        MOV     r0, #(?mb_namedisc-1)*16+12     ; modify menu width for namedisc
+        LDR     r14, menu_namedisc + m_itemwidth
+        CMP     r0, r14
+        STRGT   r0, menu_namedisc + m_itemwidth
+
+	MOV	r14, #4
+	STR	r14, menu_format + m_headersize + mi_submenu
+
+	Pull	"r0-r3,pc"
+
+;-----------------------------------------------------------------------
+UpdateIcon ; Entry is r0 = slot number (int 0 to 7)
+	   ; Exit is an updated icon on the iconbar (well, what a surprise!)
+	Push	"r0-r9,lr"
+	MOV	r7, r0			;Bung slot number in r7
+	ADR	r8, sloticondata
+	ADD	r8, r8, r7, LSL #5	;Points to icon definition for this slot
+	LDR	r2, [r8, #28]		;Get icon handle into r1
+	MOV	r1, #-2
+	Push	"r1-r2"
+
+	MOV	r1, sp
+	SWI	XWimp_DeleteIcon	;Corrupts r0
+	Pull	"r1-r2"			;just to clear up the stack
+	Pull	"r0-r9,pc",VS		;Byee if error
+
+	LDRB	r1, num_slots
+	SUB	r1, r1, #1
+	CMP	r1, r7
+	Pull	"r0-r9,pc",MI		;if slot is out of range, we go back
+	MOVEQ	r6, #Iconbar_Priority	;If icon is leftmost
+	LDRNE	r6, [r8, #(32+28)]	;Otherwise, grab the icon handle of the icon to the left
+	BL	FindIconInfo
+	BL	CreateIcon
+	Pull	"r0-r9,pc",,^
+
+;--------------------------------------------------------------
+win_currform
+	DCB	"Current",0
+win_format
+	DCB	"Format",0
+	ALIGN
+
+BuildWindows	ROUT
+	Push	"lr"
+	ADDR	r1, template_filename
+	SWI	XWimp_OpenTemplate
+	BVS	errorabort
+	ADR	r2, miscdata
+	ADR	r3, win_currform
+
+	DebugS	wt,"wombat is ",r3
+
+01	LDRB	r4, [r3], #1
+	STRB	r4, [r2], #1
+	CMP	r4, #0
+	BNE 	%BT01
+
+	MOV	r1, #-1
+	MOV	r4, #-1
+	ADR	r5, miscdata
+	MOV	r6, #0
+	DebugS	wt,"Template being looked for is ",r5
+	SWI	XWimp_LoadTemplate
+	BVS	templateerrorabort
+	Debug	wt,"Template for 'Current format' requires space of",r1
+	Debug	wt,"It also requires workspace of",r2
+	Debug	wt,"By the way, it came back with r6",r6
+
+	ADR	r1, miscdata + &10
+	ADR	r2, currformindir
+	ADD	r3, r2, #64			;64 is the size of currformindir
+	MOV	r4, #-1
+	ADR	r5, miscdata
+	MOV	r6, #0
+	SWI     XWimp_LoadTemplate
+        SWIVC   XWimp_CreateWindow
+        STRVC   r0, currform_handle
+        BVS     templateerrorabort
+        ;That's the current format window done. Now, let's do the interactive format window
+	ADR	r2, miscdata
+	ADR	r3, win_format
+02	LDRB	r4, [r3], #1
+	STRB	r4, [r2], #1
+	CMP	r4, #0
+	BNE 	%BT02
+
+	MOV	r1, #-1
+	MOV	r4, #-1
+	ADR	r5, miscdata
+	MOV	r6, #0
+	DebugS	wt,"Template being looked for is",r5
+	SWI	XWimp_LoadTemplate
+	BVS	templateerrorabort
+	Debug	wt,"Template for 'Interactive format' requires space of ",r1
+	Debug	wt,"It also requires workspace of ",r2
+	Debug	wt,"By the way, it came back with r6",r6
+
+	ADR	r1, miscdata + &10
+	ADR	r2, ictvformindir
+	ADD	r3, r2, #&a0			;64 is the size of ictvformindir
+	MOV	r4, #-1
+	ADR	r5, miscdata
+	MOV	r6, #0
+	SWI     XWimp_LoadTemplate
+        SWIVC   XWimp_CreateWindow
+        STRVC   r0, ictvform_handle
+        BVS     templateerrorabort
+
+	SWI	XWimp_CloseTemplate
+	BVS	errorabort
+
+	;Here, get the addresses of the various indirected thingies we're interested in,
+	;and stuff them into our workspace so's we can access them later.
+	LDR	r0, currform_handle
+	MOV	r2, #0
+	ADR	r3, currform_indir
+	BL	getindirinfo
+
+	LDR	r0, ictvform_handle
+	MOV	r2, #2
+	ADR	r3, ictvform_nameindir
+	BL	getindirinfo
+
+	LDR	r0, ictvform_handle
+	MOV	r2, #3
+	ADR	r3, ictvform_buttindir
+	BL	getindirinfo
+
+	LDR	r0, ictvform_handle
+	MOV	r2, #0
+	ADR	r3, ictvform_slotindir
+	BL	getindirinfo
+
+	LDR	r0, ictvform_handle
+	MOV	r2, #5
+	ADR	r3, ictvform_msgsindir
+	BL	getindirinfo
+
+	;That's the icons done. now, lets grab the titlebar info
+	ADR	r1, miscdata
+	LDR	r0, ictvform_handle
+	STR	r0, [r1]
+	ORR	r1, r1, #1			;Window block only
+	Debug	wt,"On entry, r0, r1 are ",r0,r1
+	SWI	XWimp_GetWindowInfo
+	Debug	wt,"On exit, r0, r1 are ",r0,r1
+	BIC	r1, r1, #1
+	ADR	r1, miscdata
+	LDR	r0, [r1, #76]			;Grab indirbuffer address for title
+	STR	r0, ictvform_titlindir
+	Debug	wt,"Storing the indirected title as being at",r0
+
+	Pull	"pc"
+
+getindirinfo	;Takes r0=window handle, r2=icon number, r3=place to put indir address
+	ADR	r1, miscdata
+	STMIA	r1, {r0,r2}
+	SWI	XWimp_GetIconState
+	BVS	errorabort
+	LDR	r0, [r1, #28]
+	STR	r0, [r3]
+	Debug	wt,"Storing the indirected string as being at",r0
+	Debug	wt,"Storing that value at",r3
+	MOV	pc, lr
+;--------------------------------------------------------------
+	LNK	s.events

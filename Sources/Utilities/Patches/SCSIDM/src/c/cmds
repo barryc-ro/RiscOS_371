@@ -1,0 +1,1672 @@
+/*
+ * $Header: /ab/bsd:etc/scsidm/cmds.c:bsd  1.11  $
+ * $Source: /ab/bsd:etc/scsidm/cmds.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	cmds.c,v $
+ * Revision 1.11  90/10/30  12:59:29  kwelton
+ * device() is more careful about closing descriptors for previously opened
+ * target.  This should fix bug#4855.
+ * 
+ * Revision 1.10  90/08/13  15:10:17  jroach
+ * Bring Risc OS and RisciX versions in line with each other.
+ * 
+ * Revision 1.9  90/08/02  15:43:11  kwelton
+ * When device() fails to open the new target, it forces a close on the
+ * currently open target (if there is one). This reduces the risk of
+ * unintentionally doing something to the wrong device.
+ * section() now guards against using the same string twice for dr_diskname.
+ * 
+ * Revision 1.8  90/05/25  10:45:14  kwelton
+ * Several changes and bug fixes. Most notably, partition() has now been
+ * split into two commands: section() (split disk between RISC OS / RISCiX),
+ * and partition() (write RISCiX partition table).
+ * Also added support for optical drives.
+ * 
+ * Revision 1.7  89/10/23  14:43:49  kwelton
+ * The SCSI driver now defines P_BOOT as the RISC OS area of the disc. Two
+ * changes have been made because of this - partition() automatically fills in
+ * the P_BOOT entry in the partition table, as it is no longer user-definable;
+ * device() uses a different test to decide whether or not to iniitalise a
+ * default partition table.
+ * Several of the help messages referred to ADFS - they have now been
+ * corrected to SCSIFS.
+ * 
+ * Revision 1.6  89/09/13  17:53:03  kwelton
+ * Entered a couple of changes provided by Richard Manby for the RISC OS
+ * version: refuses to create an `ADFS' partition > 512 Mb, asks for
+ * confirmation before partitioning the disk as this destroys all data on the
+ * RISC OS partition.
+ * 
+ * Revision 1.5  89/06/26  15:50:31  kwelton
+ * d_ident in struct d_parms is now a char [], not a char * so it makes no
+ * sense for device() to test this field against NULL to see whether any
+ * identification text exists for the current device or not.
+ * 
+ * Revision 1.4  89/05/25  10:21:31  kwelton
+ * 
+ * Added code to align the start of all partitions on a DEV_BSIZE
+ * boundary.
+ * 
+ * Revision 1.3  89/04/27  10:28:46  kwelton
+ * Fixed what looked like a sign extension problem with the unix start
+ * cylinder number: this turned out not to be the bug I was chasing, but
+ *  it is a good idea to keep the `fix' in anyway.
+ * 
+ * Revision 1.2  89/04/18  17:43:16  kwelton
+ * struct scsiop flags (ps_scsi.h) changed from I_... to SC_...
+ * 
+ * Revision 1.1  89/04/06  11:21:39  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /ab/bsd:etc/scsidm/cmds.c:bsd  1.11  $";
+#endif
+
+#include <stdio.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "time.h"
+#include "ps_scsi.h"
+#include "ps_direct.h"
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <sys/time.h>
+#include <dev/ps_scsi.h>
+#include <dev/ps_direct.h>
+#endif
+#include "scsidm.h"
+#include "dmcmds.h"
+#include "partition.h"
+
+	/* declare globals */
+global UNIX_Info infoblock;	/* copy of the current partition table */
+global u_int unixstart;		/* 1st block of UNIX filesystem */
+global u_int unixlen;		/* no. of blocks in UNIX filesystem */
+global u_char nptblocks;	/* no. of blocks used by partition table */
+global u_char part_gotmap;	/* marks partitions which are preceeded
+				 * by a spare copy of the partition table
+				 */
+
+global DefectList defects = {
+	0, NULL
+	};
+
+global PTLIST *pthead = NULL, *pttail;
+
+	/* import externals */
+import bool fromatty;
+import char **iphelp;
+import struct d_parms *cdev;
+import struct scsiop devcmd;
+
+import struct cmd defcmds[], optcmds[], initcmds[];
+import int ndefcmds, noptcmds, ninitcmds;
+
+import struct cmd *cmdtab;
+import int ncmds;
+import bool optical;
+
+	/* declare external functions */
+import int vdbool(), vdint(), vdstr(), sendglist(), scanlist(), atoi();
+import u_int unixstartbyte();
+import char *ctime(), *typename();
+import unsigned long iplims(), ipdata(), vdul(), getfailure();
+import bool gotdev(), runcmd(), wradfsboot(), getparts(), addbad(),
+	chkboot(), wrtptable(), rdramptable(), wrtramptable(),
+	wrtrambsize(), chainpt(), adfsoverlap(), isoptical();
+import void *malloc(), initparts(), dumpdef(), prpmap(), showptable(),
+	freept(), bzero();
+import ADFS_bblock *read_bblock();
+/*
+import struct tm *localtime();
+*/
+	/* declare statics */
+static char inpbuf[CANBSIZ];
+
+#if defined(SCSIDM_FOR_RISCOS)
+#define DisableEscape _kernel_osbyte(200,1,0)
+#define EnableEscape  _kernel_osbyte(200,0,0)
+#endif
+
+/************************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, cmds.c:
+ *
+ * 1) void quit() - leave the program
+ *
+ * 2) void device() - print/change the current device name
+ *
+ * 3) void format() - format the disk
+ *
+ * 4) void section() - section the disk between RISCOS & RISCiX
+ *
+ * 5) void partition() - partition the disk
+ *
+ * 6) void verify() - verify the disk
+ *
+ * 7) void prptable() - print UNIX partition table
+ *
+ * 8) void scanptable() - scan the disk for partition tables
+ *
+ */
+
+/************************************************************************/
+
+void quit()
+{
+	/*
+	 * subroutine quit() -
+	 *
+	 * routine is called to leave the program. this routine
+	 * does not return.
+	 *
+	 */
+
+	/* close device file & finish */
+	close(cdev->d_fd);
+	exit(0);
+}
+
+/************************************************************************/
+
+void device(argc,argv)
+
+int argc;
+char **argv;
+
+{
+    /*
+     * subroutine device() -
+     *
+     * routine either prints the name of the current device if
+     * no argument is given in argv, or attempts to change the
+     * device name if an argument is given. no value is returned.
+     *
+     */
+
+    /* declare autos */
+    struct d_parms newdev;
+
+    /* is an a new name given? */
+    if( argc > 1 )
+    {
+	/*
+	 * yes - close any device that is currently open
+	 */
+	if( cdev )
+	    close(cdev->d_fd);
+
+	if( opdev(*++argv,&newdev) == -1 )
+	{
+	    printf("bad device name %s\n",*argv);
+
+	    /*
+	     * 90/08/01 K Welton:
+	     *
+	     * If another device is currently open, then
+	     * close it. This reduces the risk of somebody
+	     * failing to notice the error & doing
+	     * something to the current device they would
+	     * rather not do
+	     */
+	    if( cdev != NULL )
+	    {
+		free(cdev);
+		cdev = NULL;
+	    }
+	}
+	else
+	{
+	    register int retc;
+
+	    if( cdev == NULL )
+		cdev = malloc(sizeof(*cdev));
+
+	    if( cdev == NULL )
+	    {
+		fprintf(stderr,"malloc() failure in device() - abort\n");
+		exit(1);
+	    }
+
+	    *cdev = newdev;
+
+	    /*
+	     * only fuss about partitions if this
+	     * is a direct access device
+	     */
+	    if( cdev->d_type == DAPTYPE || cdev->d_type == OMPTYPE )
+	    {
+		/* try to read the RAM partition table */
+		if( !(retc = rdramptable(&infoblock.pt)) ||
+		   nounixarea(infoblock.pt.pt) )
+		{
+		    /* need to initiallise a proper partition table */
+		    if( !retc )
+			/* function failed so be noisy about it */
+			fputs("Cannot read RAM partition table - "
+			      "faking it to be empty\n", stdout);
+
+		    initparts(&(infoblock.pt),TRUE);
+
+		    /* write this back if we possibly can */
+		    if( retc )
+			/* table read OK, so it should write OK */
+			(void)wrtramptable(&(infoblock.pt));
+		}
+	  
+		/* set a valid marker for this table */
+		infoblock.id = ID_MARK;
+	    }
+	}
+    }
+
+    /* print the current device name */
+    if( cdev == NULL )
+    {
+	printf("No device selected\n");
+	cmdtab = initcmds;
+	ncmds = ninitcmds;
+    }
+    else
+    {
+	printf("Current device is %s, type %d (%s)\n",
+	       cdev->d_name,cdev->d_type,typename(cdev->d_type));
+
+	/* print warning about restricted commands */
+	if( cdev->d_type != DAPTYPE && cdev->d_type != OMPTYPE )
+	    fputs("This is not a Direct Access device "
+		  "- command set is restricted\n",
+		  stdout);
+
+	/* read the disk's name */
+	if( cdev->d_ident[0] != '\0' )
+	{
+	    printf("Device identifies itself as a %s\n",
+		   cdev->d_ident);
+
+	    if( isoptical(cdev->d_ident) )
+	    {
+		cmdtab = optcmds;
+		ncmds = noptcmds;
+		optical = TRUE;
+	    }
+	    else
+	    {
+		cmdtab = defcmds;
+		ncmds = ndefcmds;
+		optical = FALSE;
+	    }
+	}
+      
+	else
+	{
+	    fputs("No identification text given for this device\n",
+		  stdout);
+
+	    /*
+	     * must be a standard Direct Access device
+	     */
+	    cmdtab = defcmds;
+	    ncmds = ndefcmds;
+	    optical = FALSE;
+	}
+    }
+
+    /* finished */
+    return;
+}
+
+/************************************************************************/
+
+#if defined(SCSIDM_FOR_RISCOS)
+/*>>>RCM format is a stub that calls do_format (the old format) */
+/*       then re-enables escape                                 */
+
+void do_format(argc,argv)
+#elif defined(SCSIDM_FOR_RISCiX)
+void format(argc,argv)
+#endif
+
+int argc;
+char **argv;
+
+{
+	/*
+	 * subroutine format() (RISCiX) or do_format() (RISCOS) -
+	 *
+	 * routine formats the SCSI device. if it is not passed a
+	 * parameter stating whether or not to include the growing
+	 * list of defects in the format, the routine will explicitly
+	 * ask the user for a decision. no value is returned.
+	 *
+	 */
+
+	/* declare autos */
+	register int incglist, interleave, reallydoit;
+	register struct scsiop *cmdptr;
+	int maxileave;
+	char reallyprompt[CANBSIZ];
+	char badlisthdr[BLDBLEN];
+	static char maxileavemsg[CANBSIZ];
+
+	static char *fmtiphelp[] =
+	{
+	 "The  current command is format a disk.  Answer  `yes' if you",
+	 "want to keep the list of known bad blocks during the format,",
+	 "answer `no' if  you wish to  erase the  existing list of bad",
+	 "blocks.",
+	 ""
+	};
+
+	static char *ileaveiphelp[] =
+	{
+	 "Enter the  interleave required  for the format.  This can be",
+	 maxileavemsg,
+	 "sectors  per track  on this device.  Note that if  the block",
+	 "size  is changed,  the number of  sectors per  track changes",
+	 "during the format,  so this maximum limit may be wrong,  and",
+	 "the  device  will return an  `illegal field in  command data",
+	 "block' error.",
+	 ""
+	};
+
+	static char *doitiphelp[] =
+	{
+	 "The current  command is format a disk.  This will remove ALL",
+	 "data that currently resides  on the device.  Answer `yes' if",
+	 "you are  sure that this  is what you want,  otherwise answer",
+	 "`no'.",
+	 ""
+	};
+
+	/* check that a device name is given */
+	if( !gotdev(*argv) )
+	 return;
+
+	if( --argc > 0 )
+	 incglist = (int)ipdata(*++argv,NULL,vdbool,FALSE);
+	else
+	{
+	 iphelp = fmtiphelp;
+	 incglist = (int)ipdata(inpbuf,
+		       "Keep the existing bad block list? >",
+		       vdbool,FALSE);
+	}
+
+	/* do not continue if bad arg given */
+	if( incglist == BADARG )
+	 return;
+
+	/*
+	 * calculate the max. interleave allowed & then read
+	 * what the user wants
+	 */
+	maxileave = cdev->d_blokstrk - 1;
+	if( --argc > 0 )
+	{
+	 if( (interleave = (int)iplims(*++argv,NULL,vdint,
+	 				1,maxileave,FALSE)) == BADARG )
+	  return;
+	}
+	else
+	{
+	 sprintf(maxileavemsg,
+	 	"any  number between 1 (no interleave) and %3d, the number of",
+	 	maxileave);
+	 iphelp = ileaveiphelp;
+	 if( (interleave = (int)iplims(inpbuf,"Interleave? (1) >",vdint,
+	 				1,maxileave,TRUE)) == USEDEFAULT )
+	  interleave = 1;
+	}
+
+
+	/*
+	 * confirm that user really wants to format the disk, do
+	 * NOT use anything that may be on the command line
+	 */
+#if defined(SCSIDM_FOR_RISCOS)
+	sprintf(reallyprompt,"\nW A R N I N G - Formatting will destroy all"
+			     "\n                data on this device\n"
+			     "\nDo you really want to format device %s? >",cdev->d_name);
+#elif defined(SCSIDM_FOR_RISCiX)
+	sprintf(reallyprompt,"Really format %s? >",cdev->d_name);
+#endif
+	iphelp = doitiphelp;
+	reallydoit = (int)ipdata(inpbuf,reallyprompt,vdbool,FALSE);
+	if( reallydoit != TRUE )
+	 return;
+
+#if defined(SCSIDM_FOR_RISCOS)
+/*>>>RCM  From here on, escape will leave a naff disc (no shape info etc) */
+/*        so disable escape until formatting is complete                  */
+
+        DisableEscape;          /*>>>RCM */
+#endif
+
+	/* build the skeleton command block */
+	cmdptr = &devcmd;
+	bldskelcb(FORMAT,cmdptr);
+	clrdata(badlisthdr,BLDBLEN);
+
+	/* fill in command specific information */
+	cmdptr->cdb[1] |= (incglist) ? 0x10 : 0x18;
+	storelong((cmdptr->cdb) + 3,(long)interleave,2);
+	cmdptr->xfer = BLDBLEN;
+	cmdptr->addr = badlisthdr;
+	cmdptr->timeout = FMTTIMEO;
+#if defined(SCSIDM_FOR_RISCOS)
+	cmdptr->flags |= SC_WRITE;
+#elif defined(SCSIDM_FOR_RISCiX)
+	cmdptr->flags |= (SC_WRITE | SC_ALLOW_DISCONNECT);
+#endif
+
+	/* print chatty message */
+	fputs("Formatting...",stdout);
+	fflush(stdout);
+
+	/* run the command & analyse the results */
+	if( runcmd(cmdptr) != GOOD )
+	 /* return immediately */
+	 return;
+	else
+	 fputs("format complete\n",stdout);
+
+	/* print another chatty message */
+	fputs("reading new disk shape...",stdout);
+	fflush(stdout);
+
+	/* disk has been reformatted - read possible new shape */
+	if( rdshape(cdev) != GOOD )
+	{
+	 printf("could not read/set new disk shape\n");
+	 return;
+	}
+
+	/* send possible new block size to the driver */
+	if( !wrtrambsize((int)cdev->d_bloksize) )
+	{
+	 printf("Warning - device has rejected a"
+		" block size of %lu bytes\n\n",
+		cdev->d_bloksize);
+	 fputs("\tUse mode select to define a new"
+	       " block size that is a power\n",
+		stdout);
+#if defined(SCSIDM_FOR_RISCOS)
+	 fputs("\tof 2, and in the range 256 to 1024; then reformat the drive\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+	 fputs("\tof 2; then reformat the drive\n",
+#endif
+		stdout);
+	 return;
+	}
+
+	/* all bets are now off on the partition table */
+	initparts(&(infoblock.pt),FALSE);
+	infoblock.pt.pt[P_BOOT].flags = 0;
+
+	if( !wrtramptable(&(infoblock.pt)) )
+	 return;
+	else
+	 fputs("done\n",stdout);
+
+	/* finished */
+	return;
+}
+
+#if defined(SCSIDM_FOR_RISCOS)
+void format(argc,argv)
+
+int argc;
+char **argv;
+
+{
+  do_format(argc,argv);
+  EnableEscape;
+}
+#endif
+
+/************************************************************************/
+
+void section(argc, argv)
+
+int argc;
+char **argv;
+
+{
+    /*
+     * subroutine section() -
+     *
+     * routine sections a disk, dividing it up between RISCOS and
+     * (optionally) RISCiX. The RISC OS partition is initialised.
+     */
+
+    /* declare autos */
+    register int dounix;
+    register u_long nbloks, nadfsbloks;
+    register u_long *bloksiz;
+    register u_int unixcyl;
+    u_int cylsize;
+    u_long scsifsmin, riscixmin;
+    u_long scratch;
+    char promptbuffer[CANBSIZ];
+    u_char notboth = 0;
+    struct timeval tp;
+    struct tm *tms;
+    ADFS_bblock bblock;
+    ADFS_drecord *adrptr = &(bblock.bb_discrec);
+    Partition *pptr;
+    static char LastName[MAXDNAME + 1];
+    static char NextAppend;
+
+    static char *unixiphelp[] =
+    {
+	"The current  command is section a disk.  Answer `yes' if you",
+	"wish to  have an area  of the disk  used for RISCiX,  answer",
+#if defined(SCSIDM_FOR_RISCOS)
+	"`no' if the whole disk is to be used for RISC OS.",
+#elif defined(SCSIDM_FOR_RISCiX)
+	"`no' if the whole disk is to be used for SCSIFS.",
+#endif
+	""
+    };
+
+    static char *apiphelp[] =
+    {
+	"The current  command is section  a disk.  Enter the required",
+#if defined(SCSIDM_FOR_RISCOS)
+	"size of the RISC OS area, in blocks. This will be rounded up",
+	"so RISC OS uses a whole number of cylinders on the disk.",
+#elif defined(SCSIDM_FOR_RISCiX)
+	"size  of the SCSIFS area, in blocks. This will be rounded up",
+	"so SCSIFS uses a whole number of cylinders on the disk.",
+#endif
+	""
+    };
+
+    static char *dochangeiphelp[] = 
+    {
+	"The  current device  already has  user defined partitions in",
+	"the RISCiX area,  and you are about to alter where this area",
+	"starts.  This means that RISCiX  will be unable to  read the",
+	"partition table next time the machine is booted.",
+	""
+    };
+
+    static char *doitiphelp[] =
+    {
+	"The current command is section a  disk. This will remove ALL",
+#if defined(SCSIDM_FOR_RISCOS)
+	"existing RISC OS files currently on the device. Answer `yes'",
+#elif defined(SCSIDM_FOR_RISCiX)
+	"existing SCSIFS files currently on the device.  Answer `yes'",
+#endif
+	"if you wish to proceed, otherwise answer `no'.",
+	""
+    };
+
+    /* check that a device is open */
+    if( !gotdev(*argv) )
+	return;
+
+    /*
+     * calculate minimum number of cylinders required for
+     * the SCSIFS & RISCiX areas, make sure that there is
+     * enough space on the device
+     */
+    bloksiz = &(cdev->d_bloksize);
+    cylsize = cdev->d_blokstrk * cdev->d_heads * *bloksiz;
+    scsifsmin = ((MINSCSIFS - 1) / cylsize) + 1;
+    riscixmin = ((MINRISCIX - 1) / cylsize) + 1;
+    if( scsifsmin > cdev->d_cyls )
+    {
+	printf("%s is too small - cannot support this device\n",
+	       cdev->d_name);
+	return;
+    }
+    else if( (scsifsmin + riscixmin) > cdev->d_cyls )
+	/* enough for SCSIFS only, but not for both */
+	++notboth;
+
+    /*
+     * clear boot block record, calculate log2(sector_size)
+     * then fill in minimum shape info & clear the defect list
+     */
+    bzero(&bblock, sizeof(bblock));
+    for( scratch = cdev->d_bloksize, adrptr->dr_log2secsize = 0;
+	scratch > 1; scratch >>= 1 )
+	/* this is another power of two */
+	++(adrptr->dr_log2secsize);
+
+    adrptr->dr_secstrk = cdev->d_blokstrk;
+    adrptr->dr_heads = cdev->d_heads;
+    adrptr->dr_discsize = cdev->d_size;
+    bblock.bb_defectlist[0] = END_DEFECT;
+
+    /*
+     * if there are any valid user partitions in the RISCiX area,
+     * keep a record of current size of SCSIFS area in case it
+     * grows (excuse the double negative)
+     */
+    pptr = ((Partition *)(infoblock.pt.pt)) + P_BOOT;
+    if( (pptr->flags & PT_VALID) && !nounixarea(infoblock.pt.pt) )
+	scratch = pptr->length;
+    else
+	scratch = 0;
+
+    /* ask whether a UNIX partition is required */
+    if( --argc > 0 )
+    {
+	if( (dounix = ipdata(*++argv,NULL,vdbool,FALSE)) == BADARG )
+	    return;
+    }
+    else
+    {
+	iphelp = unixiphelp;
+	if( (dounix = ipdata(inpbuf,"Include RISCiX partitions? (yes) >",
+			     vdbool,TRUE)) == USEDEFAULT )
+	    dounix = TRUE;
+    }
+
+    /* get the total number of blocks on this device */
+    nbloks = cdev->d_size / *bloksiz;
+
+    if( dounix )
+    {
+	u_long scsifsmax;
+
+	/* check that there is enough space */
+	if( notboth )
+	{
+	    printf("%s is not large enough to support "
+#if defined(SCSIDM_FOR_RISCOS)
+		   "both RISC OS & RISCiX areas\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+		   "both SCSIFS & RISCiX areas\n",
+#endif
+		   cdev->d_name);
+	    return;
+	}
+
+	/*
+	 * calculate maximum & minimum length of
+	 * SCSIFS paritition in blocks
+	 */
+	scsifsmin *= (cylsize / *bloksiz);
+	scsifsmax = (cdev->d_cyls - riscixmin) * (cylsize / *bloksiz);
+
+	/* fetch size of SCSIFS partition */
+	if( --argc > 0 )
+	    nadfsbloks = iplims(*++argv, NULL, vdul,
+				scsifsmin,
+				scsifsmax, FALSE);
+	else
+	{
+	    iphelp = apiphelp;
+
+	    /*
+	     * print block size & range for SCSIFS area
+	     */
+#if defined(SCSIDM_FOR_RISCOS)
+	    printf("Device %s has a block size of %ld bytes\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+	    printf("%s has a block size of %ld bytes\n",
+#endif
+		   cdev->d_name, *bloksiz);
+#if defined(SCSIDM_FOR_RISCOS)
+	    printf("The RISC OS area must be between %lu and %lu blocks long\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+	    printf("SCSIFS area must be between %lu and %lu blocks long\n",
+#endif
+		   scsifsmin, scsifsmax);
+
+#if defined(SCSIDM_FOR_RISCOS)
+	    sprintf(promptbuffer, "size of RISC OS area (%lu)? >",
+#elif defined(SCSIDM_FOR_RISCiX)
+	    sprintf(promptbuffer, "size of SCSIFS area (%lu)? >",
+#endif
+		    scsifsmin);
+	    nadfsbloks = iplims(inpbuf, promptbuffer, vdul,
+				scsifsmin, scsifsmax, TRUE);
+	}
+
+	if( nadfsbloks == BADARG )
+	    return;
+	else if( nadfsbloks == USEDEFAULT )
+	    nadfsbloks = scsifsmin;
+
+	/*
+	 * calculate the start cylinder for
+	 * the RISCiX partition
+	 */
+	unixcyl = (nadfsbloks * *bloksiz) / cylsize(adrptr);
+	if( (nadfsbloks * *bloksiz) % cylsize(adrptr) != 0 )
+	{
+	    /* round the no. of cylinders up */
+	    ++unixcyl;
+
+	    /* adjust the no. of blocks */
+	    nadfsbloks = (unixcyl * cylsize(adrptr)) / *bloksiz;
+#if defined(SCSIDM_FOR_RISCOS)
+	    printf("Rounded no. of blocks in RISC OS partition up to %lu\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+	    printf("Rounded no. of blocks in SCSIFS partition up to %lu\n",
+#endif
+		   nadfsbloks);
+	}
+    }
+    else
+    {
+	/* SCSIFS takes up the whole disk */
+	nadfsbloks = nbloks;
+
+	/* no unix partition */
+	unixcyl = 0;
+    }
+
+    /*
+     * now check for RISC OS growing into
+     * potentially active RISCIX area
+     */
+    if( scratch > 0 && nadfsbloks != scratch )
+    {
+	/*
+	 * warn the user & confirm whether or not to continue
+	 */
+#if defined(SCSIDM_FOR_RISCOS)
+	printf("** WARNING ** Size of RISC OS area changed"
+#elif defined(SCSIDM_FOR_RISCiX)
+	printf("** WARNING ** Size of SCSIFS area changed"
+#endif)
+	       " from old value of %lu blocks\n", scratch);
+	iphelp = dochangeiphelp;
+	if( (int)ipdata(inpbuf, "Continue? >", vdbool, FALSE) != TRUE )
+	    /* give up */
+	    return;
+    }
+
+    /*
+     *
+     * R Manby:
+     *
+     * filecore CANNOT support more than 512 MBytes,
+     * reduce nadfsbloks if necessary. The RISCiX
+     * start point is not altered.
+     */
+    if( (nadfsbloks * *bloksiz) >= SIZELIM )
+    {
+	nadfsbloks = (SIZELIM / *bloksiz) - 1;
+#if defined(SCSIDM_FOR_RISCOS)
+	printf("RISC OS partition size too large, reduced to %d\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+	printf("SCSIFS partition size too large, reduced to %d\n",
+#endif
+	       (int)nadfsbloks);
+    }
+
+    /*
+     * R Manby:
+     *
+     * Section is a dangerous command as it destroys
+     * RISC OS files & directories -> force the user
+     * to confirm the operation
+     */
+#if defined(SCSIDM_FOR_RISCOS)
+    sprintf(promptbuffer, "\nW A R N I N G - Sectioning will remove all"
+			  "\n                RISC OS data on this device\n"
+			  "\nDo you really want to section device %s? >",
+#elif defined(SCSIDM_FOR_RISCiX)
+    sprintf(promptbuffer, "Do you really want to section device %s? >",
+#endif
+	    cdev->d_name);
+    iphelp = doitiphelp;
+    if( (int)ipdata(inpbuf, promptbuffer, vdbool, FALSE) != TRUE )
+	 /* abort command */
+         return;
+
+    /*
+     * RISCiX start cylinder follows last SCSIFS cylinder,
+     * but cylinder numbers count from zero, therefore
+     * unixcyl contains the correct start cylinder
+     * number - save it away
+     */
+    adrptr->dr_UNIXcylstart = (u_char)unixcyl & 0xff;
+    adrptr->dr_UNIXcylstartHI = (u_char)(unixcyl >> 8) & 0xff;
+
+    /* identify the unix format type */
+    adrptr->dr_UNIXformat = (dounix) ? RISCiXDISCFORMAT : 0;
+
+    /* use current date & time for default disk name */
+    if( gettimeofday(&tp, NULL) < 0 )
+    {
+	perror("section: gettimeofday");
+	tp.tv_sec = 0;
+    }
+    tms = localtime((time_t *)&(tp.tv_sec));
+
+    sprintf((char *)adrptr->dr_discname, "%02d%02d_%02d%02d",
+	    tms->tm_mday, tms->tm_mon + 1,
+	    tms->tm_hour, tms->tm_min);
+
+    /*
+     * must be careful about two disks being sectioned within
+     * the same minute: this will result in both disks having
+     * the same name - something guaranteed to upset SCSIFS.
+     */
+    if( !strcmp(adrptr->dr_discname, LastName) )
+    {
+	/*
+	 * it may be unusual, but it has happened!!
+	 */
+	u_char *cptr = adrptr->dr_discname + strlen(adrptr->dr_discname);
+	*cptr++ = NextAppend++;
+	*cptr++ = '\0';
+    }
+    else
+    {
+	strcpy(LastName, adrptr->dr_discname);
+	NextAppend = 'a';
+    }
+
+/* 
+ * Write out structure to disc
+ */
+
+    if( new_structure(&bblock, (u_int)(nadfsbloks * *bloksiz)) != 0 )
+    {
+#if defined(SCSIDM_FOR_RISCOS)
+	printf("Fatal internal error, new_structure failed\n");
+#elif defined(SCSIDM_FOR_RISCiX)
+	printf("** BAD NEWS **  new_structure() crapped out\n");
+#endif
+	return;
+    }
+
+    else
+	fputs("done\n",stdout);
+
+    /*
+     * update the P_BOOT entry in partition table
+     */
+    pptr->start = 0;
+    pptr->length = nadfsbloks;
+    if( !(pptr->flags & PT_VALID) )
+    {
+	pptr->flags = PT_VALID;
+	strcpy(pptr->text, "Boot");
+    }
+    (void)wrtptable(&infoblock, -1, FALSE);
+
+    /* finished */
+    return;
+}
+
+/************************************************************************/
+
+void partition(argc,argv)
+
+int argc;
+char **argv;
+
+{
+    /*
+     * subroutine partition() -
+     *
+     * routine partitions a SCSI device, providing up to eight
+     * UNIX partitions, plus an optional ADFS partition. Parameters
+     * can be passed on the command line, if not they are prompted
+     * for. no value is returned.
+     *
+     */
+
+    /* declare autos */
+    register long nbloks;
+    register unsigned long *bloksiz;
+    register Partition *pptr;
+    register int npart;
+    register int i;
+    int adjustment;
+    char partnos[CANBSIZ];
+    unsigned long nadfsbloks;
+    ADFS_bblock *bbptr;
+    ADFS_drecord *adrptr;
+    UNIX_Info newtable;
+
+    static char *npiphelp[] =
+    {
+	"Enter a comma separated  list of the partitions you  wish to",
+	"have on the disk.  A maximum of six  partitions  is allowed,",
+	"numbered from 0 to 5.",
+	""
+    };
+
+    /* check that a device name is given */
+    if( !gotdev(*argv) )
+	return;
+
+    /* read the disk shape */
+    if( (bbptr = read_bblock()) == NULL )    {
+#if defined(SCSIDM_FOR_RISCOS)
+	printf("Fatal internal error, read_bblock failed\n");
+#elif defined(SCSIDM_FOR_RISCiX)
+	printf("** BAD NEWS ** read_bblock() crapped out\n");
+#endif
+	return;
+    }
+
+    else if( !chkboot(bbptr) )
+    {
+	printf("Device %s has not been sectioned - cannot partition it\n",
+	       cdev->d_name);
+	free(bbptr);
+	return;
+    }
+
+    /* now check that a RISCiX area is present */
+    adrptr = &(bbptr->bb_discrec);
+    if( adrptr->dr_UNIXformat != RISCiXDISCFORMAT )
+    {
+	printf("No RISCiX area on device %s\n",
+	       cdev->d_name);
+	return;
+    }
+
+    /* address the device block size */
+    bloksiz = &(cdev->d_bloksize);
+
+    /*
+     * calculate size of ADFS area then print amount
+     * of space available to RISCiX
+     */
+    nbloks = cdev->d_size / *bloksiz;
+    nadfsbloks = adrptr->dr_UNIXcylstart +
+	(adrptr->dr_UNIXcylstartHI << 8);
+    nadfsbloks *= cdev->d_blokstrk * cdev->d_heads;
+    printf("RISCiX area has %ld logical blocks, each %ld bytes long\n",
+	   nbloks - nadfsbloks, *bloksiz);
+
+    /*
+     * initiallise the new partition table: copy the
+     * current partition across & then reset the important
+     * bits.
+     */
+    bcopy(&infoblock,&newtable,sizeof(UNIX_Info));
+    initparts(&(newtable.pt),FALSE);
+
+    /*
+     * calculate the first block number & the length
+     * of the UNIX filesystem, leave enough spare blocks
+     * at the start & end to store a backup copy of the
+     * partition table.
+     */
+    nptblocks = ((sizeof(newtable) - 1) / *bloksiz) + 1;
+    unixstart = nadfsbloks + nptblocks;
+    unixlen = nbloks - (unixstart + nptblocks);
+
+    /*
+     * all partitions must start on a DEV_BSIZE byte
+     * boundary: get the required adjustment for unixstart
+     */
+    if( (adjustment = alignpart(unixstart)) != 0 )
+    {
+	unixstart += adjustment;
+	unixlen -= adjustment;
+    }
+
+    /* read the number of partitions required */
+    if( --argc > 0 )
+	strcpy(inpbuf,*++argv);
+    else
+    { 
+	iphelp = npiphelp;
+	(void)ipdata(inpbuf,"define which partitions? >",
+		     vdstr, FALSE);
+    }
+
+    /* scan the list of partitions */
+    if( (npart = scanlist(inpbuf, partnos, atoi)) == -1 )
+	/* error in scanlist() */
+	return;
+    else if( npart > NUSERPART )
+    {
+	printf("Can only specify a maximum of %d partitions\n",
+	       NUSERPART);
+	return;
+    }
+    /*
+     * if args supplied, force ALL the partition
+     * data to be given in argv.
+     */
+    else if( --argc > 0 && (argc < (npart * 2)) )
+    {
+	printf("Not enough data supplied to specify %d partitions\n",
+	       npart);
+	return;
+    }
+    else
+    {
+	/* loop over all partitions in the list */
+	for( i = 0; i < npart; ++i )
+	{
+	    /* check for bad partition number */
+	    if( partnos[i] < 0 || partnos[i] > (NUSERPART - 1) )
+	    {
+		printf("Bad partition number %d: must "
+		       "be in therange 0 -> %d\n",
+		       partnos[i], NUSERPART - 1);
+		return;
+	    }
+	    else
+		/* set pointer to this partition in the table */
+		pptr = ((Partition *)(newtable.pt.pt)) + partnos[i];
+
+	    /* check this partition is not already defined */
+	    if( (pptr->flags & PT_VALID) == PT_VALID )
+	    {
+		printf("Partition %d: duplicate definition\n",
+		       partnos[i]);
+		return;
+	    }
+	    else
+		pptr->flags |= PT_VALID;
+	}
+    }
+
+    /* fill in the UNIX partition table */
+    if( !getparts(&(newtable.pt),argc,++argv) )
+	/* return immediately */
+	return;
+
+    /*
+     * calculate partition table address & write the table
+     * to disk: block index is equal to the number of ADFS
+     * blocks (number counts from 1, index counts from 0)
+     */
+    /* fill in the magic number & write the table to disk */
+    if( !wrtptable(&newtable,(u_int)(nadfsbloks * *bloksiz),TRUE) )
+	return;
+
+    /* print the partition map */
+    prpmap(&(infoblock.pt));
+    
+    /* finished */
+    return;
+}
+
+/************************************************************************/
+
+void verify(argc,argv)
+
+int argc;
+char **argv;
+
+{
+	/*
+	 * subroutine verify() -
+	 *
+	 * routine verifies a SCSI disk, by reading all partitions, and
+	 * checking that no errors were encountered. no value is
+	 * returned.
+	 *
+	 */
+
+	/* declare autos */
+	register int nbloks, ndone, increment;
+	register int niter, losedefects;
+	register struct scsiop *cmdptr;
+	register int retc;
+	int ndefects;
+	char *vfymsg = "Verifying...";
+	char null;
+
+	static char *vitiphelp[] =
+	{
+	 "The current  command is  verify a disk.  Enter the number of",
+	 "iterations to be performed by the verification routines,  or",
+	 "press <enter> to use the default value of 1. The verify will",
+	 "continue until:",
+	 " ",
+#if defined(SCSIDM_FOR_RISCOS)
+	 "   (1) the process is interrupted by ESCape",
+#elif defined(SCSIDM_FOR_RISCiX)
+	 "   (1) the process is interrupted with a CTRL-C",
+#endif
+	 "   (2) the program fails to map out any defects.",
+	 ""
+	};
+
+	static char *vdefiphelp[] =
+	{
+	 "The current  command is  verify a disk.  Answer `yes' if you",
+	 "want  any defects  detected  mapped out, answer `no' if they",
+	 "are to be left alone.",
+	 ""
+	};
+
+	/* check that a device name is given */
+	if( !gotdev(*argv) )
+	 return;
+
+	/* calculate no. of blocks on the current device */
+	nbloks = cdev->d_size / cdev->d_bloksize;
+
+	/* get no. of iterations required */
+	if( --argc > 0 )
+	 niter = (int)iplims(*++argv,NULL,vdul,1,9999,FALSE);
+	else
+	{
+	 iphelp = vitiphelp;
+	 niter = (int)iplims(inpbuf,"No. of iterations? (1) >",
+			     vdul,1,9999,TRUE);
+	}
+
+	/* check for bum answers */
+	if( niter == BADARG )
+	 return;
+
+	/* OK - check whether default requested */
+	else if( niter == USEDEFAULT )
+	 niter = 1;
+
+	/* ask whether to map out defects */
+	if( --argc > 0 )
+	 losedefects = (int)ipdata(*++argv,NULL,vdbool,FALSE);
+	else
+	{
+	 iphelp = vdefiphelp;
+	 losedefects = (int)ipdata(inpbuf,"Reassign bad blocks (yes)? >",
+				   vdbool,TRUE);
+	}
+
+	/* analyse strange answers */
+	if( losedefects == BADARG )
+	 return;
+	else if( losedefects == USEDEFAULT )
+	 losedefects = TRUE;
+
+	/* put as much as possible into the command block */
+	cmdptr = &devcmd;
+	bldskelcb(VERIFY,cmdptr);
+	cmdptr->cdb[1] |= VFYTYPE;
+	cmdptr->xfer = 0;
+	cmdptr->addr = &null;
+	cmdptr->timeout = VFYTIMEO;
+#if defined(SCSIDM_FOR_RISCOS)
+	cmdptr->flags |= SC_READ;
+#elif defined(SCSIDM_FOR_RISCiX)
+	cmdptr->flags |= (SC_READ | SC_ALLOW_DISCONNECT);
+#endif
+
+	/* perform verify for given no. of iterations */
+	while( niter-- > 0 )
+	{
+	 fputs(vfymsg,stdout);
+	 fflush(stdout);
+
+	 /* verify the device in MAXVERIFY lumps */
+	 for( ndone = 0; ndone < nbloks; ndone += increment )
+	 {
+	  /*
+	   * verify the next set of blocks - calculate the
+	   * size of this set & fill in the rest of the
+	   * command block
+	   */
+	  increment = ((nbloks - ndone) > MAXVERIFY) ?
+			MAXVERIFY : (nbloks - ndone);
+	  storelong(((cmdptr->cdb) + 2),(long)ndone,4);
+	  storelong(((cmdptr->cdb) + 7),(long)increment,2);
+
+	  if( (retc = runcmd(cmdptr)) == BAD )
+	  {
+	   register u_long badblock;
+
+	   /* read the bad block number and add it to the list */
+	   if( (badblock = getfailure(cmdptr)) == -1 )
+	   {
+	    /* cannot read block number */
+	    fputs("verify: cannot determine bad block number\n",stdout);
+
+	    /*
+	     * this is a fatal error as we cannot work out where
+	     * to restart the verify from
+	     */
+	    return;
+	   }
+	   else
+	   {
+	    printf("bad block: %#lx\n",badblock);
+	    if( !addbad(badblock) )
+	    {
+#if defined(SCSIDM_FOR_RISCOS)
+	     printf("Fatal internal error, Cannot allocate core to store defect list\n");
+#elif defined(SCSIDM_FOR_RISCiX)
+	     printf("** BAD NEWS **  Cannot allocate core to store defect list\n");
+#endif
+	     return;
+	    }
+	   }
+
+	   /*
+	    * reset the increment to start at first block following
+	    * the failure.
+	    */
+	   increment = (badblock - ndone) + 1;
+
+	   /* put the verify message out again & continue */
+	   fputs(vfymsg,stdout);
+	   fflush(stdout);
+	  }
+
+	  else if( retc == BADARG )
+	  {
+	   printf("verify: bad device %s\n",cdev->d_name);
+	   return;
+	  }
+	 }
+
+	 /* check for bad blocks picked up */
+	 ndefects = defects.dl_header & 0xffff;
+	 if( ndefects != 0 )
+	 {
+	  printf("%d bad block%s detected\n",ndefects,
+		 ndefects == 1 ? "" : "s");
+
+	  if( losedefects )
+	  {
+	   printf("\rSaving bad blocks to the GLIST\n");
+	   /* remap the bad blocks */
+	   if( sendglist() != GOOD )
+	   {
+	    /* command failed */
+	    printf("Could not remap the defects\n");
+
+	    /* offer to save the defects in a file */
+	    dumpdef();
+	    return;
+	   }
+	  }
+#if defined(SCSIDM_FOR_RISCOS)
+	  else
+	  { dumpdef();          /*>>>RCM if user doesn't want defects mapped */
+	  }                     /*       out, offer to save then to a file.  */
+#endif
+	 }
+	 else
+	  printf("verify OK\n");
+	}
+	
+	/* finished */
+	return;
+}
+
+/************************************************************************/
+
+/*ARGSUSED*/
+void prptable(argc,argv)
+
+int argc;
+char **argv;
+
+{
+	/*
+	 * subroutine prptable() -
+	 *
+	 * routine prints the UNIX partition table. no value is
+	 * returned.
+	 *
+	 */
+
+	/* declare autos */
+	register u_int byteaddr;
+	register u_long *bloksiz;
+	register u_char ptlen;
+	UNIX_Info info;
+
+	/* keep the compiler happy */
+	argc = argc;
+
+	/* check that a device is present */
+	if( !gotdev(*argv) )
+	 return;
+
+	/*
+	 * try to get the byte address for the start
+	 * of the UNIX partition
+	 */
+	if( (byteaddr = unixstartbyte(TRUE)) == -1 )
+	 return;
+
+	/* make a note of the block size */
+	bloksiz = &(cdev->d_bloksize);
+
+	/*
+	 * set unixstart, and unixlen, do not forget the space
+	 * for partition tables at the beginning & end of the
+	 * disk.
+	 */
+	ptlen = (sizeof(info) / *bloksiz);
+	if( (sizeof(info) % *bloksiz) )
+	 ++ptlen;
+	unixstart = (byteaddr / *bloksiz) + ptlen;
+	unixlen = (cdev->d_size / cdev->d_bloksize) - (unixstart + ptlen);
+
+	/* read the UNIX partition table */
+	if( rddev(byteaddr,&info,sizeof(info),FALSE) != GOOD )
+	 return;
+
+	/* check for a proper partition table */
+	if( info.id != ID_MARK )
+	{
+	 fputs("partition table not found\n",stdout);
+	 return;
+	}
+
+	/* display the table */
+	showptable(&info);
+
+	/* wait for the enter key */
+	(void)ipdata(inpbuf,"Press <enter> to continue...",vdstr,TRUE);
+
+	/* print the partition table & return */
+	prpmap(&(info.pt));
+	return;
+}
+
+/************************************************************************/
+
+/*ARGSUSED*/
+void scanptable(argc,argv)
+
+int argc;
+char **argv;
+
+{
+	/*
+	 * subroutine scanptable() -
+	 *
+	 * routine scans the entire disk, looking for lost
+	 * partition tables. it prints all those it finds & gives
+	 * the option of writing one of these as the new partition table.
+	 * no value is returned.
+	 *
+	 */
+
+	/* declare autos */
+	register int nextblock, ptblocks, npt;
+	register int dopart;
+	register u_int unixaddr;
+	register char *blockbuf;
+	register PTLIST *ptnext;
+	Partition *pptr;
+	static char scanmsg[] = "Scanning...";
+
+	static char *prtiphelp[] =
+	{
+	 "Enter the  number of  the partition  table to  be printed in",
+	 "full.  This command will repeat  indefinitely until an entry",
+	 "of 0 is given.",
+	 ""
+	};
+
+	static char *wrtptiphelp[] =
+	{
+	 "Enter the number of the partition table you wish to use.  An",
+	 "answer of -1 will be interpreted as do not write a table,  0",
+	 "will return to the previous  section where partitions can be",
+	 "printed out.",
+	 ""
+	};
+
+	/* keep the compiler happy */
+	argc = argc;
+
+	/* check that a device name is given */
+	if( !gotdev(*argv) )
+	 return;
+
+	/* free the list in case previous call was interrupted */
+	freept();
+
+	/* get the supposed start address of the partition table */
+	if( (unixaddr = unixstartbyte(FALSE)) == -1 )
+	{
+	 /* no UNIX partitions on this device */
+#if defined(SCSIDM_FOR_RISCOS)
+	 printf("all blocks on device %s are used for RISC OS\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+	 printf("all blocks on device %s are used for SCSIFS\n",
+#endif
+		cdev->d_name);
+	 return;
+	}
+	else
+	 /* convert this to a block number */
+	 unixaddr /= cdev->d_bloksize;
+
+	/* calculate the size of the partition table in blocks */
+	ptblocks = sizeof(UNIX_Info) / cdev->d_bloksize;
+	if( (sizeof(UNIX_Info) % cdev->d_bloksize) )
+	 ++ptblocks;
+
+	/* allocate some core & set pointer to ALL partition */
+	if( (blockbuf = malloc(ptblocks * cdev->d_bloksize)) == NULL )
+	{
+	 fputs("scanpart(): out of core\n",stdout);
+	 return;
+	}	 
+	pptr = (Partition *)&infoblock.pt.pt[P_ALL];
+
+	/*
+	 * loop over the entire disk, may find an old table
+	 * in what is now the ADFS partition.
+	 */
+	fputs(scanmsg,stdout);
+	fflush(stdout);
+
+	for( nextblock = pptr->start;
+	     nextblock < (pptr->start + pptr->length);
+	     nextblock += ptblocks )
+	{
+#if 0
+	 printf("\r%7d",nextblock);
+	 fflush(stdout);
+#endif
+
+	 /* try to read next block from disk */
+	 if( rddev(nextblock,blockbuf,ptblocks,TRUE) != GOOD )
+	 {
+	  /* error messages would have appeared, show we are still working */
+	  fputs(scanmsg,stdout);
+	  fflush(stdout);
+	  continue;
+	 }
+
+	 /* test for partition table magic number */
+	 if( *((u_int *)blockbuf) == ID_MARK )
+	 {
+	  register UNIX_Info *table;
+	  struct timeval tp;
+
+	  /*
+	   * as an additional check, test that the timestamp is
+	   * earlier than the current time.
+	   */
+	  gettimeofday(&tp,NULL);
+	  table = (UNIX_Info *)blockbuf;
+	  if( table->pt.time_stamp >= tp.tv_sec )
+	   /* cannot be a proper table */
+	   continue;
+
+	  /* 
+	   * this is a valid table as far as we can tell - chain
+	   * it into the list of tables found.
+	   */
+	  if( !chainpt(table,nextblock == unixaddr ? TRUE : FALSE) )
+	  {
+	   /* free used space before aborting */
+	   free(blockbuf);
+	   freept();
+	   return;
+	  }
+	 }
+	}
+
+	/* finished with disk buffer */
+	free(blockbuf);
+	fputs("scan complete\n",stdout);
+
+	/* see whether any tables found */
+	if( pthead == NULL )
+	{
+	 fputs("\nNo partition tables found\n",stdout);
+	 return;
+	}
+
+	/*
+	 * the user has probably just been through a long wait
+	 * while the disk was being scanned. although we cannot
+	 * guard against complete idiots who deserve what they get,
+	 * we should give them as many chances as possible at looking
+	 * at the information so carefully gathered.
+	 */
+
+	/* loop until 1 or no entries are chosen for the new table */
+	for(;;)
+	{
+	 /* loop, offering to print one of the tables */
+	 for(;;)
+	 {
+	  /* print the tables found */
+	  fputs("\n\n",stdout);
+	  for( npt = 0, ptnext = pthead; ptnext != NULL;
+	       ptnext = ptnext->nextpt )
+	  {
+	   register char *datestr;
+
+	   datestr = ctime((time_t *)(&ptnext->pt.pt.time_stamp));
+	   datestr[24] = '\0';
+	   printf("\ttable %d: written on %s%s\n",npt++ + 1,
+		  datestr,ptnext->current ? " (current table)" : "");
+	  }
+	  fputs("\n\n",stdout);
+
+	  /*
+	   * do not use the command line parameters for this
+	   * command as the user has no real way of knowing what
+	   * is coming until now & we do not really wnat to fault
+	   * them just because they happened to type a silly number
+	   * (it takes a long time to get the list & they may get
+	   * annoyed at having to repeat the command)
+	   */
+	  iphelp = prtiphelp;
+	  dopart = (int)iplims(inpbuf,"Display table? [0 to end] >",
+			  vdint,0,npt,FALSE);
+
+	  /* an answer of 0 means `go on to the next bit' */
+	  if( dopart == 0 )
+	   break;
+	  else
+	  {
+	   register int i;
+
+	   /* scan down the chain to the correct partition */
+	   for( i = 1, ptnext = pthead; i < dopart; ++i )
+	    /* move the pointer down the chain */
+	    if( (ptnext = ptnext->nextpt) == NULL )
+	    {
+	     /* this is bad news */
+	     fputs("scanptable(): internal error, unexpected end of chain\n",
+		    stdout);
+	     freept();
+	     return;
+	    }
+
+	   /* print this table */
+	   showptable(&(ptnext->pt));
+
+	   /* show the ADFS stuff */
+#if defined(SCSIDM_FOR_RISCOS)
+	   printf("\t\t\tRISC OS uses blocks 0 to %d\n",unixaddr - 1);
+#elif defined(SCSIDM_FOR_RISCiX)
+	   printf("\t\t\tSCSIFS uses blocks 0 to %d\n",unixaddr - 1);
+#endif
+	   if( adfsoverlap(ptnext->pt.pt.pt,unixaddr) )
+#if defined(SCSIDM_FOR_RISCOS)
+	    fputs("\t\t*Warning* this table has partitions in the RISC OS area\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+	    fputs("\t\t*Warning* this table has partitions in the SCSIFS area\n",
+#endif
+		  stdout);
+	  }
+	 }
+
+	 /* read the partition to write as a new one */
+	 iphelp = wrtptiphelp;
+	 dopart = (int)iplims(inpbuf,
+		       "New table number? [0 to repeat, -1 for none] >",
+		       vdint,-1,npt,FALSE);
+
+	 if( dopart == 0 )
+	  /* repeat the loop */
+	  continue;
+	 else if( dopart == -1 )
+	  /* do not write anything */
+	  break;
+	 else
+	 {
+	  register int i;
+	  register PTLIST *temp;
+
+	  /*
+	   * clear the current flag if set & set pointer to
+	   * the correct element in the chain
+	   */
+	  for( i = 1, temp = pthead, ptnext = NULL; i <= npt;
+	      ++i, temp = temp->nextpt )
+	  {
+	   temp->current = FALSE;
+
+	   /* buffer the pointer if necessary */
+	   if( i == dopart )
+	    ptnext = temp;
+	  }
+
+	  /* test element found */
+	  if( ptnext == NULL )
+	  {
+	   /* this is bad news */
+	   fputs("scanptable(): internal error, element not found\n",
+		  stdout);
+	   freept();
+	   return;
+	  }
+
+	  /*
+	   * do not to initiallise a new table: a potential problem
+	   * occurs if the ALL partition in the new table is the wrong
+	   * size. However, the size of a disk can only change during a
+	   * format, in which case there would be no partition tables on
+	   * the disk, so the problem goes away.
+	   */
+
+	  /* write this new table */
+	  if( !wrtptable(&(ptnext->pt),unixaddr * cdev->d_bloksize,TRUE) )
+	   /* give up */
+	   return;
+	  else
+	   /* mark this new table as the current one */
+	   ptnext->current = TRUE;
+	 }
+	}
+
+	/* finished */
+	freept();
+	return;
+}
+
+/************************************************************************/

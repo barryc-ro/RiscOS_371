@@ -1,0 +1,561 @@
+
+; > Error32
+;revamped code for 32 bit (16m colour) quality
+
+; Given:
+; abefore=R2    anow=R3    aafter=R4
+;  before=R5     now=R9
+; Use
+; now+(before*7+abefore*1+anow*5+aafter*3)/16 as the actual pixel
+
+
+;Notes on DiffuseError32 macro:
+;
+; - errors are accumulated using 4 bits of fractional precision
+; - exits with GE condition if dot is to be set
+; - bottom byte of 'direction' is threshold level (nominally 128 for half max, but may
+;   be higher to reduce overall ink density)
+; - increasing random amplitude to +-63 fixes nasty patterning near 25% dot occupancy - note
+;   that this increases the chance of changing decision for level further away from threshold
+;   but the +-31 limits mean that the range of levels for which randomise can occur is
+;   still the +-31 recommended.
+;
+        MACRO
+        DiffuseError32 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+;
+        ADD   $level,$abefore,$level,ASL #4  ;4 fractional bits for level, add 1/16 of abefore
+        ADD   $level,$level,$anow,ASL #2
+        ADD   $level,$level,$anow            ;add 5/16 of anow
+        ADD   $level,$level,$aafter,ASL #1
+        ADD   $level,$level,$aafter          ;add 3/16 of aafter
+        ADD   $level,$level,$before,ASL #3
+        SUB   $level,$level,$before          ;add 7/16 of before
+
+        ADD   $level,$level,#8               ;add 0.5 (rounding)
+
+;$level now holds level*16
+        MOV   $abefore,$anow                 ;shift levels/errors on
+        MOV   $anow,$aafter
+;$before and $aafter now scratch registers
+        AND   $aafter,$direction,#255        ;diffusion threshold
+        RSB   $level,$aafter,$level,ASR #4   ;$level becomes level-threshold
+
+        CMN   $level,#31
+        BLT   %FT00                          ;no point in generating random number if < -31
+        CMP   $level,#31
+        BGT   %FT00                          ;no point in generating random number if > +31
+
+        LDR   $before,RandomSeed
+        MUL   $before,R11,$before
+        STR   $before,RandomSeed
+        CMP   $level,$before,ASR #32-6       ;cmp level-thresh with random O(+/-63)
+00
+        ADD   $level,$level,$aafter          ;if dot is not set, residual is level itself
+        SUBGE $level,$level,$aafter,LSL #1   ;if dot is set, residual is level-2*threshold
+        STR   $level,[$abuffer],$direction,ASR #(30-2)  ;store this for next row
+        MEND
+
+
+; takes place of macro DiffuseError when it is known that component must be set to 0 (used for
+; C,M and Y when DiffuseError for K returned 1, since CMY cannot be set with K) 
+        MACRO
+        DiffuseError32MustBe0 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+        ADD   $level,$abefore,$level,ASL #4  ;4 fractional bits for level, add 1/16 of abefore
+        ADD   $level,$level,$anow,ASL #2
+        ADD   $level,$level,$anow            ;add 5/16 of anow
+        ADD   $level,$level,$aafter,ASL #1
+        ADD   $level,$level,$aafter          ;add 3/16 of aafter
+        ADD   $level,$level,$before,ASL #3
+        SUB   $level,$level,$before          ;add 7/16 of before
+        ADD   $level,$level,#8               ;add 0.5 (rounding)
+        MOV   $level,$level,ASR #4           ;back to no fractional precision
+
+        MOV   $abefore,$anow                              ;shift registers on
+        MOV   $anow,$aafter
+
+        STR   $level,[$abuffer],$direction,ASR #(30-2)    ;store this for next row
+        MEND
+
+
+        MACRO
+        NewRow32 $abefore,$anow,$before
+        MOV   $before,#0                    ;before is 0 at start of line
+        EOR   $abefore,$abefore,$anow       ;swap directions for the new line
+        EOR   $anow,$abefore,$anow
+        EOR   $abefore,$abefore,$anow
+        MEND
+
+        MACRO
+        ColourDiffuseError32 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction,$DiffuseInfo,$Value,$Bit,$pixel,$ptr
+        LDMIA $ptr,{$abefore,$anow,$before}   ;load them
+
+        LDR   $aafter,[$abuffer,$direction,ASR #(30-4)]     ;fetch aafter (rest are held)
+        DiffuseError32 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+
+        STMIA $ptr,{$abefore,$anow,$level}    ;keep the new levels
+;N.B. $level must be higher register than $abefore/$anow
+        ORRGE $pixel,$pixel,#1 :SHL: $Bit     ;and set the relevant bit for this dot on
+        MEND
+
+
+        MACRO
+        ColourDiffuseError32MustBe0 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction,$DiffuseInfo,$Value,$Bit,$pixel,$ptr
+        LDMIA $ptr,{$abefore,$anow,$before}   ;load them
+
+        LDR   $aafter,[$abuffer,$direction,ASR #(30-4)]    ;fetch aafter (rest are held)
+        DiffuseError32MustBe0 $level,$abefore,$anow,$aafter,$before,$abuffer,$direction
+
+        STMIA $ptr,{$abefore,$anow,$level}    ;keep the new levels
+;N.B. $level must be higher register than $abefore/$anow
+        MEND
+
+
+        MACRO
+        ColourNewRow32 $abefore,$anow,$before,$DiffuseInfo,$ptr
+        ADR   $ptr,$DiffuseInfo
+        LDMIA $ptr,{$abefore,$anow}           ;pick up errors at end of last line
+        NewRow32 $abefore,$anow,$before
+        STMIA $ptr,{$abefore,$anow,$before}   ;and keep the errors for the next sweep
+;N.B. $before must be higher register than $abefore/$anow
+        MEND
+
+
+
+;clean error diffusion buffer CMY pixels between R2 (start) and R3 (stop) - this is
+;used for any new margin pixels, preventing errors contaminating graphics further
+;down the page, when a margin reduces again
+;
+clean_edbuff_cmy
+        Push   "R2-R6,LR"
+  Debug mjs2,"clean edbuff cmy start stop ",R2,R3
+        LDR    R14,errorbuffer
+        ADD    R14,R14,#16       ;account for one extra entry at end
+        ADD    R14,R14,R2,LSL #4 ;16 bytes per entry
+        SUB    R2,R3,R2          ;no. of entries to clean
+        MOV    R4,#0
+        MOV    R5,#0
+        MOV    R6,#0
+clean_edb_cmy_loop
+        ADD    R14,R14,#4        ;skip K
+        STMIA  R14!,{R4-R6}      ;zap CMY
+        SUBS   R2,R2,#1
+        BNE    clean_edb_cmy_loop
+        Pull   "R2-R6,PC"
+
+;similar, but clean K
+;
+clean_edbuff_k
+        Push   "R2-R6,LR"
+  Debug mjs2,"clean edbuff k start stop ",R2,R3
+        LDR    R14,errorbuffer
+        ADD    R14,R14,#16       ;account for one extra entry at end
+        ADD    R14,R14,R2,LSL #4 ;16 bytes per entry
+        SUB    R2,R3,R2          ;no. of entries to clean
+        MOV    R6,#0
+clean_edb_k_loop
+        STR    R6,[R14],#4       ;zap K
+        ADD    R14,R14,#12       ;skip CMY
+        SUBS   R2,R2,#1
+        BNE    clean_edb_k_loop
+        Pull   "R2-R6,PC"
+
+;handle margin update/cleaning
+;corrupts R2-R8
+next_margins32
+        STMFD  SP!,{LR}
+        LDR    R14,rowmargins
+        LDMIA  R14,{R3-R6}
+  Debug mjs2,"next_margins32 ",R3,R4,R5,R6
+        LDR    R7,thisleftmargin
+        STR    R3,thisleftmargin
+        STR    R7,lastleftmargin
+        LDR    R8,thisleftgreymargin
+        STR    R5,thisleftgreymargin
+        STR    R8,lastleftgreymargin
+        MOV    R2,R7
+        CMP    R2,R3
+        BLLT   clean_edbuff_k        ;clean k from any new whitespace
+        ADD    R2,R7,R8              ;last total left margin = start
+        ADD    R3,R3,R5              ;this total left margin = stop
+        CMP    R2,R3
+        BLLT   clean_edbuff_cmy      ;clean cmy from any new white/grey space
+        LDR    R7,thisrightmargin
+        STR    R4,thisrightmargin
+        STR    R7,lastrightmargin
+        LDR    R8,thisrightgreymargin
+        STR    R6,thisrightgreymargin
+        STR    R8,lastrightgreymargin
+        SUB    R2,R0,R4              ;width - this white right margin = start
+        SUB    R3,R0,R7              ;width - last right white margin = stop
+        CMP    R2,R3
+        BLLT   clean_edbuff_k        ;clean k from any new whitespace
+        SUB    R2,R0,R6
+        SUB    R2,R2,R4              ;width - this total right margin = start
+        SUB    R3,R0,R8
+        SUB    R3,R3,R7              ;width - last total right margin = stop
+        CMP    R2,R3
+        BLLT   clean_edbuff_cmy      ;clean cmy from any new white/grey space
+        LDMFD  SP!,{PC}
+
+;entry: R0=width, R1=rows left
+FullRGBSwitch32
+        STMFD  SP!,{R2-R8,R11,R14}
+        ADR    R11,FullRGBInfo     ;Goes redbuffer,greenbuffer,bluebuffer,pixsep,remove
+        LDMIA  R11,{R3-R6}
+        ADD    R14,R0,R8,ASR #30
+        MULS   R14,R6,R14
+        RSBMI  R14,R14,#0          ;Answer must be +ve (R6 may have switched)
+        ADD    R3,R3,R14
+        ADD    R4,R4,R14
+        ADD    R5,R5,R14
+        RSB    R6,R6,#0
+        STMIA  R11,{R3-R6}
+        CMP    R1,#1
+        BLE    frgbs_done          ;don't try to pick up next margins on last row!
+        LDR    R14,rowmargins
+        ADD    R14,R14,R0,LSL #2
+        STR    R14,rowmargins
+        BL     next_margins32
+frgbs_done
+        LDMFD  SP!,{R2-R8,R11,PC}^
+
+
+;process white space margin, left or right, in either scan direction
+; entry: R2 = size of margin (left or right)
+;        R10 -> next output pixel (1 byte/pixel) 
+;        R8 = direction +/-1 (coded in top 2 bits)
+;        R1 -> next input pixel (4 bytes/pixel)
+;        R7 -> next error buffer entry (16 bytes/pixel)
+;
+; corrupts R2-R5
+;
+process_margin
+        TST       R8,#1:SHL:31   ;get R5 -> beginning of margin, either direction
+        MOVEQ     R5,R10     
+        SUBNE     R5,R10,R2
+        ADDNE     R5,R5,#1
+        MOV       R3,#0
+        MOVS      R4,R2
+        BEQ       pm_done
+  Debug mjs,"process_margin ",R4,R7,R8
+pm_next
+        STR       R3,[R5],#4      ;store 4 white ouput pixels at a time
+        SUBS      R4,R4,#4
+        BNE       pm_next
+pm_done
+        TST       R8,#1:SHL:31
+        RSBNE     R2,R2,#0         ;R2 is number of pixels in margin, signed with direction
+        ADD       R10,R10,R2       ;adjust output ptr
+        ADD       R1,R1,R2,LSL #2  ;adjust input ptr
+        ADD       R7,R7,R2,LSL #4  ;adjust error ptr
+  Debug mjs,"process_margin ",R4,R7,R8
+        MOV       PC,LR
+
+
+; entry: R2 = size of margin (left or right)
+;        R10 -> next output pixel (1 byte/pixel) 
+;        R8 = direction +/-1 (coded in top 2 bits)
+;        R1 -> next input pixel (4 bytes/pixel)
+;        R7 -> next error buffer entry (16 bytes/pixel)
+dither_grey_margin
+        Push      "R0,LR"
+        MOVS      R0,R2
+        Pull      "R0,PC",EQ
+  Debug mjs,"dither_grey_margin ",R0,R7,R8
+        TST       R8,#1:SHL:31
+        ADDNE     R7,R7,R8,ASR #(30-2)    ;backwards, adjust diffuse ptr to K
+        ADDNE     R7,R7,R8,ASR #(30-3)
+        ADR       R14,KeyDiffuse
+        LDMIA     R14,{R2,R3,R5}          ;load up abefore,anow,before
+dgm_loop
+        LDR       R9,[R1],R8,ASR #(30-2)  ;pick up K pixel (CMY should be 0)
+        MOV       R6,#0                   ;initialise output byte
+        LDR       R4,[R7,R8,ASR #(30-4)]  ;fetch aafter
+        DiffuseError32 R9,R2,R3,R4,R5,R7,R8
+        MOV       R5,R9                   ;resultant level is new before
+        ORRGE     R6,R6,#1:SHL:3          ;set K bit if diffuse says so
+        STRB      R6,[R10],R8,ASR #30
+        ADD       R7,R7,R8,ASR #(30-2)    ;step diffuse ptr to skip colours
+        ADD       R7,R7,R8,ASR #(30-3)
+        SUBS      R0,R0,#1
+        BNE       dgm_loop
+        TST       R8,#1:SHL:31
+        SUBNE     R7,R7,R8,ASR #(30-2)    ;backwards, readjust diffuse ptr 
+        SUBNE     R7,R7,R8,ASR #(30-3)
+  Debug mjs,"dither_grey_margin ",R0,R7,R8
+        Pull      "R0,PC"
+
+
+randomnumber32
+        & &A5C87C83
+
+
+Do_DitherColourSprite32
+; Entry is R0=columncount
+;          R1=rowcount
+;          R10=sprite
+;          R12,errorbuffer=allocated buffer for between lines
+;          R12,KCMYTable=pointer to table for inverse calculations (8-bit only)
+;          R12,XXXDiffuse=anow etc. from end of last line
+; Exit with diffused sprite, all else scrambled!
+        STMFD SP!,{R0,R14}                           ;Keep columncount for later
+
+  Debug mjs,"Do_DitherColourSprite32"
+ 
+        LDR   R11,randomnumber32
+
+;desperate register usage! but loads/stores on per pixel or per component basis
+;are expensive
+;R8 is shared between diffuse direction (top 2 bits = 2_01 or 2_11 for +1 or -1; can
+;be used ASR #30 to actually give +/- 1) and diffusion level (bottom byte)
+
+        MOV   R8,#1:SHL:30         ;Set the direction to +1
+
+;fetch diffusion level, OR into lower byte
+        ADR R7,mjsCalibrationTable
+        LDR R7,[R7]
+        ORR R8,R8,R7
+
+        LDR   R7,errorbuffer       ;start error buffer one back from start
+        ADD   R7,R7,#12            ;Put pointer as if just finished row on the way back
+;buffer is one too large at both ends, with 0 error at that point
+
+;initialise margin handling
+        STMFD SP!,{R2-R8}
+        STR   R10,rowmargins
+        LDR   R2,FirstStrip    ;init margins to 0 on first strip seen
+  Debug mjs2,"Do_DitherColourSprite32, FirstStrip=",R2
+        CMP   R2,#0
+        MOVNE R2,#0
+        STRNE R2,thisleftmargin
+        STRNE R2,thisrightmargin
+        STRNE R2,thisleftgreymargin
+        STRNE R2,thisrightgreymargin
+        BL    next_margins32
+        LDMFD SP!,{R2-R8}
+
+ec32_rowloop
+
+;need to swap abefore,anow and clear before for direction change
+        ColourNewRow32 R2,R3,R5,KeyDiffuse,    R14
+        ColourNewRow32 R2,R3,R5,CyanDiffuse,   R14
+        ColourNewRow32 R2,R3,R5,MagentaDiffuse,R14
+        ColourNewRow32 R2,R3,R5,YellowDiffuse, R14
+
+        ADD   R7,R7,R8,ASR #(30-2)                ;realign with sprite
+        STMFD SP!,{R1}                            ;save row count ...
+        LDR   R1,redbuffer                        ;... and use R1 for pixel ptr (speed-up)
+
+        Push  "R2-R5"
+  Debug mjs,"  > left margins"
+        LDR   R2,thisleftmargin
+        SUB   R0,R0,R2
+        BL    process_margin      ;process R2 marginal pixels on left
+        LDR   R2,thisleftgreymargin
+        SUB   R0,R0,R2
+        BL    dither_grey_margin
+        LDR   R3,thisrightmargin
+        SUB   R0,R0,R3
+        LDR   R3,thisrightgreymargin
+        SUB   R0,R0,R3            ;R0 is now no. of non-marginal pixels
+  Debug mjs,"  > left margins done (R0)",R0
+        Pull  "R2-R5"
+
+        CMP   R0,#0
+        BEQ   ec32_columnloop1a    ;no non-marginal pixels
+
+        ADR   R14,KeyDiffuse                     ;R14 addresses diffusion info during column scan
+
+ec32_columnloop
+
+        LDR  R6,[R1],R8,ASR #(30-2)              ;pick up 32 bit CMYK pixel
+
+        AND   R9,R6,#&FF                         ;K component
+        BIC   R6,R6,#&FF                         ;clear LSByte of R6 (will be 0000CMYK for dot bits)
+
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,KeyDiffuse,    KeyValue,    3,R6,R14
+        BGE   ec32_columnloop_blackset1
+
+        MOV   R9,R6,LSR #8
+        AND   R9,R9,#&FF                         ;C component
+        ADD   R14,R14,#diffuse_workspace
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+
+        MOV   R9,R6,LSR #16
+        AND   R9,R9,#&FF                         ;M component
+        ADD   R14,R14,#diffuse_workspace
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+
+        MOV   R9,R6,LSR #24                      ;Y component
+        ADD   R14,R14,#diffuse_workspace
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+
+        SUB   R14,R14,#(diffuse_workspace*3)     ;restore diffuse info ptr
+        STRB  R6,[R10],R8,ASR #30                ;Store CMYK and bump in right direction
+        SUBS  R0,R0,#1
+        BNE   ec32_columnloop
+        B     ec32_columnloop1a
+
+ec32_columnloop_blackset1
+        MOV R9,R6,LSR #8
+        AND R9,R9,#&FF                           ;C component
+        ADD R14,R14,#diffuse_workspace
+        ColourDiffuseError32MustBe0 R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+
+        MOV R9,R6,LSR #16
+        AND R9,R9,#&FF                           ;M component
+        ADD R14,R14,#diffuse_workspace
+        ColourDiffuseError32MustBe0 R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+
+        MOV R9,R6,LSR #24                        ;Y component
+        ADD R14,R14,#diffuse_workspace
+        ColourDiffuseError32MustBe0 R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+
+        SUB   R14,R14,#(diffuse_workspace*3)    ;restore diffuse info ptr
+        STRB  R6,[R10],R8,ASR #30               ;Store CMYK dots and bump in right direction
+        SUBS  R0,R0,#1
+        BNE   ec32_columnloop
+
+ec32_columnloop1a
+        Push  "R2-R5"
+  Debug mjs,"  > right margins"
+        LDR   R2,thisrightgreymargin
+        BL    dither_grey_margin           ;dither R2 grey pixels on right
+        LDR   R2,thisrightmargin
+        BL    process_margin               ;process R2 marginal pixels on right
+  Debug mjs,"  > right margins done "
+        Pull  "R2-R5"
+
+ec32_columnloop1
+        STR   R1,redbuffer
+        LDMFD SP!,{R1}                          ;restore row count
+
+        EOR   R8,R8,#1:SHL:31                   ;reverse direction
+        LDR   R0,[SP]                           ;get the columncount back
+        ADD   R10,R10,R0                        ;get to right end (works both times!)
+        ADD   R10,R10,R8,ASR #30
+
+        BL FullRGBSwitch32
+        SUBS  R1,R1,#1
+  Debug mjs,"  row ",R1
+        BEQ   ec32_bogup
+
+;need to swap abefore,anow and clear before for direction change
+
+        ColourNewRow32 R2,R3,R5,KeyDiffuse,    R14
+        ColourNewRow32 R2,R3,R5,CyanDiffuse,   R14
+        ColourNewRow32 R2,R3,R5,MagentaDiffuse,R14
+        ColourNewRow32 R2,R3,R5,YellowDiffuse, R14
+
+        ADD   R7,R7,R8,ASR #(30-2)                ;realign with sprite
+
+        STMFD SP!,{R1}                            ;save row count ...
+        LDR   R1,redbuffer                        ;... and use R1 for pixel ptr (speed-up)
+
+        Push  "R2-R5"
+  Debug mjs,"  < right margins"
+        LDR   R2,thisrightmargin
+        SUB   R0,R0,R2
+        BL    process_margin
+        LDR   R2,thisrightgreymargin
+        SUB   R0,R0,R2
+        BL    dither_grey_margin
+        LDR   R3,thisleftmargin
+        SUB   R0,R0,R3
+        LDR   R3,thisleftgreymargin
+        SUB   R0,R0,R3                ;R0 is now no. of non-marginal pixels
+  Debug mjs,"  < right margins done (R0)",R0
+        Pull  "R2-R5"
+
+        CMP   R0,#0
+        BEQ   ec32_columnloop2a   ;no non-marginal pixels
+
+        ADR   R14,KeyDiffuse                     ;R14 addresses diffusion info during column scan
+
+ec32_columnloopb
+        LDR  R6,[R1],R8,ASR #(30-2) ;pick up CMYK value from cmyk_convert_strip32 stuff
+
+; it would be easier on this backward pass to process in the order YMCK, but we do K first
+; so that we can do the black-set optimisation (CMY must be not-set). Hence, the fooling
+; with the R7 buffer pointer
+
+        ADD   R7,R7,R8,ASR #(30-2)
+        ADD   R7,R7,R8,ASR #(30-3)
+
+        AND   R9,R6,#&FF                          ;K component
+        BIC   R6,R6,#&FF                          ;clear LSByte of R6 (will be 0000CMYK for dot bits)
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,KeyDiffuse,    KeyValue,    3,R6,R14
+        SUB   R7,R7,R8,ASR #(30-4)
+        BGE ec32_columnloop_blackset2
+
+        MOV   R9,R6,LSR #24                       ;Y component
+        ADD   R14,R14,#(diffuse_workspace*3)
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+
+        MOV   R9,R6,LSR #16
+        AND   R9,R9,#&FF                          ;M component
+        SUB   R14,R14,#diffuse_workspace
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+
+        MOV   R9,R6,LSR #8
+        AND   R9,R9,#&FF                          ;C component
+        SUB   R14,R14,#diffuse_workspace
+        ColourDiffuseError32 R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+
+        ADD   R7,R7,R8,ASR #(30-2)
+        SUB   R14,R14,#diffuse_workspace          ;restore diffuse info ptr
+        STRB  R6,[R10],R8,ASR #30                 ;Store and bump in right direction
+        SUBS  R0,R0,#1
+        BNE   ec32_columnloopb
+        B     ec32_columnloop2a
+
+ec32_columnloop_blackset2
+        MOV   R9,R6,LSR #24                       ;Y component
+        ADD   R14,R14,#(diffuse_workspace*3)
+        ColourDiffuseError32MustBe0 R9,R2,R3,R4,R5,R7,R8,YellowDiffuse, YellowValue, 0,R6,R14
+ 
+        MOV   R9,R6,LSR #16
+        AND   R9,R9,#&FF                          ;M component
+        SUB   R14,R14,#diffuse_workspace
+        ColourDiffuseError32MustBe0 R9,R2,R3,R4,R5,R7,R8,MagentaDiffuse,MagentaValue,1,R6,R14
+
+        MOV   R9,R6,LSR #8
+        AND   R9,R9,#&FF                          ;C component
+        SUB   R14,R14,#diffuse_workspace
+        ColourDiffuseError32MustBe0 R9,R2,R3,R4,R5,R7,R8,CyanDiffuse,   CyanValue,   2,R6,R14
+
+        ADD   R7,R7,R8,ASR #(30-2)
+        SUB   R14,R14,#diffuse_workspace          ;restore diffuse info ptr
+        STRB  R6,[R10],R8,ASR #30                 ;Store and bump in right direction
+        SUBS  R0,R0,#1
+        BNE   ec32_columnloopb
+
+ec32_columnloop2a
+        Push  "R2-R5"
+   Debug mjs,"  < left margins"
+        LDR   R2,thisleftgreymargin
+        BL    dither_grey_margin
+        LDR   R2,thisleftmargin
+        BL    process_margin                      ;process R2 marginal pixels on left
+   Debug mjs,"  < left margins done"
+        Pull  "R2-R5"
+
+ec32_columnloop2
+        STR   R1,redbuffer
+        LDMFD SP!,{R1}                            ;restore row count
+
+        EOR   R8,R8,#1:SHL:31                     ;reverse direction
+        LDR   R0,[SP]                             ;get the columncount back
+        ADD   R10,R10,R0                          ;get to right end (works both times!)
+        ADD   R10,R10,R8,ASR #30
+
+        BL FullRGBSwitch32
+        SUBS  R1,R1,#1
+  Debug mjs,"  row ",R1
+        BNE   ec32_rowloop
+
+ec32_bogup
+        LDMFD SP!,{R0,PC}
+
+
+       END

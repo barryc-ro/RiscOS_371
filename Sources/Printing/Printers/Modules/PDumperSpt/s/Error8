@@ -1,0 +1,160 @@
+
+; > Error8
+;revamped code for 8 bit grey quality
+
+
+;clean error diffusion buffer pixels between R2 (start) and R3 (stop) - this is
+;used for any new margin pixels, preventing errors contaminating graphics further
+;down the page, when a margin reduces again
+;
+clean_edbuff_k8
+        Push   "R2,R6,LR"
+  Debug mjs2,"clean edbuff k8 start stop ",R2,R3
+        LDR    R14,errorbuffer
+        ADD    R14,R14,#4        ;account for one extra entry at end
+        ADD    R14,R14,R2,LSL #2 ;4 bytes per entry
+        SUB    R2,R3,R2          ;no. of entries to clean
+        MOV    R6,#0
+clean_edb_k8_loop
+        STR    R6,[R14],#4       ;zap K
+        SUBS   R2,R2,#1
+        BNE    clean_edb_k8_loop
+        Pull   "R2,R6,PC"
+
+
+;process white space margin, left or right, in either scan direction
+; entry: R2 = size of margin (left or right)
+;        R10 -> next input/output pixel (1 byte/pixel) 
+;        R8 = direction +/-1 (coded in top 2 bits)
+;        R7 -> next error buffer entry (4 bytes/pixel)
+;
+; doesn't need to actually process margins, since they are already set
+; white in k space - does adjust ptrs
+;
+process_margin8
+  Debug mjs,"process_margin8 ",R2,R8
+        TST       R8,#1:SHL:31
+        RSBNE     R2,R2,#0         ;R2 is number of pixels in margin, signed with direction
+        ADD       R10,R10,R2       ;adjust input/output ptr
+        ADD       R7,R7,R2,LSL #2  ;adjust error ptr
+        MOV       PC,LR
+
+
+;handle margin update/cleaning
+;corrupts R2-R5
+next_margins8
+        STMFD SP!,{LR}
+        LDR   R14,rowmargins
+        LDR   R3,[R14]                     ;pick-up margin counts
+        MOV   R4,#0
+        STR   R4,[R14]                     ;reset 1st four pixels to white
+        MOV   R4,R3,LSR #16                ;right margin
+        BIC   R3,R3,#&FF000000
+        BIC   R3,R3,#&00FF0000             ;left margin
+  Debug mjs2,"next_margins ",R3,R4
+        LDR   R5,thisleftmargin
+        STR   R3,thisleftmargin
+        STR   R5,lastleftmargin
+        MOV   R2,R5
+        CMP   R2,R3
+        BLLT  clean_edbuff_k8              ;clean k from any new whitespace
+        LDR   R5,thisrightmargin
+        STR   R4,thisrightmargin
+        STR   R5,lastrightmargin
+        SUB   R2,R0,R4                     ;width-thisrightmargin = start
+        SUB   R3,R0,R5                     ;width-lastrightmargin = stop
+        CMP   R2,R3
+        BLLT  clean_edbuff_k8              ;clean k from any new whitespace
+        LDMFD  SP!,{PC}
+
+Do_DitherGreySprite
+        STMFD SP!,{R0,R14}
+        LDR   R11,randomnumber32
+
+        MOV   R8,#1:SHL:30                 ;Set the direction to +1
+
+;fetch diffusion level, OR into lower byte
+        ADR   R7,mjsCalibrationTable
+        LDR   R7,[R7]
+        ORR   R8,R8,R7
+
+        LDR   R7,errorbuffer               ;start error buffer one back from start
+;buffer is one too large at both ends, with 0 error at that point
+
+;initialise margin handling
+        STR   R10,rowmargins
+        Push  "R2-R5,LR"
+        LDR   R2,FirstStrip    ;init margins to 0 on first strip seen
+  Debug mjs2,"Do_DitherGreySprite, FirstStrip=",R2
+        CMP   R2,#0
+        MOVNE R2,#0
+        STRNE R2,thisleftmargin
+        STRNE R2,thisrightmargin
+        BL    next_margins8
+        Pull  "R2-R5,LR"
+
+eg_rowloop
+        NewRow32 R2,R3,R5           
+        ADD   R7,R7,R8,ASR #(30-2)         ;realign with sprite
+
+        Push  "R2-R5"
+;  Debug mjs,"  left/right margins (8bpp grey)"
+        LDR   R2,thisleftmargin
+        LDR   R3,thisrightmargin
+        SUB   R0,R0,R2
+        SUB   R0,R0,R3                     ;R0 is now no. of non-marginal pixels
+        TST   R8,#1:SHL:31
+        MOVNE R2,R3                        ;if going backwards, first margin is right (not left)
+        BL    process_margin8
+;  Debug mjs," left/right margins (8bpp grey) done (R0)",R0
+        Pull  "R2-R5"
+
+        CMP   R0,#0
+        BEQ   eg_columnloop1a
+
+eg_columnloop
+        MOV   R6,#0                        ;Clear the pixel
+        LDRB  R9,[R10]                     ;Load the test level
+
+        LDR   R4,[R7,R8,ASR #(30-2)]       ;Get aafter from right place
+        DiffuseError32 R9,R2,R3,R4,R5,R7,R8
+
+        MOV   R5,R9                        ;Resultant level is new before
+        ORRGE R6,R6,#&FF                   ;Set relevant bits (all of them!)
+
+        STRB  R6,[R10],R8,ASR #30          ;Store and bump in right direction
+
+        SUBS  R0,R0,#1                     ;Next column
+        BNE   eg_columnloop
+
+eg_columnloop1a
+        Push  "R2-R5"
+;  Debug mjs,"  right/left margins (8bpp grey)"
+        LDR   R2,thisleftmargin
+        LDR   R3,thisrightmargin
+        TST   R8,#1:SHL:31
+        MOVEQ R2,R3                        ;if going forwards, second margin is right (not left)
+        BL    process_margin8
+;  Debug mjs,"  right/left margins (8bpp grey) done"
+        Pull  "R2-R5"
+
+        EOR   R8,R8,#1:SHL:31               ;reverse direction
+        LDR   R0,[SP]                       ;get the columncount back
+        ADD   R10,R10,R0                    ;get to right end of sprite row
+        ADD   R10,R10,R8,ASR #30
+
+;sort out next margins
+        CMP   R1,#1
+        BLE   eg_nrow                       ;don't pick-up next margins on last row
+        Push  "R2-R5,R14"
+        LDR   R14,rowmargins
+        ADD   R14,R14,R0
+        STR   R14,rowmargins
+        BL    next_margins8
+        Pull  "R2-R5,R14"
+eg_nrow
+        SUBS  R1,R1,#1                     ;Next row
+        BNE   eg_rowloop
+        LDMFD SP!,{R0,PC}
+
+       END

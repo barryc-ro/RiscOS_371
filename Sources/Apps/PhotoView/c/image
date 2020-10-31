@@ -1,0 +1,1131 @@
+/*
+ *  c.image
+ *
+ *  Routines for opening and handling image windows
+ *
+ */
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "werr.h"
+#include "wimpt.h"
+#include "win.h"
+#include "help.h"
+#include "template.h"
+#include "saveas.h"
+#include "visdelay.h"
+#include "magnify.h"
+#include "txt.h"
+#include "akbd.h"
+
+
+#include "pcdlib.h"
+
+#include "pcdovervw.h"
+#include "sprparam.h"
+#include "callback.h"
+#include "palettes.h"
+#include "image.h"
+#include "scrollview.h"
+
+#ifdef TEMPORARY_EXPORT
+#include "export32.h"
+#endif
+
+
+
+/*--- some global status vars ---*/
+
+
+static PCDpaletteHdl  imgpalettehdl = 0;
+static int  sproption_palette_prev = -1;
+static int  sproption_dither_prev = -1;
+
+menu  image_menu;
+
+#ifdef TEMPORARY_EXPORT
+menu  export_res_menu;
+menu  export_ori_menu;
+#endif
+
+
+
+#define  NUM_IMAGE_ENTRIES  128
+
+
+image_str  *images;
+
+
+
+/*--- some arrays for use in redraw ---*/
+
+char    pixtrans[256];
+
+
+
+#define  Filetype_Sprite  0xff9
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  image_quitting(void)
+{
+   int   i;
+
+
+   for (i = 0; i < NUM_IMAGE_ENTRIES; i++)
+   {
+      if (images[i].whandle != 0)
+         PCDclose(images[i].pcdhdl);
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL  image_init(void)
+{
+
+   images = calloc(NUM_IMAGE_ENTRIES, sizeof(image_str));
+   if (images == NULL)
+      return FALSE;
+
+   atexit(image_quitting);
+
+   txt_init();       /* init the txt functions (for when reading copyright files) */
+
+   return TRUE;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+int  image_find_whandle(wimp_w wh)
+{
+   int    i = 0;
+
+
+   while ((wh != images[i].whandle) && (i < NUM_IMAGE_ENTRIES))
+      i++;
+
+   if (i == NUM_IMAGE_ENTRIES)
+      return -1;
+
+   return i;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+/*      Sprite save routines                                                */
+/*--------------------------------------------------------------------------*/
+
+
+
+static BOOL  sprite_saver(char *filename, void *handle)
+/* save file to disc */
+{
+   int     i = (int)handle;
+   int    *sp;
+   int     hdr[3];
+   int     fh;
+   _kernel_swi_regs   r;
+
+
+   sp = (int *)PCDgetSpritePtr(images[i].sprite);
+   if (sp == NULL)
+      return FALSE;
+
+
+   visdelay_begin();
+
+   /*--- open the file ---*/
+   r.r[0] = 0x80;     /* open a new file */
+   r.r[1] = (int)filename;
+   _kernel_swi(OS_Find, &r, &r);
+
+   if ((fh = r.r[0]) == 0)
+   {
+      werr(FALSE, msgs_lookup("notsave:Could not open file for saving"));
+      visdelay_end();
+      return FALSE;
+   }
+
+   /*--- save the sprite file header ---*/
+   hdr[0] = 1;             /* number of sprites */
+   hdr[1] = 16;            /* offset to first sprite */
+   hdr[2] = sp[0] + 16;    /* offset to first free byte */
+
+   r.r[0] = 2;             /* write bytes to current file pointer */
+   r.r[1] = fh;
+   r.r[2] = (int)hdr;
+   r.r[3] = 12;
+   if (wimpt_complain((os_error *)_kernel_swi(OS_GBPB, &r, &r)))
+   {
+      /* close the file */
+      r.r[0] = 0;
+      r.r[1] = fh;
+      _kernel_swi(OS_Find, &r, &r);
+      visdelay_end();
+      return FALSE;
+   }
+
+   /*--- add the sprite ---*/
+   r.r[0] = 2;             /* write bytes to current file pointer */
+   r.r[1] = fh;
+   r.r[2] = (int)sp;
+   r.r[3] = sp[0];
+   if (wimpt_complain((os_error *)_kernel_swi(OS_GBPB, &r, &r)))
+   {
+      /* close the file */
+      r.r[0] = 0;
+      r.r[1] = fh;
+      _kernel_swi(OS_Find, &r, &r);
+      visdelay_end();
+      return FALSE;
+   }
+
+   /*--- close the file ---*/
+   r.r[0] = 0;
+   r.r[1] = fh;
+   if (wimpt_complain((os_error *)_kernel_swi(OS_Find, &r, &r)))
+   {
+      visdelay_end();
+      return FALSE;
+   }
+
+   /*--- set the file type ---*/
+   r.r[0] = 18;
+   r.r[1] = (int)filename;
+   r.r[2] = Filetype_Sprite;
+   _kernel_swi(OS_File, &r, &r);
+
+   visdelay_end();
+
+   return TRUE;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+/*--------------------------------------------------------------------------*/
+/*      Sprite/image display window event handlers                          */
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  image_magnifyhandler(void *handle)
+{
+   /*--- called by RISC_OSLib's 'magnify' routines
+         when the zoom factor has changed ---*/
+
+   int             i = (int)handle;
+   wimp_redrawstr  wr;
+   wimp_wstate     ws;
+
+
+   /*--- set the new work area size ---*/
+   wr.w = images[i].whandle;
+   wr.box.x0 = 0;
+   wr.box.x1 = (images[i].width * images[i].zoom_mul) / images[i].zoom_div;
+   wr.box.y1 = 0;
+   wr.box.y0 = (-images[i].height * images[i].zoom_mul) / images[i].zoom_div;
+   wimpt_noerr(wimp_set_extent(&wr));
+
+   /*--- redraw the window at new zoom factor ---*/
+   wimpt_noerr(wimp_get_wind_state(images[i].whandle, &ws));
+   wimpt_complain(wimp_open_wind(&ws.o));            /* reopen in case window size has changed */
+
+   /*--- redraw the window (at it's *actual* final extent) ---*/
+   wr.box.x0 = 0;
+   wr.box.x1 = ws.o.box.x1 - ws.o.box.x0;
+   wr.box.y1 = 0;
+   wr.box.y0 = ws.o.box.y0 - ws.o.box.y1;
+   wimpt_noerr(wimp_force_redraw(&wr));
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+/*--- image_magnify is a direct replacement for the RISC_OSLib
+      function 'magnify_select()'.  This new version uses the
+      new RO3 Style Guide zoom box.
+      Because this uses a percentage scale, div will be forced
+      to 100. ---*/
+
+
+static void image_magnify(int *mul, int *div, int maxmul, int maxdiv,
+                          void (*proc)(void *), void *phandle)
+{
+   dbox  d;
+   int   f;
+   int   curmul;
+   int   maxpc, minpc;
+   BOOL  done = FALSE;
+
+
+   curmul = *mul;
+
+   minpc = 100 / maxdiv;
+   maxpc = maxmul * 100;
+
+   if (curmul < 1)  curmul = 1;
+   if (*div >= 1)
+      curmul = (curmul * 100) / *div;
+   else
+      curmul = (curmul * 100);
+
+   if ((d = dbox_new("ScaleView")) == NULL)
+      return;
+   dbox_setnumeric(d, 6, curmul);
+
+   dbox_raw_eventhandler(d, help_dboxrawevents, (void *)"SCALEVIEW");
+   dbox_show(d);
+
+   while ((!done) && ((f = dbox_fillin(d)) != dbox_CLOSE))
+   {
+      wimp_mousestr  ms;
+      int            newmul;
+      BOOL           adjust;
+
+
+      wimpt_noerr(wimp_get_point_info(&ms));
+      adjust = ((ms.bbits & 1) != 0);
+
+      curmul = dbox_getnumeric(d, 6);
+
+      if (((f == 2) || (f == 3)) && adjust)
+         f = f^1 ;    /* adjust goes the other way */
+
+      switch (f)
+      {
+         case 0:   /* ok */
+            *mul = curmul;
+            *div = 100;
+            if (proc)
+               proc(phandle) ;
+            if (!adjust)
+               done = TRUE;
+            break;
+
+         case 1:   /* cancel */
+            done = TRUE;
+            break;
+
+         case 7:   /* down */
+            if (curmul > 100)
+               newmul = ((curmul - 1) / 50) * 50;    /* round down to nearest 50% */
+            else
+               newmul = ((curmul - 1) / 5) * 5;       /* round down to nearest 5% */
+            if (newmul >= minpc)
+               curmul = newmul;
+            break ;
+
+         case 8:   /* up */
+            if (curmul >= 100)
+               newmul = ((curmul + 50) / 50) * 50;    /* round up to nearest 50% */
+            else
+               newmul = ((curmul + 5) / 5) * 5;       /* round up to nearest 5% */
+            if (newmul <= maxpc)
+               curmul = newmul;
+            break ;
+
+         case 9:  /* 25% */
+            curmul = 25;
+            break;
+
+         case 10:  /* 50% */
+            curmul = 50;
+            break;
+
+         case 11:  /* 100% */
+            curmul = 100;
+            break;
+
+         case 12:  /* 150% */
+            curmul = 150;
+            break;
+
+         case 13:  /* 200% */
+            curmul = 200;
+            break;
+
+         case 14:  /* 400% */
+            curmul = 400;
+            break;
+
+      }
+
+      if (!done)
+         dbox_setnumeric(d, 6, curmul);
+   }
+
+   dbox_dispose(&d) ;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+menu  image_menumaker(void *handle)
+{
+   /* Controls the making of the menus.
+      This is needed if menu help is wanted. */
+
+
+   help_register_handler(help_simplehandler, "IMGMNU");    /* help for the image menu */
+
+   return image_menu;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  image_rights_txt_event_handler(txt rights_txt, void *handle)
+{
+   txt_eventcode  e;
+
+
+   e = txt_get(rights_txt);    /* what event is it? */
+
+   switch(e)
+   {
+      case (txt_EXTRACODE + akbd_Fn + 127):    /* click on close icon */
+         txt_dispose(&rights_txt);
+         break;
+
+      /*--------*/
+
+      case (txt_EXTRACODE + akbd_Sh + akbd_Ctl + akbd_UpK):    /* up one line */
+         txt_movevertical(rights_txt, -1, 1);
+         break;
+
+      /*--------*/
+
+      case (txt_EXTRACODE + akbd_Sh + akbd_Ctl + akbd_DownK):  /* down one line */
+         txt_movevertical(rights_txt, 1, 1);
+         break;
+
+      /*--------*/
+
+      case (txt_EXTRACODE + akbd_Sh + akbd_UpK):    /* up a page */
+         txt_movevertical(rights_txt, -txt_visiblelinecount(rights_txt), 1);
+         break;
+
+      /*--------*/
+
+      case (txt_EXTRACODE + akbd_Sh + akbd_DownK):    /* down a page */
+         txt_movevertical(rights_txt, txt_visiblelinecount(rights_txt), 1);
+         break;
+
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  image_read_rights(char *path, char *filename)
+{
+   /*--- Use the RISC_OSLib 'txt' functions to display the
+         image's copyright info file ---*/
+
+   txt          rights_txt;
+   char         str[256];
+   os_filestr   of;
+   int          len;
+   char        *buf, *p1, *p2;
+
+
+   /*--- generate filename for rights file ---*/
+   sprintf(str, "%s.PHOTO_CD.RIGHTS.%s", path, filename);
+
+   /*--- read the file into a temporary buffer ---*/
+   of.action = 17;     /* read catalogue information */
+   of.name = str;
+   if (wimpt_complain(os_file(&of)))
+      return;
+   len = of.start;     /* file length */
+
+   if (!flex_alloc((flex_ptr)&buf, len + 1))
+   {
+      werr(FALSE, msgs_lookup("rightmem:Not enough memory to show copyright information"));
+      return;
+   }
+
+   of.action = 16;     /* read file into memory */
+   of.name = str;
+   of.loadaddr = (int)buf;
+   of.execaddr = 0;
+   if (wimpt_complain(os_file(&of)))
+   {
+      flex_free((flex_ptr)&buf);
+      return;
+   }
+   buf[len] = '\0';   /* zero terminate the file */
+
+   /*--- rights file is in memory, now we want to go through it
+         and remove the carraige returns ---*/
+   p1 = p2 = buf;
+   do
+   {
+      if (*p2 != 13)
+         *p1++ = *p2;
+   }
+   while (*p2++);
+
+
+   /*--- create the 'txt' objext ---*/
+   rights_txt = txt_new(msgs_lookup("righttit:Copyright information for image"));
+   txt_eventhandler(rights_txt, image_rights_txt_event_handler, NULL);
+   txt_show(rights_txt);
+
+   txt_setcharoptions(rights_txt, txt_CARET, 0);        /* no caret */
+
+   txt_setdot(rights_txt, 0);
+   txt_insertstring(rights_txt, buf);
+
+   /*--- we can get rid of the temporary buffer now ---*/
+   flex_free((flex_ptr)&buf);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  image_infobox(int i)
+{
+   /* Display the image info box */
+
+   dbox           d;
+   PCDpacInfoRec  info;
+   dbox_field     f;
+   char           cli[256];
+   char          *timestr = cli;   /* use the same buffer for our time buffer */
+
+
+   if (wimpt_complain((os_error *)PCDreadImageInfo(images[i].pcdhdl, &info)))
+      return;
+
+   /* Create the dialogue box */
+   if (d = dbox_new("ImageInfo"), d != NULL)
+   {
+      PCDconvertTimeToString(timestr, info.scanTime);
+      dbox_setfield(d, 7, timestr);
+
+      if ((info.modTime == 0xffffffff) || (info.modTime == info.scanTime))
+      {
+         /* image hasn't been modified */
+         dbox_setfield(d, 8, msgs_lookup("notmod:-"));
+      }
+      else
+      {
+         PCDconvertTimeToString(timestr, info.modTime);
+         dbox_setfield(d, 8, timestr);
+      }
+
+      switch(info.mediaId)
+      {
+         case PCD_COLOR_NEGATIVE:   dbox_setfield(d, 9, "Colour negative"); break;
+         case PCD_COLOR_REVERSAL:   dbox_setfield(d, 9, "Colour reversal"); break;
+         case PCD_COLOR_HARDCOPY:   dbox_setfield(d, 9, "Colour hardcopy"); break;
+         case PCD_THERMAL_HARDCOPY: dbox_setfield(d, 9, "Thermal hardcopy"); break;
+         case PCD_BW_NEGATIVE:      dbox_setfield(d, 9, "B & W negative"); break;
+         case PCD_BW_REVERSAL:      dbox_setfield(d, 9, "B & W reversal"); break;
+         case PCD_BW_HARDCOPY:      dbox_setfield(d, 9, "B & W hardcopy"); break;
+         case PCD_INTERNEGATIVE:    dbox_setfield(d, 9, "Internegative"); break;
+         case PCD_SYNTHETIC_IMAGE:  dbox_setfield(d, 9, "Synthetic image"); break;
+         default: dbox_setfield(d, 9, "Unknown");
+      }
+      info.mediaType[19] = '\0';   /* might lose last char, but who's worried? */
+      dbox_setfield(d, 10, info.mediaType);
+
+      if (info.copyright != 0)
+         dbox_setfield(d, 11, "Yes");
+      else
+         dbox_setfield(d, 11, "No");
+
+      dbox_setfield(d, 12, info.copyrightFile);   /* this string is terminated for us */
+
+      if (info.copyrightFile[0] == '\0')          /* fade the 'read it' button if no filename */
+         dbox_fadefield(d, 13);
+      else
+      {
+         FILE   *ch;
+
+         /* generate full copyright filename */
+         sprintf(cli, "%s.PHOTO_CD.RIGHTS.%s", images[i].path, info.copyrightFile);
+
+         /*--- if filename exists but file itself doesn't... ---*/
+         if ((ch = fopen(cli, "r")) != NULL)
+            fclose(ch);
+         else
+            dbox_fadefield(d, 13);
+      }
+
+
+      dbox_raw_eventhandler(d, help_dboxrawevents, (void *)"IMAGEINFO");   /* the only events we are interested in
+                                                                             are interactive help messages        */
+      /* Show the dialogue box */
+      dbox_show(d);
+
+      while ((f = dbox_fillin(d)) != dbox_CLOSE)
+      {
+         if (f == 13)  /* 'Read it' button */
+         {
+            image_read_rights(images[i].path, info.copyrightFile);
+            wimp_create_menu((wimp_menustr*)-1, 0, 0);     /* clear the menu tree */
+         }
+      }
+
+      /* Dispose of the dialogue box */
+      dbox_dispose(&d);
+
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  image_menuproc(void *handle, char *hit)
+{
+   /*--- Event handler for the menu ---*/
+
+   int     i = (int)handle;
+
+
+   /* Find which menu item was hit and take action as appropriate */
+   switch (hit[0])
+   {
+      case 1: /* image info */
+         if (hit[1] != 0)       /* only open if crossed over submenu arrow */
+            image_infobox(i);
+         break;
+
+      /*--------*/
+
+      case 2: /* save */
+         {
+            int    *sp = (int *)PCDgetSpritePtr(images[i].sprite);
+
+
+            saveas(Filetype_Sprite,
+                   "Spritefile",
+                   sp[0],         /* estimated size */
+                   sprite_saver,
+                   0,
+                   0,
+                   handle);
+
+         }
+         break;
+
+      /*--------*/
+
+      case 3: /* export */
+#ifdef TEMPORARY_EXPORT
+         switch (hit[1])
+         {
+            case 1:  /* resolution */
+               if (hit[2] != 0)
+               {
+                  menu_setflags(export_res_menu, export_resolution, FALSE,FALSE);
+                  export_resolution = hit[2];
+                  menu_setflags(export_res_menu, export_resolution, TRUE,FALSE);
+               }
+               break;
+
+            /*--------*/
+
+            case 2:  /* orientation */
+               if (hit[2] != 0)
+               {
+                  menu_setflags(export_ori_menu, export_orientation+1, FALSE,FALSE);
+                  export_orientation = hit[2]-1;
+                  menu_setflags(export_ori_menu, export_orientation+1, TRUE,FALSE);
+               }
+               break;
+
+            /*--------*/
+
+            case 3:  /* export 32 bpp sprite */
+               if (hit[2] != 0)
+               {
+                  int    *sp = (int *)PCDgetSpritePtr(images[i].sprite);
+
+
+                  saveas(Filetype_Sprite,
+                         "Spritefile",
+                         sp[0],         /* estimated size */
+                         export32_saver,
+                         0,
+                         0,
+                         handle);
+               }
+               break;
+
+         }
+#endif
+         break;
+
+      /*--------*/
+
+      case 4: /* scale view */
+
+         if (hit[1] != 0)       /* only open if crossed over submenu arrow */
+            image_magnify(&images[i].zoom_mul, &images[i].zoom_div,
+                          16, 16, image_magnifyhandler, (void *)i);
+         break;
+
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  image_event_handler(wimp_eventstr *e, void *handle)
+{
+
+   switch(e->e)
+   {
+
+      case wimp_EOPEN:
+         wimpt_noerr(wimp_open_wind(&e->data.o));
+         break;
+
+      /*----------*/
+
+      case wimp_ECLOSE:
+         {
+            int   i;
+
+
+            wimpt_noerr(wimp_close_wind(e->data.o.w));
+
+            i = image_find_whandle(e->data.o.w);
+            if (i == -1)  return;
+
+            /*--- close the Image Pac ---*/
+            PCDclose(images[i].pcdhdl);
+
+            /*--- remove and tidy up array entry ---*/
+            PCDfreeBitmap(images[i].sprite);
+            images[i].whandle = 0;
+
+         }
+         break;
+
+      /*----------*/
+
+      case wimp_EREDRAW:
+         {
+            wimp_redrawstr    r;
+            int               more;
+            int               i, j;
+            _kernel_swi_regs  rg;
+            PCDspriteform     mi;
+            int               scale[4];
+            int              *sp;
+            char             *ctrans;
+
+
+            i = image_find_whandle(e->data.o.w);
+            if (i == -1)  return;
+
+            r.w = e->data.o.w;
+            wimp_redraw_wind(&r, &more);
+
+
+            /*--- set up scale factors ---*/
+            pcdovervw_read_modeinfo(&mi);
+            scale[0] = mi.Xdpi * images[i].zoom_mul;
+            scale[1] = mi.Ydpi * images[i].zoom_mul;
+            scale[2] = images[i].xdiv * images[i].zoom_div;
+            scale[3] = images[i].ydiv * images[i].zoom_div;
+
+
+            /*--- set up colour translation table (see RO3 PRMs page 1-834) ---*/
+            ctrans = 0;
+            if (mi.bpp <= 8)
+            {
+               int k;
+
+               sp = (int *)PCDgetSpritePtr(images[i].sprite);
+
+               rg.r[0] = 256;              /* >= 256 indicates sprite area */
+               rg.r[1] = (int)sp;          /* sprite pointer */
+               rg.r[2] = -1;               /* dest mode = current */
+               rg.r[3] = -1;               /* destination palette = current */
+               rg.r[4] = (int)pixtrans;    /* palette buffer */
+               rg.r[5] = 1;                /* (b0 set: r1 = pointer to sprite) */
+               _kernel_swi(ColourTrans_SelectTable, &rg, &rg);
+
+               /* check for 1:1 colout mapping */
+/*why do this? SpriteExtend will just ignore the ttable anyway if it's a 1:1 mapping.*/
+               k = (sp[8] - 44) / 8;       /* (number of palette entries) */
+
+               if (k == 0)                 /* src must be a 16/32 bpp sprite */
+                  ctrans = pixtrans;
+               else
+               {
+                  for (j=0; j<k; j++)
+                  {
+                     if (pixtrans[j] != j)
+                     {
+                        ctrans = pixtrans;
+                        break;
+                     }
+                  }
+               }
+            }
+
+            rg.r[0] = 0x234;         /* put sprite scaled */
+            rg.r[1] = 42;            /* Hello Arthur, how's Ford Prefect? */
+            rg.r[2] = PCDgetSpritePtr(images[i].sprite);
+            rg.r[3] = r.box.x0 - r.scx;
+            rg.r[4] = (r.box.y1 - r.scy) - (images[i].height * images[i].zoom_mul / images[i].zoom_div);
+            if (mi.bpp <= 8)
+              rg.r[5] = 0;           /* set plot action */
+            else
+              rg.r[5] = 1<<4;        /* set plot action + plot from palette*/
+            rg.r[6] = (int)scale;    /* scale factors */
+            rg.r[7] = (int)ctrans;   /* colour translation */
+
+            while (more)
+            {
+               _kernel_swi(OS_SpriteOp, &rg, &rg);
+
+               wimp_get_rectangle(&r, &more);
+            }
+
+         }
+         break;
+
+   }
+
+   return;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+/*      Sprite/image display window main routine                            */
+/*--------------------------------------------------------------------------*/
+
+
+
+void  image_openimage(int ovw_id, char *path, int thumbno, BOOL adjust, void *data)
+{
+   int     f;
+   char    str[32];
+
+   PCDspriteform   mi;
+   PCDstatus       err;
+   PCDphotoHdl     pcdh;
+   template       *t;
+   wimp_w          wh;
+   wimp_wstate     ws;
+   wimp_redrawstr  wr;
+   static BOOL     busy = FALSE;
+#if 0  /* re-insert for debugging 'scrollview' windows (see later this proc) */
+   os_error        svoe;
+   #define DEBUGGING_SCROLLVIEWS
+#endif
+
+
+   /*--- get the sprite/image parameters ---*/
+
+   if (!sprparam_getdata(ovw_id, thumbno))
+      return;
+
+
+   /*--- stop user trying to start another one - otherwise
+         we'll end up corrupting some of these local vars ---*/
+   if (busy)
+   {
+      werr(FALSE,msgs_lookup("already:Can only generate one image at a time"));
+      return;
+   }
+
+   busy = TRUE;
+
+
+   /*--- OK, now read and display the full image ---*/
+
+   /* find a new slot for the data to go into */
+   f = 0;
+   while ((images[f].whandle != 0) && (f < NUM_IMAGE_ENTRIES))
+      f++;
+
+   if (f == NUM_IMAGE_ENTRIES)
+   {
+      werr(FALSE, msgs_lookup("toomany:Too many open Image Pac windows"));
+      return;
+   }
+
+
+   images[f].path = path;
+
+   pcdovervw_read_modeinfo(&mi);
+   images[f].xdiv = mi.Xdpi;
+   images[f].ydiv = mi.Ydpi;
+
+
+   images[f].zoom_mul = 1;
+   images[f].zoom_div = 1;
+
+
+   /*--- open the Image Pac ---*/
+   if ((err = PCDopen(path, thumbno, &pcdh)) == NULL)
+      images[f].pcdhdl = pcdh;
+
+   /*--- set the resolution ---*/
+   if (err == NULL)
+      err = PCDsetResolution(pcdh, sproption_resolution);
+
+   /*--- set the orientation ---*/
+   if (err == NULL)
+   {
+      int   r;
+
+      r = (sproption_orientation % 4) * 90;
+      if (sproption_orientation >= 4)
+         r |= 0x80000000;
+      err = PCDsetTransform(pcdh, r);
+   }
+
+   if (mi.bpp <= 8)
+   {
+      /*--- set the palette to use ---*/
+      if ((err == NULL) &&
+          ((sproption_palette != sproption_palette_prev) || (sproption_dither != sproption_dither_prev)))
+      {
+         /*--- free previous palette ---*/
+         if (imgpalettehdl != 0)
+            PCDfreePalette(imgpalettehdl);
+
+         /*--- generate the new palette ---*/
+         err = palette_setup(sproption_palette, sproption_dither, &imgpalettehdl);
+
+         if (err == NULL)
+            sproption_palette_prev = sproption_palette;
+      }
+
+      /*--- select it for use ---*/
+      if (err == NULL)
+         err = PCDsetPalette(pcdh, imgpalettehdl);
+
+      mi.haspalette = TRUE;
+   }
+   else
+      mi.haspalette = FALSE;
+
+   /*--- set up the callback functions ---*/
+   if (err == NULL)
+   {
+      PCDsetProgress(pcdh, callback_progress, 0);
+      PCDsetAbort(pcdh, callback_abort, 0);
+   }
+
+
+   /*--- create the sprite ---*/
+
+#ifdef DEBUGGING_SCROLLVIEWS
+   /* for debugging 'scrollview' windows
+      - hold down SHIFT when clicking on
+        the OK button in the parameter box */
+   if ((sproption_resolution >= 4) && akbd_pollsh())
+   {
+      svoe.errnum = pcdNoMem;
+      strcpy(svoe.errmess, "Fake error for debugging purposes");
+      err = (PCDstatus)&svoe;
+   }
+#endif
+
+   if (err == NULL)
+      err = PCDloadImage(pcdh, NULL, &mi, &images[f].sprite);
+
+   busy = FALSE;               /* safe to turn this off now */
+
+
+   /*--- if not enough memory, try opening a partial view instead ---*/
+   if ((sproption_resolution >= 4) && (err->errnum == pcdNoMem))
+   {
+      if (scrollview_openimage(f, thumbno, &mi))
+         return;
+   }
+
+
+   if (err != NULL)
+   {
+      PCDclose(pcdh);
+      images[f].whandle = 0;
+
+      if (err->errnum != pcdUserAbort)       /* ignore user aborted error message */
+         werr(FALSE, "PhotoCD error: %s", err->errmess);
+
+      return;
+   }
+
+
+   /*--- create the window ---*/
+   t = template_copy(template_find("Image"));
+   if (wimpt_complain(wimp_create_wind(&t->window, &wh)) != NULL)
+      return;
+
+   images[f].whandle = wh;
+
+
+   /*--- event handler for the window ---*/
+   win_register_event_handler(wh, image_event_handler, NULL);
+
+   /*--- menu etc for the window ---*/
+   image_menu = menu_new(msgs_lookup("MEimageT:Image"),
+#ifdef TEMPORARY_EXPORT
+                         msgs_lookup("MEimageB:>Image info,>Save,Export,>Scale view"));
+#else
+                         msgs_lookup("MEimageB:>Image info,>Save,>Export,>Scale view"));
+#endif
+
+#ifdef TEMPORARY_EXPORT
+   {
+      menu    sm;
+
+      sm = menu_new("Export","Resolution,Orientation|>24 bit sprite");
+
+      export_res_menu = menu_new(msgs_lookup("MEresolT"), msgs_lookup("MEresol1"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol2"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol3"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol4"));
+         menu_extend(export_res_menu, msgs_lookup("MEresol5"));
+      menu_submenu(sm, 1, export_res_menu);
+      export_resolution = sproption_resolution;
+      menu_setflags(export_res_menu, export_resolution, TRUE,FALSE);
+
+      export_ori_menu = menu_new(msgs_lookup("MExformT"), msgs_lookup("MExform0"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform1"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform2"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform3"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform4"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform5"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform6"));
+         menu_extend(export_ori_menu, msgs_lookup("MExform7"));
+      menu_submenu(sm, 2, export_ori_menu);
+      export_orientation = sproption_orientation;
+      menu_setflags(export_ori_menu, export_orientation+1, TRUE,FALSE);
+
+      menu_submenu(image_menu, 3, sm);
+   }
+#else
+   menu_setflags(image_menu, 3, 0, 1);   /* temp. fade export menu item */
+#endif
+
+   /* attach the menu */
+   event_attachmenumaker(wh, image_menumaker, image_menuproc, (void *)f);
+
+
+   sprintf(str, "img%4.4d", thumbno);
+   win_settitle(wh, str);
+
+   wimpt_noerr(wimp_get_wind_state(wh, &ws));
+
+   /* set the work area size */
+   wr.w = wh;
+   PCDgetSize(pcdh, (PCDrect *)&wr.box);
+   images[f].width  = wr.box.x1 *= 2;
+   images[f].height = wr.box.y1 * 2;
+   wr.box.x1 = images[f].width;
+   wr.box.y0 = -images[f].height;
+   wr.box.y1 = 0;
+   wimpt_noerr(wimp_set_extent(&wr));
+
+   ws.o.behind = -1;
+   if (wimpt_complain(wimp_open_wind(&ws.o)) != NULL)
+      return;
+   win_activeinc();      /* count active windows */
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  image_palettechange(void)
+{
+   int             i;
+   wimp_wstate     state;
+   wimp_redrawstr  r;
+
+
+   /*--- Called when the application receives a PALETTECHANGE
+         message, so that the image windows can be redrawn.
+         This will affect both normal image windows *and*
+         scrollview type windows ---*/
+
+   for (i = 0; i < NUM_IMAGE_ENTRIES; i++)
+   {
+      if (images[i].whandle != 0)
+      {
+         /*--- get window info ---*/
+         if (wimp_get_wind_state(images[i].whandle, &state) != NULL)
+            return;
+
+         r.w   = images[i].whandle;
+         r.box = state.o.box;
+
+         r.box.x0 = state.o.x;
+         r.box.y1 = state.o.y;
+         r.box.x1 = state.o.x + (state.o.box.x1 - state.o.box.x0);
+         r.box.y0 = state.o.y - (state.o.box.y1 - state.o.box.y0);
+
+         wimp_force_redraw(&r);
+
+      }
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+

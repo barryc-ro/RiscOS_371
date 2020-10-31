@@ -1,0 +1,376 @@
+        SUBT    Server ==> &.Arthur.Broadcast.Server
+
+StartServer
+   ;     BL      OpenControlServerRx                    ; Expect ConnectGrant from anywhere
+   ;     BVS     ErrorInServer
+        [       Debug
+        DLINE   "Starting the server"
+        ]
+        MOV     r0, #Mode_Serving
+        ST      r0, Mode
+        BL      UnSetImHereCallBack
+        MOVVC   r0, #0
+        STRVC   r0, FileServedLength
+        MOVVC   r0, #NetFS_StartBroadcastSave
+        LDRVC   r1, FileLength
+        BLVC    DoUpCall
+        BVS     ErrorInServer
+        ;       Start broadcasting the data
+        MOV     r0, #:NOT: BooleanFalse
+        ST      r0, BroadcastingData
+
+WaitTillTxd     ROUT
+        BL      ReadEscapeState                         ; Allow CallBacks, ignore result
+        ADR     r10, TxControlHandles                   ; Added to fix "lost granted" bug, doesn't seem to have any effect
+WaitTillTxdLoop
+        LDR     r0, [ r10 ], #Tx_RecordSize
+        TEQ     r0,#0
+        BNE     WaitTillTxd
+        ADR     r0, TxControlHandlesEnd
+        TEQ     r10, r0
+        BNE     WaitTillTxdLoop
+
+        PHPSEI  r10
+        BL      BroadcastDataNow                        ; Kick off the low level task
+        PLP     r10
+        BVS     ErrorInServerWait
+WaitTillBroadcasted                                     ; Wait until nobody wants me
+        BL      ReadEscapeState
+        [       Debug
+        BCC     %96
+        DLINE   "Escape has been pressed during ServerTime"
+96
+        ]
+        ADRCS   r0, ErrorEscape
+        [       UseMsgTrans
+        BLCS    MessageTransErrorLookup
+        BVS     ErrorInServerWait
+        |
+        BCS     ErrorInServerWait
+        ]
+        ADR     r0, ErrorBuffer                         ; Check for an error reported from the event code
+        LDR     r1, [ r0 ]                              ; See it has happened
+        TEQ     r1, #0                                  ; If it has this will be the error number
+        BNE     ErrorInServerWait
+
+        MOV     r0, #NetFS_PartBroadcastSave
+        LDR     r1, FileServedLength
+        BL      DoUpCall                                ; Adjust the %age
+        BVS     ErrorInServerWait
+        LD      r2, Mode
+        TEQ     r2, #Mode_Served                        ; State changes when complete
+        BNE     WaitTillBroadcasted
+        MOV     r0, #NetFS_FinishBroadcastSave
+        BL      DoUpCall
+        BVS     ErrorInServer
+        B       FileLoadEnd                             ; There wasn't one so exit OK
+
+ErrorInServerWait ROUT
+        MOV     r1, r0
+        MOV     r0, #NetFS_FinishBroadcastSave          ; Turn off the hourglass
+        BL      DoUpCall
+        MOV     r0, r1
+ErrorInServer
+        Push    r0
+        ADR     r0, RxControlHandle1                    ; Stop paying any attention to the clients
+        BL      AbandonReceive
+        ADR     r0, RxControlHandle2
+        BL      AbandonReceive                          ; Ignoring errors
+        MOV     r0, #Type_Error                         ; Transmit to clients I've bogged off
+        MOV     r1, #Port_BroadcastControl
+        BL      SetAllBroadcastRegs
+        SWI     XEconet_DoTransmit                      ; Returns when done, ignore errors
+        B       ErrorInFileR0
+
+SetAllBroadcastRegs
+        MOV     r4, #0
+        MOV     r5, #0                                  ; Send no data
+SetBroadcastRegs
+        MOV     r2, #&FF
+        MOV     r3, #&FD                                ; Local broadcast
+SetBroadcastRetries
+        MOV     r6, #Econet_BroadcastCount
+        MOV     r7, #Econet_BroadcastDelay
+        MOV     pc, lr
+
+        [       False
+RetainError
+        Push    "r0-r1, lr"
+        ADR     r1, ErrorBuffer                         ; See if it is already there
+        TEQ     r0, r1
+        BEQ     ExitRetainError
+        LDR     r14, [ r1 ]                             ; See if there is already an error
+        TEQ     r14, #0                                 ; By checking the error number
+        BNE     ExitRetainError                         ; If there is then leave it be
+        LDR     r14, [ r0 ], #4                         ; Get the error number (word)
+        STR     r14, [ r1 ], #4                         ; Transfer the error number
+RetainErrorLoop
+        LDRB    r14, [ r0 ], #1                         ; Get the error string (byte)
+        STRB    r14, [ r1 ], #1
+        TEQ     r14, #0                                 ; Check for the terminator
+        BNE     RetainErrorLoop                         ; AFTER copying it
+ExitRetainError
+        Pull    "r0-r1, pc",,^
+        ]
+
+Wait    ROUT    ; Wait time in centi-seconds in R0, not preserved
+        Push    "r1, lr"
+        MOV     r1, r0                                  ; The wait time
+        SWI     XOS_ReadMonotonicTime
+        Pull    "r1, pc", VS                            ; Exit if error, not likely
+        ADD     r1, r1, r0                              ; The end of the wait
+WaitLoop
+        MOV     r0, #&1000                              ; A smallish loop so we don't call
+InnerWaitLoop
+        DECS    r0                                      ; the SWI too much
+        BNE     InnerWaitLoop
+        SWI     XOS_ReadMonotonicTime
+        Pull    "r1, pc", VS                            ; Exit if error, not likely
+        CMP     r0, r1                                  ; Have we run out of time?
+        BLT     WaitLoop                                ; No, wait some more
+        Pull    "r1, pc"                                ; Yes, exit destroying R0
+
+OpenControlServerRx ROUT
+        ;       Entry conditions
+        ;       R8 ==> Pointer to Handle, followed by Buffer
+        MOV     r1, #&FF                                ; Receive from anybody
+        MOV     r2, #&FF
+        ;       Note the fall through
+OpenControlClientRx
+        ;       Entry conditions
+        ;       R1 ==> Station
+        ;       R2 ==> Network
+        ;       R8 ==> Pointer to Handle, followed by Buffer
+        Push    lr
+        MOV     r0, #Port_BroadcastControl
+        ADD     r3, r8, #4                              ; Buffer follows the handle
+        MOV     r4, #?RxControlBuffer1
+        BL      OpenRx
+        Pull    pc
+
+OpenDataRx
+        ;       Entry conditions
+        ;       R8 ==> Receive Handle Address
+        ;       R9 ==> Receive Buffer Address
+        MOV     r0, #Port_BroadcastData
+        LDRB    r1, ServerStation                       ; Open Data RxCBs to listen to the server
+        MOV     r2, #0                                  ; Must be the local network
+        MOV     r3, r9
+        MOV     r4, #?RxDataBuffer1
+OpenRx
+        Push    "r10, lr"
+        PHPSEI  r10                                     ; Disable Irq !
+        [       Debug      
+        BREG    r2, "Open Rx for station &", cc
+        BREG    r1, ".&", cc
+        BREG    r0, "; on port &", cc
+        DREG    r8, "; Handle @ &"
+        ]
+        LDR     r14, [ r8 ]
+        CMP     r14, #0                                 ; Clears V
+        [       Debug
+        BEQ     %91
+        DREG    r14, "Overwriting handle &"
+91
+        ]
+        ADRNEL  r0, ErrorFatalInternal
+        [       UseMsgTrans
+        BLNE    MessageTransErrorLookup
+        |
+        SETV    NE
+        ]
+        SWIVC   XEconet_CreateReceive
+        STRVC   r0, [ r8 ]                              ; Store successful result
+        [       False ; Debug
+        DREG    psr, "PSR = &"
+        BVC     %92
+        INC     r0, 4
+        DSTRING r0, "XEconet_CreateReceive returns an error: "
+        DEC     r0, 4
+        SETV
+        B       %93
+92
+        DREG    r0, "XEconet_CreateReceive returns &"
+93
+        ]
+        PLP     r10                                     ; Restore Irq state, V is preserved
+        Pull    "r10, pc"
+
+TxBroadcastControl ROUT
+        MOV     r1, #Port_BroadcastControl
+        MOV     r2, #&FF
+        MOV     r3, #&FD                                ; Use local broadcast
+        ADR     r4, TxControlBuffer
+Tx
+        Push    lr                                      ; Including IFlag state
+        BL      SetBroadcastRetries
+        MOV     lr, #IFlag
+        ORR     lr, lr, pc
+        TEQP    lr, #0                                  ; Disable Irq !
+        Push    r0                                      ; The Type_xx byte
+        SWI     XEconet_StartTransmit
+        Pull    r5
+        BVS     TxError
+        ADR     r7, TxControlHandles                    ; Base of the table
+TxHandleLoop
+        LDR     r6, [ r7 ], #Tx_RecordSize              ; Get the current value
+        TEQ     r6, #0                                  ; Is it empty?
+        STREQ   r0, [ r7, #-Tx_RecordSize + Tx_Handle ] ; Yes, so use it
+        STREQB  r3, [ r7, #-Tx_RecordSize + Tx_Station ]
+        STREQB  r4, [ r7, #-Tx_RecordSize + Tx_Network ]
+        STREQB  r5, [ r7, #-Tx_RecordSize + Tx_Type ]
+        [       Debug
+        BNE     %91
+        DEC     r7, Tx_RecordSize
+        DREG    r7, "TxControlHandle is at &"
+        INC     r7, Tx_RecordSize
+91
+        ]
+        Pull    pc, EQ , ^                              ; and return
+        ADR     r6, TxControlHandlesEnd                 ; No, get the end of the table
+        TEQ     r7, r6                                  ; Are we there yet?
+        BNE     TxHandleLoop                            ; No, so try the next handle
+        SWI     XEconet_AbandonTransmit                 ; Throw this one away
+        ADR     Error, ErrorFatalInternal               ; If no spare handle, note fall through 
+        [       UseMsgTrans
+        BL      MessageTransErrorLookup
+        ]
+TxError
+        [       Debug
+        INC     r0, 4
+        DSTRING r0, "Tx error: "
+        DEC     r0, 4
+        ]
+        Pull    lr                                      ; With the state of IFlag
+        ORR     lr, lr, #VFlag                          ; Include the error
+        MOVS    pc, lr                                  ; and return, setting PSR from LR
+
+ErrorFatalInternal
+        DCD     0
+        [       UseMsgTrans
+        DCB     "Fatal", 0
+        |
+        DCB     "Fatal internal error", 0
+        ]
+        ALIGN
+
+AbandonReceive  ROUT                                    ; This routine calls Econet_AbandonReceive
+        ;       R0 is a pointer to the receive handle, and is preserved
+        Push    "r0-r2, lr"
+        [       Debug
+        DREG    r0, "Abandoning receive handle @ &"
+        ]
+        MOV     r1, #0                                  ; Get ready to zero the handle
+        PHPSEI                                          ; Disable interupts so the handle op. is atomic
+        LDR     r2, [ r0 ]                              ; Get the handle
+        STR     r1, [ r0 ]                              ; Now zero it
+        PLP                                             ; Restore the interrupt state
+        MOVS    r0, r2                                  ; Test the handle, is it already zero?
+        BEQ     NoAbandon                               ; Yes, so exit without a fuss
+        SWI     XEconet_AbandonReceive
+        B       Abandoned
+
+StartTransmit                                           ; This routine calls Econet_StartTransmit
+        ;       R8 is a pointer to the handle
+        Push    "r9, lr"
+        PHPSEI  r9
+        LDR     r14, [ r8 ]                             ; Check that the handle is already empty
+        TEQ     r14, #0
+        BNE     StartIsFatal
+        SWI     XEconet_StartTransmit
+        [       Debug
+        DREG    r0, "Start transmit on handle &", cc
+        DREG    r8, " stored at &"
+        ]
+        STRVC   r0, [ r8 ]
+ExitStartTransmit
+        PLP     r9
+        Pull    "r9, pc"
+
+StartIsFatal
+        ADR     Error, ErrorFatalInternal
+        PLP     r9
+        [       UseMsgTrans
+        BL      MessageTransErrorLookup
+        |
+        SETV
+        ]
+        Pull    "r9, pc"
+
+AbandonTransmit                                         ; This routine calls Econet_AbandonTransmit
+        ;       R0 is a pointer to the TxRecord, and is preserved
+        Push    "r0-r2, lr"
+        MOV     r1, #0                                  ; Get ready to zero the handle
+        PHPSEI                                          ; Disable interupts so the handle op. is atomic
+        LDR     r2, [ r0, #Tx_Handle ]                  ; Get the handle
+        STR     r1, [ r0, #Tx_Handle ]                  ; Now zero it
+        LDR     r1, [ r0, #Tx_Station ]                 ; Pick up Station, Network and Type
+        PLP                                             ; Restore the interrupt state
+        [       Debug
+        DREG    r0, "Abandoning the transmit handle at &", cc
+        DREG    r2, ", handle is &"
+        ]
+        MOVS    r0, r2                                  ; Test the handle, is it already zero?
+        BEQ     NoAbandon                               ; Yes, so exit without a fuss
+        SWI     XEconet_AbandonTransmit
+        BVS     Abandoned
+        TEQ     r0, #Status_Transmitted
+        BEQ     Abandoned
+        Push    "r3, r4"
+        AND     r3, r1, #&FF                            ; Station number only
+        AND     r4, r1, #&FF00                          ; Network number only
+        ASR     r4, 8
+        ADR     r1, ErrorBuffer
+        MOV     r2, #?ErrorBuffer
+        SWI     XEconet_ConvertStatusToError
+        Pull    "r3, r4"
+        [       Debug
+        INC     r0, 4
+        DSTRING r0, "AbandonTransmit error: "
+        DEC     r0, 4
+        ]
+Abandoned
+        STRVS   r0, [ sp ]                              ; Poke errors into the stack
+        B       ExitAbandon
+
+NoAbandon
+        CLRV                                            ; Return without error
+ExitAbandon
+        Pull    "r0-r2, pc"
+
+ConnectedTotal                                          ; Count and return in R0
+        ROUT
+        Push    "r1, lr"
+        MOV     r0, #0                                  ; Initialise the output
+        ADR     r14, ClientTable
+10
+        LDR     r1, [ r14 ], #4
+20
+        LSR     r1, 1, S                                ; Get a bit into C
+        ADDCS   r0, r0, #1                              ; If it was set then that's one more client
+        BNE     %20                                     ; Loop until there are no more bits set
+        ADR     r1, ClientTable+?ClientTable            ; End of the table yet?
+        TEQ     r14, r1
+        BNE     %10                                     ; No, so get more data
+        Pull    "r1, pc"
+
+DoUpCall
+        Push    "r9, lr"
+        MOV     r9, #EconetV
+        SWI     XOS_CallAVector
+        Pull    "r9, pc"
+
+ReadEscapeState                                         ; Allows CallBacks to happen
+        Push    "r0, lr"                                ; Keep the mode and interrupt state
+        LDR     r0, [ sp, #4 ]                          ; Get the entry flags
+        TEQP    psr, #0                                 ; Enable all interrupts and go to user mode
+        NOP
+        SWI     XOS_ReadEscapeState                     ; Doesn't enable IRQ, ignore the error
+        CLC     VS
+        ORRCS   r0, r0, #CFlag                          ; Adjust them to match the escape state
+        BICCC   r0, r0, #CFlag
+        SWI     XOS_EnterOS                             ; Get back to SVC mode, ignore error
+        STR     r0, [ sp, #4 ]                          ; Restore as return flags
+        Pull    "r0, pc",,^                             ; Restore interrupts and mode (might be IRQ)
+
+        END

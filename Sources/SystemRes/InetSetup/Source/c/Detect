@@ -1,0 +1,172 @@
+/* File:    detect.c
+ * Purpose: Detection of installed expansion cards and the CMOS IP address
+ * Author:  K Bracey
+ * History: 07-Nov-06: KJB: fixed for different cards with same driver
+ *                          removed use of podule_read_info for RISC OS 3.1
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "kernel.h"
+
+#include "osbyte.h"
+#include "podule.h"
+
+#include "ModUtils.h"
+#include "Load.h"
+#include "Main.h"
+
+static int count[10];
+
+static struct
+{
+    const int type;
+    const char *description;
+    const char *unit;
+    const char *modules;
+    int *const count;
+}
+known_types[] =
+{
+    { 0x0003, "et", "et", ":Ether1:4.00:Ether1", &count[0] },
+    { 0x0031, "ev", "ev", ":EtherV:0.00:EtherV", &count[1] },
+    { 0x0061, "en", "en", ":Ether2:3.55:Ether2", &count[2] },
+    { 0x00A4, "ea", "ea", ":Ether3:4.20:Ether3-16", &count[3] },
+    { 0x00C3, "er", "er", ":EtherR:2.00:EtherR", &count[4] },
+    { 0x00D4, "eh5", "eh", ":EtherH:4.06:EtherH16", &count[5] }, /* expansion card */
+    { 0x00E4, "eb", "eb", ":EtherB:4.20:EtherB", &count[6] },
+    { 0x00E8, "cte8", "ct", ":CTNetDrvr:0.00:CTNetDrvr", &count[7] },
+    { 0x00EC, "eh6", "eh", ":EtherH:4.06:EtherH16", &count[5] }, /* NIC */
+    { 0x00F4, "ctf4", "ct", ":CTNetDrvr:0.00:CTNetDrvr", &count[7] },
+    { 0x00F5, "ctf5", "ct", ":CTNetDrvr:0.00:CTNetDrvr", &count[7] },
+    { 0x011E, "eh6", "eh", ":EtherH:4.18:EtherH16", &count[5] }, /* NIC (Acorn) */
+    { 0xffff, "eo", "eo", ":EtherO:4.00:EtherO", &count[8] },
+    { 0xffff, "ea8", "ea", ":Ether3:4.20:Ether3-8", &count[9] },
+    { 0, 0 },
+};
+
+
+
+/* Address stored is CMOS108.CMOS109.CMOS110.CMOS0 */
+
+#define osbyte_CONFIGURE_IPADDRESS0 108
+#define osbyte_CONFIGURE_IPADDRESS1 109
+#define osbyte_CONFIGURE_IPADDRESS2 110
+#define osbyte_CONFIGURE_IPADDRESS3 osbyte_CONFIGURE_STATION
+
+static unsigned int ReadCMOSIP(void)
+{
+    unsigned int b0, b1, b2, b3;
+
+    b0=readCMOS(osbyte_CONFIGURE_IPADDRESS0);
+    b1=readCMOS(osbyte_CONFIGURE_IPADDRESS1);
+    b2=readCMOS(osbyte_CONFIGURE_IPADDRESS2);
+    b3=readCMOS(osbyte_CONFIGURE_IPADDRESS3);
+
+    if (b0==0 && b1==0 && b2==0)
+    {
+        if (b3==0)
+            return 0;
+        else
+            /* Call it 10.0.0.x, an IANA assigned private block */
+            return 10 | (b3 << 24);
+    }
+
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+os_error *ScanInterfaces(void)
+{
+    podule_section slot;
+    podule_header header;
+    int type, i;
+    char *p, *p2;
+    char buffer[256];
+
+    memset(count, 0, sizeof count);
+
+    for (slot = 0; slot <= 8; slot++)
+    {
+        if (xpodule_read_header(&header, slot))
+            continue;                             /* No card present */
+
+        if ((header.b[0] & 0x78) != 0)
+            continue;                             /* Simple ID only */
+
+        type = header.b[3] + (header.b[4] << 8);
+
+        for (i = 0; known_types[i].type; i++)
+            if (type == known_types[i].type)
+            {
+                char buffer[64];
+                char buffer2[64];
+                if (slot < 8)
+                {
+                    sprintf(buffer2, msgs_lookup("Slot"), slot);
+                    sprintf(buffer, "InetSetup$Driver$%s", buffer2);
+                }
+                else
+                    sprintf(buffer, "InetSetup$Driver$%s", msgs_lookup("NIC"));
+
+    	    	if (!getenv(buffer))
+    	    	{
+    	    	    sprintf(buffer2, "%s:%s%d%s", msgs_lookup(known_types[i].description),
+    	    	    	    	    	     	  known_types[i].unit,
+    	    	    	    	    	     	  (*known_types[i].count)++,
+    	    	    	    	    	     	  known_types[i].modules);
+                    _kernel_setenv(buffer, buffer2);
+                }
+                break;
+            }
+    }
+
+    if (RMLoaded("Econet"))
+    {
+        _kernel_setenv("InetSetup$Driver$Econet", "Econet:ec0:EconetA:0.00:EconetA");
+        HaveEconet = TRUE;
+    }
+
+    if (!getenv("InetSetup$Driver$Serial") && Exists("System:Modules.Network.Slip"))
+        _kernel_setenv("InetSetup$Driver$Serial", "SLIP:sl0:Slip:2.07:Slip:P");
+
+    CMOSIP=ReadCMOSIP();
+
+    /* Right, now to examine those variables, and any other ones that may have been
+       set */
+
+
+    p = 0;
+
+    for (;;)
+    {
+        int len;
+        if (xos_read_var_val("InetSetup$Driver$*", buffer, sizeof buffer, (int) p, 3,
+            	    	     &len, (int *) &p, 0))
+            break;
+
+        buffer[len]='\0';
+
+    	strcpy(interface_location[interfaces], p + sizeof "InetSetup$Driver$" - 1);
+    	for (p2 = interface_location[interfaces]; *p2; p2++)
+    	    if (*p2 == '_') *p2 = ' ';
+
+        strcpy(interface_name[interfaces], strtok(buffer, ":"));
+        strcpy(interface_unit[interfaces], strtok(0, ":"));
+        if ((p2 = strtok(0, ":")) != 0)
+        {
+            strcpy(interface_module[interfaces], p2);
+            interface_version[interfaces] = VersionToInt(strtok(0, ":"));
+            if ((p2 = strtok(0, ":")) != 0)
+            {
+            	strcpy(interface_filename[interfaces], p2);
+                if ((p2 = strtok(0, ":")) != 0)
+                    if (strchr(p2, 'P'))
+                        interface_is_pp[interfaces] = 1;
+            }
+        }
+        interfaces++;
+    }
+
+    return NULL;
+}

@@ -1,0 +1,344 @@
+/* > arhdr.c
+
+ * © SJ Middleton, 1994
+
+ * Routines for decoding an ARMovie file header.
+
+ * CHANGE LOG:
+ *  25/03/93:   fixed bug in freehdr, multiply freed the first soundtrack's chunks.
+ *              setting UnsignedSound now sets LinearSound also (as everything else assumed !). 
+ *  02/04/93:   ADPCM sound now is set to 4 bits if it isn't already.
+ *  05/04/93:   new field nframes if not read from header then calculated.
+ *              (even|odd)_chunksize now int.
+ *  04/11/93:   nframe in header not adopted so now just calculated - accurate figure can be got from arinfo().bpp and last chunksize
+ *  07/12/93:   lift maximum number of soundtracks and shrink hdr->sound after reading tracks in (possibly to zero).
+ *  10/12/93:   use strtoul rather than atoi. Implement sound format 2. Reorganised header reading slightly.
+ *  13/12/93:   added seekable flag when ADPCM detected.
+ *  23/01/94:   read sndmul from Info file, changed rate to double.
+ *              fillin leafname[] field for type 1 audio. 
+ *  08/02/94:   fix it so that it will say nsoundtracks == 0 now (it would always have given at least 1 before).
+ *  21/02/94:   added scanhdrto and readhdrto fns for use by AREncode.
+ */
+
+#include "msgs.h"
+#include "werr.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "armovie.h"
+#include "arline.h"
+#include "utils.h"
+#include "arutils.h"
+
+/* ---------------------------------------------------------------------------------------- */
+
+#define UNKNOWN_VIDEO_FORMAT    msgs_lookup("arhdr0:Unknown video format (%i).")
+#define LOADING_HDR             msgs_lookup("arhdr4:loading movie header.")
+#define NOT_MOVIE_FILE          msgs_lookup("arhdr7:Not a movie file.")
+#define LOADING_SOUNDSTR        msgs_lookup("arhdr8:loading sound structure")
+#define TRACK_TOO_LARGE         msgs_lookup("arhdr9:Too many soundtracks in movie (%i).")
+
+#define NLINES_IN_HEADER    21
+#define ARMOVIE_IDENT       "ARMOVIE"
+#define REVERSED_IDENT      "REVER"
+#define LINEAR_IDENT        "LIN"
+#define UNSIGNED_IDENT      "UNSIGN"
+#define ADPCM_IDENT         "ADPCM"
+#define YUV_IDENT           "YUV"
+#define PALETTE_IDENT       "PALETTE"
+
+static int max_tracks;
+
+static BOOL decode_soundline(armovie_hdr *hdr, int line, char *s)
+{
+    char *p = strtok(s, "|");
+
+    do
+    {
+        armovie_soundstr    *sp;
+        int     track = p == s ? 1 : (int) strtoul(p, &p, 10);
+
+/* allocate track structure in multiples of 8 to cut down on heap frag */
+        if (track >= max_tracks)
+        {
+            max_tracks += 8;
+            if ((hdr->sound = realloc(hdr->sound, max_tracks * sizeof(armovie_soundstr))) == NULL)
+            {
+                oom_err(LOADING_SOUNDSTR, max_tracks * sizeof(armovie_soundstr));
+                return FALSE;
+            }
+            memset(&hdr->sound[max_tracks-8], 0, 8*sizeof(armovie_soundstr));
+        }
+
+/* update number of soundtracks */
+        if (hdr->nsoundtracks < track)
+            hdr->nsoundtracks = track;
+
+        sp = &hdr->sound[track-1];
+
+        switch (line)
+        {
+            case arline_SoundType:
+                sp->format = (int) strtoul(p, &p, 10);
+                if (sp->format == replay_IndirectAudio)
+                {
+                    int i = 0;
+                    while (*p && isspace(*p))
+                        p++;
+                    while (*p && !isspace(*p) && i < sizeof(sp->filename)-1)
+                        sp->filename[i++] = *p++;
+                    sp->filename[i] = '\0';
+
+                    {
+                        arsnd_info info;
+                        arsnd_readinfo(sp->filename, &info, FALSE);
+                        if (info.flags & arsnd_Seekable)
+                            sp->sflags |= armovie_Seekable;
+                        sp->sndmul = (char)info.nbits;
+                    }
+                }
+                break;
+
+            case arline_SoundRate:
+                sp->rate = strtod(p, NULL);
+                break;
+
+            case arline_SoundChannels:
+                sp->channels = (int) strtoul(p, &p, 10);
+                if (strstr(strupr(p), REVERSED_IDENT))
+                    sp->sflags |= armovie_ReversedStereo;
+                break;
+
+            case arline_SoundPrecision:
+                sp->precision = (int) strtoul(p, &p, 10);
+                if (sp->format == replay_StandardAudio)
+                {
+                    int ch;
+                    strupr(p);
+                    if (sp->precision == 4 || strstr(p, ADPCM_IDENT))
+                    {
+                        ch = 'A';
+                        sp->sndmul = 16;
+                    }
+                    else
+                    {
+                        sp->sflags |= armovie_Seekable;
+                        sp->sndmul = sp->precision;
+                        if (sp->precision == 16 || strstr(p, LINEAR_IDENT) != NULL)
+                            ch = strstr(p, UNSIGNED_IDENT) ? 'U' : 'S';
+                        else
+                            ch = 'E';
+                    }
+                    sprintf(sp->filename, "Sound%c%d", ch, sp->precision);
+                }
+                break;
+        }
+    }
+    while ((p = strtok(NULL, "|")) != NULL);
+
+    return TRUE;
+}
+
+static void strip_spaces(char *buffer)
+{
+    int len = strlen(buffer);
+    while (len > 0)
+    {
+        int c = buffer[--len];
+        if (c <= ' ')
+            buffer[len] = '\0';
+        else
+            break;
+    }
+}
+
+/*
+ * load and decode the movie header
+ */
+
+armovie_hdr *armovie_scanhdrto(unsigned f, int line)
+{
+    armovie_hdr *hdr = calloc(sizeof(armovie_hdr), 1);
+    if (hdr)
+    {
+        int i;
+        char buffer[256];
+
+        file_setpos(f, 0);
+
+/* initialise size of track structure */
+        max_tracks = 0;
+
+        for (i = 0; i <= line; i++)
+        {
+            char *ptr;
+            int  val, pos;
+
+            if (os_err(file_getpos(f, &pos)) != NULL ||
+                os_err(file_readlinebuffer(f, buffer, sizeof(buffer))) != NULL)
+            {
+                free(hdr->sound);
+                free(hdr);
+                return NULL;
+            }
+
+            val = (int) strtoul(buffer, NULL, 10);
+
+            switch (i)
+            {
+                case arline_Ident:
+                    if (strncmp(strupr(buffer), ARMOVIE_IDENT, sizeof(ARMOVIE_IDENT)-1) != 0)
+                    {
+                        werr(0, NOT_MOVIE_FILE);
+                        free(hdr->sound);
+                        free(hdr);
+                        return NULL;
+                    }
+                    break;
+
+                case arline_Name:
+                    strip_spaces(buffer);
+                    hdr->name = strdup(buffer);
+                    break;
+                case arline_Date:
+                    strip_spaces(buffer);
+                    hdr->date = strdup(buffer);
+                    break;
+                case arline_Author:
+                    strip_spaces(buffer);
+                    hdr->author = strdup(buffer);
+                    break;
+
+                case arline_VideoType:
+                    hdr->video_format = val;
+                    break;
+                case arline_XSize:
+                    hdr->xsize = val;
+                    break;
+                case arline_YSize:
+                    hdr->ysize = val;
+                    break;
+                case arline_PixelDepth:
+                    hdr->bpp = val;
+                    strupr(buffer);
+                    if ((ptr = strstr(buffer, PALETTE_IDENT)) != NULL)
+                    {
+                        hdr->palette_offset = (int)strtoul(ptr + sizeof(PALETTE_IDENT)-1, NULL, 10);
+                        hdr->flags |= colourspace_Palette;
+                    }
+                    else if (strstr(buffer, YUV_IDENT))
+                        hdr->flags |= colourspace_YUV;
+                    else if (hdr->bpp == 8 && (hdr->flags & armovie_ColourSpace) == 0)
+                        hdr->flags |= colourspace_Grey;
+                    break;
+
+                case arline_FrameRate:
+                    hdr->fps = strtod(buffer, NULL);
+                    break;
+
+                case arline_SoundType:
+                case arline_SoundRate:
+                case arline_SoundChannels:
+                case arline_SoundPrecision:
+                    if (!decode_soundline(hdr, i, buffer))
+                    {
+                        free(hdr->sound);
+                        free(hdr);
+                        return NULL;
+                    }
+                    break;
+
+                case arline_FramesPerChunk:
+                    hdr->frames_per_chunk = val;
+                    break;
+                case arline_NChunks:
+                    hdr->nchunks = val + 1;
+                    hdr->nframes = hdr->nchunks*hdr->frames_per_chunk;
+                    break;
+                case arline_EvenChunkSize:
+                    hdr->even_chunksize = val;
+                    break;
+                case arline_OddChunkSize:
+                    hdr->odd_chunksize = val;
+                    break;
+
+                case arline_CatalogueOffset:
+                    hdr->catalogue_offset = val;
+                    break;
+                case arline_SpriteOffset:
+                    hdr->sprite_offset = val;
+                    break;
+                case arline_SpriteSize:
+                    hdr->sprite_size = val;
+                    break;
+                case arline_KeyFrameOffset:
+                    if (pos <= hdr->sprite_offset && pos <= hdr->catalogue_offset)
+                        hdr->key_frame_offset = val;
+                    break;
+            }
+        }
+
+        if (hdr->key_frame_offset == 0)
+            hdr->key_frame_offset = -1;
+
+/* shrink size of track structure down as much as poss */
+        if (hdr->nsoundtracks == 1 && hdr->sound->format == 0)
+        {
+            hdr->nsoundtracks = 0;
+            free(hdr->sound);
+            hdr->sound = NULL;
+        }
+        else
+            hdr->sound = realloc(hdr->sound, hdr->nsoundtracks*sizeof(armovie_soundstr));
+    }
+    else
+        oom_err(LOADING_HDR, sizeof(armovie_hdr));
+
+    return hdr;
+}
+
+armovie_hdr *armovie_readhdrto(const char *filename, int line)
+{
+    armovie_hdr *hdr = NULL;
+    unsigned    f;
+
+    if (os_err(file_open(fopt_Read, filename, &f)) == NULL)
+    {
+        hdr = armovie_scanhdrto(f, line);
+        file_close(f);
+    }
+
+    return hdr;
+}
+
+armovie_hdr *armovie_scanhdr(unsigned f)
+{
+    return armovie_scanhdrto(f, arline_KeyFrameOffset);
+}
+
+armovie_hdr *armovie_readhdr(const char *filename)
+{
+    return armovie_readhdrto(filename, arline_KeyFrameOffset);
+}
+
+void armovie_freehdr(armovie_hdr *hdr)
+{
+    if (hdr)
+    {
+        free(hdr->name);
+        free(hdr->date);
+        free(hdr->author);
+
+        free(hdr->palette_data);
+
+        armovie_disposecataloguememory(hdr);
+        free(hdr->sound);
+
+        free(hdr);
+    }
+}
+
+/* eof arhdr.c */

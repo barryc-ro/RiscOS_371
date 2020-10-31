@@ -1,0 +1,396 @@
+/* > saveas.c
+
+ * © SJ Middleton, 1993
+
+ * CHANGE LOG:
+ *  28/04/93:   fixed bug with changefiletype, didn't change stored type (tfiletype).
+
+ */
+
+#include "dboxes.h"
+#include "fileicon.h"
+#include "help.h"
+#include "macros.h"
+#include "msgs.h"
+#include "xfersend.h"
+#include "visdelay.h"
+#include "werr.h"
+#include "wimpx.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "strfn.h"
+
+#include "saveas.h"
+
+#define SAVEAS_IDENT    "xfersend"
+
+#define DRAG_TO_DIR     msgs_lookup("Esaveas1:You must give a location to which to save the data. Drag icon to a directory display.")
+#define SELECTION       msgs_lookup("selection:Selection")
+
+struct saveas_box
+{
+    dbox    d;
+
+    int     filetype;
+    char    *filename;
+    int     estsize;
+
+    xfersend_saveproc   saveproc;
+    xfersend_sendproc   sendproc;
+    xfersend_printproc  printproc;
+
+    void    *handle;
+};
+
+static saveas_box   saveas_s = NULL;        /* for popup saveas() */
+static BOOL         saveas__showstatic = FALSE,
+                    saveas__fadeselection = FALSE;
+
+/* --------------------------------------------------------------------------------- */
+
+/* Auto-selection functions */
+
+/*
+ * Setup icons according to the state of the flags
+ */
+
+void dboxautoicons_init(dbox d, saveas_icons icons[], int flags)
+{
+    if (icons)
+    {
+        saveas_icons *sp;
+        for (sp = icons; sp->icon_number != -1; sp++)
+            dbox_setnumeric(d, sp->icon_number, (flags & sp->bit_mask) == sp->bit_value);
+            
+        for (sp = icons; sp->icon_number != -1; sp++)
+            if (sp->dependant_on == -2 || (sp->dependant_on >= 0 && !dbox_getnumeric(d, sp->dependant_on)))
+                dbox_fadefield(d, sp->icon_number);
+    }
+}
+
+/*
+ * Handle a click on one of the flag icons
+ * Returns TRUE if the state of the flags has changed.
+ */
+
+BOOL dboxautoicons_processaction(dbox d, dbox_field action, saveas_icons icons[], int *ptflags)
+{
+    BOOL changed = FALSE;
+    if (icons)
+    {
+        saveas_icons    *sp;
+        int tflags = *ptflags;
+        int set = dbox_getnumeric(d, action);
+        for (sp = icons; sp->icon_number != -1; sp++)
+        {
+            if (sp->icon_number == action)
+                tflags = (tflags &~ sp->bit_mask) | (set*sp->bit_value);
+
+            if (sp->dependant_on == action)
+                dbox_fadestate(d, sp->icon_number, !set);
+        }
+        changed = *ptflags != tflags;
+        *ptflags = tflags;
+    }
+    return changed;
+}
+
+/* --------------------------------------------------------------------------------- */
+
+/*
+ * Handle a raw event click on the saveas window
+ * Returns TRUE if handled
+ */
+
+BOOL saveas_processrawevents(dbox d, wimp_eventstr *e, saveas_box s)
+{
+    switch (e->e)
+    {
+        case wimp_EBUT:
+            if (e->data.but.m.bbits == wimp_BDRAGLEFT &&
+                e->data.but.m.i == saveas_SPRITE_FIELD)
+            {
+                dbox_getxfield(s->d, saveas_NAME_FIELD, &s->filename);
+
+                xfersend_close_on_xfer(TRUE, dbox_syshandle(s->d));
+                xfersend(s->filetype, s->filename, s->estsize,
+                    s->saveproc, s->sendproc, s->printproc,
+                    e, s->handle);
+
+                return TRUE;
+            }
+            break;
+    }
+    return FALSE;
+    UNUSED(d);
+}
+
+/*
+ * Handle an event click on the saveas window
+ * Returns TRUE if handled
+ */
+
+BOOL saveas_processevents(dbox d, dbox_field action, saveas_box s, BOOL *pclose)
+{
+    BOOL close = FALSE, handled = TRUE;
+    switch (action)
+    {
+        case saveas_SAVE_FIELD:
+            dbox_getxfield(d, saveas_NAME_FIELD, &s->filename);
+            if (strchr(s->filename, '.') == NULL)
+                werr(0, DRAG_TO_DIR);
+            else
+            {
+                xfersend_set_fileissafe(TRUE);
+                close = s->saveproc(s->filename, s->handle) &&
+                        !dbox_persist();
+            }
+            break;
+
+        case saveas_CANCEL_FIELD:
+            if (dbox_persist())
+                dbox_setfield(d, saveas_NAME_FIELD, s->filename);
+            else
+                close = TRUE;
+            break;
+
+        case saveas_SELECTION_FIELD:
+            if (dbox_getnumeric(d, saveas_SELECTION_FIELD))
+                dbox_setfield(d, saveas_NAME_FIELD, SELECTION);
+            else
+                dbox_setfield(d, saveas_NAME_FIELD, s->filename);
+            break;
+
+        case dbox_CLOSE:
+            close = TRUE;
+            break;
+
+        default:
+            handled = FALSE;
+            break;
+    }
+
+    if (pclose)
+        *pclose = close;
+
+    return handled;
+}
+
+/*
+ * Dispose of saveas window
+ */
+
+void saveas_dispose(saveas_box *ps)
+{
+    saveas_box s = *ps;
+    if (s)
+    {
+        if (s->d)
+            dbox_dispose(&s->d);
+
+        free(s->filename);
+        free(s);
+        *ps = NULL;
+    }
+}
+
+saveas_box saveas_new(const char *ident, int filetype, char *leafname, int estsize,
+        xfersend_saveproc saveproc, xfersend_sendproc sendproc, xfersend_printproc printproc, 
+        void *handle)
+{
+    saveas_box s;
+    if ((s = calloc(sizeof(struct saveas_box), 1)) == NULL)
+        return NULL;
+
+    if ((s->d = dbox_new((char *)ident)) == NULL)
+    {
+        saveas_dispose(&s);
+        return NULL;
+    }
+
+    s->estsize = estsize;
+    s->filetype = filetype;
+    s->filename = strdup(leafname);
+
+    s->saveproc = saveproc;
+    s->sendproc = sendproc;
+    s->printproc = printproc;
+    s->handle = handle;
+
+    dbox_setnumeric(s->d, saveas_SELECTION_FIELD, FALSE);
+    dbox_setfield(s->d, saveas_NAME_FIELD, s->filename);
+    if (filetype != -1)
+        fileicon(dbox_syshandle(s->d), saveas_SPRITE_FIELD, filetype);
+
+    return s;
+}
+
+void *saveas_syshandle(saveas_box s)
+{
+    return s ? s->d : NULL;
+}
+
+BOOL saveas_selectionstate(saveas_box s)
+{
+    if (s == NULL)
+        s = saveas_s;
+    if (s && s->d)
+        return dbox_getnumeric(s->d, saveas_SELECTION_FIELD);
+    return FALSE;
+}
+
+/* old-style stuff */
+
+static void open_saveas(saveas_box s)
+{
+    if (saveas__showstatic)
+    {
+        dbox_showstatic(s->d);
+        saveas__showstatic = FALSE;
+    }
+    else
+        dbox_show(s->d);
+
+    if (saveas__fadeselection)
+    {
+        dbox_fadefield(s->d, saveas_SELECTION_FIELD);
+        saveas__fadeselection = FALSE;
+    }
+}
+
+BOOL saveas_defaultrawevents(dbox d, void *event, void *handle)
+{
+    saveas_box s = handle;
+    return saveas_processrawevents(d, event, s);
+}
+
+void saveas_defaultevents(dbox d, void *handle)
+{
+    saveas_box  s = handle;
+    BOOL        close = FALSE;
+    saveas_processevents(d, dbox_get(d), s, &close);
+    if (close)
+        saveas_dispose(&s);
+}
+
+BOOL saveas_extended(const char *ident, int filetype, char *leafname, int estsize,
+        xfersend_saveproc saveproc, xfersend_sendproc sendproc, xfersend_printproc printproc, 
+        saveas_icons icons[], int in_flags, saveas_notify fn,
+        void *handle)
+{
+    saveas_box s;
+    saveas_dispose(&saveas_s);
+    if ((s = saveas_new(ident, filetype, leafname, estsize, saveproc, sendproc, printproc, handle)) != NULL)
+    {
+        BOOL close;
+        int flags = in_flags;
+
+        saveas_s = s;
+
+        open_saveas(s);
+
+        dbox_raw_eventhandler(s->d, saveas_defaultrawevents, s);
+        dboxautoicons_init(s->d, icons, flags);
+
+        do
+        {
+            dbox_field action = dbox_fillin(s->d);
+
+            if (action == saveas_CANCEL_FIELD)
+            {
+                flags = in_flags;
+                dboxautoicons_init(s->d, icons, flags);
+            }
+            else
+                dboxautoicons_processaction(s->d, action, icons, &flags);
+
+            if (fn)
+                s->estsize = fn(flags, s->handle);
+
+            saveas_processevents(s->d, action, s, &close);
+        }
+        while (!close);
+
+        saveas_dispose(&saveas_s);
+    }
+    return TRUE;
+}
+
+BOOL saveas(int filetype, char *leafname, int estsize,
+        xfersend_saveproc saveproc, xfersend_sendproc sendproc, xfersend_printproc printproc,
+        void *handle)
+{
+    saveas_box s;
+    saveas_dispose(&saveas_s);
+    if ((s = saveas_new(SAVEAS_IDENT, filetype, leafname, estsize, saveproc, sendproc, printproc, handle)) != NULL)
+    {
+        BOOL close;
+
+        saveas_s = s;
+
+        open_saveas(s);
+
+        dbox_raw_eventhandler(s->d, saveas_defaultrawevents, s);
+
+        do
+        {
+            dbox_field action = dbox_fillin(s->d);
+            saveas_processevents(s->d, action, s, &close);
+        }
+        while (!close);
+
+        saveas_dispose(&saveas_s);
+    }
+    return TRUE;
+}
+
+void saveas_setstatic(BOOL showstatic)
+{
+    saveas__showstatic = showstatic;
+}
+
+void saveas_fadeselection(void)
+{
+    saveas__fadeselection = TRUE;
+}
+
+void saveas_seticon(const char *spritename)
+{
+    saveas_box s = saveas_s;
+    if (s)
+    {
+        fileicon(dbox_syshandle(s->d), saveas_SPRITE_FIELD, (int)spritename);
+        no_err(wimp_set_icon_state(dbox_syshandle(s->d), saveas_SPRITE_FIELD, 0, 0));
+    }
+}
+
+void saveas_changefiletype(int filetype)
+{
+    saveas_box s = saveas_s;
+    if (s)
+    {
+        saveas_seticon((const char *)filetype);
+        s->filetype = filetype;
+    }
+}
+
+void saveas_read_leafname_during_send(char *name, int length)
+{
+    saveas_box s = saveas_s;
+    if (s)
+    {
+        char *dot = strrchr(s->filename, '.');
+        if (dot)
+            dot++;
+        else
+            dot = s->filename;
+
+        strncpy(name, dot, length-1);
+        name[length-1] = '\0';
+    }
+}
+
+/* eof saveas.c */

@@ -1,0 +1,4212 @@
+/*-*-c-*- Title  : > c.type1
+ * Author : Neil Raine
+ * Purpose: Convert font outline files in Adobe Type 1 format
+ *          to RISC OS Font Manager Outlines files
+ */
+
+#define CHUNKSIZE 32
+
+#define DESIGNSIZE 1000
+
+/*
+ * page 41 of Black Book
+ */
+#define DEFAULT_FUZZ 1
+
+/* Define this to link grid scaffolds to blue zones.  If this
+ * is not defined then only arc scaffolds get linked.
+ */
+#define GRID_BLUES
+
+/* Define this to adjust grid-type overshoots by moving the scaffold
+ * line rather than by reparenting.  To use this, you must define GRID_BLUES.
+ */
+#define GRID_BLUES_MOVE
+
+/* Define this to flatten flex features to the midpoint
+ * position rather than the endpoint.  Doesn't seem to help
+ * much.
+ */
+#undef FLEX2
+
+/* Define this to match points within a stem, rather than just those
+ * on the boundary of the stem.
+ */
+#undef STEM_WITHIN
+
+/*
+ * Define this to output the font bounding box
+ */
+#define OUTPUTFONTBBOX
+
+/*
+ * Define this to prevent null characters being produced.  These appear to
+ * upset the font manager under certain circumstances.  Instead, produce
+ * empty zero-sized glyphs for non-existent characters, which is what FontEd
+ * seems to produce.
+ */
+#define NO_NULL_CHARS 1
+
+
+#include "h.main"
+#include "h.encoding"
+#include "h.metrics"
+#include "h.type1"
+#include "h.ctype"
+#include "h.remap"
+
+#include "h.os"                 /* For Draw_FlattenPath */
+#include "h.swis"
+#include "msgs.h"
+#include "werr.h"
+
+#define CHARDEBUG 0
+#define STEMDEBUG 0
+#define LOWDEBUG 0
+#define HIGHDEBUG 0
+
+/* Storage for segment data and Type-1 style stem hints */
+
+static OutlinePtr outlines = 0;        /* now allocated dynamically */
+                                       /* to a size of encchars */
+int outlineNumber;
+
+SegmentPtr segs, lastSeg, subpath;
+StemPtr stems, lastStem;
+
+int bbox_x1, bbox_y1, bbox_x2, bbox_y2;
+
+/* Storage for alignment zones */
+
+BluesRec topZones;
+BluesRec bottomZones;
+int baseIndex;                  /* index into bottomZones of baseline zone */
+                                /* UNKNOWN if we haven't seen it */
+static double matrix[6];
+
+
+/*---- type definitions ------------------------------------------------------- */
+
+
+typedef struct subrheader
+{
+    int offset;                        /* byte offset to next byte to write */
+    int size;                          /* size of block in total */
+} subrheader;
+
+
+typedef struct subrcode
+{
+    subrheader hdr;
+    char code[64];                     /* initial block has room for 64 bytes */
+} subrcode;
+
+
+typedef enum
+{
+    TOK_EOF,                           /* end of file */
+    TOK_BRACELEFT,                     /* { */
+    TOK_BRACERIGHT,                    /* } */
+    TOK_MARKLEFT,                      /* [ */
+    TOK_MARKRIGHT,                     /* ] */
+    TOK_STRING,                        /* (string) */
+    TOK_ID,                            /* /name */
+    TOK_NUMBER,                        /* decimal integer */
+    TOK_NAME,                          /* name */
+    TOK_RD,                            /* prefix to a list of commands */
+    TOK_COMMAND,                       /* inside subrs and charstrings */
+    TOK_ERROR                          /* unrecognised character in file */
+} toktype;
+
+typedef enum
+{
+  COM_HSTEM     = 1,
+  COM_VSTEM     = 3,
+  COM_VMOVETO   = 4,
+  COM_RLINETO   = 5,
+  COM_HLINETO   = 6,
+  COM_VLINETO   = 7,
+  COM_RRCURVETO = 8,
+  COM_CLOSEPATH = 9,
+  COM_CALLSUBR  = 10,
+  COM_RETURN    = 11,
+  COM_ESCAPE    = 12,
+  COM_HSBW      = 13,
+  COM_ENDCHAR   = 14,
+  COM_RMOVETO   = 21,
+  COM_HMOVETO   = 22,
+  COM_VHCURVETO = 30,
+  COM_HVCURVETO = 31,
+  COM_DOTSECTION= 32,
+  COM_VSTEM3    = 33,
+  COM_HSTEM3    = 34,
+  COM_SEAC      = 38,
+  COM_SBW       = 39,
+  COM_DIV       = 44,
+  COM_CALLOTHERSUBR = 48,
+  COM_POP       = 49,
+  COM_SETCURRENTPOINT = 65
+} com_number;
+
+
+typedef enum
+{
+  SUBR_FLEXBEGIN = 1,
+  SUBR_FLEXPOINT = 2,
+  SUBR_FLEXEND = 0,
+  SUBR_HINTREPLACE = 3
+} subrno;
+
+
+typedef struct tokstr
+{
+    toktype type;
+    union
+    {
+        int number;
+        char string[256];
+        int array[64];
+    } value;
+} tokstr;
+
+
+typedef struct CODEFILE
+{
+    FILE *file;                        /* for file access                   */
+    char *pointer;                     /* for RAM access                    */
+    int subr_bytecount;                /* nonzero if we're in a subr        */
+    int subr_R;                        /* decryption key for getbyte_subr() */
+    BOOL eexec;                        /* true if we're decoding an eexec   */
+    unsigned int eexec_R;              /* decrypting key for eexec          */
+    BOOL eexec_hex;                    /* true => hex digits follow eexec   */
+    int lenlV;                         /* random bytes in charstrings       */
+} CODEFILE;
+
+
+typedef struct
+{
+    int x0, y0, x1, y1;
+} wimp_box;
+
+
+/*---- variables ------------------------------------------------------- */
+
+
+static FILE *outfile;                  /* for OFputc() etc. */
+
+/*---- functions -------------------------------------------------------------- */
+
+
+static os_error *readtoken_number(CODEFILE * infile, int *n);
+os_error *readtoken(CODEFILE * infile, tokstr * token);
+os_error *readnumber(CODEFILE * infile, BOOL minus, int *result);
+os_error *readname(CODEFILE * infile, char *result, int buffsize);
+os_error *readstring(CODEFILE * infile, char *result, int buffsize);
+
+void repeatlast(CODEFILE * infile);
+int getbyte(CODEFILE * infile);
+int get4bytes(CODEFILE * infile);
+
+os_error *subr_start(CODEFILE * infile, int bytecount);
+int getbyte_subr(CODEFILE * infile);
+
+os_error *eexec_start(CODEFILE * infile);
+os_error *eexec_stop(CODEFILE * infile);
+int getbyte_eexec(CODEFILE * infile);
+
+int code_getc(CODEFILE * input);
+int code_eof(CODEFILE * input);
+int code_seek(CODEFILE * input, long offset, int origin);
+
+#if LOWDEBUG
+os_error *printtoken(tokstr * token);
+#endif
+#if LOWDEBUG || HIGHDEBUG || CHARDEBUG || STEMDEBUG || VERBOSE
+os_error *myprint(const char *format,...);
+#endif
+
+static BOOL isblank(int c)
+{
+     return (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+}
+static BOOL ishexdigit(int c)
+{
+     return ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+}
+static BOOL isnamefirstchar(int c)
+{
+     return (c == '|' || c == '-' || c == '.' || isalpha(c));
+}
+static BOOL isnamechar(int c)
+{
+     return (c == '|' || c == '.' || c == '-' || isalnum(c));
+}
+static int hexdigit(int c)
+{
+     c = toupper(c);
+    return ((c <= '9') ? (c - '0') : (c - 'A' + 10));
+}
+
+static os_error *executechar(int code, subrcode * s, subrcode ** subrsarray);
+static os_error *executesubr(subrcode * s, subrcode ** subrsarray);
+static os_error *readsubr(CODEFILE * infile, subrcode ** subrpointer);
+static os_error *storesubrbyte(char c, subrcode ** s);
+
+static char *debug_charname;
+
+os_error *com_callsubr(subrcode ** subrsarray, int subr);
+os_error *com_callothersubr(int subr, int args);
+os_error *subr_flexbegin(void);
+os_error *subr_flexpoint(int x, int y);
+os_error *subr_flexend(int height, int finalx, int finaly);
+os_error *subr_hintreplace(int subr);
+os_error *com_pop(void);
+
+os_error *com_hstem(int y, int dy);
+os_error *com_hstem3(int ymin, int dymin, int ymid, int dymid, int ymax, int dymax);
+os_error *com_vstem(int x, int dx);
+os_error *com_vstem3(int xmin, int dxmin, int xmid, int dxmid, int xmax, int dxmax);
+os_error *com_dotsection(void);
+
+os_error *com_rmoveto(int x, int y);
+os_error *com_rlineto(int x, int y);
+os_error *com_rcurveto(int x1, int y1, int x2, int y2, int x3, int y3);
+os_error *com_closepath(void);
+os_error *com_setcurrentpoint(int x, int y);
+os_error *com_endchar(void);
+
+os_error *com_seac(int asb, int adx, int ady, int bchar, int achar);
+os_error *com_sbw(int sbx, int sby, int wx, int wy);
+
+void     invalidateStems(void);
+os_error *addStem(Orientation orient, StemType type, int position, int width);
+os_error *addSegment(void);
+os_error *addMoveto(int x, int y);
+os_error *addLineto(int x, int y, BOOL closeflag);
+os_error *addCurveto(int x1, int y1, int x2, int y2, int x3, int y3);
+os_error *addEndchar(void);
+os_error *addInclusion(int code, int dx, int dy, int count);
+#if GENAFM
+os_error *addXYWidths(int wx, int wy);
+#endif
+
+StemPtr  matchingStem(SegmentPtr seg, StemPtr head, Orientation orient, int p1, int p2);
+void     markScaffolds(void);
+void     make1Scaf (ScaffoldPtr p, int position, int width, int link, BOOL linear);
+int      makeScafs (Orientation direction, ScaffoldPtr scafs);
+void     constructScaffolds (ScaffoldPtr hscafs, ScaffoldPtr vscafs, tiny *pnh, tiny *pnv);
+int      scaffoldSize (OutlinePtr outl);
+void     writeDirScaffolds (Orientation orient, ScaffoldPtr sp, int n);
+void     writeScaffolds (OutlinePtr outl);
+void     outputSegment (SegmentPtr seg, BOOL need16);
+int      attachmentNumber (LinkType type, StemPtr link);
+int      attachMask (SegmentPtr seg);
+BOOL     outputCharData (OutlinePtr outl, wimp_box *bbox);
+#if GENAFM
+void     getXYWidths (OutlinePtr outl, int *wx, int *wy);
+#endif
+void     initZones (void);
+os_error *addTopZone (int flat, int overshoot);
+os_error *addBottomZone (int flat, int overshoot, BOOL isBaseline);
+int      fixBottomZone (ScaffoldPtr scafs, int nscafs, BlueZonePtr zone);
+int      fixTopZone (ScaffoldPtr scafs, int nscafs, BlueZonePtr zone);
+void     spotDependencies(int chunkno, int encchars, OutlinePtr outlines,
+                          char *depbytes, int ndepbytes, int *ndeps);
+
+/* BBox stuff */
+
+static BOOL findbbox(OutlinePtr outl, wimp_box *bbox);
+static PathPtr buildpath(OutlinePtr outl, PathPtr path, int offx, int offy, BOOL inclusion);
+static PathPtr addToPath (PathPtr path, int draw_type, int offx, int offy,
+                          int x1, int y1, int x2, int y2, int x3, int y3);
+static BOOL pathbbox (PathPtr path, wimp_box *bbox);
+
+/* Freeing */
+
+static void freeAll(void);
+
+
+/*
+ * Transform thru matrix
+ */
+
+int xformx (int x, int y)
+{
+    return (int) ((double) x * matrix[0] + (double) y * matrix[2] + matrix[4]);
+}
+
+int xformy (int x, int y)
+{
+    return (int) ((double) x * matrix[1] + (double) y * matrix[3] + matrix[5]);
+}
+
+
+/* AFM generation code */
+
+#if GENAFM
+
+/* Support for generating the AFM file from the contents of the
+ * Type 1 file.  This code groks the (optional) entries for ItalicAngle,
+ * etc.
+ */
+
+FILE *exportmets;               /* caller must define this (or set it to NULL) */
+static char floatbuff[20];      /* String repn of floating point number */
+
+static BOOL AFMnumber (char *afmname, CODEFILE *input, FILE *op)
+{
+    if (readtoken_number(input, NULL) != NULL)
+        return FALSE;
+    fprintf(op, "%s %s\n", afmname, floatbuff);
+    return TRUE;
+}
+
+static BOOL AFMstring (char *afmname, CODEFILE *input, FILE *op)
+{
+    tokstr token;
+    if (readtoken(input, &token) == NULL)
+    {
+        if (token.type == TOK_ID || token.type == TOK_NAME || token.type == TOK_STRING)
+        {
+            fprintf(op, "%s %s\n", afmname, token.value.string);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static struct AFMentry
+{
+    char *t1name;               /* string to grok, without leading slash */
+    char *afmname;              /* string to output under.  NULL = use t1name */
+    BOOL (*func)();             /* call to read and produce value */
+    BOOL *seen;                 /* set to 1 if this field processed successfully */
+} AFMfields [] =
+{
+    "ItalicAngle", NULL, AFMnumber,             NULL,
+    "isFixedPitch", "IsFixedPitch", AFMstring,  NULL,
+    "UnderlinePosition", NULL, AFMnumber,       NULL,
+    "UnderlineThickness", NULL, AFMnumber,      NULL,
+    "CapHeight", NULL, AFMnumber,               NULL,
+
+#if 0
+    "FontBBox", NULL, AFMBBox,
+    "FamilyName", NULL, AFMstring,              NULL,
+    "FullName", NULL, AFMstring,                NULL,
+    "FontName", NULL, AFMstring,                NULL,
+    "Weight", NULL, AFMstring,                  NULL,
+    "version", "Version", AFMnumber,            NULL,
+#endif
+    NULL, NULL, NULL, NULL
+};
+
+static BOOL grok_afm_entry (char *name, CODEFILE *input, FILE *op)
+{
+    struct AFMentry *entry;
+    if (*name == '/') name++;
+    for (entry = AFMfields; entry->t1name; entry++)
+    {
+        if (strcmp(name, entry->t1name) == 0)
+        {
+            BOOL res = (entry->func)(entry->afmname ? entry->afmname : entry->t1name, input, op);
+            if (entry->seen) *(entry->seen) = res;
+            return res;
+        }
+    }
+    return FALSE;
+}
+
+#endif
+
+
+static os_error *readtoken_number(CODEFILE * infile, int *n)
+{
+    tokstr token;
+
+    e(return (e), readtoken(infile, &token));
+    if (token.type != TOK_NUMBER)
+        return make_oserror(214, msgs_lookup("T1Number"));
+    if (n) *n = token.value.number;
+
+    return (NULL);
+}
+
+os_error *init_subrs(subrcode *** subrsarrayp, int nsubrs)
+{
+    int i;
+
+    *subrsarrayp = malloc_abort(nsubrs * sizeof(subrcode *));
+    for (i = 0; i < nsubrs; i++)
+        (*subrsarrayp)[i] = NULL;
+
+    return (NULL);
+}
+
+
+/*---- convert a type 1 font -------------------------------------------------- */
+
+
+/*
+ * Read data from Adobe Type 1 Font file, converting to Outlines file
+ */
+
+static encstr newencblk, adobeenc;     /* accessed from command subrs */
+
+static subrcode **subrsarray = 0;      /* pointer to list of subroutines       */
+static int nsubrs = 0;                 /* size of above */
+static subrcode **charsarray = 0;      /* array of characters (new encoding) (now dynamic) */
+static int charsarraysize = 0;         /* total size of charsarray */
+static int otherchars;                 /* next index for chars not in encoding */
+static int encchars = 0;               /* number of chars in encoding */
+static int scafindexsize;              /* number of chars in scaf index (may be < encchars) */
+static int nchunks;                    /* number of chunks */
+
+static int ndepbytes = 0;              /* number of dependency bytes */
+static char *depbytes = 0;             /* the dependency flag bytes */
+static int *chunkindex = 0;            /* dynamically allocated */
+
+#define NUM_OTHER_CHARS 256
+
+static BOOL flattenFlex = FALSE;       /* Flatten flex features */
+static int fuzz;                       /* user-specified sloppiness factor */
+static int BlueFuzz = DEFAULT_FUZZ;    /* font-specified sloppiness factor */
+static FILE *export;
+
+static BOOL stat_decrypt_only, seen_charstrings;
+
+/*
+ * If encname is non-NULL, then it is a filename to find the font encoding in.
+ * If encname is NULL, then try to find the encoding from inside the Type1 file itself.
+ * Look for the /Encoding entry.  If this is StandardEncoding or AdobeStandardEncoding,
+ * then use T1ToFont:Encodings.Specials.Adobe.  If not, then construct encoding from the
+ * array assignments that follow.
+ *
+ * In any case, leave the encoding in a static variable and pass its address back to
+ * the caller via returnenc; it is the caller's responsibility to free this.
+ */
+
+os_error *converttype1(const char *fontprefix,
+                       const char *fontname,
+                       const char *infile,
+                       const char *fuzzstring,
+                       keyid actions,
+                       const char *encname,
+                       BOOL decrypt_file,
+                       BOOL decrypt_only,
+                       BOOL *bboxesOK,
+                       encstr **returnenc)
+{
+    CODEFILE inputblk;
+    char filename[256];
+    BOOL private;                      /* has "/Private" occurred yet?       */
+    BOOL fontdirectory = FALSE;        /* has "FontDirectory" occurred?      */
+    BOOL seen_subrs = FALSE;
+    os_error *lasterr = NULL;
+
+    stat_decrypt_only = decrypt_only;
+    seen_charstrings = FALSE;
+    matrix[0] = matrix[2] = 0.001 * DESIGNSIZE;
+    matrix[1] = matrix[3] = matrix[4] = matrix[5] = 0.0;
+    bbox_x1 = bbox_y1 = BIG;
+    bbox_x2 = bbox_y2 = -BIG;
+
+    outfile = inputblk.file = export = NULL;
+
+    *bboxesOK = TRUE; *returnenc = NULL;
+
+    if (fontprefix == NULL || fontname == NULL)
+    {
+        /* Non-command line callers should ensure this does not happen */
+        lasterr = make_oserror(214, msgs_lookup("BadArgs"));
+        goto fail;
+    }
+
+    if (decrypt_file)
+    {
+        char filename[256];
+        sprintf(filename, "%s%s.Decrypted", fontprefix, fontname);
+        EG(fail, fopen_err(filename, "w", &export));
+        EG(fail, settype(filename, 0xff5));
+    }
+
+    flattenFlex = (actions & DO_FLATTEN) != 0;
+
+    /* output file encoding */
+    if (encname)
+    {
+        EG(fail, readencoding(&newencblk, NULL, encname, DontCheck, TRUE));
+        *returnenc = &newencblk;
+    }
+
+    /* Adobe Standard Encoding */
+    EG(fail, readencoding(&adobeenc, NULL, "Specials.Adobe", DontCheck, TRUE));
+
+    inputblk.subr_bytecount = 0;       /* not yet in a coded subroutine */
+    inputblk.lenlV = 4;                /* number of random bytes at start of subroutines */
+    inputblk.pointer = NULL;           /* use file access */
+
+    /* open Type 1 file for input */
+
+    EG(fail, fopen_err(infile, "r", &inputblk.file));
+
+    /* initialise alignment zone storage */
+
+    initZones();
+
+    /* read all the tokens out of the file */
+    {
+        tokstr token;
+        char charname[64];             /* temporary buffer */
+
+        EG(fail, eexec_stop(&inputblk));        /* plaintext bytes to begin with */
+        private = false;
+        subrsarray = NULL;
+
+        while (!code_eof(&inputblk))
+        {
+            EG(fail, readtoken(&inputblk, &token));
+
+            if (decrypt_only)
+            {
+                if (token.type == TOK_EOF)
+                    break;
+                continue;
+            }
+
+            switch (token.type)
+            {
+            case TOK_EOF:
+                break;
+
+            case TOK_NAME:
+                if (private && strcmp(token.value.string, "FontDirectory") == 0)
+                    fontdirectory = true;
+                break;
+
+            case TOK_ID:
+                if (strcmp(token.value.string, "Private") == 0)
+                    private = true;
+                else
+
+                if (!fontdirectory && *returnenc == NULL && strcmp(token.value.string, "Encoding") == 0)
+                {
+                    /* If the next token is not a number, then we wait for the default encoding
+                     * to be picked.
+                     */
+                    EG(fail, readtoken(&inputblk, &token));
+                    if (token.type == TOK_NUMBER)
+                    {
+                        int nchars = token.value.number > MAX_CHARS ? MAX_CHARS : token.value.number;
+                        startencoding(&newencblk);
+                        *returnenc = &newencblk; /* The partially-constructed encoding can always
+                                                   * be freed if we return with an error.
+                                                   */
+                        do
+                        {
+                            EG(fail, readtoken(&inputblk, &token));
+                            
+                            if (token.type != TOK_NAME)
+                                continue;
+                            if (strcmp(token.value.string, "readonly") == 0 ||
+                                strcmp(token.value.string, "def") == 0)
+                                break;
+                            if (strcmp(token.value.string, "dup") == 0)
+                            {
+                                int code, ch2;
+                                EG(fail, readtoken_number(&inputblk, &code));
+                                EG(fail, readtoken(&inputblk, &token));
+                                if (token.type != TOK_ID)
+                                {
+                                    lasterr = make_oserror(214, msgs_lookup("EncError"));
+                                    goto fail;
+                                }
+                                if (code >= MAX_CHARS)
+                                    continue;
+                                if (strcmp(token.value.string, ".notdef") == 0 || strcmp(token.value.string, ".NotDef") == 0)
+                                    continue;
+
+                                ch2 = matchname(&newencblk, token.value.string);
+                                newencblk.matchtable[code] = ENC_EXIST; /* char exists in encoding vector */
+                                if (ch2 >= 0)
+                                {
+                                    newencblk.matchtable[code] = ENC_CHECKED; /* quick check that data
+                                                                               * corresponds */
+                                }
+                                addname(&newencblk, code, token.value.string);
+                                if (newencblk.nchars <= code)
+                                    newencblk.nchars = code + 1;
+                            }
+                        } while (1);
+                        if (newencblk.nchars < nchars)
+                            newencblk.nchars = nchars;
+                    }
+                }
+                else
+
+/*
+ * Take care to read the coded Subrs properly even when we are ignoring the
+ * set from the base font in a synthetic font.  Also when we find a bonus set
+ * of Subrs such as those to be found in Linotype Optima Bold Oblique, which
+ * tries to selects between two different sets of Subrs depending on the
+ * output device's resolution!!  (We just take the first set we see, as with
+ * CharStrings).
+ */
+                if (strcmp(token.value.string, "Subrs") == 0)
+                {
+                    int i, subr, n;
+                    BOOL doit;
+
+                    if (fontdirectory == FALSE && seen_subrs == FALSE)
+                        doit = seen_subrs = TRUE;
+                    else
+                        doit = FALSE;
+
+                    EG(fail, readtoken_number(&inputblk, &n));
+                    if (doit)
+                    {
+                        nsubrs = n;
+                        EG(fail, init_subrs(&subrsarray, nsubrs));
+                    }
+
+                    for (i = 1; i <= n; i++)
+                    {
+                        int nbytes;
+                        /* Throw stuff away till you see "dup" */
+                        do
+                        {
+                            EG(fail, readtoken(&inputblk, &token));
+                        } while (token.type != TOK_NAME || strcmp(token.value.string, "dup"));
+
+                        EG(fail, readtoken_number(&inputblk, &subr));
+
+                        /* expecting another number (nbytes), a name (RD, to junk) and then the data */
+
+                        EG(fail, readtoken_number(&inputblk, &nbytes));
+
+                        EG(fail, readtoken(&inputblk, &token));
+                        getbyte(&inputblk);                             /* skip name terminator */
+                        EG(fail, subr_start(&inputblk, nbytes));        /* coded bytes follow */
+
+                        /* now file position should be at the start of the binary data */
+
+                        EG(fail, readsubr(&inputblk, doit ?  &subrsarray[subr] : NULL));
+                    }
+                }
+                else
+
+/*
+ * Take care to read the coded CharStrings properly even when we find a bonus set
+ * of CharStrings such as those to be found in Linotype's Optima Bold Oblique, which
+ * tries to selects between two different sets of CharStrings depending on the
+ * output device's resolution!!  (We just take the first set we see, as with
+ * Subrs).
+ */
+                if (strcmp(token.value.string, "CharStrings") == 0)
+                {
+                    BOOL doit;
+
+		    /* If the next token is not a number, then assume this is not
+		     * actually the CharStrings dictionary which canonically starts
+		     * /CharStrings <number> dict dup begin.  Other occurrences
+		     * of /CharStrings occur in synthetic fonts and need
+		     * to be ignored.
+		     */
+
+		    EG(fail, readtoken(&inputblk, &token));
+		    if (token.type != TOK_NUMBER)
+			continue;
+
+                    if (seen_charstrings == FALSE)
+                        doit = seen_charstrings = TRUE;
+                    else
+                        doit = FALSE;
+
+                    /* We now need to allocate the following arrays.  We should have the
+                     * encoding data by now, but if we don't, we resort to Adobe Standard.
+                     */
+
+                    if (doit)
+                    {
+                        if (*returnenc == NULL)
+                        {
+                            /* DUBIOUS CODE WARNING (actually it's *all* pretty dubious)
+                             * The flag 1<<4 below is as documented in Wimp_ReportError; it is not
+                             * part of the documented RISC_OSLib interface.  (Why not?)  This code
+                             * therefore depends on the current implementation of wimpt_reporterror.
+                             */
+                            wimpt_reporterror(make_oserror(0, msgs_lookup("AdobeEnc")), 1<<4);
+                            EG(fail, readencoding(&newencblk, NULL, "Specials.Adobe", DontCheck, TRUE));
+                        }
+
+                        *returnenc = &newencblk;
+
+                        otherchars = encchars = newencblk.nchars; /* allocate unencoded chars here */
+                        nchunks = (encchars + (CHUNKSIZE-1)) / CHUNKSIZE;
+                        charsarraysize = encchars + NUM_OTHER_CHARS;
+                        charsarray = (subrcode **) malloc_abort(charsarraysize * sizeof(subrcode *));
+                        outlines = (OutlinePtr) malloc_abort(encchars * sizeof(OutlineRec));
+                        {
+                            int i;
+
+                            for (i = 0; i < charsarraysize; i++)
+                                charsarray[i] = NULL;
+                        }
+                    }
+
+                    do
+                    {
+                        int c, nbytes;
+
+                        /* Get ID for the next glyph, or else the name "end" */
+                        do
+                        {
+                            EG(fail, readtoken(&inputblk, &token));
+                        } while (!(token.type == TOK_NAME
+                                   && strcmp(token.value.string, "end") == 0)
+                                 && token.type != TOK_ID);
+                        if (token.type != TOK_ID)
+                            break;
+
+                        strcpy(charname, token.value.string);   /* used later */
+                        c = matchname(&newencblk, charname);    /* see if name is in
+                                                                 * encoding */
+
+                        /* Expect a number (size of charstring) and a name (RD; to junk) */
+
+
+                        EG(fail, readtoken_number(&inputblk, &nbytes));
+
+                        EG(fail, readtoken(&inputblk, &token));
+                        getbyte(&inputblk);                             /* skip name terminator */
+                        EG(fail, subr_start(&inputblk, nbytes));        /* coded bytes follow */
+
+                        /* now file position should be at the start of the binary data */
+
+                        if (c >= 0 || doit == FALSE)
+                        {
+                            EG(fail, readsubr(&inputblk, doit ? &charsarray[c] : NULL));
+                        }
+                        else
+                        {
+                            EG(fail, addname(&newencblk, otherchars, charname));
+                            EG(fail, readsubr(&inputblk, &charsarray[otherchars++]));
+                        }
+
+                    } while (true);
+                }
+                else
+
+#if TRUSTFONTBBOX
+/* Note: we don't trust the FontBBox entry in the font; we calculate it
+ * ourselves.  This is partly for the benefit of transformed fonts.
+ */
+                if (!fontdirectory && strcmp(token.value.string, "FontBBox") == 0)
+                {
+                    EG(fail, readtoken(&inputblk, &token)); /* chuck [ */
+                    EG(fail, readtoken_number(&inputblk, &bbox_x1));
+                    EG(fail, readtoken_number(&inputblk, &bbox_y1));
+                    EG(fail, readtoken_number(&inputblk, &bbox_x2));
+                    EG(fail, readtoken_number(&inputblk, &bbox_y2));
+                    EG(fail, readtoken(&inputblk, &token)); /* chuck ] */
+                }
+                else
+#endif /* TRUSTFONTBBOX */
+
+                if (!fontdirectory && strcmp(token.value.string, "BlueFuzz") == 0)
+                {
+                    EG(fail, readtoken_number(&inputblk, &BlueFuzz));
+                }
+                else
+
+/*
+ * BlueValues is an array of up to 7 pairs of integers.
+ * It can be empty.  First pair is the baseline overshoot
+ * and baseline (a bottom zone).  All the rest are top zones.
+ */
+                if (!fontdirectory && strcmp(token.value.string, "BlueValues") == 0)
+                {
+                    int flat, overshoot;
+
+                    /* Should be [ next */
+                    EG(fail, readtoken(&inputblk, &token));
+                    if (token.type != TOK_MARKLEFT)
+                    {
+                        lasterr = make_oserror(214, msgs_lookup("T1Bracket"));
+                        goto fail;
+                    }
+
+                    EG(fail, readtoken(&inputblk, &token));
+
+                    if (token.type == TOK_NUMBER)
+                    {
+                        overshoot = token.value.number;
+                        EG(fail, readtoken_number(&inputblk, &flat));
+                        EG(fail, addBottomZone(flat, overshoot, TRUE));
+
+                        EG(fail, readtoken(&inputblk, &token));
+                    }
+
+                    while (token.type == TOK_NUMBER)
+                    {
+                        flat = token.value.number;
+                        EG(fail, readtoken_number(&inputblk, &overshoot));
+                        EG(fail, addTopZone(flat, overshoot));
+                        
+                        EG(fail, readtoken(&inputblk, &token));
+                    }
+                         
+#if STEMDEBUG
+                    printf("After BlueValues, %d bottoms and %d tops\n",
+                           bottomZones.num, topZones.num);
+#endif
+                }
+                else
+
+/*
+ * OtherBlues is an array of up to 5 pairs of integers.
+ * It can be empty.  Each pair is a bottom zone (other than
+ * the baseline zone, which comes from BlueValues).
+ */
+                if (!fontdirectory && strcmp(token.value.string, "OtherBlues") == 0)
+                {
+                    int flat, overshoot;
+
+                    /* Should be [ next */
+                    EG(fail, readtoken(&inputblk, &token));
+                    if (token.type != TOK_MARKLEFT)
+                    {
+                        lasterr = make_oserror(214, msgs_lookup("T1Bracket"));
+                        goto fail;
+                    }
+
+                    EG(fail, readtoken(&inputblk, &token));
+                    while (token.type == TOK_NUMBER)
+                    {
+                        flat = token.value.number;
+                        EG(fail, readtoken_number(&inputblk, &overshoot));
+                        EG(fail, addBottomZone(flat, overshoot, FALSE));
+                        
+                        EG(fail, readtoken(&inputblk, &token));
+                    }
+                         
+#if STEMDEBUG
+                    printf("After OtherBlues, %d bottoms and %d tops\n",
+                           topZones.num, bottomZones.num);
+#endif
+                }
+
+                else if (!fontdirectory && strcmp(token.value.string, "FontMatrix") == 0)
+                {
+                    int i;
+                    /* Swallow the [ that should be next */
+                    EG(fail, readtoken(&inputblk, &token));
+
+                    for (i = 0; i < 6; i++)
+                    {
+                        EG(fail, readtoken_number(&inputblk, NULL));
+                        sscanf (floatbuff, "%lf", &matrix[i]);
+                        matrix[i] *= DESIGNSIZE;
+                    }
+                }
+#if GENAFM
+                else if (exportmets)
+                    (void) grok_afm_entry(token.value.string, &inputblk, exportmets);
+#endif
+
+               
+                break;
+
+            }
+        }
+    }
+    
+    if (export) {fclose(export); export = NULL;}
+    fclose(inputblk.file);
+
+   if (decrypt_only)
+        goto end;
+
+    /* Sort out the right fuzz factor */
+
+    if (fuzzstring)
+        fuzz = atoi(fuzzstring);
+    else
+        fuzz = BlueFuzz;
+
+    /* open Outlines file for output */
+
+    {
+        int charno, chunkno, i;
+        long int charstart, chunkstart, indexstart;
+        long int tablestart, tableend;
+        int charindex[CHUNKSIZE];
+
+        ndepbytes = ((nchunks + 31) / 32) * 4;   /* keep it word aligned */
+        depbytes = malloc_abort(ndepbytes);
+
+        getoutlinesfname(filename, fontprefix, fontname, newencblk.alphabet);
+        EG(fail, fopen_err(filename, "w", &outfile));
+
+        /* now write out the results */
+
+        OFputs("FONT");
+        OFputc(0);                     /* bits per pixel = 0 */
+        OFputc(8);                     /* version number     */
+        OFput2(DESIGNSIZE);            /* design size        */
+
+        OFput2(0);                     /* bounding box (overwritten later) */
+        OFput2(0);
+        OFput2(DESIGNSIZE);
+        OFput2(DESIGNSIZE);
+
+        /* indexstart is the file offset of the word which will contain */
+        /* the file offset of the chunk index table */
+
+        indexstart = ftell(outfile);
+
+
+        /* From here on, we don't want any more output to the
+         * file until we have read and stored all the outline
+         * and stem information.
+         */
+
+        for (chunkno = 0; chunkno < nchunks; chunkno++)
+        {
+            for (charno = 0; charno < CHUNKSIZE; charno++)
+            {
+                int code = (chunkno << 5) + charno;
+                if (code >= encchars)
+                    break;             /* last chunk may be incomplete */
+                outlineNumber = code;
+                outlines[outlineNumber].used = FALSE;
+
+                switch (newencblk.matchtable[code])
+                {
+                case ENC_CHECKED:
+                    /* get 'primary' copy */
+                    code = matchname(&newencblk, newencblk.nameof[code]->name);
+                case ENC_EXIST:
+                    if (charsarray[code])
+                    {
+#if LOWDEBUG || HIGHDEBUG || CHARDEBUG
+                        myprint("\n\nCharacter %d %s\n", code, newencblk.nameof[code]->name);
+#endif
+                        debug_charname = newencblk.nameof[code]->name;
+
+                        EG(fail, executechar(code, charsarray[code], subrsarray));
+                        break;
+                    }
+                case ENC_NOEXIST:
+                    break;      /* null character */
+
+                }                      /* switch */
+            }                          /* for charno */
+        }                              /* for chunkno */
+
+/*
+ * Now we have all the required character information in the
+ * outlines array.
+ */
+
+/*
+ * Determine how many scaffold index entries are needed.
+ */
+
+        scafindexsize = 1;             /* must be at least 1 */
+        for (i = encchars - 1; i >= 1; i--)
+            if (scaffoldSize(outlines + i) != 0)
+            {
+                scafindexsize = i + 1;
+                break;
+            }
+
+        /* The file pointer is still at indexstart */
+
+        OFput4(0);                     /* offset of chunk index - unknown */
+        OFput4(nchunks);
+        OFput4(scafindexsize);         /* number of scaffold entries */
+        OFput4(1|4);                   /* scaffold flags - 16 bit indices, non-zero rule */
+
+        /* 20 bytes reserved */
+        OFput4(0); OFput4(0); OFput4(0); OFput4(0); OFput4(0); 
+
+        tablestart = ftell(outfile);
+        OFput2(-1);                    /* size of table following - unknown */
+/*
+ * Lay down the scaffold offsets
+ */
+        block
+        {
+            /* Offset of first scaffold data from tablestart */
+            int where = 2              /* scaffold table size */
+                + 2 * (scafindexsize - 1)   /* one offset per scaffold */
+                    + 1;               /* skeleton threshold */
+                
+            for (i = 1; i < scafindexsize; i++)
+            {
+                int ss = scaffoldSize(outlines + i);    /* 0 if no char/scaffs */
+                OFput2(ss == 0 ? 0 : where);
+                where += ss;
+            }
+        }
+        OFputc(0);                     /* skeleton threshold */
+/*
+ * Now lay down the scaffold data proper.  writeScaffolds
+ * writes nothing if the character does not exist or if it
+ * has no scaffolds.
+ */
+        for (i = 1; i < scafindexsize; i++)
+            writeScaffolds(outlines + i);
+/*
+ * Write back the table size
+ */
+        tableend = ftell(outfile);
+        fseek(outfile, tablestart, SEEK_SET);
+        OFput2((int)(tableend - tablestart));
+        fseek(outfile, tableend, SEEK_SET);
+/*
+ * Name
+ */
+        fprintf(outfile, "%s", fontname);
+        OFputc(0);
+        fprintf(outfile, "%s", "Outlines");
+        OFputc(0);
+        wordalign;
+/*
+ * This is where the chunk index lies.  Go back and fill in its offset.
+ */
+        block
+        {
+            long int here = ftell(outfile);
+            fseek(outfile, indexstart, SEEK_SET);
+            OFput4((int)here);
+            fseek(outfile, here, SEEK_SET);
+        }
+/*
+ * Record position of chunk index, and allow space for it.
+ */
+        indexstart = ftell(outfile);
+        fseek(outfile, indexstart + (nchunks + 1) * (long)4, SEEK_SET);
+
+/*
+ * Chunks
+ */
+        chunkstart = ftell(outfile);
+        chunkindex = (int *) malloc_abort((nchunks + 1) * sizeof(int));
+        chunkindex[0] = (int) chunkstart;
+
+        for (chunkno = 0; chunkno < nchunks; chunkno++)
+        {
+            int ndeps = 0;
+            long int marker;
+            wimp_box bbox;
+
+            spotDependencies(chunkno, encchars, outlines, depbytes, ndepbytes, &ndeps);
+
+            /* Room for flag word, char index and dependency bytes */
+            charstart = chunkstart + 4 + (CHUNKSIZE * 4) + (ndeps ? ndepbytes : 0);
+            marker = charstart;
+            fseek(outfile, charstart, SEEK_SET);
+
+            for (charno = 0; charno < CHUNKSIZE; charno++)
+            {
+                int code = (chunkno << 5) + charno;
+                if (code < encchars && outlines[code].used)
+                {
+#if VERBOSE
+                    printf("Writing character %d %s with %dv, %dh\n",
+                           code, newencblk.nameof[code]->name,
+                           outlines[code].nv, outlines[code].nh);
+#endif
+                    if (outputCharData(outlines + code, &bbox) == FALSE)
+                    {
+#if VERBOSE
+                        printf("BBoxes not valid!!\n");
+#endif
+                        *bboxesOK = FALSE;
+                    }
+                    else
+                    {
+                        /* Update font bbox if necessary */
+                        if (bbox.x0 < bbox_x1) bbox_x1 = bbox.x0;
+                        if (bbox.y0 < bbox_y1) bbox_y1 = bbox.y0;
+                        if (bbox.x1 > bbox_x2) bbox_x2 = bbox.x1;
+                        if (bbox.y1 > bbox_y2) bbox_y2 = bbox.y1;
+                    }
+
+#if GENAFM
+                    if (exportmets)
+                    {
+                        int wx = 0, wy = 0;
+                        getXYWidths(outlines + code, &wx, &wy);
+                        fprintf(exportmets, "C %d ; WX %d ; N %s ; B %d %d %d %d\n",
+                                code, wx, newencblk.nameof[code]->name,
+                                bbox.x0, bbox.y0, bbox.x1, bbox.y1);
+                    }
+#endif
+
+                    charindex[charno] = (int) (charstart - chunkstart - 4);
+                    charstart = ftell(outfile);
+                }
+                else
+                {
+#if NO_NULL_CHARS
+                    if (code != 0)
+                    {
+                        OFputc(0x9);
+                        OFput3(0, 0);
+                        OFput3(0, 0);
+                        OFputc(0);
+                        charindex[charno] = (int) (charstart - chunkstart - 4);
+                        charstart = ftell(outfile);
+                        /* Update font bbox if necessary */
+                        if (0 < bbox_x1) bbox_x1 = 0;
+                        if (0 < bbox_y1) bbox_y1 = 0;
+                        if (0 > bbox_x2) bbox_x2 = 0;
+                        if (0 > bbox_y2) bbox_y2 = 0;
+                    }
+#else
+                    charindex[charno] = 0;      /* null character */
+#endif
+                }
+            }                                   /* for charno */
+
+            wordalign;
+            charstart = ftell(outfile);
+
+#if VERBOSE
+            printf("Writing chunk index at offset %p\n", (void *) chunkstart);
+#endif
+            fseek(outfile, chunkstart, SEEK_SET);       /* if no chars, leave out index */
+            if (charstart > marker)
+            {
+                unsigned int flag = 0x80000000 | (ndeps ? 0x80 : 0);
+                OFput4(flag);
+                for (i = 0; i < CHUNKSIZE; i++)
+                    OFput4(charindex[i]);
+                if (ndeps)
+                    for (ndeps = 0; ndeps < ndepbytes; ndeps++)
+                        OFputc(depbytes[ndeps]);
+
+                fseek(outfile, charstart, SEEK_SET);
+                chunkstart = charstart;
+            }
+            chunkindex[chunkno + 1] = (int) chunkstart; /* there are nchunks+1 entries! */
+
+        }                              /* for chunkno */
+        /* end of file */
+
+#ifdef OUTPUTFONTBBOX
+        /* We now know the font bbox.  Go back and fill it in */
+        {
+            long place = ftell (outfile);
+            fseek (outfile, 8, SEEK_SET);
+            
+            OFput2(bbox_x1);               /* bounding box */
+            OFput2(bbox_y1);
+            OFput2(bbox_x2 - bbox_x1);
+            OFput2(bbox_y2 - bbox_y1);
+            fseek (outfile, place, SEEK_SET);
+        }
+#endif
+
+#if GENAFM
+        /* Do this now so that we are sure we have the matrix-adjusted bbox */
+        if (exportmets)
+            fprintf(exportmets, "FontBBox %d %d %d %d\n",
+                    bbox_x1, bbox_y1, bbox_x2, bbox_y2);
+#endif
+
+        findbbox(NULL, NULL);   /* tell findbbox to free its buffers */
+
+#if VERBOSE
+        printf("Writing main index at offset %p\n", (void *) indexstart);
+#endif
+        fseek(outfile, indexstart, SEEK_SET);
+
+        for (i = 0; i <= nchunks ; i++)
+            OFput4(chunkindex[i]);
+
+        fclose(outfile);
+    }
+
+    freeAll();
+    return (settype(filename, 0xff6)); /* outline file constructed from draw files */
+
+fail:
+    if (inputblk.file) fclose(inputblk.file);
+    if (export) {fclose(export); export = NULL;}
+    if (outfile) {fclose(outfile); outfile = NULL;}
+end:
+    freeAll();
+    return lasterr;
+}
+
+
+/* argument stack and PostScript stack */
+
+#define ARG_LIMIT 24
+static int arg[ARG_LIMIT];
+static int *stackp = arg;
+static int *stacklim = arg + ARG_LIMIT;
+
+#define PS_LIMIT 24
+static int ps_stack[PS_LIMIT];
+static int *ps_stackp = ps_stack;
+static int *ps_stacklim = ps_stack + PS_LIMIT;
+
+#define FLEX_LIMIT 24
+static int flex_args[FLEX_LIMIT];
+static int *flex_stackp = flex_args;
+static int *flex_stacklim = flex_args + FLEX_LIMIT;
+static int flex_startx, flex_starty;
+static BOOL doingflex = false;
+
+
+/* 'execute' a character definition, writing the equivalent to the Outlines file */
+
+static int orgx, orgy;                 /* character origin (for composite glyphs) */
+static int curx, cury;                 /* current 'cursor' position */
+static int ppx, ppy;                   /* prev point x and y */
+static int firstx, firsty;             /* start of the current subpath */
+static int sidebx;                     /* stems are relative to this */
+static int sideby;                     /* they are absolute coordinates, */
+                                       /* i.e. org[xy] has been added */
+
+/*
+ * executechar.  Uses global outlineNumber to access the outlines[] array
+ */
+
+static os_error *executechar(int code, subrcode * s, subrcode ** subrsarray)
+{
+#ifdef notdef
+    OFputc(0x09);                      /* bit 0 => 12-bit bounding box, bit 3 => outlines */
+    OFput3(0, 0);                      /* bounding box is crap for now */
+    OFput3(500, 500);*/
+#endif
+
+    /* Start the global segs and stems lists */
+    segs = lastSeg = subpath = NULL;
+    stems = lastStem = NULL;
+
+    orgx = curx = firstx = ppx =
+        sidebx = sideby = ppy =
+        orgy = cury = firsty = 0;
+
+    stackp = arg;                      /* flatten both stacks at start of a new char */
+    ps_stackp = ps_stack;
+    flex_stackp = flex_args;
+    doingflex = false;
+     
+    e(return (e), executesubr(s, subrsarray));
+
+/* YYY take these two into scaf loop and parameterise markScaffolds */
+    markScaffolds();
+    constructScaffolds(outlines[outlineNumber].hscafs, outlines[outlineNumber].vscafs,
+                       &(outlines[outlineNumber].nh), &(outlines[outlineNumber].nv));
+
+    outlines[outlineNumber].segments = segs;
+    outlines[outlineNumber].stems = stems;
+    outlines[outlineNumber].used = TRUE;
+
+#ifdef notdef
+    OFputc(0x00);                      /* terminator */
+#endif
+
+    return (NULL);
+}
+
+
+
+/* 'execute' a character subroutine, working out its outline. */
+
+static os_error *executesubr(subrcode * s, subrcode ** subrsarray)
+{
+    CODEFILE input;
+    tokstr token;
+    BOOL subrdone = false;
+
+    if (s == NULL)
+        return (NULL);                 /* routine does not exist */
+
+    input.file = NULL;
+    input.pointer = ((char *) s) + sizeof(subrheader);
+    input.subr_bytecount = ((char *) s) + s->hdr.offset - input.pointer;
+    input.lenlV = 0;                   /* no encoding in stored subroutines */
+    input.eexec = false;
+
+    while (input.subr_bytecount && !subrdone)
+    {
+        e(return (e), readtoken(&input, &token));
+
+        switch (token.type)
+        {
+        case TOK_NUMBER:
+            *stackp++ = token.value.number;
+            break;
+        case TOK_COMMAND:
+            switch (token.value.number)
+            {
+            case COM_HSTEM:
+                E(com_hstem(arg[0], arg[1]));
+                stackp = arg;
+                break;
+            case COM_VSTEM:
+                E(com_vstem(arg[0], arg[1]));
+                stackp = arg;
+                break;
+            case COM_VMOVETO:
+                E(com_rmoveto(0, arg[0]));
+                stackp = arg;
+                break;
+            case COM_RLINETO:
+                E(com_rlineto(arg[0], arg[1]));
+                stackp = arg;
+                break;
+            case COM_HLINETO:
+                E(com_rlineto(arg[0], 0));
+                stackp = arg;
+                break;
+            case COM_VLINETO:
+                E(com_rlineto(0, arg[0]));
+                stackp = arg;
+                break;
+            case COM_RRCURVETO:
+                {
+                    int x1, y1, x2, y2, x3, y3;
+
+                    x1 = arg[0];
+                    y1 = arg[1];
+                    x2 = x1 + arg[2];
+                    y2 = y1 + arg[3];
+                    x3 = x2 + arg[4];
+                    y3 = y2 + arg[5];
+                    E(com_rcurveto(x1, y1, x2, y2, x3, y3));
+                } stackp = arg;
+                break;
+            case COM_CLOSEPATH:
+                E(com_closepath());
+                stackp = arg;
+                break;
+            case COM_CALLSUBR:
+                E(com_callsubr(subrsarray, *--stackp));
+                break;
+            case COM_RETURN:
+                subrdone = true;
+                break;
+            case COM_HSBW:
+                E(com_sbw(arg[0], 0, arg[1], 0));
+                stackp = arg;
+                break;
+            case COM_ENDCHAR:
+                E(com_endchar());
+                stackp = arg;
+                break;
+            case COM_RMOVETO:
+                E(com_rmoveto(arg[0], arg[1]));
+                stackp = arg;
+                break;
+            case COM_HMOVETO:
+                E(com_rmoveto(arg[0], 0));
+                stackp = arg;
+                break;
+            case COM_VHCURVETO:
+                {
+                    int y1, x2, y2, x3;
+
+                    y1 = arg[0];
+                    x2 = arg[1];
+                    y2 = y1 + arg[2];
+                    x3 = x2 + arg[3];
+                    E(com_rcurveto(0, y1, x2, y2, x3, y2));
+                } stackp = arg;
+                break;
+            case COM_HVCURVETO:
+                {
+                    int x1, x2, y2, y3;
+
+                    x1 = arg[0];
+                    x2 = x1 + arg[1];
+                    y2 = arg[2];
+                    y3 = y2 + arg[3];
+                    E(com_rcurveto(x1, 0, x2, y2, x2, y3));
+                } stackp = arg;
+                break;
+            case COM_DOTSECTION:
+                E(com_dotsection());
+                stackp = arg;
+                break;
+            case COM_VSTEM3:
+                E(com_vstem3(arg[0], arg[1], arg[2], arg[3], arg[4], arg[5]));
+                stackp = arg;
+                break;
+            case COM_HSTEM3:
+                E(com_hstem3(arg[0], arg[1], arg[2], arg[3], arg[4], arg[5]));
+                stackp = arg;
+                break;
+            case COM_SEAC:
+                E(com_seac(arg[0], arg[1], arg[2], arg[3], arg[4]));
+                stackp = arg;
+                break;
+            case COM_SBW:
+                E(com_sbw(arg[0], arg[1], arg[2], arg[3]));
+                stackp = arg;
+                break;
+            case COM_DIV:
+                {
+                    int x = stackp[-2] / stackp[-1];
+
+                    stackp--;
+                    stackp[-1] = x;
+                } break;
+            case COM_CALLOTHERSUBR:
+                {
+                    int s = *--stackp;
+
+                    E(com_callothersubr(s, *--stackp));
+                } break;
+            case COM_POP:
+                E(com_pop());
+                break;
+            case COM_SETCURRENTPOINT:
+                E(com_setcurrentpoint(arg[0], arg[1]));
+                stackp = arg;
+                break;
+
+            default:
+                return make_oserror(214, msgs_lookup("T1Illegal"));
+            }
+        }
+    }
+
+    return (NULL);
+}
+
+
+/*---- character outline execution --------------------------------------------- */
+
+
+os_error *com_callsubr(subrcode ** subrsarray, int subr)
+{
+#if VERBOSE
+     myprint("callsubr(%d) ", subr);
+#endif
+
+    return (executesubr(subrsarray[subr], subrsarray));
+}
+
+
+os_error *com_callothersubr(int subr, int args)
+{
+    int i;
+
+#if VERBOSE
+    myprint("callothersubr(%d,%d) ", subr, args);
+#endif
+
+    for (i = 1; i <= args; i++)
+        *ps_stackp++ = *--stackp;      /* put args on 'PostScript' stack */
+    /* NB: reverse order from buildchar stack */
+    /* emulate PostScript OtherSubrs routine here */
+
+    switch (subr)
+    {
+    case SUBR_FLEXBEGIN:
+        e(return (e), subr_flexbegin());
+        break;
+    case SUBR_FLEXPOINT:
+        e(return (e), subr_flexpoint(curx, cury));
+        break;
+    case SUBR_FLEXEND:
+        {
+            int arg1, arg2, arg3;
+
+            arg1 = *--ps_stackp;
+            arg2 = *--ps_stackp;
+            arg3 = *--ps_stackp;
+            e(return (e), subr_flexend(arg1, arg2, arg3));
+        } break;
+
+    case SUBR_HINTREPLACE:
+        e(return (e), subr_hintreplace(ps_stackp[-1]));
+        break;
+
+        /* ignore all others */
+    }
+
+    return (NULL);
+}
+
+
+os_error *subr_flexbegin(void)
+{
+    flex_startx = curx;
+    flex_starty = cury;
+
+    flex_stackp = flex_args;
+
+    doingflex = true;
+
+    return (NULL);
+}
+
+
+os_error *subr_flexpoint(int x, int y)
+{
+    int relx = flex_startx;
+    int rely = flex_starty;
+
+    if (flex_stackp - flex_args >= 8)
+    {
+        relx += flex_args[6];
+        rely += flex_args[7];
+    }
+
+    *flex_stackp++ = x - relx;
+    *flex_stackp++ = y - rely;
+
+    return (NULL);
+}
+
+
+os_error *subr_flexend(int height, int finalx, int finaly)
+{
+    curx = flex_startx;
+    cury = flex_starty;
+
+    if (flattenFlex)
+    {
+#ifdef FLEX2
+        BOOL horiz = (flex_args[7] + flex_args[13] == 0);
+        int adjustx = horiz ? 0 : flex_args[6];
+        int adjusty = horiz ? flex_args[7] : 0;
+
+        /* May have to move endpoint of last segment */
+        if (curx == firstx && cury == firsty)
+        {
+            firstx += adjustx; firsty += adjusty;
+        }    
+        else if (lastSeg)
+        {
+            switch (lastSeg->type)
+            {
+            case Lineto:
+                lastSeg->x1 += adjustx;
+                lastSeg->y1 += adjusty;
+                break;
+            case Curveto:       /* should I do the control point too? */
+                lastSeg->x2 += adjustx;
+                lastSeg->y2 += adjusty;
+                lastSeg->x3 += adjustx;
+                lastSeg->y3 += adjusty;
+                break;
+            }
+        }
+        curx += adjustx; cury += adjusty;
+#endif
+                
+        E(com_rlineto(flex_args[6] + flex_args[12],
+                      flex_args[7] + flex_args[13]));
+
+#ifdef FLEX2
+        curx -= adjustx; cury -= adjusty;
+#endif
+    }
+    else
+    {
+        e(return (e), com_rcurveto(flex_args[2], flex_args[3],
+                                   flex_args[4], flex_args[5],
+                                   flex_args[6], flex_args[7]));
+
+        e(return (e), com_rcurveto(flex_args[8], flex_args[9],
+                                   flex_args[10], flex_args[11],
+                                   flex_args[12], flex_args[13]));
+    }
+
+#if VERBOSE
+    if (curx != finalx || cury != finaly)
+    {
+        fprintf(stderr, "Flex problem in '%s': curx,cury = (%d,%d); finalx,y = (%d,%d) ***\n",
+                debug_charname, curx, cury, finalx, finaly);
+    }
+#endif
+
+    *ps_stackp++ = finaly;             /* NB: reverse order from buildchar stack */
+    *ps_stackp++ = finalx;
+
+    doingflex = false;
+
+    return (NULL);
+}
+
+
+os_error *subr_hintreplace(int subr)
+{
+    /* Backpatch the hints list to invalidate them.  Then just return;
+     * we leave the subr number on the top of the ps stack, so
+     * that the "pop callsubr" command that we expect next
+     * can find it.
+     */
+
+    invalidateStems();
+    return (NULL);
+}
+
+
+os_error *com_pop(void)
+{
+#if VERBOSE
+     myprint("pop ");
+#endif
+
+    *stackp++ = *--ps_stackp;          /* take a value back from the PostScript stack */
+
+    return (NULL);
+}
+
+
+os_error *com_hstem(int y, int dy)
+{
+#if VERBOSE || STEMDEBUG
+    myprint("hstem(%d,%d) ", y, dy);
+#endif
+
+    E(addStem(Hstem, Solo, y, dy));
+    return (NULL);
+}
+
+#define swap1(a, b) {int t; t = (a); (a) = (b); (b) = t;}
+
+void swap2 (int *pa, int *wa, int *pb, int *wb)
+{
+    swap1(*pa, *pb);
+    swap1(*wa, *wb);
+}
+    
+void sort3 (int *p1, int *w1,
+            int *p2, int *w2,
+            int *p3, int *w3)
+{
+    if (*p1 > *p3) swap2(p1, w1, p3, w3);
+    if (*p2 > *p3) swap2(p2, w2, p3, w3);
+    if (*p1 > *p2) swap2(p1, w1, p2, w2);
+}
+
+os_error *com_hstem3(int ymin, int dymin, int ymid, int dymid, int ymax, int dymax)
+{
+#if VERBOSE || STEMDEBUG
+    myprint("hstem3(%d,%d,%d,%d,%d,%d) ", ymin, dymin, ymid, dymid, ymax, dymax);
+#endif
+
+    sort3(&ymin, &dymin, &ymid, &dymid, &ymax, &dymax);
+#if VERBOSE || STEMDEBUG
+    myprint("->(%d,%d,%d,%d,%d,%d) ", ymin, dymin, ymid, dymid, ymax, dymax);
+#endif
+
+    E(addStem(Hstem, Min, ymin, dymin));
+    E(addStem(Hstem, Mid, ymid, dymid));
+    E(addStem(Hstem, Max, ymax, dymax));
+    return (NULL);
+}
+
+
+os_error *com_vstem(int x, int dx)
+{
+#if VERBOSE || STEMDEBUG
+    myprint("vstem(%d,%d) ", x, dx);
+#endif
+
+    E(addStem(Vstem, Solo, x, dx));
+    return (NULL);
+}
+
+
+os_error *com_vstem3(int xmin, int dxmin, int xmid, int dxmid, int xmax, int dxmax)
+{
+#if VERBOSE || STEMDEBUG
+    myprint("vstem3(%d,%d,%d,%d,%d,%d) ", xmin, dxmin, xmid, dxmid, xmax, dxmax);
+#endif
+
+    sort3(&xmin, &dxmin, &xmid, &dxmid, &xmax, &dxmax);
+#if VERBOSE || STEMDEBUG
+    myprint("->(%d,%d,%d,%d,%d,%d) ", xmin, dxmin, xmid, dxmid, xmax, dxmax);
+#endif
+
+    E(addStem(Vstem, Min, xmin, dxmin));
+    E(addStem(Vstem, Mid, xmid, dxmid));
+    E(addStem(Vstem, Max, xmax, dxmax));
+    return (NULL);
+}
+
+
+os_error *com_dotsection(void)
+{
+#if VERBOSE
+     myprint("dotsection ");
+#endif
+
+    return (NULL);
+}
+
+
+
+os_error *com_rmoveto(int x, int y)
+{
+#if VERBOSE
+    myprint("rmoveto(%d,%d) ", x, y);
+#endif
+
+    curx += x;
+    cury += y;
+
+    if (!doingflex)
+    {
+        firstx = curx;
+        firsty = cury;
+    }
+
+/*    E(addMoveto(curx, cury)); */
+               
+    return (NULL);
+}
+
+
+os_error *com_rlineto(int x, int y)
+{
+#if VERBOSE
+    myprint("rlineto(%d,%d) ", x, y);
+#endif
+
+    if (curx == firstx && cury == firsty)
+    {
+        E(addMoveto(curx, cury));
+
+#ifdef notdef
+        OFputc(1);
+        OFput3(curx, cury);
+#endif
+    }
+
+    curx += x;
+    cury += y;
+    E(addLineto(curx, cury, false));
+
+#ifdef notdef
+    OFputc(2);
+    OFput3(curx, cury);
+#endif
+
+    return (NULL);
+}
+
+
+os_error *com_rcurveto(int x1, int y1, int x2, int y2, int x3, int y3)
+{
+#if VERBOSE
+    myprint("rcurveto(%d,%d,%d,%d,%d,%d) ", x1, y1, x2, y2, x3, y3);
+#endif
+
+    if (curx == firstx && cury == firsty)
+    {
+        E(addMoveto(curx, cury));
+
+#ifdef notdef
+        OFputc(1);
+        OFput3(curx, cury);
+#endif
+    }
+
+    E(addCurveto(curx + x1, cury + y1,
+                 curx + x2, cury + y2,
+                 curx + x3, cury + y3));
+
+    curx += x3; cury += y3;
+
+
+#ifdef notdef
+    OFputc(3);
+    OFput3(curx + x1, cury + y1);
+    OFput3(curx + x2, cury + y2);
+    OFput3(curx = curx + x3, cury = cury + y3);
+#endif
+
+    return (NULL);
+}
+
+
+os_error *com_closepath(void)
+{
+#if VERBOSE
+    myprint("closepath ");
+#endif
+
+    if (curx != firstx || cury != firsty)
+    {
+        E(addLineto(firstx, firsty, true));
+
+#ifdef notdef
+        OFputc(2);
+        OFput3(firstx, firsty);
+#endif
+    }
+
+    return (NULL);
+}
+
+
+os_error *com_setcurrentpoint(int x, int y)
+{
+#if VERBOSE
+     myprint("setcurrentpoint(%d,%d) ", x, y);
+#endif
+
+    curx = orgx + x;
+    cury = orgy + y;
+
+    return (NULL);
+}
+
+
+os_error *com_endchar(void)
+{
+#if VERBOSE
+    myprint("endchar ");
+#endif
+
+    E(addEndchar());
+    /* Ensure that all stems are turned off */
+    invalidateStems();          /* is this needed? */
+    return (NULL);
+}
+
+
+/* make an accented character (translate charnames -> index) */
+/* 
+ * We will have come here by way of executechar() which will have
+ * set up the seg and stems list for us.  Note that in an outline
+ * style inclusion, the stems for the second char will be
+ * added to those of the first - is this right or wrong?
+ * We add segs of type == Inclusion for the included-by-code
+ * characters; it is up to the final output routine to
+ * place these in the final data
+ */
+
+os_error *com_seac(int asb, int adx, int ady, int bchar, int achar)
+{
+    nameblk *aname = adobeenc.nameof[achar];
+    nameblk *bname = adobeenc.nameof[bchar];
+    int aindex, bindex;
+    int adjust = asb - (sidebx - orgx);
+
+    if (!aname || !bname)
+        return make_oserror(214, msgs_lookup("T1Accent"));
+
+    aindex = matchname(&newencblk, aname->name);
+    bindex = matchname(&newencblk, bname->name);
+
+    if (aindex < 0 || bindex < 0)
+        return (NULL);                 /* err("Illegal accent char"); */
+
+    if (bindex >= encchars)
+    {
+        orgx = curx = firstx =
+            sidebx = sideby =
+            orgy = cury = firsty = 0;
+        e(return (e), executesubr(charsarray[bindex], subrsarray));
+        
+        /* If the base char had no endchar, I fake it.  This is so that
+         * we can identify the two parts of the composite outline, and also
+         * to ensure that backpatchStems() gets called.
+         */
+
+        if (lastSeg && lastSeg->type != Endchar)
+            E(com_endchar());
+    }
+
+    if (aindex >= encchars)
+    {
+        orgx = curx = firstx = adx;
+        orgy = cury = firsty = ady;
+        sidebx = sideby = 0;
+        e(return (e), executesubr(charsarray[aindex], subrsarray));
+    }
+
+#ifdef notdef
+    OFputc(0x08);                      /* composite characters follow */
+#endif
+
+    block
+    {
+        int count = 0;                       /* see addInclusion */
+
+        if (bindex < encchars)
+        {
+            addInclusion(bindex, 0, 0, count++);
+
+#ifdef notdef
+            OFputc(bindex);
+            OFput3(0, 0);
+#endif
+        }
+        if (aindex < encchars)
+        {
+            addInclusion(aindex, adx - adjust, ady, count++);
+
+#ifdef notdef
+            OFputc(aindex);
+            OFput3(adx, ady);
+#endif
+        }
+    }
+
+#if VERBOSE
+    myprint("seac(%d,%d,%d,%d,%d) ", asb, adx, ady, bchar, achar);
+#endif
+
+    return (NULL);
+}
+
+
+os_error *com_sbw(int sbx, int sby, int wx, int wy)
+{
+#if VERBOSE
+    myprint("sbw(%d,%d,%d,%d) ", sbx, sby, wx, wy);
+#endif
+
+    sidebx = curx = orgx + sbx;
+    sideby = cury = orgy + sby;
+#if GENAFM
+    E(addXYWidths(wx, wy));
+#endif
+
+    return (NULL);
+}
+
+
+/*--------------------------------------------------------------------------- */
+
+
+/* read a coded subroutine into a buffer for later use */
+
+static os_error *readsubr(CODEFILE * input, subrcode ** subrpointer)
+{
+    while (input->subr_bytecount)
+    {
+         e(return (e), storesubrbyte(getbyte(input), subrpointer));
+    }
+
+    return (NULL);
+}
+
+/* store a byte in a subroutine, increasing the buffer size if required */
+
+static os_error *storesubrbyte(char c, subrcode ** s)
+{
+    if (s == NULL) return NULL;
+    if (*s == NULL)
+    {
+        *s = malloc_abort(sizeof(subrcode));
+        (*s)->hdr.size = sizeof(subrcode);
+        (*s)->hdr.offset = sizeof(subrheader);
+    }
+
+    if ((*s)->hdr.offset >= (*s)->hdr.size)
+    {
+        int newsize = (*s)->hdr.size + 64;      /* increase by a chunk at a time */
+
+        *s = realloc(*s, newsize);
+        if (*s == NULL)
+            return make_oserror(214, msgs_lookup("OutOfMem"));
+        (*s)->hdr.size = newsize;
+    }
+
+    *(((char *) *s) + (*s)->hdr.offset) = c;
+    (*s)->hdr.offset++;
+
+    return (NULL);
+}
+
+
+/* return tokens from the input file, performing necessary decryption */
+
+os_error *readtoken(CODEFILE * input, tokstr * token)
+{
+    int nextchar;
+    BOOL finished;
+
+    token->value.string[0] = 0;
+
+    do
+    {
+        finished = 1;
+
+        if (input->subr_bytecount)
+        {
+            nextchar = getbyte(input);
+
+            if (nextchar >= 32)
+            {
+                token->type = TOK_NUMBER;
+                token->value.number = (nextchar < 247) ? nextchar - 139 :
+                    (nextchar < 251) ? ((nextchar - 247) << 8) + getbyte(input) + 108 :
+                    (nextchar < 255) ? -((nextchar - 251) << 8) - getbyte(input) - 108 :
+                    get4bytes(input);  /* signed big-endian! */
+            }
+            else
+            {
+                token->type = TOK_COMMAND;
+                switch (nextchar)
+                {
+                case COM_ESCAPE:
+                    token->value.number = 32 + getbyte(input);
+                    break;
+                default:
+                    token->value.number = nextchar;
+                }
+            }
+        }
+        else
+        {
+            BOOL negative = FALSE;
+            nextchar = getbyte(input);
+            switch (nextchar)
+            {
+            case EOF:
+                token->type = TOK_EOF;
+                break;
+            case '{':
+                token->type = TOK_BRACELEFT;
+                break;
+            case '}':
+                token->type = TOK_BRACERIGHT;
+                break;
+            case '[':
+                token->type = TOK_MARKLEFT;
+                break;
+            case ']':
+                token->type = TOK_MARKRIGHT;
+                break;
+            case '(':
+                token->type = TOK_STRING;
+                e(return (e), readstring(input,
+                                         token->value.string,
+                                         sizeof(token->value.string)
+                                         )
+                    );
+                break;
+            case '/':
+                token->type = TOK_ID;
+                e(return (e), readname(input,
+                                       token->value.string,
+                                       sizeof(token->value.string)
+                                       )
+                    );
+                break;
+            case '%':
+                while (!code_eof(input))
+                {
+                    nextchar = getbyte(input);
+                    if (nextchar == '\n' || nextchar == '\r')
+                        break;
+                }
+                finished = 0;
+                break;
+            case '-':
+                {
+                    int ch = getbyte(input);
+                    repeatlast(input);
+                    negative = TRUE;
+                    if (ch == '|')
+                        goto forcename;    /* nextchar is still '-' */
+                    else
+                        goto forcenumber;
+                }
+            case '0':
+            case '1':
+            case '2':
+            case '3':
+            case '4':
+            case '5':
+            case '6':
+            case '7':
+            case '8':
+            case '9':
+                negative = FALSE;
+                repeatlast(input);     /* getbyte() will return nextchar again */
+forcenumber:
+                token->type = TOK_NUMBER;
+                e(return (e), readnumber(input, negative, &token->value.number));
+                break;
+            default:
+forcename:
+                if (isblank(nextchar))
+                {
+                    finished = 0;
+                }
+                else
+                {
+                    if (isnamefirstchar(nextchar))
+                    {
+                        token->type = TOK_NAME;
+                        token->value.string[0] = nextchar;
+                        e(return (e), readname(input, token->value.string + 1, sizeof(token->value.string) - 1));
+
+                        if (strcmp(token->value.string, "eexec") == 0)
+                        {
+                            getbyte(input);     /* flush out the terminator (used
+                                                 * repeatlast()) */
+                            e(return (e), eexec_start(input));
+                            finished = 0;       /* don't return the "eexec" itself */
+                        }
+                        else
+
+#if 0
+                        if (strcmp(token->value.string, "RD") == 0)
+                        {
+                            token->type = TOK_RD;
+                            getbyte(input);     /* skip name terminator */
+                            e(return (e), subr_start(input, lastnumber));       /* coded bytes follow */
+                        }
+                        else
+#endif
+
+#if 0
+                        if (strcmp(token->value.string, "readonly") == 0)
+                        {
+                            e(return (e), readtoken(input, token));
+                            if (token->type == TOK_NAME && strcmp(token->value.string, "def") == 0)
+                            {
+                                token->type = TOK_RD;
+                                strcpy(token->value.string, "RD");
+                                getbyte(input); /* skip name terminator */
+                                e(return (e), subr_start(input, lastnumber));   /* coded bytes follow */
+                            }
+                        }
+                        else
+#endif
+
+                        if (!stat_decrypt_only && seen_charstrings && strcmp(token->value.string, "closefile") == 0)
+                        {
+                            code_seek(input, 0, SEEK_END);
+                        }
+
+                    }
+                    else
+                    {
+                        token->type = TOK_ERROR;
+                        token->value.string[0] = nextchar;
+                    }
+                }
+            }
+        }
+    } while (!finished);
+
+#if LOWDEBUG
+    e(return (e), printtoken(token));  /* debugging output */
+#endif
+
+    return (NULL);
+}
+
+
+#if 0  /* REPLACED BY THE ONE BELOW */
+os_error *readnumber(CODEFILE * input, int *result)
+{
+    int number = 0;
+    int nextchar;
+    BOOL minus = 0;
+
+    nextchar = getbyte(input);
+    if (nextchar == '-')
+    {
+        minus = 1;
+        nextchar = getbyte(input);
+    }
+
+    while (isdigit(nextchar))
+    {
+        number = number * 10 + nextchar - '0';
+        nextchar = getbyte(input);
+        if (nextchar == '.')
+            nextchar = getbyte(input); /* ignore decimal point! */
+    }
+
+    repeatlast(input);                 /* in case it was significant */
+
+    *result = minus ? -number : number;
+
+    return (NULL);
+}
+#endif
+
+
+BOOL isradixchar(int ch, int radix, int *val)
+{
+    if (ch >= '0' && ch <= '9')
+        *val = ch - '0';
+    else if (ch >= 'a' && ch <= 'z')
+        *val = ch - 'a' + 10;    
+    else if (ch >= 'A' && ch <= 'Z')
+        *val = ch - 'A' + 10;
+    else
+        return FALSE;
+    return *val < radix;
+}
+
+
+/*
+ * Read a non-negative integer radix number
+ */
+
+os_error *readnumber_radix(CODEFILE * input, int radix, int *result)
+{
+    int number = 0;
+    int nextchar, radixvalue;
+
+    for (nextchar = getbyte(input);
+         isradixchar(nextchar, radix, &radixvalue);
+         nextchar = getbyte(input))
+    {
+        number = number * radix + radixvalue;
+    }
+
+    repeatlast(input);                 /* in case it was significant */
+
+    *result = number;
+    return NULL;
+}
+    
+os_error *readnumber(CODEFILE * input, BOOL minus, int *result)
+{
+    int number = 0;
+    int nextchar;
+#if GENAFM
+    char *fp = floatbuff;
+    *fp = 0;
+#endif
+
+#if GENAFM
+    if (minus) *fp++ = '-';
+#endif
+
+    for (nextchar = getbyte(input);
+         isdigit(nextchar) || nextchar == '.' || nextchar == '-' ||
+           nextchar == 'e' || nextchar == 'E' || nextchar == '#';
+         nextchar = getbyte(input))
+    {
+        if (nextchar == '#')
+        {
+#if GENAFM
+           *fp = 0;
+#endif
+           return readnumber_radix (input, number, result);
+        }
+#if GENAFM
+        if (fp < floatbuff + sizeof(floatbuff) - 1)
+            *fp++ = nextchar;
+#endif
+        if (isdigit(nextchar)) number = number * 10 + nextchar - '0';
+    }
+
+    repeatlast(input);                 /* in case it was significant */
+
+    *result = minus ? -number : number;
+#if GENAFM
+    *fp = 0;
+#endif
+    return NULL;
+}
+
+os_error *readname(CODEFILE * input, char *result, int buffsize)
+{
+    int nextchar;
+
+    for (nextchar = getbyte(input); (--buffsize > 0) && isnamechar(nextchar);)
+    {
+        *result++ = nextchar;
+        nextchar = getbyte(input);
+    }
+
+    repeatlast(input);                 /* in case it was significant */
+
+    *result = '\0';
+
+    return (NULL);
+}
+
+os_error *readstring(CODEFILE * input, char *result, int buffsize)
+{
+    int nextchar;
+    int bracount = 1;                  /* first open bracket read already */
+
+    for (nextchar = getbyte(input); (--buffsize > 0) && nextchar != EOF;)
+    {
+        if (nextchar == ')')
+        {
+            if (--bracount)
+                *result++ = nextchar;
+            else
+                break;                 /* finished */
+        }
+        else
+        {
+            switch (nextchar)
+            {
+            case '\n':
+                break;                 /* ignore newlines in strings */
+            case '\\':
+                *result++ = getbyte(input);
+                break;                 /* ignore octal numbers !!! */
+            case '(':
+                bracount++;            /* drop through */
+            default:
+                *result++ = nextchar;
+            }
+        }
+        nextchar = getbyte(input);
+    }
+
+    *result = '\0';
+
+    return (NULL);
+}
+
+
+
+/*---- lowest level routines (read a byte) ------------------------------------ */
+
+/* read big-endian signed 4-byte integer from file (for charstrings code) */
+
+int get4bytes(CODEFILE * input)
+{
+    int c = getbyte(input);
+
+    c = (c << 8) + getbyte(input);
+    c = (c << 8) + getbyte(input);
+    c = (c << 8) + getbyte(input);
+
+    return (c);
+}
+
+static int keeplast = -1;
+static int lastchar = -1;
+CODEFILE *lastfile = NULL;
+
+/* call this to get the last char to be returned again by getbyte() */
+
+void repeatlast(CODEFILE * input)
+{
+     keeplast = lastchar;
+    lastfile = input;
+}
+
+/* return next byte from file, or previous one if repeatlast() was called */
+
+int getbyte(CODEFILE * input)
+{
+    if (keeplast >= 0 && input == lastfile)
+    {
+         lastchar = keeplast;
+    }
+    else
+    {
+        lastchar = getbyte_subr(input);
+    }
+
+    keeplast = -1;
+
+    return (lastchar);
+}
+
+/* initiate subr decoding in getbyte_subr() */
+
+os_error *subr_start(CODEFILE * input, int bytecount)
+{
+    int i;
+
+    input->subr_bytecount = bytecount;
+
+    input->subr_R = 4330;
+
+    for (i = 1; i <= input->lenlV; i++)
+        getbyte_subr(input);           /* discard first n bytes */
+
+    return (NULL);
+}
+
+/* return byte, taking note of whether subr decoding is required
+ * also calls getbyte_eexec(), so eexec decoding may also be performed
+ */
+
+int getbyte_subr(CODEFILE * input)
+{
+    if (input->subr_bytecount)
+    {
+        unsigned char plain;
+        int C = getbyte_eexec(input);
+
+        input->subr_bytecount--;
+
+        if (C == EOF || input->lenlV == 0)
+        {
+            return (C);
+        }                              /* no encoding if lenlV==0 */
+
+        plain = C ^ (input->subr_R >> 8);
+        input->subr_R = (C + input->subr_R) * 52845 + 22719;
+        return (plain);
+
+    }
+    else
+    {
+        return (getbyte_eexec(input));
+    }
+}
+
+
+/* initiate eexec decoding in getbyte_eexec() */
+
+os_error *eexec_start(CODEFILE * input)
+{
+    int i;
+
+    input->eexec_hex = 1;              /* assume hex digits follow */
+    for (i = 1; i <= 4; i++)
+    {
+        if (!ishexdigit(code_getc(input)))
+            input->eexec_hex = 0;      /* not hex if any of first 4 not hex */
+    }
+    code_seek(input, -4, SEEK_CUR);    /* go back to start of those 4 bytes */
+
+#if VERBOSE
+    myprint("\n\ninput->eexec_hex = %d\n\n", input->eexec_hex);
+#endif
+
+    input->eexec = true;
+    input->eexec_R = 55665;
+
+    for (i = 1; i <= 4; i++)
+        getbyte_eexec(input);          /* throw away the first 4 bytes */
+
+    return (NULL);
+}
+
+/* plaintext follows in this file - called at the start */
+
+os_error *eexec_stop(CODEFILE * input)
+{
+     input->eexec = false;
+
+    return (NULL);
+}
+
+/* return byte, taking note of whether eexec decoding is required */
+
+int getbyte_eexec(CODEFILE * input)
+{
+    int plain;
+
+    if (input->eexec)
+    {
+        int C = code_getc(input);
+
+        if (input->eexec_hex)
+        {
+            int C2;
+
+            while (isblank(C))
+                C = code_getc(input);
+            if (C == EOF)
+                return (EOF);
+            do
+            {
+                C2 = code_getc(input);
+            } while (isblank(C2));
+            if (C2 == EOF)
+                return (EOF);
+            C = (hexdigit(C) << 4) + hexdigit(C2);
+        }
+        plain = (C ^ (input->eexec_R >> 8)) & 0xFF;
+        input->eexec_R = (C + input->eexec_R) * 52845 + 22719;
+    }
+    else
+    {
+        plain = code_getc(input);
+    }
+
+    if (export && input->file && plain != EOF)
+        fputc(plain, export);          /* export file has eexec stuff removed */
+
+    return (plain);
+}
+
+
+/*---- codefile access routines ------------------------------------------------- */
+
+
+int code_getc(CODEFILE * input)
+{
+    if (input->file)
+         return (fgetc(input->file));
+    else
+        return (*(input->pointer++));
+}
+
+
+int code_eof(CODEFILE * input)
+{
+     return (feof(input->file));
+}
+
+
+int code_seek(CODEFILE * input, long offset, int origin)
+{
+     return (fseek(input->file, offset, origin));
+}
+
+
+/*---- debugging routines ------------------------------------------------------- */
+
+#if LOWDEBUG
+
+os_error *printtoken(tokstr * token)
+{
+    switch (token->type)
+    {
+        case TOK_ID:e(return (e), myprint("/%s ", token->value.string));
+        break;
+    case TOK_RD:
+    case TOK_NAME:
+        e(return (e), myprint("%s ", token->value.string));
+        if (strcmp(token->value.string, "def") == 0 ||
+            strcmp(token->value.string, "put") == 0 ||
+            strcmp(token->value.string, "ND") == 0)
+            myprint("\n");
+        break;
+    case TOK_NUMBER:
+        e(return (e), myprint("%d ", token->value.number));
+        break;
+    case TOK_STRING:
+        e(return (e), myprint("(%s) ", token->value.string));
+        break;
+    case TOK_BRACELEFT:
+        e(return (e), myprint("{ "));
+        break;
+    case TOK_BRACERIGHT:
+        e(return (e), myprint("} "));
+        break;
+    case TOK_MARKLEFT:
+        e(return (e), myprint("[ "));
+        break;
+    case TOK_MARKRIGHT:
+        e(return (e), myprint("] "));
+        break;
+    case TOK_COMMAND:
+        {
+            const char *com;
+
+            switch (token->value.number)
+            {
+            case COM_HSTEM:
+                com = "hstem ";
+                break;
+            case COM_VSTEM:
+                com = "vstem ";
+                break;
+            case COM_VMOVETO:
+                com = "vmoveto ";
+                break;
+            case COM_RLINETO:
+                com = "rlineto ";
+                break;
+            case COM_HLINETO:
+                com = "hlineto ";
+                break;
+            case COM_VLINETO:
+                com = "vlineto ";
+                break;
+            case COM_RRCURVETO:
+                com = "rrcurveto ";
+                break;
+            case COM_CLOSEPATH:
+                com = "closepath ";
+                break;
+            case COM_CALLSUBR:
+                com = "callsubr ";
+                break;
+            case COM_RETURN:
+                com = "return ";
+                break;
+            case COM_ESCAPE:
+                com = "escape ";
+                break;
+            case COM_HSBW:
+                com = "hsbw ";
+                break;
+            case COM_ENDCHAR:
+                com = "endchar ";
+                break;
+            case COM_RMOVETO:
+                com = "rmoveto ";
+                break;
+            case COM_HMOVETO:
+                com = "hmoveto ";
+                break;
+            case COM_VHCURVETO:
+                com = "vhcurveto ";
+                break;
+            case COM_HVCURVETO:
+                com = "hvcurveto ";
+                break;
+            case COM_DOTSECTION:
+                com = "dotsection ";
+                break;
+            case COM_VSTEM3:
+                com = "vstem3 ";
+                break;
+            case COM_HSTEM3:
+                com = "hstem3 ";
+                break;
+            case COM_SEAC:
+                com = "seac ";
+                break;
+            case COM_SBW:
+                com = "sbw ";
+                break;
+            case COM_DIV:
+                com = "div ";
+                break;
+            case COM_CALLOTHERSUBR:
+                com = "callothersubr ";
+                break;
+            case COM_POP:
+                com = "pop ";
+                break;
+            case COM_SETCURRENTPOINT:
+                com = "setcurrentpoint ";
+                break;
+            default:
+                com = "Com:%d ";
+            }
+            e(return (e), myprint(com, token->value.number));
+        }
+        break;
+
+    case TOK_EOF:
+        break;
+
+    case TOK_ERROR:
+        e(return (e), myprint("<%X> ", token->value.string[0]));
+        break;
+
+    default:
+        e(return (e), myprint("Tok=%d (0x%X) ", token->type, token->value.string[0]));
+    }
+
+    return (NULL);
+}
+
+#endif
+
+#if LOWDEBUG || HIGHDEBUG || CHARDEBUG || STEMDEBUG || VERBOSE
+
+static int currlinelength = 0;
+
+os_error *myprint(const char *format,...)
+{
+    va_list args;
+    char line_buffer[256];
+    int len;
+
+    va_start(args, format);
+    vsprintf(line_buffer, format, args);
+    va_end(args);
+
+    len = strlen(line_buffer);
+
+    if (currlinelength + len > 76)
+    {
+        printf("\n");
+        currlinelength = 0;
+    }
+
+    printf("%s", line_buffer);
+
+    currlinelength = (line_buffer[len - 1] == '\n') ? 0 : currlinelength + len;
+
+    return (NULL);
+}
+
+#endif
+
+/*-------------------------------- Hint Stuff --------------------------------*/
+
+/*
+ * Stems are no longer valid.
+ */
+
+void invalidateStems (void)
+{
+    StemPtr s;
+    for (s = stems; s; s = s->next)
+        s->active = FALSE;
+}
+
+
+/*
+ * The position of a type 1 stem is relative to the left
+ * sidebearing point.  We add sideb[xy] to the position;
+ * since this is set (in com_sbx) to org[xy] + sb[xy],
+ * it should be an absolute coordinate in our coordinate
+ * system.  Note that the org[xy] ensures that this
+ * is true for seac inclusions; the stems for the accent
+ * are in the same coordinate system as the main char.
+ */
+
+os_error * addStem (Orientation orient,
+                    StemType type,
+                    int position,
+                    int width)
+{
+    int offset = (orient == Hstem) ? sideby : sidebx;
+    StemPtr stem;
+
+    /* Deal with negative width */
+    if (width < 0)
+    {
+        position += width;
+        width = -width;
+    }
+
+    /* Check for old stem, reactivate if found */
+
+    for (stem = stems; stem; stem = stem->next)
+    {
+        if (stem->orient == orient &&
+            stem->type == type &&
+            stem->position == position + offset &&
+            stem->width == width)
+        {
+            stem->active = TRUE;
+            return NULL;
+        }
+    }
+
+    stem = (StemPtr) malloc_abort(sizeof(StemRec));
+    stem->orient = orient;
+    stem->type = type;
+    stem->position = position + offset;
+    stem->width = width;
+    stem->active = TRUE;
+    stem->gridScaf = stem->minArcScaf = stem->maxArcScaf = UNWANTED;
+
+    stem->next = NULL;
+    
+    if (stems == NULL)
+    {
+        stems = stem;
+        stems->prev = NULL;
+    }
+    else
+    {
+        lastStem->next = stem;
+        stem->prev = lastStem;
+    }
+
+    lastStem = stem;
+
+    return NULL;
+}
+
+os_error * addSegment (void)
+{
+    SegmentPtr newSeg = (SegmentPtr) malloc_abort(sizeof(SegmentRec));
+    
+    if (segs == NULL)
+    {
+        segs = newSeg;
+/*      segs->prev = NULL;*/
+    }
+    else
+    {
+        lastSeg->next = newSeg;
+/*      newSeg->prev = lastSeg;*/
+    }
+
+    newSeg->vlink = newSeg->hlink = NULL;
+    newSeg->htype = newSeg->vtype = None;
+    newSeg->next = NULL;
+
+    lastSeg = newSeg;
+    return NULL;
+}
+    
+os_error * addMoveto (int x, int y)
+{
+    E(addSegment());
+    lastSeg->type = Moveto;
+    lastSeg->x1 = ppx = x;
+    lastSeg->y1 = ppy = y;
+    subpath = lastSeg;
+    return NULL;
+}
+
+os_error * addLineto (int x, int y, BOOL closeflag)
+{
+    SegmentPtr prev = lastSeg;
+    E(addSegment());
+    lastSeg->type = closeflag ? Closepath : Lineto;
+    lastSeg->x1 = x;
+    lastSeg->y1 = y;
+
+    /* Hint matching */
+
+    if (prev != NULL)           /* ppx, ppy are valid */
+    {
+        StemPtr stem = matchingStem(lastSeg, stems, Hstem, ppy, y);
+        if (stem != NULL)
+        {
+            lastSeg->hlink = prev->hlink = stem;
+            lastSeg->htype = prev->htype = Grid;
+            if (lastSeg->type == Closepath && subpath)
+            {
+                subpath->hlink = stem;
+                subpath->htype = Grid;
+            }
+        }
+        stem = matchingStem(lastSeg, stems, Vstem, ppx, x);
+        if (stem != NULL)
+        {
+            lastSeg->vlink = prev->vlink = stem;
+            lastSeg->vtype = prev->vtype = Grid;
+            if (lastSeg->type == Closepath && subpath)
+            {
+                subpath->vlink = stem;
+                subpath->vtype = Grid;
+            }
+        }
+    }
+    ppx = x; ppy = y;
+    if (lastSeg->type == Closepath)
+        subpath = NULL;
+
+    return NULL;
+}
+
+os_error * addCurveto(int x1, int y1, int x2, int y2, int x3, int y3)
+{
+    SegmentPtr prev = lastSeg;
+    E(addSegment());
+    lastSeg->type = Curveto;
+    lastSeg->x1 = x1;
+    lastSeg->y1 = y1;
+    lastSeg->x2 = x2;
+    lastSeg->y2 = y2;
+    lastSeg->x3 = x3;
+    lastSeg->y3 = y3;
+
+    /* Stem matching */
+
+    if (prev != NULL)           /* ppx, ppy are valid */
+    {
+        /* Do the first half of the bezier */
+        StemPtr stem = matchingStem(lastSeg, stems, Hstem, ppy, y1);
+        if (stem != NULL && prev->htype == None)
+        {
+            prev->hlink = stem;
+            prev->htype = (ppy < y3) ? Barc : Tarc;
+        }
+        stem = matchingStem(lastSeg, stems, Vstem, ppx, x1);
+        if (stem != NULL && prev->vtype == None)
+        {
+            prev->vlink = stem;
+            prev->vtype = (ppx < x3) ? Larc : Rarc;
+        }
+        
+        /* Now do the second half */
+        stem = matchingStem(lastSeg, stems, Hstem, y2, y3);
+        if (stem != NULL)
+        {
+            lastSeg->hlink = stem;
+            lastSeg->htype = (y3 < ppy) ? Barc : Tarc;
+        }
+        stem = matchingStem(lastSeg, stems, Vstem, x2, x3);
+        if (stem != NULL)
+        {
+            lastSeg->vlink = stem;
+            lastSeg->vtype = (x3 < ppx) ? Larc : Rarc;
+        }
+    }
+    ppx = x3; ppy = y3;
+
+    return NULL;
+}
+
+os_error * addEndchar(void)
+{
+    E(addSegment());
+    lastSeg->type = Endchar;
+    return NULL;
+}
+
+os_error * addInclusion(int code, int dx, int dy, int count)
+{
+    E(addSegment());
+    lastSeg->type = Inclusion;
+    lastSeg->includedChar = code;
+    lastSeg->inclusionNumber = count;
+    lastSeg->x1 = dx;
+    lastSeg->y1 = dy;
+    return NULL;
+}
+
+#if GENAFM
+os_error * addXYWidths(int wx, int wy)
+{
+    E(addSegment());
+    lastSeg->type = XYWidths;
+    lastSeg->x1 = wx;
+    lastSeg->y1 = wy;
+    return NULL;
+}
+#endif
+
+/*
+ * Check to see if a feature is wholly inside a stem.  Return
+ * pointer to the stem, else NULL.  Fonts should be designed
+ * in such a way that the feature can match at most one stem;
+ * we just find the first match.
+ *
+ * A line matches an hstem if it is horizontal and lies exactly
+ * on one extrema of the stem.  (It may be necessary to have a
+ * fuzz factor, we'll check this later).
+ *
+ * For half a curveto, just pass in the coordinates of the
+ * endpoint and the nearest control point.  Note: only
+ * notices horizontal/vertical extrema.
+ */
+
+static BOOL almost (int a, int b)
+{
+    return abs(a - b) <= fuzz;
+}
+
+StemPtr matchingStem (SegmentPtr seg,        /* the seg XXXX unused */
+                      StemPtr head,          /* list of stems */
+                      Orientation orient,    /* only checks one direction */
+                      int p1,                /* x or y, not both */
+                      int p2)
+{
+    if (seg == NULL || head == NULL)
+        return NULL;
+
+    if (orient == Hstem && matrix[1] != 0)
+        return NULL;
+    if (orient == Vstem && matrix[2] != 0)
+        return NULL;
+
+    block
+    {
+        StemPtr stem;
+
+        for (stem = head; stem; stem = stem->next)
+        {
+            if (!stem->active ||
+                stem->orient != orient)
+                continue;
+#ifdef STEM_WITHIN
+            else
+            {
+                int start = stem->position - fuzz;
+                int finish = stem->position + stem->width + fuzz /* - 1*/;
+
+                if (start <= p1 && p1 <= finish &&
+                    start <= p2 && p2 <= finish)
+                    return stem;
+            }
+#else
+            else
+            {
+                int start = stem->position;
+                int finish = stem->position + stem->width /* - 1*/;
+
+                if (almost(p1, start) && almost(p2, start) ||
+                    almost(p1, finish) && almost(p2, finish))
+                    return stem;
+#endif
+            }
+        }
+    }
+    return NULL;
+}
+
+
+void markScaffolds ()
+{
+    SegmentPtr seg;
+
+    /* Work out which stems need which types of scaffold entries */
+
+    /* Do Grid ones first */
+
+    for (seg = segs; seg; seg = seg->next)
+    {
+        if (seg->htype == Grid)
+            seg->hlink->gridScaf = WANTED;
+        if (seg->vtype == Grid)
+            seg->vlink->gridScaf = WANTED;
+    }
+
+    /* Now the arc ones.  If a stem has grid links, make
+     * all links to it grid links
+     */
+
+    for (seg = segs; seg; seg = seg->next)
+    {
+        switch (seg->htype)
+        {
+        case Tarc:
+            if (seg->hlink->gridScaf == WANTED)
+                seg->htype = Grid;
+            else
+                seg->hlink->maxArcScaf = WANTED;
+            break;
+        case Barc:
+            if (seg->hlink->gridScaf == WANTED)
+                seg->htype = Grid;
+            else
+                seg->hlink->minArcScaf = WANTED;
+            break;
+        }
+        switch (seg->vtype)
+        {
+        case Rarc:
+            if (seg->vlink->gridScaf == WANTED)
+                seg->vtype = Grid;
+            else
+                seg->vlink->maxArcScaf = WANTED;
+            break;
+        case Larc:
+            if (seg->vlink->gridScaf == WANTED)
+                seg->vtype = Grid;
+            else
+                seg->vlink->minArcScaf = WANTED;
+            break;
+        }
+    }                                        /* for */
+}                                            /* function */
+
+
+void make1Scaf (ScaffoldPtr p, int position, int width, int link, BOOL linear)
+{       
+    p->position = position;
+    p->width = width;
+    p->link = link;
+    p->linear = linear;
+}
+
+#if STEMDEBUG
+void dumpScafs (Orientation orient, ScaffoldPtr scafs, int n)
+{
+    printf("\n%cSCAFS (%d): ", orient == Hstem ? 'H' : 'V', n);
+    for (; n--; scafs++)
+        printf("%dx%d->%d%s ", scafs->position, scafs->width,
+               scafs->link, scafs->linear ? "L" : "");
+    printf("\n");
+}
+#endif
+
+/*
+ *  Make the scaffold entries for one direction.
+ */
+
+int makeScafs (Orientation direction,
+               ScaffoldPtr scafs)
+{
+    StemPtr stem = stems;
+    int n = 0;
+
+    for (; stem; stem = stem->next)
+    {
+        if (stem->orient != direction)
+            continue;
+
+        if (stem->gridScaf == WANTED)
+        {
+            if (n < MAXSCAFS)
+            {
+/*
+ * Check for [hv]stem3 and insert linked triplet if possible.  The
+ * check below assumes that if you see a Max then the previous two
+ * stems are the corresponding Mid and Min.  The way stem replacement is
+ * handled needs to be looked at because we cannot guarantee this
+ * at present!  However this is hardly likely to do anything worse
+ * than fail to link.
+ */
+                if (stem->type == Max &&
+                    stem->prev && stem->prev->type == Mid &&
+                    stem->prev->prev && stem->prev->prev->type == Min &&
+                    stem->prev->gridScaf != WANTED && stem->prev->gridScaf != UNWANTED &&
+                    stem->prev->prev->gridScaf != WANTED && stem->prev->prev->gridScaf != UNWANTED)
+                {
+                    ScaffoldPtr sp = scafs + (stem->prev->gridScaf - 1);
+
+                    /* Make max scaf with non-linear link to min */
+                    make1Scaf(scafs + n, stem->position, stem->width,
+                              stem->prev->prev->gridScaf, FALSE);
+                    stem->gridScaf = ++n;
+
+                    /* Link mid to max linearly */
+                    sp->link = stem->gridScaf;
+                    sp->linear = TRUE;
+                }
+                else
+                {
+                    make1Scaf(scafs + n, stem->position, stem->width, 0, FALSE);
+                    stem->gridScaf = ++n;
+                }
+            }
+#if STEMDEBUG || VERBOSE
+            else
+            {
+                printf("Ignoring excess grid scaffold line\n");
+            }
+#endif
+        }
+        if (stem->minArcScaf == WANTED)
+        {
+            if (n < MAXSCAFS)
+            {
+                make1Scaf(scafs + n, stem->position, WID_LTANGENT, 0, FALSE);
+                stem->minArcScaf = ++n;
+            }
+#if STEMDEBUG || VERBOSE
+            else
+            {
+                printf("Ignoring excess minarc scaffold line\n");
+            }
+#endif
+        }
+        if (stem->maxArcScaf == WANTED)
+        {
+            if (n < MAXSCAFS)
+            {
+                make1Scaf(scafs + n, stem->position + stem->width - 1,
+                          WID_RTANGENT, 0, FALSE);
+                stem->maxArcScaf = ++n;
+            }
+#if STEMDEBUG || VERBOSE
+            else
+            {
+                printf("Ignoring excess maxarc scaffold line\n");
+            }
+#endif
+        }
+    }
+#if STEMDEBUG
+    dumpScafs(direction, scafs, n);
+#endif
+    return n;
+}
+
+
+/* 
+ * Take the list of segs and stems, which have been processed by
+ * markScaffolds, and produce a list of scaffold lines
+ * suitable for inclusion in the output.  The parameters should each
+ * point to a MAXSCAFS array of ScaffoldRecs (indexed with scaffold
+ * number - 1).
+ */
+
+/* This code should deal with linked lines when we implement them */
+
+void constructScaffolds (ScaffoldPtr hscafs, ScaffoldPtr vscafs, tiny *pnh, tiny *pnv)
+{
+    int i;
+    *pnh = makeScafs(Hstem, hscafs);
+    *pnv = makeScafs(Vstem, vscafs);
+
+    /* Fix the baseline first, it is important */
+    if (baseIndex != UNKNOWN)
+        *pnh = fixBottomZone(hscafs, *pnh, &(bottomZones.zone[baseIndex]));
+
+    /* Fix all top zones */
+    for (i = 0; i < topZones.num; i++)
+        *pnh = fixTopZone(hscafs, *pnh, &(topZones.zone[i]));
+
+    /* Fix any bottom zones */
+    for (i = 0; i < topZones.num; i++)
+        if (i != baseIndex)
+            *pnh = fixBottomZone(hscafs, *pnh, &(bottomZones.zone[i]));
+}
+
+/*
+ * Return the size in bytes of the scaffolding info that
+ * writeScaffolds() would write for this outline.
+ */
+
+int scaffoldSize (OutlinePtr outl)
+{
+    if (outl->nh == 0 && outl->nv == 0)
+        return 0;
+    else
+    {
+        return 6 + (outl->nh + outl->nv) * 3;
+    }
+}
+
+/*
+ * Write scaffold data to the current position in output file
+ */
+
+#define BITMASK(n) ((~((~0) << (n))) << 1)
+
+void writeDirScaffolds (Orientation orient, ScaffoldPtr sp, int n)
+{
+    int i;
+    for (i = 0; i < n; i++, sp++)
+    {
+        int twobytes = orient == Hstem ? xformy(0, sp->position) : xformx(sp->position, 0);
+        int width = sp->width;
+        if (width != WID_LTANGENT && width != WID_RTANGENT)
+            width = orient == Hstem ? xformy(0, width) : xformx(width, 0);
+        twobytes &= 0xfff; /* signed in 12 bits */
+        twobytes |= (sp->link & 0x7) << 12;
+        twobytes |= (sp->linear ? 1 : 0) << 15;
+        OFputc(twobytes & 0xff);
+        OFputc((twobytes >> 8) & 0xff);
+        OFputc(width);
+    }
+}
+
+void writeScaffolds (OutlinePtr outl)
+{
+    if (scaffoldSize(outl) == 0)
+        return;
+
+    OFput2(0);                         /* no base char */
+    OFputc(0);                         /* no h scaffs from base */
+    OFputc(0);                         /* no v scaffs from base */
+    OFputc(BITMASK(outl->nv));
+    OFputc(BITMASK(outl->nh));
+#if STEMDEBUG || VERBOSE
+    printf("Writing %d vscafs and %d hscafs\n", outl->nv, outl->nh);
+#endif
+    writeDirScaffolds(Vstem, outl->vscafs, outl->nv);
+    writeDirScaffolds(Hstem, outl->hscafs, outl->nh);
+}
+
+/*
+ * Output any data due to this segement
+ */
+
+void outputSegment (SegmentPtr seg, BOOL need16)
+{
+    if (seg == NULL)
+        return;
+    switch (seg->type)
+    {
+    case Moveto:
+        OFputc(1 | attachMask(seg));
+        OFput3(xformx(seg->x1, seg->y1),
+               xformy(seg->x1, seg->y1));
+        break;
+    case Lineto:
+    case Closepath:
+        OFputc(2 | attachMask(seg));
+        OFput3(xformx(seg->x1, seg->y1),
+               xformy(seg->x1, seg->y1));
+        break;
+    case Curveto:
+        OFputc(3 | attachMask(seg));
+        OFput3(xformx(seg->x1, seg->y1),
+               xformy(seg->x1, seg->y1));
+        OFput3(xformx(seg->x2, seg->y2),
+               xformy(seg->x2, seg->y2));
+        OFput3(xformx(seg->x3, seg->y3),
+               xformy(seg->x3, seg->y3));
+        break;
+    case Inclusion:
+        if (seg->inclusionNumber == 0)
+            OFputc(0x08);                    /* composite follows */
+        if (need16)
+            OFput2(seg->includedChar);
+        else
+            OFputc(seg->includedChar);
+        OFput3(xformx(seg->x1, seg->y1),
+               xformy(seg->x1, seg->y1));
+        break;
+    case Endchar:
+        break;
+    }
+}
+
+/*
+ * Return the scaffold number.  0 means none.
+ */
+
+int attachmentNumber (LinkType type, StemPtr link)
+{
+    int num;
+    switch (type)
+    {
+    case Larc: case Barc:
+        num = link->minArcScaf; break;
+    case Rarc: case Tarc:
+        num = link->maxArcScaf; break;
+    case Grid:
+        num = link->gridScaf; break;
+    case None: default:
+        num = 0; break;
+    }
+    if (num == WANTED || num == UNWANTED)
+        return 0;
+    else
+        return num;
+}
+
+/*
+ * Create the scaffold mask: OR this with the segment
+ * type in the first byte of an output line segment.
+ */
+
+int attachMask (SegmentPtr seg)
+{
+    int mask = 0;
+    if (seg == NULL)
+        return mask;
+    mask = ((attachmentNumber(seg->htype, seg->hlink) << 5) & 0xE0)
+        | ((attachmentNumber(seg->vtype, seg->vlink) << 2) & 0x1C);
+    return mask;
+}
+
+
+#if GENAFM
+void getXYWidths (OutlinePtr outl, int *wx, int *wy)
+{
+    SegmentPtr seg;
+    if (!outl->used) return;
+    
+    for (seg = outl->segments; seg; seg = seg->next)
+        if (seg->type == XYWidths)
+        {
+            /* Push through the matrix.  Not normally needed for oblique fonts,
+             * but it is for condensed ones.
+             */
+            *wx = xformx(seg->x1, 0);
+            *wy = xformy(0, seg->y1);
+            return;
+        }
+}
+#endif
+
+/*
+ * Output the character data for the outline indexed by 'code'.
+ * Return FALSE if the bbox could not be calculated.
+ */
+
+BOOL outputCharData (OutlinePtr outl, wimp_box *bbox)
+{
+    SegmentPtr seg, inclusions[2];
+    BOOL bboxOK;
+    BOOL need16 = FALSE;
+    BOOL composite = TRUE;     /* Can be composed with "base+accent" method */
+    int numinclusions = 0;
+
+    if (!outl->used)
+        return TRUE;
+
+    if ((bboxOK = findbbox(outl, bbox)) == FALSE)
+    {
+        bbox->x0 = bbox->y0 = 0;                  /* bounding box is crap for now */
+        bbox->x1 = bbox->y1 = 500;
+    }
+
+    for (seg = outl->segments; seg; seg = seg->next)
+    {
+        switch (seg->type)
+        {
+        case Moveto: case Lineto: case Curveto: case Closepath:
+            composite = FALSE;
+            break;
+        case Inclusion:
+            if (seg->includedChar > 255)
+                need16 = TRUE;  
+            numinclusions++;
+            if (numinclusions <= 2)
+                inclusions[numinclusions - 1] = seg;
+            break;
+        }
+    }
+    if (numinclusions < 1 || numinclusions > 2)
+        composite = FALSE;
+
+    /* Do it as a base char (+accent) if possible */
+    if (composite)
+    {
+        /* The base char is known to be first, and it is known to be at 0,0
+         * because it can only get there by way of SEAC
+         */
+        OFputc(0x9 |                    /* bit 0 => 12-bit coords, bit 3 => outlines */
+               (need16 ? 0x40 : 0) |    /* bit 6 => 2-byte inclusions if needed */
+               (1 << 4) |               /* Base character */
+               (numinclusions == 2 ? (1 << 5) : 0));  /* + accent if needed */
+        if (need16)
+            OFput2(inclusions[0]->includedChar);
+        else
+            OFputc(inclusions[0]->includedChar);
+        if (numinclusions == 2)
+        {
+            if (need16)
+                OFput2(inclusions[1]->includedChar);
+            else
+                OFputc(inclusions[1]->includedChar);
+            OFput3(xformx(inclusions[1]->x1, inclusions[1]->y1),
+                   xformy(inclusions[1]->x1, inclusions[1]->y1));
+        }
+    }
+    else
+    {
+        /* bit 0 => 12-bit coords, bit 3 => outlines, bit 6 => 2-byte inclusions if needed */
+        OFputc(0x9 | (need16 ? 0x40 : 0));
+
+#if 0
+        OFputc(0x49);                      /* bit 0 => 12-bit coords, bit 3 => outlines, bit 6 => 2-byte inclusions */
+#endif
+
+        OFput3(bbox->x0, bbox->y0);
+        OFput3(bbox->x1 - bbox->x0, bbox->y1 - bbox->y0);
+        for (seg = outl->segments; seg; seg = seg->next)
+            outputSegment(seg, need16);
+
+        /*
+         * Output the terminator here, rather than in Endchar processing,
+         * because of composite characters and suchlike.  Extra terminators
+         * shouldn't hurt.
+         */
+
+        OFput2(0);
+    }
+    return bboxOK;
+}
+
+
+/*
+ * Processing alignment zones
+ */
+
+void initZones ()
+{
+    topZones.num = bottomZones.num = 0;
+    baseIndex = UNKNOWN;
+}
+
+/* Quietly ignore excess zones */
+
+os_error * addTopZone (int flat, int overshoot)
+{
+    int num = topZones.num;
+    if (num == BLUE_MAX)
+        return NULL;
+
+    if (flat > overshoot)
+        swap1(flat, overshoot); /* assume error */
+
+    topZones.zone[num].flat = flat;
+    topZones.zone[num].overshoot = overshoot;
+    topZones.num++;
+    return NULL;
+}
+
+os_error * addBottomZone (int flat, int overshoot, BOOL isBaseline)
+{
+    int num = bottomZones.num;
+    if (num == BLUE_MAX)
+        return NULL;
+
+    if (flat < overshoot)
+        swap1(flat, overshoot); /* assume error */
+
+    bottomZones.zone[num].flat = flat;
+    bottomZones.zone[num].overshoot = overshoot;
+
+    if (isBaseline)
+        baseIndex = num;
+        
+    bottomZones.num++;
+    return NULL;
+}
+
+
+/*
+ * Find index of matching scaffold in the array.  Return 0-base
+ * index number or else UNKNOWN.  Pass a width of WID_[LR]TANGENT
+ * to find min and max arc scaffolds respectively.  Pass width of
+ * GRID_MIN to match grid scaffolds with a minimum coordinate
+ * of 'position' and GRID_MAX to match those with a maximum
+ * coordinate of 'position'.
+ */
+
+#define GRID_MIN -1
+#define GRID_MAX -2
+
+int findScaffold (ScaffoldPtr scafs,
+                  int nscafs,
+                  int position, 
+                  int width,
+                  int ignore)
+{
+    int i;
+    if (width == GRID_MIN)
+    {
+        for (i = 0; i < nscafs; i++)
+            if (i != ignore &&
+                almost(scafs[i].position, position) &&
+                scafs[i].width != WID_LTANGENT &&
+                scafs[i].width != WID_RTANGENT)
+                return i;
+    }
+    else if (width  == GRID_MAX)
+    {
+        for (i = 0; i < nscafs; i++)
+            if (i != ignore &&
+                almost(scafs[i].position + scafs[i].width - 1, position) &&
+                scafs[i].width != WID_LTANGENT &&
+                scafs[i].width != WID_RTANGENT)
+                return i;
+    }
+    else
+    {
+        for (i = 0; i < nscafs; i++)
+            if (i != ignore &&
+                almost(scafs[i].position, position) &&
+                scafs[i].width == width &&
+                scafs[i].link == 0)
+                return i;
+    }
+            
+    return UNKNOWN;
+}
+
+
+#ifdef GRID_BLUES
+
+/*
+ * Look for any grid scaffold whose bottom line is between the flat and
+ * overshoot positions (overshoot <= pos < flat)
+ */
+
+int findGridBotBetween (ScaffoldPtr scafs, int nscafs,
+                        int flat, int overshoot)
+{
+    int i;
+    flat += fuzz;
+    overshoot -= fuzz;
+    for (i = 0; i < nscafs; i++, scafs++)
+    {
+        int w = scafs->width;
+        int p = scafs->position;
+        if (scafs->link != 0)
+            continue;
+        if (w == WID_LTANGENT || w == WID_RTANGENT)
+            continue;
+        if (overshoot <= p && p < flat)
+            return i;
+    }
+    return UNKNOWN;
+}
+
+/*
+ * Look for any grid scaffold whose top line is between the flat and
+ * overshoot positions (flat < pos+width <= overshoot)
+ */
+
+int findGridTopBetween (ScaffoldPtr scafs, int nscafs,
+                        int flat, int overshoot)
+{
+    int i;
+    flat -= fuzz;
+    overshoot += fuzz;
+    for (i = 0; i < nscafs; i++, scafs++)
+    {
+        int w = scafs->width;
+        int p = scafs->position + w - 1;
+        if (scafs->link != 0)
+            continue;
+        if (w == WID_LTANGENT || w == WID_RTANGENT)
+            continue;
+        if (flat < p && p <= overshoot)
+            return i;
+    }
+    return UNKNOWN;
+}
+
+#endif
+
+
+/*
+ * Look for a scaffold line relating to the given
+ * bottom bluezone.  If found, and it does not have a parent,
+ * then make a parent at the flat position and link them together.
+ * (If a suitable parent already exists, use it instead).
+ * Return the (possibly incremented) number of scaffold lines.
+ */
+
+int fixBottomZone (ScaffoldPtr scafs,
+                   int nscafs,
+                   BlueZonePtr zone)
+{
+    int flatScaf, overScaf;
+
+    if (zone == NULL || scafs == NULL || nscafs == 0)
+        return nscafs;
+
+    overScaf = findScaffold(scafs, nscafs, zone->overshoot, WID_LTANGENT, UNKNOWN);
+
+#ifdef GRID_BLUES
+    if (overScaf == UNKNOWN)
+    {
+        overScaf = findGridBotBetween(scafs, nscafs,
+                                      zone->flat, zone->overshoot);
+#ifdef GRID_BLUES_MOVE
+        if (overScaf != UNKNOWN)
+        {
+            scafs[overScaf].position = zone->flat;
+            return nscafs;
+        }
+#endif
+    }
+#endif
+
+    if (overScaf == UNKNOWN)
+        return nscafs;
+
+    /* Is there a suitable parent scaffold present?  It needs to be any
+     * grid scaffold whose minimum is at the flat position.
+     */
+
+    flatScaf = findScaffold(scafs, nscafs, zone->flat, GRID_MIN, overScaf);
+
+    if (flatScaf == UNKNOWN)
+    {
+        /* Try to make one up */
+        if (nscafs == MAXSCAFS)
+        {
+#if STEMDEBUG || VERBOSE
+            printf("No room to add bottom blue\n");
+#endif
+            return nscafs;      /* failed */
+        }
+        make1Scaf(scafs + nscafs, zone->flat, 24, 0, FALSE);
+        flatScaf = nscafs++;
+    }
+
+    /* Make the link from overshoot to flat */
+
+    scafs[overScaf].link = flatScaf + 1;
+    scafs[overScaf].linear = FALSE;
+
+#if STEMDEBUG
+    printf("Adding bottom blue\n");
+#endif
+    return nscafs;
+}
+
+/*
+ * Look for a grid scaffold line relating to the given
+ * top bluezone.  (Ie, one at of over the flat position and at or
+ * below the overshoot position).  If found, and it does not have a parent,
+ * then make an arc parent at the overshoot position and link them together.
+ * (If a suitable parent already exists, use it instead).
+ * Return the (possibly incremented) number of scaffold lines.
+ */
+
+int fixTopZone (ScaffoldPtr scafs,
+                int nscafs,
+                BlueZonePtr zone)
+{
+    int gridScaf, arcScaf;
+
+    if (zone == NULL || scafs == NULL || nscafs == 0)
+        return nscafs;
+
+    gridScaf = findGridTopBetween(scafs, nscafs,
+                                  zone->flat - 1, zone->overshoot);
+
+    if (gridScaf == UNKNOWN)
+        return nscafs;
+
+    /* Is there a suitable parent scaffold present?  It needs to be a top arc
+     * scaffold at the overshoot position
+     */
+
+    arcScaf = findScaffold(scafs, nscafs, zone->overshoot, WID_RTANGENT, gridScaf);
+
+    if (arcScaf == UNKNOWN)
+    {
+        /* Try to make one up */
+        if (nscafs == MAXSCAFS)
+        {
+#if STEMDEBUG || VERBOSE            
+            printf("No room to add top blue\n");
+#endif
+            return nscafs;      /* failed */
+        }
+        make1Scaf(scafs + nscafs, zone->overshoot, WID_RTANGENT, 0, FALSE);
+        arcScaf = nscafs++;
+    }
+
+    /* Make the link from overshoot to flat */
+
+    scafs[gridScaf].link = arcScaf + 1;
+    scafs[gridScaf].linear = FALSE;
+
+#if STEMDEBUG
+    printf("Adding top blue\n");
+#endif
+    return nscafs;
+}
+
+#define SETBIT(n,p) p[n >> 3] |= (1 << (n & 7))
+
+void spotDependencies(int chunkno, int encchars, OutlinePtr outlines,
+                      char *depbytes, int ndepbytes, int *ndeps)
+{
+    int first = chunkno * CHUNKSIZE;
+    int last = first + CHUNKSIZE;
+    if (last > encchars)
+        last = encchars;
+
+    *ndeps = 0;
+    memset((void *) depbytes, 0, (size_t) ndepbytes);
+    
+    for (; first < last; first++)
+    {
+        SegmentPtr seg;
+        if (!outlines[first].used)
+            continue;
+        for (seg = outlines[first].segments;
+             seg;
+             seg = seg->next)
+        {
+            if (seg->type == Inclusion)
+            {
+                int targetChunk = seg->includedChar / CHUNKSIZE;
+/*                if (targetChunk != chunkno)*/
+                {
+                    SETBIT(targetChunk, depbytes);
+                    (*ndeps)++;
+                }
+            }
+        }
+    }
+}
+
+
+#if 0                           /* NOW IMPLEMENTED IN FRONTEND */
+
+/*
+ * Get the /FontName setting of a given Type 1 file.  If it fails for
+ * any reason, it just returns FALSE; otherwise it returns TRUE and sets
+ * the result buffer.
+ */
+
+BOOL getfontname(const char *infile, char *resultbuf, int resultsize)
+{
+    CODEFILE inputblk;
+    tokstr token;
+    BOOL found = FALSE;
+
+    *resultbuf = 0;
+    if (!infile)
+        return FALSE;
+
+    inputblk.subr_bytecount = 0;        /* not yet in a coded subroutine */
+    inputblk.lenlV = 4;                 /* number of random bytes at start of subroutines */
+    inputblk.pointer = NULL;            /* use file access */
+
+    if ((inputblk.file = fopen(infile, "r")) == NULL)
+    {
+        return FALSE;
+    }
+
+    if (eexec_stop(&inputblk) != NULL)
+        goto endit;
+    while (!code_eof(&inputblk))
+    {
+        if (readtoken(&inputblk, &token))
+            break;
+        if (token.type == TOK_ID)
+        {
+            if (strcmp(token.value.string, "FontName") == 0)
+            {
+                if (readtoken(&inputblk, &token) == NULL)
+                {
+                    resultbuf[resultsize - 1] = 0;
+                    strncpy(resultbuf, token.value.string, resultsize - 1);
+                    found = TRUE;
+                }
+                break;
+            }
+        }
+    }                                   /* while */
+
+ endit:
+    fclose(inputblk.file);
+    return found;
+}
+
+#endif
+
+
+/*
+ * Bounding box calculations
+ */
+
+/* Ensure at least 'words' ints available in the path.  Extend if needed.
+ * Return pointer to next int to write, and increase the used count.
+ * Return NULL for failure, in which case path->space will be NULL and should not
+ * be freed.
+ */
+
+static DRAW_TYPE * pathspace (PathPtr path, int words)
+{
+    int unused = path->allocated - path->used;
+
+    if (unused < words)
+    {
+        path->allocated += (words <= DRAW_CHUNK ? DRAW_CHUNK : words);
+        path->space = (DRAW_TYPE *)realloc((char *)path->space, path->allocated * sizeof(DRAW_TYPE));
+    }
+
+    if (path->space == NULL)
+        return NULL;
+    else
+    {
+        DRAW_TYPE *start = path->space + path->used;
+        path->used += words;
+        return start;
+    }
+}
+
+
+/*
+ * Update bounding box of outline character, including the size of
+ * any composite inclusions.  Return FALSE if this could not be done.
+ * After calling this (as many times as you want to) call it with
+ * both pointers NULL to free up its internal storage.
+ */
+
+static BOOL findbbox(OutlinePtr outl, wimp_box *bbox)
+{
+    int needed;
+    static PathRec inpath = {0, 0, NULL};
+    static PathRec outpath = {0, 0, NULL};
+
+    if (outl == NULL && bbox == NULL)   /* cleanup */
+    {
+        if (inpath.space) free((char *) inpath.space);
+        if (outpath.space) free((char *) outpath.space);
+        inpath.space = outpath.space = NULL;
+        inpath.allocated = outpath.allocated = 0;
+        return FALSE;
+    }
+
+    inpath.used = outpath.used = 0;
+
+    bbox->x0 = bbox->y0 = BIG;
+    bbox->x1 = bbox->y1 = -BIG;
+
+#if VERBOSE
+    printf("findbbox IN\n");
+#endif
+
+    if (buildpath(outl, &inpath, 0, 0, FALSE) == NULL)
+    {
+#if VERBOSE
+        printf("findbbox OUT\n");
+#endif
+        return FALSE;           /* nothing to free */
+    }
+
+    if (inpath.used <= 1)       /* just a DRAW_TERM */
+    {
+        bbox->x0 = bbox->y0 = bbox->x1 = bbox->y1 = 0;
+#if VERBOSE
+        printf("findbbox OUT\n");
+#endif
+        return TRUE;
+    }
+
+    /* Determine space required */
+
+    if (os_swi3r(os_X | Draw_FlattenPath, inpath.space, 0, 256, &needed, NULL, NULL) != NULL)
+        return FALSE;
+
+    if (pathspace(&outpath, needed / 4 + 1) == NULL)
+        return FALSE;
+
+    /* Prime output buffer with size for Draw module */
+    outpath.space[0] = 0; outpath.space[1] = outpath.allocated * 4;
+
+    if (os_swi3(os_X | Draw_FlattenPath, inpath.space, outpath.space, 256) != NULL)
+        return FALSE;
+#if VERBOSE
+    {
+        BOOL ret = pathbbox(&outpath, bbox);
+        printf("findbbox OUT\n");
+        return ret;
+    }
+#else
+    return pathbbox(&outpath, bbox);
+#endif
+}
+
+
+/* Scale between design units and draw units */
+
+#define drawscale(n) ((n) << 8)
+#define undrawscale(n) (((n) + 128) >> 8)
+
+/*
+ * Build path for character into the Draw module path specified by path.
+ * Return the path vector pointer, or else NULL if we ran out of space.
+ */
+
+static PathPtr buildpath(OutlinePtr outl, PathPtr path, int offx, int offy, BOOL inclusion)
+{
+    SegmentPtr seg = outl->segments;
+#if VERBOSE
+    printf("buildpath IN\n");
+#endif
+    while (outl->used && seg)
+    {
+        switch (seg->type)
+        {
+        case Moveto:
+#if VERBOSE
+            printf("MOVE\n");
+#endif
+            if (addToPath(path, DRAW_MOVE, offx, offy, seg->x1, seg->y1, 0, 0, 0, 0) == NULL)
+                return NULL;
+            break;
+        case Lineto:
+#if VERBOSE
+            printf("LINE\n");
+#endif
+            if (addToPath(path, DRAW_LINE, offx, offy, seg->x1, seg->y1, 0, 0, 0, 0) == NULL)
+                return NULL;
+            break;
+        case Closepath:         /* should probably use Lineto code */
+#if VERBOSE
+            printf("CLOSE\n");
+#endif
+            if (addToPath(path, DRAW_CLOSE, offx, offy, 0, 0, 0, 0, 0, 0) == NULL)
+                return NULL;
+            break;
+        case Curveto:
+#if VERBOSE
+            printf("CURVE\n");
+#endif
+            if (addToPath(path, DRAW_CURVE, offx, offy, seg->x1, seg->y1,
+                             seg->x2, seg->y2, seg->x3, seg->y3) == NULL)
+                return NULL;
+            break;
+        case Inclusion:
+#if VERBOSE
+            printf("INCLUSION\n");
+#endif
+            if (buildpath(outlines + seg->includedChar, path, offx + seg->x1, offy + seg->y1, TRUE) == NULL)
+                return NULL;
+            break;
+        case Endchar:
+#if VERBOSE
+            printf("ENDCHAR\n");
+#endif
+            break;
+        }
+        seg = seg->next;
+    }
+
+    if (!inclusion)
+    {
+#if VERBOSE
+        printf("TERMINATOR\n");
+#endif
+        if (addToPath(path, DRAW_TERM, 0, 0, 0, 0, 0, 0, 0, 0) == NULL)
+            return NULL;
+    }
+#if VERBOSE
+    printf("buildpath OUT\n");
+#endif
+    return path;
+}
+
+
+/*
+ * Add a single Draw module segment to the path being built.
+ */
+
+static PathPtr addToPath (PathPtr path, int draw_type, int offx, int offy,
+                          int x1, int y1, int x2, int y2, int x3, int y3)
+{
+    DRAW_TYPE *where;
+    switch (draw_type)
+    {
+    case DRAW_MOVE:
+    case DRAW_LINE:
+        if ((where = pathspace(path, 3)) == NULL)
+            return NULL;
+        *where++ = draw_type;
+        *where++ = drawscale(xformx(x1 + offx, y1 + offy));
+        *where++ = drawscale(xformy(x1 + offx, y1 + offy));
+        break;
+    case DRAW_CLOSE:
+        if ((where = pathspace(path, 1)) == NULL)
+            return NULL;
+        *where++ = draw_type;
+        break;
+    case DRAW_CURVE:
+        if ((where = pathspace(path, 7)) == NULL)
+            return NULL;
+        *where++ = draw_type;
+        *where++ = drawscale(xformx(x1 + offx, y1 + offy));
+        *where++ = drawscale(xformy(x1 + offx, y1 + offy));
+        *where++ = drawscale(xformx(x2 + offx, y2 + offy));
+        *where++ = drawscale(xformy(x2 + offx, y2 + offy));
+        *where++ = drawscale(xformx(x3 + offx, y3 + offy));
+        *where++ = drawscale(xformy(x3 + offx, y3 + offy));
+        break;
+    case DRAW_TERM:
+        if ((where = pathspace(path, 1)) == NULL)
+            return NULL;
+        *where++ = draw_type;
+        break;
+    }
+    return path;
+}
+
+
+/*
+ * Scan a draw path, returning the bounding box
+ * The path may or may not have been flattened beforehand
+ * Return FALSE if something went wrong.
+ */
+
+static BOOL pathbbox (PathPtr path, wimp_box *bbox)
+{
+    DRAW_TYPE *ptr = path->space;
+    while (ptr && *ptr != DRAW_TERM)
+    {
+        int count;
+        switch(*ptr++)
+        {
+        case DRAW_CURVE:
+            count = 3;          /* 3 sets of coords */
+            break;
+        case DRAW_MOVE:
+        case DRAW_LINE:
+            count = 1;          /* 1 set of coords */
+            break;
+        default:
+            count = 0;          /* no coords */
+            break;
+        }
+        for ( ; count; count--)
+        {
+            int x = undrawscale(*ptr++);
+            int y = undrawscale(*ptr++);
+            if (x < bbox->x0) bbox->x0=x;
+            if (y < bbox->y0) bbox->y0=y;
+            if (x > bbox->x1) bbox->x1=x;
+            if (y > bbox->y1) bbox->y1=y;
+        }
+    }
+    return TRUE;
+}
+
+
+/*
+ * Deallocation
+ */
+
+static void freeSegments (SegmentPtr seg)
+{
+    while (seg)
+    {
+        SegmentPtr next = seg->next;
+        free((char *)seg);
+        seg = next;
+    }
+}
+
+static void freeStems (StemPtr stem)
+{
+    while (stem)
+    {
+        StemPtr next = stem->next;
+        free((char *)stem);
+        stem = next;
+    }
+}
+
+static void freeSubrs ()
+{
+    if (nsubrs && subrsarray)
+    {
+        int i;
+        for (i = 0; i < nsubrs; i++)
+            if (subrsarray[i])
+                free((char *)subrsarray[i]);
+        free((char *)subrsarray);
+    }
+    nsubrs = 0; subrsarray = 0;
+}
+
+static void freeChars ()
+{
+    if (charsarraysize && charsarray)
+    {
+        int i;
+        for (i = 0; i < charsarraysize; i++)
+            if (charsarray[i])
+                free((char *)charsarray[i]);
+        free((char *)charsarray);
+    }
+    charsarraysize = 0; charsarray = 0;
+}
+
+static void freeOutlines ()
+{
+    if (encchars && outlines)
+    {
+        int i;
+        for (i = 0; i < encchars; i++)
+            if (outlines[i].used)
+            {
+                freeSegments(outlines[i].segments);
+                freeStems(outlines[i].stems);
+            }
+        free((char *)outlines);
+    }
+    encchars = 0; outlines = 0;
+}
+
+static void freeAll ()
+{
+    freeEncoding(&adobeenc);
+/*    freeEncoding(&newencblk);   converttype1's caller does this */
+    freeOutlines();
+    freeSubrs();
+    freeChars();
+    if (ndepbytes && depbytes)
+    {
+        free(depbytes);
+        depbytes = 0; ndepbytes = 0;
+    }
+    if (chunkindex)
+    {
+        free((char *)chunkindex);
+        chunkindex = 0;
+    }
+}

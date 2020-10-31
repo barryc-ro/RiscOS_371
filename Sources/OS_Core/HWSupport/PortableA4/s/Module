@@ -1,0 +1,1913 @@
+; => Module
+
+; ***********************************
+; ***    C h a n g e   L i s t    ***
+; ***********************************
+
+; Date      Vn.   Who   Description
+; ----      ----  ---   -----------
+; 26-Apr-91 0.01  TMD   Initial border flasher for testing kernel speed switching.
+; ??-???-91 0.02  TMD   Updated to actually poke speed latch as well as border.
+; 19-Nov-91 0.03  TMD   Removed border flashing.
+;                       Added LCD driver, SWI Portable_Control.
+; 26-Nov-91 0.04  TMD   Fixed hot keys for invert video code, hard disc power-down.
+; 28-Nov-91 0.05  TMD   Fixed screen mode 3.
+; 28-Nov-91 0.06  TMD   Fixed service reset code to not claim PaletteV and to reclaim
+;                        EventV.
+; 02-Dec-91 0.07  TMD   Fixed non-initialisation of EventVFlag, which stopped hot keys
+;                        working except after power-on/FX200,2 resets.
+;                       Use global messages for our two errors.
+;                       Fixed non-claiming of PaletteV after soft reset, due to Service_Reset
+;                        coming round after it's already done a mode change.
+; 04-Dec-91 0.08  TMD   Added extra waits for Vsync to try to make white lines disappear (they didn't).
+;                       Fixed non-releasing of EventV on die.
+;                       Added configuration changes for Portable machine on CMOS reset.
+; 05-Dec-91       TMD   Added option to substitute the 2nd serial port for the 1st (becuase the 1st
+;                        Perth PCBs are wired up wrong)
+; 09-Dec-91 0.09  CDP   Added BMU variables and calls to BMU init/end/SWI code.
+; 09-Dec-91 0.10  TMD   Fixed bug in power configuration code, changed config code to cope with 2nd
+;                        serial port usage.
+; 10-Dec-91 0.11  CDP   Added message file handling/error lookup routines for
+;                       internationalisation.
+; 11-Dec-91 0.12  TMD   Removed support for turning off power to 82C710/711 subunits
+;                       Added conditional support for disabling FDC (for debugging ADFS)
+;                       Merged serial disable into one bit (which turns off buffers
+;                        and oscillator if possible)
+;                       Added conditional support for turning off serial/FDC oscillator.
+;                       Try to turn off power to serial and FDC when we start up.
+;                       Put in screen blanker SWI on FN-F10.
+; 20-Jan-92 0.13  CDP   Changed IIC addresses to conform to new BMU specification
+;                       Fixed IRQ/FIQ disable code in BMU stuff when writing to IOC.
+;                       Fixed call to WriteBMU in SWI CommandBMU.
+; 23-Jan-92 0.14  TMD   Fixed default palette in 256 colour modes (well changed it anyway!)
+; 27-Jan-92 0.15  TMD   Added 24MHz pixel rate, 83Hz frame rate LCD option.
+;                       Force inverted clock, so 24MHz modes work.
+;                       When releasing hold, set software reset momentarily, in another attempt
+;                        to try to remove the white lines.
+; 30-Jan-92 0.16  CDP   Removed IIC workspace and use stack.
+;                       Added errors BadBMUVersion and BMUBusy.
+;                       Added code dependent on BacklightBug.
+; 19-Feb-92 0.17  TMD   Set Use2ndSerialPort to false, in preparation for
+;                       production Perth hardware.
+; 20-Feb-92 0.18  CDP   Incorporated BMU changes: retries on IIC failure,
+;                       new interpretation of BMU version number, reenable BMU
+;                       IRQ when BMU IIC access fails in IRQ handler.
+; 02-Mar-92 0.19  TMD   Added switch to enable Econet instead of disabling it, for
+;                       images which have non-power-switching Econet modules
+;                       (set to true on this version).
+; 04-Mar-92 0.20  TMD   Added reconfiguration of SoundDefault to 1 6 2, Configure Loud
+;                       (in response to bug report RP-1464).
+; 04-Mar-92 0.21  TMD   Include GET Hdr:NewSpace, Hdr:Sound and changed some symbol names
+;                       so it actually assembles.
+; 12-Mar-92 0.22  CDP   Make BMU code store initialisation errors and return
+;                       them to SWIs rather than report them during
+;                       initialisation.
+;                       Remove any pending BMU IRQ callback on die.
+;                       Tidy up BMU device claim/release stuff.
+; 13-Mar-92 0.23  TMD   Set EnableEconet to FALSE.
+; 30-Mar-92 0.24  TMD   Changed palette mapping code (to fix RP-1624).
+; 01-Apr-92 0.25  TMD   Removed modification to default CMOS setting for FontSize.
+; 02-Apr-92 0.26  CDP   Changed BMU memory map recognised by module.
+;                       Added BMU variable and revised BMU variable numbers
+; 13-Apr-92 0.27  TMD   Added setting of !BatMgr auto-start bit to default CMOS patching.
+;                       Added code to gate the state of LCDEnable and Backlight with the state
+;                       of the lid switch (if lid closed, both bits are set to off, although
+;                       Portable_Control still reflects the desired state).
+;                       Added new code on PaletteV to do screen blanking.
+; 13-Apr-92 0.28  CDP   BMU address for charge rate changed from 92 to 5E.
+; 22-Apr-92 0.29  TMD   Corrected setting of SoundDefault CMOS (fixes RP-2506).
+; 03-Jun-92 0.30  TMD   Corrected speed setting.
+
+        TTL     The Portable support module
+
+        SUBT    Main code
+
+        ^       0, wp ; Store
+
+MsgTransBlk     #       16      ; for MessageTrans calls
+P_FirPalSetting #       20*4
+P_SecPalSetting #       20*4
+
+Workspace       #       0       ; 1 word with various bits
+P_PalIndex      #       1
+P_DisplayNColour #      1
+BBCGapFlag      #       1
+SlowSpeedFlag   #       1
+
+MyWSTable       #       12      ; 3 words consisting of 0, mode number, -1
+
+ConfigTables    #       0
+ConfigPreTable  #       4
+ConfigPostTable #       4
+ [ DisableFDC
+ConfigFDCTable  #       4
+ ]
+ [ TurnOffOscillator
+ConfigOscilTable #      4
+ ]
+
+ConfigExtraBitsCopy #   4       ; copy of bits that aren't copies of hardware bits,
+                                ; in SWI Portable_Control bit positions
+ [ BMU
+BMUerrorpointer #       4       ; !0 => -> tokenised error
+ ]
+
+P_FlashState    #       1
+PalState        #       1
+InterceptFlag   #       1       ; 0 => not on PaletteV, 1 => on PaletteV but colours not set up,
+                                ; 2 => on PaletteV and colours set up
+EventVFlag      #       1       ; 0 => not on EventV, 1 => on EventV
+
+ProcessorSpeed  #       1       ; 0 => fast, 1 => slow
+FastSpeed       *       0
+SlowSpeed       *       1
+MachineType     #       1       ; 1 => 82C710, 2 => 82C711
+InLCDMode       #       1       ; 1 => in a stable LCD screen mode (ie not in middle of mode change), else 0
+                                ; used by screen blanking stuff so it knows if it is safe to modify LCDEnable
+                                ; and Backlight bits.
+ [ BMU
+BMU_Flags       #       1
+BMUDevFlag      #       1       ; 0 => not claimed device
+ ]
+                AlignSpace
+TotalRAMRequired *      :INDEX: @
+
+; 82C710 stuff
+
+PCWorldBase     *       &03010000       ; Base address of 82C710 = PC/AT I/O 000H
+CRI710Addr      *       &0390
+
+ConRegA710      *       PCWorldBase + &2FA*4
+ConRegB710      *       PCWorldBase + &3FA*4
+
+CRI710          *       PCWorldBase + CRI710Addr*4
+CAP710          *       CRI710 +4
+
+CRI711          *       PCWorldBase + &3F0*4
+CAP711          *       CRI711 +4
+
+;******************************************************************************
+
+; Errors
+
+        ^               ErrorBase_Portable
+        AddError        BadBMUVariable,"BadBMUVar"
+        AddError        BadBMUCommand,"BadBMUCmd"
+        AddError        BMUBusy,"BMUBusy"
+        AddError        BadBMUVersion,"BadBMUVer"
+        AddError        BMUFault,"BMUFault"
+        AddError        BMUVecClaim,"BMUVecClaim"
+        ASSERT          @ <= (ErrorBase_Portable + ?ErrorBase_Portable)
+
+;******************************************************************************
+
+; Resources
+
+MessageFile     DCB     "Portable:Messages",0
+Path            DCB     "Portable$Path",0
+DefPath         DCB     "Resources:$.Resources.Portable.",0
+
+;******************************************************************************
+
+        SUBT    Module entry stuff
+        OPT     OptPage
+
+HelpString
+        =       "Portable", 9, VString, " (", Date, ")", 0
+        ALIGN
+
+        SUBT    Initialisation code
+        OPT     OptPage
+
+InitModule ENTRY "r7"
+        MOV     r0, #2                  ; check machine type
+        SWI     XOS_ReadSysInfo
+        EXIT    VS
+        TEQ     r0, #1                  ; must have an IOEB
+        TEQEQ   r1, #1                  ; and an 82C710 (for configuration)
+        TEQEQ   r2, #1                  ; and an LC ASIC
+        BNE     %FT99
+
+        MOV     r0, #3                  ; now check type of configuration sub-unit
+        SWI     XOS_ReadSysInfo
+        EXIT    VS
+        MOV     r0, r0, LSR #20         ; extract configuration sub-unit type bits
+        AND     r4, r0, #&0F
+        TEQ     r4, #1                  ; must be type 1 (for 82C710)
+        TEQNE   r4, #2                  ;      or type 2 (for 82C711)
+        BNE     %FT99
+
+        LDR     r2, [r12]
+        TEQ     r2, #0
+        BNE     %FT10           ; soft init
+
+        MOV     r0, #ModHandReason_Claim
+        MOV     r3, #TotalRAMRequired
+        SWI     XOS_Module
+        EXIT    VS
+        STR     r2, [r12]
+10
+        MOV     wp, r2
+
+
+        STRB    r4, MachineType
+        TEQ     r4, #1                  ; set up config pointers to correct tables for 710/711
+        ADREQL  r0, ConfigTables710
+        ADRNEL  r0, ConfigTables711
+        ADD     r1, r0, #ConfigTables710End - ConfigTables710
+        ADR     r2, ConfigTables
+20
+        LDR     r3, [r0], #4
+        ADD     r3, r3, r0              ; make into absolute pointers
+        STR     r3, [r2], #4
+        TEQ     r0, r1
+        BNE     %BT20
+
+        BL      InitialisePowerBitsCopy
+
+        MOV     r0, #0
+        STR     r0, MyWSTable + 0
+        STRB    r0, InterceptFlag
+        STRB    r0, EventVFlag
+        STRB    r0, PalState            ; normal palette to start
+        STRB    r0, InLCDMode
+ [ BMU
+        STRB    r0, BMUDevFlag
+ ]
+
+        MOV     r0, #-1
+        STR     r0, MyWSTable + 8
+
+        MOV     r0, #1                  ; start in 1st state
+        STRB    r0, P_FlashState
+
+; initialise Path variable if null
+
+        addr    R0,Path
+        MOV     R2,#-1
+        MOV     R3,#0
+        MOV     R4,#VarType_Expanded
+        SWI     XOS_ReadVarVal                  ; returns R2=0 if doesn't exist
+
+        CMPS    R2,#0                           ; if null, set it
+        addr    R0,Path,EQ
+        addr    R1,DefPath,EQ
+        MOVEQ   R2,#?DefPath
+        MOVEQ   R3,#0
+        MOVEQ   R4,#VarType_String
+        SWIEQ   XOS_SetVarVal
+
+        [       standalonemessages
+        ADRL    R0,ResourceFSFiles
+        SWI     XResourceFS_RegisterFiles
+        ]
+
+; open messages file
+
+        wsaddr  R0,MsgTransBlk
+        addr    R1,MessageFile
+        MOV     R2,#0                           ; no buffer supplied
+        SWI     XMessageTrans_OpenFile
+        EXIT    VS
+
+        BL      SetFastSpeed
+        BL      ClaimEventV
+        BL      CheckForCMOSReset
+
+ [ BMU
+
+; claim IRQ for BMU and read initial flags
+ 
+        BL      ClaimBMUIRQandInit
+
+ ]
+
+        EXITS
+
+; come here if inappropriate hardware for Portable module to operate
+
+99
+        ADR     r0, ErrorBlock_BadHard
+        MOV     r1, #0                  ; only use global message file
+        MOV     r2, #0                  ; use MessageTrans buffer
+        MOV     r3, #0                  ; buffer size (irrelevant)
+        MOV     r4, #0                  ; don't substitute anything
+        MOV     r5, #0
+        MOV     r6, #0
+        MOV     r7, #0
+        SWI     XMessageTrans_ErrorLookup
+        EXIT
+
+        MakeErrorBlock  BadHard
+
+
+KillModule ENTRY
+        LDR     wp, [r12]
+ [ BMU
+        BL      ReleaseBMUIRQ
+ ]
+        BL      ReleaseEventV
+        BL      ReleaseVec
+
+; close message file
+
+        wsaddr  R0,MsgTransBlk
+        SWI     XMessageTrans_CloseFile
+
+        [       standalonemessages
+        ADRL    R0,ResourceFSFiles
+        SWI     XResourceFS_DeregisterFiles
+        ]
+
+        CLRV
+        EXIT
+
+ServiceEntry ROUT
+        TEQ     r1, #Service_Reset
+        TEQNE   r1, #Service_PreReset
+        TEQNE   r1, #Service_ModeChanging
+        TEQNE   r1, #Service_ModeExtension
+        TEQNE   r1, #Service_ModeTranslation
+        TEQNE   r1, #Service_ModeChange
+        TEQNE   r1, #Service_MonitorLeadTranslation
+; no need to handle Service_MessageFileClosed
+        [       standalonemessages
+        TEQNE   R1,#Service_ResourceFSStarting
+        ]
+        MOVNES  pc, lr
+
+        LDR     wp, [r12]
+
+        TEQ     r1, #Service_ModeChanging
+        BEQ     Svc_ModeChanging
+
+        TEQ     r1, #Service_ModeExtension
+        BEQ     Svc_ModeExtension
+
+        TEQ     r1, #Service_ModeTranslation
+        BEQ     Svc_ModeTranslation
+
+        TEQ     r1, #Service_ModeChange
+        BEQ     Svc_ModeChange
+
+        TEQ     r1, #Service_MonitorLeadTranslation
+        BEQ     Svc_MonitorLeadTranslation
+
+        TEQ     r1, #Service_PreReset
+        BEQ     Svc_PreReset
+
+        [       standalonemessages
+        TEQ     r1, #Service_ResourceFSStarting
+        BNE     %FT10
+        Push    "r0-r3,lr"
+        ADRL    r0, ResourceFSFiles
+        MOV     lr, pc
+        MOV     pc, r2
+        Pull    "r0-r3,pc",,^
+10
+        ]
+
+; else drop thru to...
+
+Svc_Reset ENTRY "r0-r2"
+        MOV     r0, #&FD                ; read last reset type
+        MOV     r1, #0
+        MOV     r2, #&FF
+        SWI     XOS_Byte
+        TEQ     r1, #0                  ; if not a soft reset, ignore
+        EXITS   NE
+        STRB    r1, EventVFlag          ; indicate not on EventV (r1 = 0)
+ [ BMU
+        STRB    r1, BMUDevFlag          ; indicate not claimed device
+ ]
+        BL      ClaimEventV
+        BL      SetFastSpeed            ; and set speed to fast in soft copy and hardware
+ [ BMU
+        BL      ClaimBMUIRQandInit
+ ]
+ [ EnableEconet
+        MOV     r0, #PortableControl_EconetEnable       ; turn it on
+ |
+        MOV     r0, #0                                  ; turn it off
+ ]
+        LDR     r1, =:NOT: (PortableControl_SerialEnable :OR: PortableControl_FDCEnable :OR: PortableControl_EconetEnable)
+        BL      PortableControl                 ; try to disable serial, FDC and Econet
+        EXITS
+
+Svc_PreReset ENTRY "r0-r2"
+        BL      SetFastSpeed            ; on pre-reset, set speed to fast in soft copy and hardware
+
+        MOV     r0, #19
+        SWI     XOS_Byte                ; wait for vsync before disabling panel
+
+        LDR     r1, =:NOT: (PortableControl_EconetEnable :OR: PortableControl_LCDEnable :OR: PortableControl_VideoEnable :OR: PortableControl_SerialEnable :OR: PortableControl_ClockBits :OR: PortableControl_BacklightEnable :OR: PortableControl_FDCEnable)                       ; reset everything to their default state
+        LDR     r0, =PortableControl_EconetEnable :OR: PortableControl_VideoEnable :OR: PortableControl_SerialEnable :OR: PortableControl_ExtClock :OR: PortableControl_FDCEnable
+        BL      PortableControl         ; disable LCD panel just before reset, in case MOS VIDC poking
+                                        ; annoys it
+        LDR     r0, =LC_Base
+        MOV     r1, #LC_Reset_Hold      ; and put LCD on hold while we're at it
+        STRB    r1, [r0, #LC_Reset]
+        EXITS
+
+Svc_ModeChanging ENTRY "r0-r3"
+
+        MOV     r0, #0                  ; we are about to modify LCD parameters, so stop any screen-blanking
+        STRB    r0, InLCDMode           ; nonsense fiddling about with them
+
+        MOV     r0, #19
+        SWI     XOS_Byte                ; wait for vsync before disabling panel
+
+        LDR     r1, =:NOT: PortableControl_LCDEnable
+        MOV     r0, #0
+        BL      PortableControl         ; always disable LCD panel during any mode change
+
+        LDR     r0, =LC_Base
+        MOV     r1, #LC_Reset_Hold      ; put LCD on hold
+        STRB    r1, [r0, #LC_Reset]
+
+        LDMIA   sp, {r0-r3}             ; reload input registers
+
+        TEQ     r3, #5
+        BNE     %FT90                   ; not an LCD mode cos not monitor type 5
+        CMP     r2, #NumModes
+        BCS     %FT90                   ; not an LCD mode cos out of range
+        ADR     r0, BigWSTable
+        LDR     r0, [r0, r2, LSL #2]    ; load workspace word
+        CMP     r0, #-1                 ; if table entry = -1
+        BEQ     %FT90                   ; then not an LCD mode
+
+        BL      ClaimVec                ; get on paletteV (and set intercept flag to ignore flashes)
+        STR     r0, Workspace           ; store workspace word for new mode
+
+        LDR     r1, =:NOT: (PortableControl_VideoEnable :OR: PortableControl_DualEnable :OR: PortableControl_ClockBits :OR: PortableControl_InvertClock :OR: PortableControl_ExtraLines :OR: PortableControl_DRAMs)
+        TST     r0, #1:SHL:24           ; NE => 8MHz clock, else 16MHz
+        LDREQ   r0, =PortableControl_DualEnable :OR: PortableControl_CrysClock :OR: PortableControl_InvertClock :OR: PortableControl_ExtraLines2 :OR: PortableControl_DRAMs2
+        LDRNE   r0, =PortableControl_DualEnable :OR: PortableControl_Crys2Clock :OR: PortableControl_InvertClock :OR: PortableControl_ExtraLines2 :OR: PortableControl_DRAMs2
+
+        BL      PortableControl         ; disable external video, and set up other bits in control register
+
+        ADRL    r0, LCDRegTable
+        MOV     r1, #11                 ; program registers 0..11
+        LDR     r2, =LC_Base
+10
+        LDRB    r3, [r0, r1]
+        STRB    r3, [r2, r1, LSL #2]
+        SUBS    r1, r1, #1
+        BCS     %BT10
+
+        BL      UpdateLCDPalette
+        EXITS
+
+90
+        BL      ReleaseVec
+
+        LDR     r1, =:NOT: PortableControl_ClockBits
+        LDR     r0, =PortableControl_ExtClock
+        BL      PortableControl         ; select external clock
+
+        LDR     r2, =LC_Base
+        MOV     r1, #LC_Reset_Hold      ; put LCD on hold
+        STRB    r1, [r2, #LC_Reset]
+        EXITS
+
+
+Svc_ModeExtension ENTRY "r0"
+        CMP     r3, #5                  ; only recognise LCD monitor type
+        CMPNE   r3, #-1                 ; or "don't care" monitor type
+        EXITS   NE
+        CMP     r2, #NumModes           ; and modes in range
+        EXITS   CS
+
+        ADRL    lr, BigVIDCTable
+        LDR     r0, [lr, r2, LSL #2]
+        CMP     r0, #-1                 ; if table entry = -1 then not one of ours
+        EXITS   EQ
+
+        ADD     r3, r0, lr              ; r3 -> VIDCList
+        ADR     r4, MyWSTable
+ [ IncludeTestModes ; for test modes, pretend they're like mode 27
+        MOV     lr, r2
+        CMP     lr, #46
+        MOVHI   lr, #27
+        STR     lr, [r4, #4]
+ |
+        STR     r2, [r4, #4]            ; store mode number in dummy workspace list (in my workspace)
+ ]
+        MOV     r1, #0                  ; claim service
+        EXITS
+
+Svc_ModeTranslation ENTRY "r0"
+        TEQ     r3, #5                  ; only recognise LCD monitor type
+        EXITS   NE
+
+        MOV     r0, r2                  ; r0 = mode number
+        MOV     r1, #VduExt_Log2BPP     ; read log2bpp
+        SWI     XOS_ReadModeVariable
+        MOV     r1, #27                 ; default mode if unknown bpp
+        BVS     %FT10                   ; if an error
+        CMPCC   r2, #4                  ; or if return CS from call (invalid mode) or if log2bpp>3 then use 27
+        ADDCC   r1, r2, #25             ; else use 25,26,27,28 for 1,2,4,8 bpp respectively
+10
+        MOV     r2, r1                  ; return substitute mode in r2
+        MOV     r1, #0                  ; claim service
+        EXITS
+
+Svc_ModeChange ENTRY "r0-r3"
+        TEQ     r3, #5
+        BNE     %FT90                   ; not an LCD mode cos not monitor type 5
+        CMP     r2, #NumModes
+        BCS     %FT90                   ; not an LCD mode cos out of range
+        ADRL    r0, BigWSTable
+        LDR     r0, [r0, r2, LSL #2]    ; load workspace word
+        CMP     r0, #-1                 ; if table entry = -1
+        BEQ     %FT90                   ; then not an LCD mode
+
+        LDR     r2, =LC_Base
+        MOV     r0, #LC_Reset_Hold :OR: LC_Reset_SoftwareReset
+        STRB    r0, [r2, #LC_Reset]     ; set software reset (Ashley's idea)
+        MOV     r0, #LC_Reset_Hold
+        STRB    r0, [r2, #LC_Reset]     ; clear software reset
+        MOV     r0, #0
+        STRB    r0, [r2, #LC_Reset]     ; clear LCD hold
+
+        MOV     r0, #19                 ; wait for vsync before enabling LCD
+        SWI     XOS_Byte                ; so the LCD signals have got started
+
+        MOV     r0, #1                  ; we can now allow the screen-blanking stuff to work again
+        STRB    r0, InLCDMode
+
+        LDR     r1, =:NOT: (PortableControl_LCDEnable :OR: PortableControl_BacklightEnable)
+        LDR     r0, = (PortableControl_LCDEnable :OR: PortableControl_BacklightEnable)
+        BL      PortableControl         ; enable LCD and backlight
+        EXITS
+
+90
+        LDR     r1, =:NOT: (PortableControl_VideoEnable :OR: PortableControl_BacklightEnable)
+        LDR     r0, = PortableControl_VideoEnable
+        BL      PortableControl         ; enable external video, disable backlight
+        EXITS
+
+Svc_MonitorLeadTranslation ENTRY
+        TEQ     r2, #4_1111             ; is no monitor plugged in (all lines +5v) ?
+        MOVEQ   r3, #27                 ; if so then use mode 27
+        MOVEQ   r4, #5                  ; and monitortype 5
+        MOVEQ   r5, #0                  ; and separate syncs
+        MOVEQ   r1, #0                  ; and claim service
+        EXITS
+
+
+SetFastSpeed ENTRY "r0,r1"
+        MOV     r0, #0                  ; set to fast
+        MOV     r1, #0                  ; ignore old
+        BL      PortableSpeed
+        EXITS
+
+SWIEntry ROUT
+        LDR     wp, [ r12 ]
+        CMP     r11, #( EndOfJumpTable - JumpTable ) / 4
+        ADDCC   pc, pc, r11, LSL #2
+        B       UnknownSWI
+
+JumpTable
+        B       PortableSpeed
+        B       PortableControl
+ [ BMU
+        B       SWI_ReadBMUVariable
+        B       SWI_WriteBMUVariable
+        B       SWI_CommandBMU
+ ]
+EndOfJumpTable
+
+;        ASSERT  (EndOfJumpTable - JumpTable) / 4 = PortableSWICheckValue - MySWIChunkBase
+
+UnknownSWI
+        Push    "r4,lr"
+        ADR     r0, ErrorBlock_ModuleBadSWI
+        ADR     r4, ModuleTitle
+        BL      ErrorLookup1Parm
+        Pull    "r4,pc"
+
+
+        MakeErrorBlock ModuleBadSWI
+
+SWINameTable
+ModuleTitle ; Share the string
+        =       "Portable", 0
+        =       "Speed", 0
+        =       "Control", 0
+ [ BMU
+        =       "ReadBMUVariable",0
+        =       "WriteBMUVariable",0
+        =       "CommandBMU",0
+ ]
+        =       0
+        ALIGN
+
+; ******************************************************************************************************
+;
+;       PortableSpeed - Read/write processor speed
+;
+; in:   R0 = EOR mask
+;       R1 = AND mask
+;
+;       New value = (Old value AND R1) EOR R0
+;
+;       0 => fast
+;       1 => slow
+;
+; out:  R0 = old value
+;       R1 = new value
+;
+
+PortableSpeed   ENTRY
+        TEQP    pc, #SVC_mode + I_bit
+        LDRB    lr, ProcessorSpeed
+        AND     r1, lr, r1
+        EOR     r1, r1, r0
+        MOV     r0, lr
+        Push    "r1"
+        ANDS    r1, r1, #1
+
+        LDR     lr, =IOEB_ProcessorSpeed
+        MOVNE   r1, #4                  ; 4 for quarter-speed
+        STRB    r1, [lr]
+
+
+ [ PokeBorder
+        LDREQ   r1, =&400000F0          ; fast = green
+        LDRNE   r1, =&4000000F          ; slow = red
+        MOV     lr, #VIDC
+        STR     r1, [lr]
+ ]
+        Pull    "r1"
+        STRB    r1, ProcessorSpeed
+        EXITS
+
+; ******************************************************************************************************
+;
+;       PortableControl - Read/write various power/LCD control settings
+;
+; in:   R0 = EOR mask
+;       R1 = AND mask
+;
+;       New value = (Old value AND R1) EOR R0
+;
+; out:  R0 = old value
+;       R1 = new value
+;
+;
+; where the bits in control are as follows:-
+;
+;       Bit     Meaning
+;
+;       0       Set => power to Econet enabled
+;
+;       1       Set => power to LCD display enabled
+;
+;       2       Set => power to external video display enabled
+;
+;       3       Set => power to serial buffer and oscillator enabled
+;
+;       4       Set => dual panel mode enabled
+;
+;       6,5     Video clock control
+;                 0,0 => External clock input
+;                 0,1 => Crystal oscillator, divided by 2
+;                 1,0 => Crystal oscillator
+;                 1,1 => reserved, do not use
+;
+;       7       Set => invert video clock
+;
+;       8       Set => back-light enabled
+;
+;       9       Clear => 1 extra line on display, Set => 2 extra lines
+;
+;       10      Clear => 1 DRAM used for dual panel, Set => 2 DRAMs
+;
+;       11-13   Reserved: this bit must not be modified, nor assumed to read
+;                any particular value.
+;
+;       14      Set => power to FDC oscillator in 82C710/82C711 enabled
+;
+;       15      Reserved: this bit must not be modified, nor assumed to read
+;                any particular value
+;
+;       16      Set => LCD palette set up for inverse video
+;
+;       17..31  Reserved: these bits must not be modified, nor assumed to
+;                read any particular value.
+;
+;       By pure fluke, bits 0..10 map directly onto the bits in LC's LICR.
+;       Bit 16 is involved with programming LC's palette registers
+;
+;       The oscillator in the 82C710/711 is used by both the serial subunit
+;       and the FDC. It is therefore only turned off if both bits 3 and 14
+;       are clear.
+;
+;
+
+ControlValidBits  * 2_10100011111111111
+ControlPowerBits  * 2_00100000000001001         ; bits that require service call when changing
+ControlOscilBits  * 2_00100000000001000         ; bits that control the oscillator
+ [ DisableFDC
+ControlConfigBits * 2_00100000000000000         ; bits that require us to enter config mode in 710/711
+ |
+ControlConfigBits * 2_00000000000000000
+ ]
+ [ BMU
+ControlLCBits     * 2_00000011011111101         ; bits that go directly to LC (LCDEnable and BackLight
+ControlExtraBits  * 2_00100000100000010         ; don't if we have a BMU, they're ANDed with the lid
+                                                ; switch state
+ |
+ControlLCBits     * 2_00000011111111111
+ControlExtraBits  * 2_00100000000000000         ; bits stored in soft copy
+ ]
+
+
+PortableControl ENTRY "r2,r3"
+        TEQP    pc, #SVC_mode + I_bit
+
+; first get old state
+
+        MOV     r3, r0
+
+        LDR     r2, =LC_Base
+        LDRB    r0, [r2, #LC_LICR_lo]
+        AND     r0, r0, #(ControlLCBits :AND: &0F)
+        LDRB    lr, [r2, #LC_LICR_mid]
+        AND     lr, lr, #((ControlLCBits :SHR: 4) :AND: &0F)
+        ORR     r0, r0, lr, LSL #4
+        LDRB    lr, [r2, #LC_LICR_hi]
+        AND     lr, lr, #((ControlLCBits :SHR: 8) :AND: &0F)
+        ORR     r0, r0, lr, LSL #8
+        LDRB    lr, PalState
+        ORR     r0, r0, lr, LSL #16     ; r0 is now old state
+        LDR     lr, ConfigExtraBitsCopy
+        ORR     r0, r0, lr
+
+        AND     r1, r0, r1
+        EOR     r1, r1, r3
+        LDR     r3, =ControlValidBits
+        AND     r1, r1, r3              ; r1 is now new state
+
+ [ BacklightBug :LAND: BMU
+
+; if charger plugged in, refuse to kill backlight
+
+        LDRB    LR,BMU_Flags                            ; get BMU flags
+        TSTS    LR,#PortableBMUF_ChargerPresent         ; if charger...
+        ORRNE   R1,R1,#PortableControl_BacklightEnable  ; or in backlight enable bit
+ ]
+
+        EOR     r3, r1, r0              ; r3 = bits that have changed
+        LDR     lr, =ControlPowerBits
+        AND     r3, r3, lr              ; r3 = bits that have changed that require service
+        ANDS    r3, r3, r0              ; r3 = bits that are going from 1 to 0 (ie power -> off)
+        BEQ     %FT10                   ; [no power bits going off]
+
+        Push    "r1-r3"
+        MOV     r1, #Service_Portable
+        MOV     r2, #ServicePortable_PowerDown ; indicate power about to go off
+        SWI     XOS_ServiceCall         ; r3 = mask of bits going off
+        Pull    "r1,r2,lr"              ; on exit r3 = mask of bits that are allowed to go off
+        EOR     r3, r3, lr              ; bits which were forbidden to go off
+        ORR     r1, r1, r3              ; so we'd better put them back on!
+10
+        LDR     lr, =ControlExtraBits
+        AND     lr, lr, r1
+        STR     lr, ConfigExtraBitsCopy ; store soft copy bits
+
+ [ ControlConfigBits <> 0
+        EOR     r3, r1, r0              ; r3 = bits that are really changing
+        LDR     lr, =ControlConfigBits  ; bits that require us to go into config mode to change
+        ANDS    r3, r3, lr              ; bits that are changing in config
+        BNE     %FT15                   ; [there are config bits changing]
+ ]
+
+ [ TurnOffOscillator
+        LDR     lr, =ControlOscilBits
+        TST     r0, lr
+        EORNE   lr, lr, #1:SHL:31       ; bit 31 set if oscillator was on
+        TST     r1, lr
+        EORNE   lr, lr, #1:SHL:31       ; bit 31 set if oscillator has changed
+        TEQ     lr, #0
+        BPL     %FT20                   ; [oscillator has not changed, no need for config]
+ |
+        B       %FT20
+ ]
+
+15
+        Push    "r4"
+        BL      EnterConfigMode
+
+ [ DisableFDC
+        LDR     lr, ConfigFDCTable
+        LDMIA   lr!, {r3,r4}            ; load addr1, data1
+        STRB    r4, [r3]                ; set up CRI
+        LDMIA   lr, {r3,r4}             ; load addr2, data2
+        LDRB    lr, [r3]
+        TST     r1, #PortableControl_FDCEnable
+        BICEQ   lr, lr, r4              ; disable
+        ORRNE   lr, lr, r4              ; or enable
+        EOR     lr, lr, r4, LSR #8      ; allow for +ve/-ve logic
+        STRB    lr, [r3]
+ ]
+
+ [ TurnOffOscillator
+        LDR     lr, ConfigOscilTable
+        LDMIA   lr!, {r3,r4}            ; load addr1, data1
+        STRB    r4, [r3]                ; set up CRI
+        LDMIA   lr, {r3,r4}             ; load addr2, data2
+        LDRB    lr, [r3]
+        TST     r1, #PortableControl_SerialEnable       ; would like to test with one instruction
+        TSTEQ   r1, #PortableControl_FDCEnable          ; but no more registers!
+        BICEQ   lr, lr, r4              ; disable
+        ORRNE   lr, lr, r4              ; or enable
+        EOR     lr, lr, r4, LSR #8      ; allow for +ve/-ve logic
+        STRB    lr, [r3]
+ ]
+
+        BL      ExitConfigMode
+        Pull    "r4"
+20
+ [ BMU
+        LDRB    lr, BMU_Flags
+        TST     lr, #PortableBMUF_LidOpen
+        MOV     r3, #&0F
+        AND     lr, r3, r1              ; bits 0..3
+        BICEQ   lr, lr, #2              ; knock out LCD enable bit if lid shut
+        STRB    lr, [r2, #LC_LICR_lo]
+        AND     lr, r3, r1, LSR #4      ; bits 4..7
+        STRB    lr, [r2, #LC_LICR_mid]
+        AND     lr, r3, r1, LSR #8      ; bits 8..11
+        BICEQ   lr, lr, #1              ; knock out backlight bit if lid shut
+        STRB    lr, [r2, #LC_LICR_hi]
+ |
+        MOV     r3, #&0F
+        AND     lr, r3, r1              ; bits 0..3
+        STRB    lr, [r2, #LC_LICR_lo]
+        AND     lr, r3, r1, LSR #4      ; bits 4..7
+        STRB    lr, [r2, #LC_LICR_mid]
+        AND     lr, r3, r1, LSR #8      ; bits 8..11
+        STRB    lr, [r2, #LC_LICR_hi]
+ ]
+
+        AND     lr, r3, r1, LSR #16
+        STRB    lr, PalState
+
+        EOR     lr, r0, r1
+        TST     lr, #1:SHL:16
+        BLNE    UpdateLCDPalette
+
+; now issue post service for those power bits that have just been turned on
+
+        EOR     r3, r1, r0              ; r3 = bits that have changed
+        LDR     lr, =ControlPowerBits
+        AND     r3, r3, lr              ; r3 = bits that have changed that require service
+        ANDS    r3, r3, r1              ; r3 = bits that are going from 0 to 1 (ie power -> on)
+        BEQ     %FT30                   ; [no power bits going on]
+
+        Push    "r1,r2"
+        MOV     r1, #Service_Portable
+        MOV     r2, #ServicePortable_PowerUp ; indicate power has just gone on
+        SWI     XOS_ServiceCall         ; r3 = mask of bits going on
+        Pull    "r1,r2"                 ; restore registers
+30
+        EXITS
+
+EnterConfigMode ENTRY "r0,r1"
+        LDR     lr, ConfigPreTable
+ProcessConfigTable
+10
+        LDMIA   lr!, {r0,r1}
+        TEQ     r0, #0
+        STRNEB  r1, [r0]
+        BNE     %BT10
+        EXITS
+
+ExitConfigMode ENTRY "r0,r1"
+        LDR     lr, ConfigPostTable
+        B       ProcessConfigTable
+
+InitialisePowerBitsCopy ENTRY "r0-r2"
+        TEQP    pc, #SVC_mode + I_bit
+        NOP
+        BL      EnterConfigMode
+
+ [ DisableFDC
+        LDR     lr, ConfigFDCTable
+        LDMIA   lr!, {r0,r1}
+        STRB    r1, [r0]
+        LDMIA   lr, {r0,r1}
+        LDRB    lr, [r0]
+        EOR     lr, lr, r1, LSR #8
+        ANDS    r2, lr, r1
+        MOVNE   r2, #PortableControl_FDCEnable
+ |
+        MOV     r2, #PortableControl_FDCEnable
+ ]
+        STR     r2, ConfigExtraBitsCopy         ; LCD enable and backlight should be off anyway
+
+ [ Use2ndSerialPort                             ; now swap 1st and 2nd serial ports for naff Perth PCBs
+        LDRB    r0, MachineType
+        TEQ     r0, #2                          ; if not on 82C711 then don't bother
+        BNE     %FT10
+        LDR     r2, =CRI711
+        MOV     r0, #2                          ; program configuration register 2
+        STRB    r0, [r2]
+        MOV     r0, #2_11000001                 ; 1st port @ 2F8, powered down, disabled
+        STRB    r0, [r2, #CAP711-CRI711]        ; 2nd port @ 3F8, powered up, enabled
+10
+ ]
+        BL      ExitConfigMode
+
+ [ EnableEconet
+        MOV     r0, #PortableControl_EconetEnable       ; turn it on
+ |
+        MOV     r0, #0                                  ; turn it off
+ ]
+        LDR     r1, =:NOT: (PortableControl_SerialEnable :OR: PortableControl_FDCEnable :OR: PortableControl_EconetEnable)
+        BL      PortableControl                 ; try to disable serial, FDC and Econet
+        EXITS
+
+; NB The order of the entries within ConfigTables710 and ConfigTables711 must be the same
+; as the order of the workspace entries.
+
+ConfigTables710
+        &       ConfigPre710      - (.+4)
+        &       ConfigPost710     - (.+4)
+ [ DisableFDC
+        &       ConfigFDC710      - (.+4)
+ ]
+ [ TurnOffOscillator
+        &       ConfigOscil710    - (.+4)
+ ]
+ConfigTables710End
+
+ConfigTables711
+        &       ConfigPre711      - (.+4)
+        &       ConfigPost711     - (.+4)
+ [ DisableFDC
+        &       ConfigFDC711      - (.+4)
+ ]
+ [ TurnOffOscillator
+        &       ConfigOscil711    - (.+4)
+ ]
+ConfigTables711End
+
+        ASSERT  ConfigTables711End-ConfigTables711 = ConfigTables710End-ConfigTables710
+
+; The following tables are pairs of (address, data) terminated by (0,0)
+; For each pair the code does ?address = data
+
+ConfigPre710
+        &       ConRegA710, &55
+        &       ConRegB710, &AA
+        &       ConRegB710, &36
+        &       ConRegB710, CRI710/4
+        &       ConRegB710, &FF :EOR: (CRI710/4)
+        &       0, 0
+
+ConfigPost710
+        &       CRI710, &0F
+        &       CAP710, &00
+        &       0, 0
+
+ConfigPre711
+        &       CRI711, &55
+        &       CRI711, &55
+        &       0, 0
+
+ConfigPost711
+        &       CRI711, &AA
+        &       0, 0
+
+; The following tables are all 4 words, (addr1, data1, addr2, data2)
+; The code does ?addr1=data1, then ?addr2=(?addr2 BIC data2) EOR (data2 >>> 8) to disable the port or
+;                                  ?addr2=(?addr2 OR  data2) EOR (data2 >>> 8) to enable the port
+
+ [ {FALSE}
+ConfigSerial710
+        &       CRI710, &0B             ; register &0B
+        &       CAP710, &0808           ; bit 3, negative logic
+
+ConfigParallel710
+        &       CRI710, &0B             ; register &0B
+        &       CAP710, &0202           ; bit 1, negative logic
+
+ConfigSerial711
+        &       CRI711, &02             ; register &02
+ [ Use2ndSerialPort
+        &       CAP711, &0080           ; bit 7, positive logic
+ |
+        &       CAP711, &0008           ; bit 3, positive logic
+ ]
+
+ConfigParallel711
+        &       CRI711, &01             ; register &01
+        &       CAP711, &0004           ; bit 2, positive logic
+
+ ]
+
+ [ DisableFDC                           ; just disable FDC, don't power it down
+                                        ; this is so we can check ADFS only talks to chip while enabled
+ConfigFDC710
+        &       CRI710, &0C             ; register &0C
+        &       CAP710, &0020           ; bit 5, positive logic
+
+ConfigFDC711
+        &       CRI711, &00             ; register &00
+        &       CAP711, &0008           ; bit 0, positive logic
+ ]
+
+ [ TurnOffOscillator
+
+ConfigOscil710
+        &       CRI710, &00             ; register &00
+        &       CAP710, &4040           ; bit 6, negative logic (NB bit 5 is programmed by MOS to 1)
+
+ConfigOscil711
+        &       CRI711, &00             ; register &00
+        &       CAP711, &4040           ; bit 6, negative logic (NB bit 5 is programmed by MOS to 1)
+ ]
+
+
+; ******************************************************************************************************
+;
+;       UpdateLCDPalette - Setup LCD palette depending on inverse video state in PalState
+;
+
+UpdateLCDPalette ENTRY "r0-r3"
+        ADR     lr, LCDPalTable
+        LDR     r0, =LC_Base + LC_PaletteOffset
+        ADD     r1, r0, #16*4
+        LDRB    r2, PalState
+        TEQ     r2, #0
+        MOVNE   r2, #8          ; if inverted, toggle bit 3
+10
+        LDRB    r3, [lr], #1
+        EOR     r3, r3, r2
+        STRB    r3, [r0], #4
+        TEQ     r0, r1
+        BNE     %BT10
+        EXITS
+
+LCDPalTable
+        =       0, 1, 2, 3, 4, 5, 6, 7, 14, 13, 12, 11, 10, 9, 8, 8
+        ALIGN
+
+        LTORG
+
+; ******************************************************************************************************
+;
+;       ClaimEventV - Claim EventV so we can notice hot keys
+;       Always preserves flags
+;
+
+ClaimEventV ENTRY "r0-r3"
+        LDRB    r3, EventVFlag
+        TEQ     r3, #0                  ; if already on vector
+        EXITS   NE                      ; then exit
+
+        MOV     r0, #EventV
+        ADRL    r1, MyEventV
+        MOV     r2, wp
+        SWI     XOS_Claim
+        EXITS   VS
+
+        MOV     r0, #14                 ; enable event
+        MOV     r1, #Event_Keyboard
+        SWI     XOS_Byte
+
+        MOV     r3, #1                  ; indicate we're on vector
+        STRB    r3, EventVFlag
+        EXITS
+
+; ******************************************************************************************************
+;
+;       ReleaseEventV - Release EventV
+;       Always preserves flags
+;
+
+ReleaseEventV ENTRY "r0-r3"
+        LDRB    r3, EventVFlag
+        TEQ     r3, #0                  ; if not on vector
+        EXITS   EQ                      ; then don't bother releasing
+
+        MOV     r0, #13                 ; disable event
+        MOV     r1, #Event_Keyboard
+        SWI     XOS_Byte
+
+        MOV     r0, #EventV
+        ADRL    r1, MyEventV
+        MOV     r2, wp
+        SWI     XOS_Release
+
+        MOV     r3, #0                  ; indicate not on vector
+        STRB    r3, EventVFlag
+        EXITS
+
+; ******************************************************************************************************
+;
+;       ClaimVec - Claim PaletteV
+;       Always preserves flags
+;
+
+ClaimVec ENTRY "r0-r3"
+        MOV     r0, #PaletteV           ; always claim PaletteV (MOS ensures we're only on once) -
+        ADR     r1, MyPaletteV          ; InterceptFlag may be wrong immediately after a soft reset.
+        MOV     r2, wp
+        SWI     XOS_Claim
+        EXITS   VS
+
+        MOV     r3, #1                  ; indicate we're on vector, but colours not inited
+        STRB    r3, InterceptFlag
+        EXITS
+
+; ******************************************************************************************************
+;
+;       ReleaseVec - Release PaletteV
+;       Always preserves flags
+;
+
+ReleaseVec ENTRY "r0-r3"
+        LDRB    r3, InterceptFlag
+        TEQ     r3, #0                  ; if not on vector
+        EXITS   EQ                      ; then don't bother releasing
+
+        MOV     r0, #PaletteV
+        ADR     r1, MyPaletteV
+        MOV     r2, wp
+        SWI     XOS_Release
+
+        MOV     r3, #0                  ; indicate not on vector
+        STRB    r3, InterceptFlag
+        EXITS
+
+; ******************************************************************************************************
+;
+;       MyPaletteV - My PaletteV handler
+;
+; in:   r4 = reason code
+;
+; out:  depends on r4
+;
+
+        ASSERT  paletteV_Complete = 0
+        ASSERT  paletteV_Read = 1
+        ASSERT  paletteV_Set = 2
+        ASSERT  paletteV_1stFlashState = 3
+        ASSERT  paletteV_2ndFlashState = 4
+        ASSERT  paletteV_SetDefaultPalette = 5
+        ASSERT  paletteV_BlankScreen = 6
+
+MyPaletteV ENTRY "r0-r3"
+        CMP     r4, #1
+        EXITS   CC
+        BEQ     PV_ReadPalette
+        CMP     r4, #3
+        BCC     PV_SetPalette
+        BEQ     PV_1stFlashState
+        CMP     r4, #5
+        BCC     PV_2ndFlashState
+        BEQ     PV_SetDefaultPalette
+        CMP     r4, #7
+        BCC     PV_BlankUnblank
+        EXITS
+
+ClaimExit
+        MOV     r4, #0
+        PullEnv
+        Pull    pc
+
+PV_1stFlashState
+        ADR     r0, P_FirPalSetting
+        MOV     r1, #1
+PV_SetFlashState ROUT
+        STRB    r1, P_FlashState
+        LDRB    lr, InterceptFlag
+        TEQ     lr, #2
+        BNE     ClaimExit
+        MOV     r1, #VIDC
+        ADD     r2, r0, #16*4
+10
+        LDR     lr, [r0], #4
+        STR     lr, [r1]
+        TEQ     r0, r2
+        BNE     %BT10
+        B       ClaimExit
+
+PV_2ndFlashState
+        ADR     r0, P_SecPalSetting
+        MOV     r1, #0
+        B       PV_SetFlashState
+
+; *****************************************************************************
+;
+;       PV_ReadPalette - PaletteV read palette handler
+;
+; in:   R0 = logical colour
+;       R1 = 16 (read normal colour)
+;            24 (read border colour)
+;            25 (read cursor colour)
+;
+; out:  R2 = first flash setting   (BBGGRRS0), supremacy bit 7
+;       R3 = second flash setting  (BBGGRRS0), supremacy bit 7
+;
+
+PV_ReadPalette ROUT
+        Push    "r10,r11"
+        LDRB    lr, InterceptFlag
+        TEQ     lr, #2                  ; if colours not inited yet
+        BNE     %FT99                   ; then return black
+
+        LDRB    r10, P_DisplayNColour   ; logical colours in this mode -1
+        TEQ     r1, #24                 ; is it reading border palette
+        MOVEQ   r11, #16                ; then set up border index
+        BEQ     %FT10                   ; and go
+
+        TEQ     r1, #25                 ; is it reading pointer palette
+        BEQ     %FT05
+        AND     r11, r0, r10            ; no, then force into suitable range
+        AND     r11, r11, #15           ; only allow 0..15
+        B       %FT10                   ; always skip
+05
+        ANDS    r11, r0, #3             ; else force logical colour 0..3
+        BEQ     %FT99                   ; and 0 is illegal, so return black
+        ADD     r11, r11, #16           ; set up correct index
+10
+        CMP     r11, #16                ; is it normal one (not border/cursor)
+        MOVCSS  r3, #0                  ; no, then don't fudge colours; Z=1
+                                        ; (carry preserved from CMP)
+        ANDCCS  r3, r10, #&F0           ; yes, then fudge if 256 colour mode
+
+        ADR     r10, P_FirPalSetting
+
+        LDR     r11, [r10, r11, LSL #2]! ; r11 := 1st XX00SBGR
+        BLNE    FudgeRGB
+
+        AND     lr, r11, #&00F          ; lr  := 1st 0000000R
+ [ NewPaletteMap
+        ADR     r3, NewInversePalTab    ; point to new inverse table
+        LDRB    lr, [r3, lr]            ; and load mapped byte
+ |
+        ORR     lr, lr, lr, LSL #4      ; lr  := 1st 000000RR
+ ]
+        ORR     r2, lr, lr, LSL #8      ; r2  := 1st 0000RRRR
+        ORR     r2, r2, lr, LSL #16     ; r2  := 1st 00RRRRRR
+        MOV     r2, r2, LSL #8          ; r2  := 1st RRRRRR00
+        AND     lr, r11, #&1000
+        ORR     r2, r2, lr, LSR #5      ; r2  := 1st RRRRRRS0
+
+        LDR     r11, [r10, #P_SecPalSetting-P_FirPalSetting]
+        BLNE    FudgeRGB
+
+        AND     lr, r11, #&00F          ; lr  := 2nd 0000000R
+ [ NewPaletteMap
+        LDRB    lr, [r3, lr]            ; (r3 still points to NewInversePalTab)
+ |
+        ORR     lr, lr, lr, LSL #4      ; lr  := 2nd 000000RR
+ ]
+        ORR     r3, lr, lr, LSL #8      ; r3  := 2nd 0000RRRR
+        ORR     r3, r3, lr, LSL #16     ; r3  := 2nd 00RRRRRR
+        MOV     r3, r3, LSL #8          ; r3  := 2nd RRRRRR00
+        AND     lr, r11, #&1000
+        ORR     r3, r3, lr, LSR #5      ; r3  := 2nd RRRRRRS0
+
+95
+        Pull    "r10, r11"
+        Pull    "r0, r1"
+        ADD     sp, sp, #2*4            ; junk stacked r2,r3
+        MOV     r4, #0
+        Pull    pc
+
+99
+        MOV     r2, #0                  ; return black for both states
+        MOV     r3, #0
+        B       %BT95
+
+FudgeRGB ROUT
+        BIC     r11, r11, #&C8          ; knock out top bit R, top 2 bits G
+        BIC     r11, r11, #&800         ; knock out top bit B
+
+        TST     r0, #&10                ; override top bit of red
+        ORRNE   r11, r11, #&8
+        TST     r0, #&20                ; override next to top bit of green
+        ORRNE   r11, r11, #&40
+        TST     r0, #&40                ; override top bit of green
+        ORRNE   r11, r11, #&80
+        TST     r0, #&80                ; override top bit of blue
+        ORRNE   r11, r11, #&800
+        MOVS    pc, lr
+
+ [ NewPaletteMap
+NewInversePalTab
+        GBLA    invcount
+invcount SETA   0
+        WHILE   invcount <= 14
+        =       (invcount*255+6)/14
+invcount SETA   invcount + 1
+        WEND
+        =       &FF                     ; put in dummy entry for 15 (just in case)
+        ALIGN
+ ]
+
+; *****************************************************************************
+
+; PaletteV call to set palette
+; in:   R0 = logical colour
+;       R1 = colour type (16,17,18,24,25)
+;       R2 = BBGGRRS0
+;       R4 = PaletteV reason code
+;
+; out:  R4 = 0, claim vector if recognised
+;       otherwise preserve R4 and pass on
+;
+
+PV_SetPalette ROUT
+        TEQ     r1, #16                 ; if 16 then set both colours
+        MOVEQ   r1, #3
+        BEQ     UpdateNormalColour
+
+        TEQ     r1, #17                 ; elif 17 then set 1st colour
+        MOVEQ   r1, #1
+        BEQ     UpdateNormalColour
+
+        TEQ     r1, #18                 ; elif 18 then set 2nd colour
+        MOVEQ   r1, #2
+        BEQ     UpdateNormalColour
+
+        TEQ     r1, #24                 ; elif 24 then border colour
+        BEQ     BorderColour
+
+        TEQ     r1, #25                 ; elif 25 then pointer colour
+        BEQ     PointerColour
+
+        B       ClaimExit               ; else unknown, so just claim
+
+; *****************************************************************************
+
+UpdateNormalColour ROUT
+        LDRB    lr, P_DisplayNColour    ; get the mask
+        AND     r0, r0, lr              ; and mask it off
+        AND     r0, r0, #15             ; maximum 15
+        BL      UpdateSettingAndVIDC
+        B       ClaimExit               ; indicate successful PaletteV op
+
+BorderColour ROUT
+        BL      BorderSubr
+        B       ClaimExit
+
+BorderSubr ENTRY
+        MOV     r0, #16                 ; palette index for border colour
+        MOV     r1, #3                  ; both colours
+        BL      UpdateSettingAndVIDC
+
+; Now test for BBC gap mode (ie 3 or 6)
+; if so then set colour 2 to same as border, and colour 3 to inverse
+
+        LDRB    lr, BBCGapFlag
+        TEQ     lr, #0
+        BEQ     %FT10                   ; [not a BBC gap mode]
+
+        MOV     r0, #2                  ; make colour 2 (gap) same as border
+        BL      UpdateSettingAndVIDC
+
+        MOV     r0, #3                  ; make colour 3 inverse gap
+        MVN     r2, r2                  ; invert R, G and B
+        EOR     r2, r2, #&FF            ; but use same supremacy
+        BL      UpdateSettingAndVIDC
+10
+        EXITS
+
+
+PointerColour ROUT
+        ANDS    r0, r0, #3              ; force pointer colour number in range 1..3
+        BEQ     %FT10                   ; zero is invalid
+        ADD     r0, r0, #16             ; form palette index 17..19
+        MOV     r1, #3
+        BL      UpdateSettingAndVIDC
+10
+        B       ClaimExit               ; indicate successful PaletteV op
+
+
+UpdateSettingAndVIDC ROUT
+        MOV     r3, r2
+        MOV     r4, r2
+
+; and drop thru to ...
+
+UpdateSettingPair ENTRY "r2"
+
+; now convert to grey level
+
+        PHPSEI                          ; protect against IRQs
+        Push    lr
+
+        LDRB    r2, P_FlashState        ; 0 => second, 1 => first
+        CMP     r2, #1                  ; C=0 => second, C=1 => first
+
+        TST     r1, #1
+        BEQ     %FT10                   ; skip if not setting 1st colour
+        BL      ConvertToGrey
+        ADR     r2, P_FirPalSetting
+        STR     r3, [r2, r0, LSL #2]
+        MOVCS   r2, #VIDC
+        STRCS   r3, [r2]                ; poke VIDC if setting 1st colour and in 1st state
+10
+        TST     r1, #2
+        BEQ     %FT20                   ; skip if not setting 2nd colour
+        MOV     r3, r4
+        BL      ConvertToGrey
+        ADR     r2, P_SecPalSetting
+        STR     r3, [r2, r0, LSL #2]
+        MOVCC   r2, #VIDC
+        STRCC   r3, [r2]                ; poke VIDC if setting 2nd colour and in 2nd state
+20
+        Pull    lr
+        PLP
+        EXITS                           ; restore registers, claim vector
+
+;
+; ConvertToGrey - convert to grey level
+;
+; in:   r0 = palette index
+;       r3 = BBGGRRS0 (true colours)
+;
+; out:  r0,r1 preserved
+;       r2 may be corrupted
+;       r3 = value to poke to VIDC
+;
+
+ConvertToGrey ENTRY "r1"
+ [ NewPaletteMap
+        MOV     lr, #&FF
+        AND     r2, lr, r3, LSR #24     ; r2 = blue
+        AND     r1, lr, r3, LSR #16     ; r1 = green
+        ADD     r2, r2, r1, LSL #2      ; r2 = blue + 4*green
+        AND     r1, lr, r3, LSR #8      ; r1 = red
+        ADD     r2, r2, r1, LSL #1      ; r2 = blue + 2*red + 4*green
+        ADR     r3, NewPalTab           ; perform binary chop using table
+        LDR     lr, [r3, #8*4]
+        CMP     r2, lr
+        ADDCC   r1, r3, #0*4
+        ADDCS   r1, r3, #8*4
+        LDR     lr, [r1, #4*4]
+        CMP     r2, lr
+        ADDCS   r1, r1, #4*4
+        LDR     lr, [r1, #2*4]
+        CMP     r2, lr
+        ADDCS   r1, r1, #2*4
+        LDR     lr, [r1, #1*4]
+        CMP     r2, lr
+        ADDCS   r1, r1, #1*4
+        SUB     r3, r1, r3
+        MOV     r2, r3, LSR #2
+ |
+        MOV     lr, #&0F
+        AND     r2, lr, r3, LSR #28     ; r2 = blue
+        AND     r1, lr, r3, LSR #20     ; r1 = green
+        ADD     r2, r2, r1, LSL #2      ; r2 = blue + 4*green
+        AND     r1, lr, r3, LSR #12     ; r1 = red
+        ADD     r2, r2, r1, LSL #1      ; r2 = blue + 2*red + 4*green
+        ADR     r1, Div7Table
+        MOVS    r2, r2, LSR #1
+        LDRB    r2, [r1, r2]
+        ANDCC   r2, lr, r2              ; use low
+        ANDCS   r2, lr, r2, LSR #4      ; or high nybble
+ ]
+        TST     r3, #&80                ; test for supremacy
+        ORRNE   r2, r2, #&1000          ; and OR in the bit if set
+        ORR     r3, r2, r0, LSL #26     ; put in VIDC register (green and blue nybbles always set to 0 -
+                                        ; this is essential for the border colour, otherwise display blanked)
+        EXITS
+
+ [ NewPaletteMap
+NewPalTab
+        &       &000, &077, &0EE, &165, &1DC, &253, &2CA, &341
+        &       &3B9, &430, &4A7, &51E, &595, &60C, &683, -1
+ |
+Div7Table
+        GBLA    divcount
+        GBLA    divval
+        GBLA    divval2
+
+divcount SETA   0
+        WHILE   divcount < 7*16
+divval  SETA    divcount / 7
+        [ divval > 14
+divval  SETA    14
+        ]
+divval2 SETA    (divcount+1) / 7
+        [ divval2 > 14
+divval2 SETA    14
+        ]
+        DCB     divval + (divval2 :SHL: 4)
+divcount SETA   divcount +2
+        WEND
+
+        ALIGN
+ ]
+
+; *****************************************************************************
+;
+;       Set default palette - "R0-R3,LR" already saved
+
+PV_SetDefaultPalette ROUT
+        Push    "r5-r9"
+        LDRB    r0, P_PalIndex          ; my palette index in range 0..4 (log2bpp 0..3, Teletext)
+        ADR     r1, paldptab
+        LDR     r2, [r1, r0, LSL #2]    ; offset from r1 to start of table
+        ADD     r0, r0, #1              ; point to next item
+        LDR     r5, [r1, r0, LSL #2]    ; offset from r1 to end of table +1
+        ADD     r2, r2, r1              ; r2 -> start of table
+        ADD     r5, r5, r1              ; r5 -> end of table
+        MOV     r0, #0                  ; start at palette index 0
+        MOV     r1, #3                  ; update both halves
+10
+        LDR     r3, [r2], #4            ; get word of palette info
+        TST     r3, #1                  ; if not flashing
+        MOVEQ   r4, r3                  ; then r4 (2nd) = r3 (1st)
+        BICNE   r3, r3, #1              ; else clear flash bit in r3
+        MVNNE   r4, r3                  ; r4 = NOT r3 (invert RGB)
+        EORNE   r4, r4, #&FF            ; apart from bottom byte which shouldn't be inverted
+        BL      UpdateSettingPair
+        ADD     r0, r0, #1
+        TEQ     r2, r5
+        BNE     %BT10
+
+; now ensure all palette entries from 0..15 are initialised
+
+        MOV     r3, #0                  ; set unused (and border) to black
+        MOV     r4, #0                  ; 2nd state also black
+20
+        CMP     r0, #16
+        BLCC    UpdateSettingPair
+        ADDCC   r0, r0, #1
+        BCC     %BT20
+
+        MOV     r2, #0                  ; Set border to black (sup 0)
+        BL      BorderSubr
+
+        MOV     r0, #2
+        STRB    r0, InterceptFlag
+
+        Pull    "r5-r9"                 ; restore registers
+        B       ClaimExit               ; claim vector
+
+        LTORG
+
+; *****************************************************************************
+
+; Table of offsets from paldata_pointer to palette data
+
+paldptab
+        &       paldat1-paldptab        ; 2  Colour Modes
+        &       paldat2-paldptab        ; 4
+        &       paldat4-paldptab        ; 16
+        &       paldat8-paldptab        ; 256
+        &       paldatT-paldptab        ; teletext mode
+        &       paldatend-paldptab      ; end of table marker
+
+paldat1 ; Data for 1 bit modes - only necessary to program registers 0 and 1
+
+;                BBGGRRSF
+
+        DCD     &00000000               ; 0  Black
+        DCD     &FFFFFF00               ; 1  White
+
+paldat2 ; Data for 2 bit modes - only necessary to program registers 0..3
+
+;                BBGGRRSF
+
+        DCD     &00000000               ; 0  Black
+        DCD     &0000FF00               ; 1  Red
+        DCD     &00FFFF00               ; 2  Yellow
+        DCD     &FFFFFF00               ; 3  White
+
+paldat4 ; Data for 4 bit modes - program all registers
+        ; Flashing Colours will be needed here
+
+;                BBGGRRSF
+
+        DCD     &00000000               ; 0  Black
+        DCD     &0000FF00               ; 1  Red
+        DCD     &00FF0000               ; 2  Green
+        DCD     &00FFFF00               ; 3  Yellow
+        DCD     &FF000000               ; 4  Blue
+        DCD     &FF00FF00               ; 5  Magenta
+        DCD     &FFFF0000               ; 6  Cyan
+        DCD     &FFFFFF00               ; 7  White
+        DCD     &00000001               ; 8  Flashing Black
+        DCD     &0000FF01               ; 9  Flashing Red
+        DCD     &00FF0001               ; 10 Flashing Green
+        DCD     &00FFFF01               ; 11 Flashing Yellow
+        DCD     &FF000001               ; 12 Flashing Blue
+        DCD     &FF00FF01               ; 13 Flashing Magenta
+        DCD     &FFFF0001               ; 14 Flashing Cyan
+        DCD     &FFFFFF01               ; 15 Flashing White
+
+paldat8 ; Data for 8 bit modes - Program all registers
+
+; *** TMD 23-Jan-92 - changed to make white white
+
+;                BBGGRRSF
+
+        DCD     &00000000               ; 0
+        DCD     &11111100               ; 1
+        DCD     &22222200               ; 2
+        DCD     &33333300               ; 3
+        DCD     &22222200               ; 4
+        DCD     &33333300               ; 5
+        DCD     &44444400               ; 6
+        DCD     &55555500               ; 7
+        DCD     &11111100               ; 8
+        DCD     &22222200               ; 9
+        DCD     &33333300               ; A
+        DCD     &44444400               ; B
+        DCD     &44444400               ; C
+        DCD     &55555500               ; D
+        DCD     &66666600               ; E
+        DCD     &77777700               ; F
+
+paldatT ; Data for teletext mode
+
+        DCD     &00000000               ; 0 Black
+        DCD     &0000FF00               ; 1 Red
+        DCD     &00FF0000               ; 2 Green
+        DCD     &00FFFF00               ; 3 Yellow
+        DCD     &FF000000               ; 4 Blue
+        DCD     &FF00FF00               ; 5 Magenta
+        DCD     &FFFF0000               ; 6 Cyan
+        DCD     &FFFFFF00               ; 7 White
+
+; Colours 8 to 15 have supremacy bit set
+
+        DCD     &00000080               ; 8 Supremacy+ Black
+        DCD     &0000FF80               ; 9            Red
+        DCD     &00FF0080               ; 10           Green
+        DCD     &00FFFF80               ; 11           Yellow
+        DCD     &FF000080               ; 12           Blue
+        DCD     &FF00FF80               ; 13           Magenta
+        DCD     &FFFF0080               ; 14           Cyan
+        DCD     &FFFFFF80               ; 15           White
+
+paldatend
+
+; *****************************************************************************
+;
+;       PV_BlankUnblank - Blank/unblank screen
+;
+; in:   r0 = -1 (read blank state)
+;          or 0 (unblank screen)
+;          or 1 (blank screen)
+;       r0-r3, lr already pushed
+;
+; out:  r0 = old state (0=unblanked, 1=blanked)
+;       r4 = 0 => operation complete
+;
+
+PV_BlankUnblank ROUT
+        LDRB    r0, InLCDMode                   ; if in the middle of a mode change
+        TEQ     r0, #0
+        STREQ   r0, [sp]                        ; then say it's not blanked
+        BEQ     ClaimExit                       ; and don't take any action
+
+        MOV     r0, #0
+        MOV     r1, #-1
+        BL      PortableControl                 ; read current state of the bits
+        LDR     lr, =PortableControl_LCDEnable :OR: PortableControl_BacklightEnable
+        AND     r1, r0, lr
+        EORS    r1, r1, lr                      ; if both on (r1=0) then unblanked
+        MOVNE   r1, #1                          ; else blanked
+
+        LDR     r0, [sp]                        ; load r0 reason code
+        STR     r1, [sp]                        ; return old state in r0 (on stack)
+        CMP     r0, #1
+        MOVCC   r0, lr                          ; if we're unblanking turn on both bits
+        MOVEQ   r0, #0                          ; if we're blanking turn off both bits
+        MVNLS   r1, lr                          ; if we're doing anything, r1 = AND mask
+        BLLS    PortableControl                 ; do it
+        B       ClaimExit                       ; then finish
+
+; *****************************************************************************
+;
+;       MyEventV - My EventV handler
+;
+; in:   r0 = event number (must be Event_Keyboard)
+;       r1 = 0 for key up, 1 for key down
+;       r2 = key number
+;       r3 = keyboard driver ID
+;       may be in IRQ mode or SVC mode
+;
+
+HotKey_InvertVideo *    &7D                     ; inverts LCD palette
+HotKey_ScreenBlank *    &7E                     ; blanks screen and spins down hard disc
+
+MyEventV ROUT
+        TEQ     r0, #Event_Keyboard             ; only interested in keyboard event
+        TEQEQ   r1, #1                          ; and only if it's key down
+        TEQEQ   r3, #2                          ; and only if it's on a Perth keyboard
+        MOVNES  pc, lr                          ; if not then exit by passing on vector
+
+        TEQ     r2, #HotKey_InvertVideo         ; and only if it's the invert video key
+        TEQNE   r2, #HotKey_ScreenBlank         ; or the screen blank key
+        MOVNES  pc, lr
+
+        TEQ     r2, #HotKey_InvertVideo
+        BNE     %FT10
+
+; invert LCD palette - NB no need to go into SVC mode - we're not issuing any SWIs
+
+        Push    "lr"
+        LDRB    lr, InterceptFlag
+        TEQ     lr, #2                          ; only invert if LCD is up and running
+        LDREQB  lr, PalState
+        EOREQ   lr, lr, #1
+        STREQB  lr, PalState
+        BLEQ    UpdateLCDPalette
+        Pull    "pc",,^                         ; pass on vector
+
+; blank screen and spin down all IDE hard discs
+
+10
+        Push    "r0-r2,lr"
+        MOV     r0, pc
+        ORR     r1, r0, #SVC_mode               ; switch to SVC mode
+        TEQP    r1, #0
+        NOP
+        Push    "r0,lr"
+
+        MOV     r0, #ScreenBlankerReason_Blank
+        SWI     XScreenBlanker_Control          ; blank screen
+
+        MOV     r0, #2                          ; manual control of drive spin
+                                                ; without affecting autospindown
+        MOV     r2, #0                          ; spin down immediately
+        BL      ADFSPowerOp                     ; apply to all IDE drives
+
+        Pull    "r0,lr"
+        TEQP    r0, #0                          ; restore old processor mode
+        NOP
+        Pull    "r0-r2,pc",,^
+
+; *****************************************************************************
+;
+;       ADFSPowerOp - Issue an ADFS_PowerControl SWI to all IDE drives
+;
+; in:   r0, r2 are the parameters we wish to pass to the SWI
+;
+; out:  -
+;
+
+ADFSPowerOp ENTRY "r0-r4"
+        MOV     r4, r0                          ; save r0 value
+        MOV     r1, #4                          ; for drive = 4 to 7
+10
+        MOV     r0, r1                          ; read type of drive
+        SWI     XADFS_ControllerType
+        BVS     %FT20                           ; if error then skip
+        TEQ     r0, #4                          ; if IDE drive
+        MOVEQ   r0, r4                          ; then perform operation
+        SWIEQ   XADFS_PowerControl
+20
+        ADD     r1, r1, #1
+        TEQ     r1, #8
+        BNE     %BT10
+        EXITS
+
+; *****************************************************************************
+;
+;       CheckForCMOSReset - Check CMOS reset bit in CMOS RAM, and reconfigure
+;                           certain values if so
+;
+; in:   -
+;
+; out:  r0-r7 may be corrupted
+;
+
+CheckForCMOSReset ENTRY
+        MOV     r0, #ReadCMOS
+        MOV     r1, #SystemSpeedCMOS            ; CMOS reset indicator location
+        SWI     XOS_Byte
+        EXITS   VS                              ; if couldn't read it then finish
+
+        TST     r2, #CMOSResetBit               ; or if bit clear then finish
+        EXITS   EQ
+
+; Set configured Delay to 25 and Repeat to 6 and reflect in current states
+
+        ADR     r0, ConfigureDelayCommand
+        SWI     XOS_CLI
+        ADR     r0, ConfigureRepeatCommand
+        SWI     XOS_CLI
+        MOV     r0, #12
+        MOV     r1, #0
+        SWI     XOS_Byte                        ; set current delay and repeat to configured
+
+; Set configured screen-blanking time to 5 minutes and reflect in current state
+
+        MOV     r0, #ReadCMOS
+        MOV     r1, #Misc1CMOS
+        SWI     XOS_Byte
+        BICVC   r2, r2, #7 :SHL: 3
+        ORRVC   r2, r2, #4 :SHL: 3              ; 0=>none, 1=>30s, 2=>1min, 3=>2min,
+        MOVVC   r0, #WriteCMOS                  ; 4=>5min, 5=>10min, 6=>15min, 7=>30min
+        SWIVC   XOS_Byte
+        ADR     r0, BlankTimeCommand
+        SWI     XOS_CLI
+
+; Set configured SoundDefault to 1 6 2 and reflect in current states
+
+        MOV     r0, #WriteCMOS
+        MOV     r1, #SoundCMOS
+        MOV     r2, #(1 :SHL: 7) :OR: (6 :SHL: 4) :OR: ((2-1) :SHL: 0)
+        SWI     XOS_Byte
+
+        MOV     r0, #6*18+1                     ; set volume to 6
+        SWI     XSound_Volume                   ; (speaker should already be set to 1)
+
+        MOV     r0, #1                          ; set channel 1
+        MOV     r1, #2                          ; to use voice generator 2 (StringLib-Soft)
+        SWI     XSound_AttachVoice
+
+; Set configured beep to Loud and reflect in current state
+
+        MOV     r0, #ReadCMOS
+        MOV     r1, #DBTBCMOS
+        SWI     XOS_Byte
+        ORRVC   r2, r2, #2                      ; set beep to LOUD
+        MOVVC   r0, #WriteCMOS
+        SWIVC   XOS_Byte
+
+        MOV     r0, #212                        ; OS_Byte number to set bell volume/envelope
+        MOV     r1, #&90
+        MOV     r2, #0
+        SWI     XOS_Byte
+
+; Set configured IDE disc spin to 2 mins and reflect in current state
+
+        MOV     r0, #WriteCMOS
+        MOV     r1, #ADFSSpinDownCMOS           ; set configured autospindown
+        MOV     r2, #120/5                      ; to 2 minutes = 120 seconds
+        SWI     XOS_Byte
+        MOV     r0, #1                          ; set drive autospindown
+        MOV     r2, #120/5                      ; to same
+        BL      ADFSPowerOp
+
+; Make !BatMgr appear on icon bar by default
+
+        MOV     r0, #ReadCMOS
+        MOV     r1, #Deskboot2CMOS
+        SWI     XOS_Byte
+        ORRVC   r2, r2, #1                      ; bit 0 set => appear on icon bar, clear => don't
+        MOVVC   r0, #WriteCMOS
+        SWIVC   XOS_Byte
+
+        EXITS
+
+ConfigureDelayCommand
+        =       "Configure Delay 25", 0
+ConfigureRepeatCommand
+        =       "Configure Repeat 6", 0
+BlankTimeCommand
+        =       "BlankTime 300", 0              ; 300 seconds = 5 minutes
+        ALIGN
+
+;******************************************************************************
+
+ErrorLookupNoParms      ENTRY   "R1-R7"
+;
+; Entry:
+;    R0 -> error block with tokenised message
+;
+; Exit:
+;    R0 -> error block with real message
+;    V set
+
+        MOV     R4,#0                           ; no parameter 0
+        B       ErrorLookupContinue
+
+ErrorLookup1Parm        ALTENTRY
+;
+; Entry:
+;    R0 -> error block with tokenised message
+;    R4 -> parameter to substitute into error
+;
+; Exit:
+;    R0 -> error block with real message
+;    V set
+
+ErrorLookupContinue
+
+        wsaddr  R1,MsgTransBlk
+        MOV     R2,#0                           ; use internal buffer
+        MOV     R5,#0                           ; no parameter 0
+        MOV     R6,#0                           ; no parameter 0
+        MOV     R7,#0                           ; no parameter 0
+        SWI     XMessageTrans_ErrorLookup
+        EXIT
+
+;******************************************************************************
+
+        END

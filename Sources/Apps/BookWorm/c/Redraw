@@ -1,0 +1,514 @@
+/*
+
+  Merlyn Kline, 1995
+
+:NOTES
+
+The redraw for the browser window
+
+:END
+
+:MESSAGES
+NoData:Document contains no data
+:END
+
+:HISTORY
+:END
+
+*/
+
+#include "stdlib.h"
+#include "stddef.h"
+#include "stdio.h"
+#include "string.h"
+
+/*----------------------------------------------------------------------*/
+#include "wimp.h"
+#include "bbc.h"
+#include "colourtran.h"
+/*----------------------------------------------------------------------*/
+#include "os.h"
+#include "font.h"
+#include "coords.h"
+#include "sprite.h"
+#include "resspr.h"
+#include "msgs.h"
+#include "wimpt.h"
+#include "win.h" /* fixes problem caused by incorrect header for iconbar.c since Acorn had a go at it */
+
+/*----------------------------------------------------------------------*/
+#include "Browser.h"
+/*----------------------------------------------------------------------*/
+#include "Reformat.h"
+/*----------------------------------------------------------------------*/
+#include "Fontmanage.h"
+#include "Redraw1.h"
+#include "ErrorGen.h"
+#include "Images.h"
+#include "Iconbar.h"
+#include "Redraw.h"
+#include "PlotSpr.h"
+#include "Main.h"
+#include "Fetch.h"
+#include "Forms.h"
+#include "Printing.h"
+#include "Utils.h"
+
+/*----------------------------------------------------------------------*/
+#include "struct.h"
+#include "tags.h"
+
+/*----------------------------------------------------------------------*/
+int HEADER(int flags)
+{
+  flags&=H7;
+  flags=flags>>10;
+  return(flags);
+}
+
+/*----------------------------------------------------------------------*/
+char *redraw_faces[]={"serif","sans","fixed"};
+
+/*----------------------------------------------------------------------*/
+void redraw_token_font_info(HStream *t,int *facenum,int *size,BOOL *italic,BOOL *bold)
+{
+  int flags;
+
+  flags=t->style;
+  *facenum=0;
+  *bold=*italic=FALSE;
+  *size=params.fontsize;
+  if(flags&(ITALIC|BLOCKQUOTE)) *italic=TRUE;
+  if(flags&(BOLD|DT)) *bold=TRUE;
+  if(flags&(H7|ADDRESS)) *facenum=1;
+  if(flags&(PRE|TT)) *facenum=2;
+  if(HEADER(flags)==1) {*bold=TRUE; *size*=2;}
+  if(HEADER(flags)==2) {*bold=TRUE; *size=*size*3/2;}
+  if(HEADER(flags)==3) {*italic=TRUE; *size=*size*4/3;}
+  if(HEADER(flags)==4) {*bold=TRUE;}
+  if(HEADER(flags)==5) {*italic=TRUE;}
+  if(HEADER(flags)==6) {*size=*size*2/3;}
+}
+
+/*----------------------------------------------------------------------*/
+fm_face redraw_find_token_font(HStream *t)
+{
+  int  facenum;
+  int  size;
+  BOOL bold,italic;
+
+  redraw_token_font_info(t,&facenum,&size,&italic,&bold);
+  return(fm_find_font(redraw_faces[facenum],size,size,italic,bold));
+}
+
+/*----------------------------------------------------------------------*/
+int redraw_backcol(browser *b)
+{ /* the actual background colour */
+  return(b->backgroundcol==-1?params.col_back:b->backgroundcol);
+}
+
+/*----------------------------------------------------------------------*/
+int redraw_background_colour(browser *b,int foregroundcolour)
+{ /* get a text background hint for text of the given foreground colour */
+  if(b->plainback) return(redraw_backcol(b));
+  switch(b->aacol)
+  {
+    case -1: return(foregroundcolour);
+    case -2: return(b->backgroundcol==-1?foregroundcolour:b->backgroundcol);
+  }
+  return(b->aacol);
+}
+
+/*----------------------------------------------------------------------*/
+int redraw_token_colour(browser *b,HStream *t,int token)
+{
+  if(t->style&(INPUT|TEXTAREA|SELECT)) return(0);
+
+  if(ISLINK(t))
+  {
+    if (token==b->highlight) return(0xff00);
+    if(browser_visited(t->anchor,FALSE)) return(b->usedcol);
+    return(b->linkcol);
+  }
+  return(b->textcol);
+}
+
+/*----------------------------------------------------------------------*/
+void redraw_set_colour(int colour)
+{
+  wimp_paletteword c;
+
+  c.word=colour;
+  colourtran_setGCOL(c,256,0,&colour);
+}
+
+
+/*----------------------------------------------------------------------*/
+int redraw_margin(HStream *t)
+{ /* left margin in OS units */
+  int s,i;
+
+  i=t->indent*32;
+  s=t->style;
+  if(HEADER(s)==1 || HEADER(s)==2) return(i+0+4);
+  if(HEADER(s)==3) return(i+16+4);
+  if(HEADER(s)==4 || HEADER(s)==5) return(i+32+4);
+  if(t->indent && !ISBULLET(t)) i+=reformat_bullet_width(t->indent);
+  if(s&(BLOCKQUOTE|ADDRESS)) return(i+96+4);
+  return(i+48+4);
+}
+
+/*----------------------------------------------------------------------*/
+int redraw_start_x(browser *b,HStream *t,reformat_line *lp,reformat_line_chunk *tp)
+{
+  int x;
+
+  if((t->style&CENTER) || ((t->type&TYPE_ALIGN_MASK)==TYPE_CENTRE))
+  {
+    int                 i=0;
+
+    convert_pair_to_points(b->display_width,i,&x,&i);
+    for(i=0;i<lp->n;x-=tp->w,i++,tp++);
+    x/=2;
+    if(x<0) x=0;
+    convert_pair_to_os(x,i,&x,&i);
+    return(x);
+  }
+  return(redraw_margin(t));
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void redraw_input_field(wimp_box *box,int colour)
+{
+  int w,h;
+
+  w=box->x1-box->x0-1;
+  h=box->y1-box->y0-1;
+  wimp_setcolour(0);
+  bbc_rectanglefill(box->x0,box->y0,w,h);
+  redraw_set_colour(colour);
+  bbc_rectanglefill(box->x0,box->y0,3,h);
+  bbc_rectanglefill(box->x1-4,box->y0,3,h);
+  bbc_rectanglefill(box->x0+4,box->y0,w-8,3);
+  bbc_rectanglefill(box->x0+4,box->y1-4,w-8,3);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void redraw_button(wimp_box *box,int colour,BOOL in)
+{
+  int w,h;
+
+  w=box->x1-box->x0-1;
+  h=box->y1-box->y0-1;
+  wimp_setcolour(in?3:1);
+  bbc_rectanglefill(box->x0,box->y0,w,h);
+  wimp_setcolour(in?4:0);
+  bbc_rectanglefill(box->x0,box->y0,1,h);
+  bbc_rectanglefill(box->x0+2,box->y0+2,1,h-2);
+  bbc_rectanglefill(box->x0+4,box->y1-2,w-4,1);
+  bbc_rectanglefill(box->x0+4,box->y1-4,w-6,1);
+  wimp_setcolour(in?0:4);
+  bbc_rectanglefill(box->x0+2,box->y0,w-2,1);
+  bbc_rectanglefill(box->x0+4,box->y0+2,w-4,1);
+  bbc_rectanglefill(box->x1-4,box->y0+4,1,h-8);
+  bbc_rectanglefill(box->x1-2,box->y0+4,1,h-6);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void redraw_switch(int x,int y,char *spr)
+{
+  sprite_id   sid;
+  int         ox,oy;
+
+  convert_pair_to_os(x,y,&ox,&oy);
+  sid.tag=sprite_id_name;
+  sid.s.name=spr;
+  plotspr_plot(resspr_area(),&sid,8,ox,oy-8,NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void redraw_bullet(int x,int y,int bullet)
+{
+  char        spr[20];
+  sprite_id   sid;
+
+  sprintf(spr,"b%d",(bullet+bullets-1)%bullets);
+  sid.tag=sprite_id_name;
+  sid.s.name=spr;
+  plotspr_plot(resspr_area(),&sid,8,x,y,NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *redraw_draw(browser *b,wimp_redrawstr *r,BOOL update,BOOL noback)
+{
+  BOOL           more;
+  reformat_line  *lp;
+  int            l, page_bottom;
+  wimp_box       wbox,fbox;
+
+  update=update;
+  do
+  {
+    if(b->stream)
+    {
+      wbox=r->g;
+      convert_pair_to_points(wbox.x0,wbox.y0,&fbox.x0,&fbox.y0);
+      convert_pair_to_points(wbox.x1,wbox.y1,&fbox.x1,&fbox.y1);
+      coords_box_toworkarea(&wbox,CVTSTR(r));
+
+      /* Get the page bottom in work area coordinates. This is a printing only */
+      /* concept, where the visible_area BBox will in fact hold the entire     */
+      /* page bounding box.                                                    */
+
+      page_bottom = coords_y_toworkarea(r->box.y0, CVTSTR(r));
+
+      if(!noback)
+      {
+        if(b->plainback || !image_tile_window(b,r,0,-BUTTONBAR_HEIGHT-URLBAR_HEIGHT))
+        {
+          redraw_set_colour(redraw_backcol(b));
+          bbc_rectanglefill(-16000,-16000,32000,32000);
+        }
+      }
+
+      lp=reformat_line_address(b,1);
+      for(l=1;l<=b->nlines;l++)
+      {
+        if(lp->n && lp->y<wbox.y1 && lp->y+lp->h>wbox.y0)
+        {
+          HStream             *tp;
+          fm_face             h;
+          int                 x,y,base,t,i;
+          char                *dp;
+          reformat_line_chunk *cp;
+
+          if (printing == 1)
+          {
+            /* If the line would only partially fit on the page, and */
+            /* we're printing, return it's top coordinate (i.e., if  */
+            /* it falls off the bottom). Note that if printing = 2,  */
+            /* this will not be done (so the printing routine can    */
+            /* signal not to split the line in this way).            */
+
+            if (lp->y < page_bottom)
+            {
+              r->scx = lp->y + lp->h;
+              return NULL;
+            }
+          }
+
+          t=0;
+          cp=reformat_line_chunk_address(lp,0);
+          tp=fetch_token_address(b,cp->t);
+          y=coords_y_toscreen(lp->y,CVTSTR(r));
+          x=coords_x_toscreen(redraw_start_x(b,tp,lp,cp),CVTSTR(r));
+          convert_pair_to_points(x,y,&x,&y);
+          base=lp->b;
+          convert_pair_to_points(base,t,&base,&t);
+          for(i=0;i<lp->n && x<fbox.x1;x+=cp->w,i++,cp++)
+          {
+            if(x+cp->w>fbox.x0)
+            {
+              tp=fetch_token_address(b,cp->t);
+              if(tp->style & (INPUT|TEXTAREA|SELECT))
+              {
+                if((tp->type&TYPE_RESET)==TYPE_TEXT || (tp->type&TYPE_RESET)==TYPE_PASSWORD ||
+                   (tp->style & (TEXTAREA|SELECT)))
+                  {
+                    wimp_box box;
+                    int      fh,ox,oy,t=0;
+
+                    convert_pair_to_os(x,y+base,&ox,&oy);
+                    fh=redraw_find_token_font(tp);
+                    fm_font_box(fh,&box);
+                    if(tp->style&TEXTAREA)
+                    {
+                      int r;
+
+                      r=tp->rows;
+                      if(r<3) r=3;
+                      box.y1=(box.y1-box.y0+4)*r+box.y0;
+                    }
+                    box.y0=box.y0+oy-8;
+                    box.y1=box.y1+oy+8;
+                    box.x0=ox+4;
+                    convert_pair_to_os(x+cp->w,t,&box.x1,&t);
+                    box.x1-=4; /* border */
+                    redraw_input_field(&box,redraw_token_colour(b,tp,cp->t));
+                    fm_set_font_colour(fh,redraw_token_colour(b,tp,cp->t),0xffffff00);
+                    form_textarea_redraw(b,cp->t,&box,&r->g,fh,
+                                         !!(tp->style&TEXTAREA),
+                                         (tp->type&TYPE_RESET)==TYPE_PASSWORD);
+                    fm_lose_font(fh);
+                    if(tp->style&SELECT)
+                    {
+                      sprite_id   sid;
+                      sprite_info info;
+
+                      sid.tag=sprite_id_name;
+                      sid.s.name="gright";
+                      if(!sprite_readsize(resspr_area(),&sid,&info))
+                      {
+                        int w,h;
+
+                        w=info.width<<bbc_modevar(info.mode,bbc_XEigFactor);
+                        h=info.height<<bbc_modevar(info.mode,bbc_YEigFactor);
+                        wimp_setcolour(7);
+                        bbc_rectanglefill(box.x1-w-8,box.y0+4,w+8-1,h+4-1);
+                        plotspr_plot(resspr_area(),&sid,8,box.x1-w-4,box.y0+4,NULL);
+                      }
+                    }
+                  }
+                else switch(tp->type & TYPE_RESET)
+                {
+                  case TYPE_CHECKBOX:
+                    redraw_switch(x,y+base,form_get_field(b,cp->t)->checked?"opton":"optoff");
+                    break;
+                  case TYPE_RADIO:
+                    redraw_switch(x,y+base,form_get_field(b,cp->t)->checked?"radioon":"radiooff");
+                    break;
+                  case TYPE_IMAGE:
+                  case TYPE_HIDDEN: break;
+                  case TYPE_SUBMIT: /* SUBMIT same as RESET: no break */
+                  case TYPE_RESET:
+                  {
+                    wimp_box box;
+                    int      fh,ox,oy,t,colour;
+                    char     *p;
+
+                    p=form_button_text(tp);
+                    convert_pair_to_os(x,y+base,&ox,&oy);
+                    fh=redraw_find_token_font(tp);
+                    fm_font_box(fh,&box);
+                    box.y0=box.y0+oy-8;
+                    box.y1=box.y1+oy+8;
+                    box.x0=ox+4;
+                    convert_pair_to_os(x+cp->w,y,&box.x1,&t);
+                    box.x1-=4; /* border */
+                    colour=redraw_token_colour(b,tp,cp->t);
+                    if(cp->t==b->highlight)
+                    {
+                      redraw_button(&box,colour,TRUE);
+                      fm_set_font_colour(fh,colour,0x99999900);
+                    }
+                    else
+                    {
+                      redraw_button(&box,colour,FALSE);
+                      fm_set_font_colour(fh,colour,0xdddddd00);
+                    }
+                    if(p) fm_puts(fh,x+400*12,y+base,p,FALSE,FALSE);
+                    fm_lose_font(fh);
+                  } break;
+                }
+              }
+              else if(tp->style&IMG)
+              {
+                wimp_box    box;
+                int         o=0;
+                int         ox,oy;
+
+                if(!reformat_get_image_size(b,cp->t,tp,&box))
+                {
+                  convert_pair_to_os(x,y+base,&ox,&oy);
+                  ox-=box.x0;
+                  if(ISLINK(tp))
+                  {
+                    o=tp->maxlen*2;
+                    if(o)
+                    {
+                      redraw_set_colour(redraw_token_colour(b,tp,cp->t));
+                      bbc_rectanglefill(ox+box.x0,oy+box.y0,box.x1-box.x0-1,o-1);
+                      bbc_rectanglefill(ox+box.x0,oy+box.y0,o-1,box.y1-box.y0-1);
+                      bbc_rectanglefill(ox+box.x0,oy+box.y1-o,box.x1-box.x0-1,o-1);
+                      bbc_rectanglefill(ox+box.x1-o,oy+box.y0,o-1,box.y1-box.y0-1);
+                    }
+                  }
+                  image_redraw(b,cp->t,ox+o+box.x0,oy+o+box.y0);
+                }
+              }
+              else if(tp->style&HR)
+              {
+                int x,w,oy,ox,l;
+
+                convert_pair_to_os(0,y,&ox,&oy);
+                oy+=(lp->h/2+1)&~3;
+                x=96;
+                l=tp->indent*32;
+                w=b->display_width-x*2-l-1;
+                x=coords_x_toscreen(x+l,CVTSTR(r));
+                redraw_set_colour(0x99999900);
+                bbc_rectanglefill(x,oy,w,3);
+                redraw_set_colour(0xEEEEEE00);
+                bbc_rectanglefill(x,oy-4,w,3);
+              }
+              else if(ISBULLET(tp))
+              {
+                int ox,oy;
+
+                convert_pair_to_os(x,y+base,&ox,&oy);
+                redraw_bullet(ox,oy,tp->indent);
+              }
+              else
+              {
+                dp=fetch_token_data_address(b,cp->t);
+                if(dp)
+                {
+                  int c;
+
+                  h=redraw_find_token_font(tp);
+                  c=redraw_token_colour(b,tp,cp->t);
+                  fm_set_font_colour(h,c,redraw_background_colour(b,c));
+                  if(dp) fm_putsl(h,x,y+base,dp+cp->o,cp->l,FALSE,b->backimage>0 && !b->plainback);
+                  if(ISLINK(tp) && !((*dp+cp->o == 0) || (*dp+cp->o == 32 && *(dp+cp->o + 1) == 0)))
+                  {
+                    int ox,oy;
+
+                    redraw_set_colour(redraw_token_colour(b,tp,cp->t));
+                    convert_pair_to_os(x,y+base,&ox,&oy);
+                    bbc_move(ox,oy-5);
+                    convert_pair_to_os(x+cp->w,y+base,&ox,&oy);
+                    bbc_draw(ox,oy-5);
+                  }
+                  fm_lose_font(h);
+                }
+              }
+            }
+          }
+        }
+        lp=reformat_next_line_address(lp);
+      }
+    }
+    else
+    {
+      if (!printing)
+      {
+        wimp_setcolour(1+128);
+        bbc_clg();
+      }
+
+      if(browser_current_url(b))
+      {
+        fm_face h;
+        int     x,y;
+
+        y=coords_y_toscreen(-BUTTONBAR_HEIGHT-URLBAR_HEIGHT-64-8,CVTSTR(r));
+        x=coords_x_toscreen(64,CVTSTR(r));
+        h=fm_find_font("sans",params.fontsize*1.5,params.fontsize*1.5,TRUE,TRUE);
+        fm_set_font_colour(h,0,0xdddddd00);
+        fm_puts(h,x,y,msgs_lookup("NoData:Document contains no data"),TRUE,FALSE);
+        fm_lose_font(h);
+
+        if (printing)
+        {
+          r->scx = 0;
+          return NULL;
+        }
+      }
+    }
+    if (!printing) wimp_get_rectangle(r,&more);
+    else more = 0;
+
+  } while(more);
+
+  return(NULL);
+}

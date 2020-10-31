@@ -1,0 +1,653 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Driver.c                                                                         ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA_Support Code Module                                        ***/
+/***  Version:       0.01                                                              ***/
+/***                                                                                   ***/
+/***  By:            Neil Critchell, Acorn Computers Ltd.                              ***/
+/***  Date:          19th August 1993                                                  ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains the code to prepare for calls to drivers, as well as the ***/
+/***                 code to register/deregister both types of driver.                 ***/
+/***                                                                                   ***/
+/***  History:       0.01 19th August 1993 - Original version                          ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Routines:-                                                                       ***/
+/***     Drivers_RegisterHardwareDriver(registers)                                     ***/
+/***     Drivers_DeRegisterHardwareDriver(registers)                                   ***/
+/***     Drivers_RegisterPCCardDriver(registers)                                       ***/
+/***     Drivers_DeRegisterPCCardDriver(registers)                                     ***/
+/***     SetUpHWDriver_CallRegs(HardwareDriverIndex, registers)                        ***/
+/***     SetUpPCCDriver_CallRegs(CardDriverIndex, registers)                           ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Variables.h"
+#include "Read.h"
+#include "Write.h"
+#include "Error.h"
+#include "Cis.h"
+#include "FSOp.h"
+#include "Interrupts.h"
+#include "misc.h"
+#include "Swi.h"
+#include "Driver.h"
+
+#include "Debug.h"
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Drivers_RegisterHardwareDriver(regs)                                             ***/
+/***                                                                                   ***/
+/***  Allows a new "Hardware Interface Driver" to register itself with the             ***/
+/***  support code. A driver must be registered before it can be used.                 ***/
+/***                                                                                   ***/
+/***    On Entry:                                                                      ***/
+/***       R0 = 0 (reason code)                                                        ***/
+/***       R1 = Driver Function handler routine address.                               ***/
+/***       R2 = Private Word of driver (passed to function routine in R12).            ***/
+/***                                                                                   ***/
+/***    On Exit:                                                                       ***/
+/***       None.                                                                       ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Registration performs the following functions:-                                  ***/
+/***       - Stores the information in the correct area of memory.                     ***/
+/***       - Call drivers Versions, and stores results                                 ***/
+/***       - Call drivers Get Feature Function, and store the results                  ***/
+/***       - Call drivers IRQ handler install, & set up default mem handler for all    ***/
+/***       - Deals with any cards already in the slots                                 ***/
+/***                                                                                   ***/
+/***  Return Value:                                                                    ***/
+/***    NO_ERROR, if succesfully.                                                      ***/
+/***    PCMCIA Error Code, if an error occured.                                        ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode Drivers_RegisterHardwareDriver(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode error = NO_ERROR;
+    int                         loop = 0;
+    int                         slotloop = 0;
+    _kernel_swi_regs            irq_regs;
+    DRIVER_REGISTERS            callregs;
+
+
+#if Debug == TRUE
+    DebugMessage("mK","\n\n********         SWI PCMCIA_Drivers 0 (&47501)  Entry     ********\n");
+    DebugMessage("mK","                     (Register Hardware Driver)\n");
+  #if Verbose == TRUE
+    DebugMessage("mK","    SWI &47501, Entry:\n");
+    DebugMessage("mK","        R1  = &%8X    (PCMCIA Driver's Routine handler code {address} )\n", reg ->r[1]);
+    DebugMessage("mK","        R2  = &%8X    (PCMCIA Driver's Private Word {address} )\n", reg ->r[2]);
+  #endif
+#endif
+
+
+    /*********************************************************************************/
+    /***    Loop through the driver registration table to find a space.            ***/
+    /*********************************************************************************/
+    while((loop < MAX_HARDWARE_DRIVERS) && (HardwareDriver[loop].Functions != 0)) loop++;
+
+    /************************************************************************************************/
+    /** Now we are either at a previous registration, or a valid storage point, or simply no room! **/
+    /************************************************************************************************/
+    if((loop < MAX_HARDWARE_DRIVERS) && (HardwareDriver[loop].Functions == 0)) {
+        /** At a valid storage point, so let's store! **/
+        #if Debug == TRUE
+            DebugMessage("mK"," Hardware driver is being registered as number %d of %d\n",loop, MAX_HARDWARE_DRIVERS-1);
+        #endif
+        HardwareDriver[loop].Functions = reg ->r[1];
+        HardwareDriver[loop].PrivateWord = reg ->r[2];
+
+        /** Let's find out some more about this'ere driver **/
+        SetUpHWDriver_CallRegs(loop, &callregs); /** Sets up similar to setupdrivercalls but not R7!**/
+        if(HardwareFunction(HARDWARE_FUNCTION__GET_SOFTWARE_FEATURES, &callregs, &DRV_Error) == NULL) {
+            HardwareDriver[loop].SoftwareFeatures = callregs.r[1];
+            HardwareDriver[loop].DataModesSupported = (callregs.r[2] & 0x1ff); /* only bits 0-8 */
+            #if Debug == TRUE && Verbose == TRUE
+                DebugMessage("mK","               (Driver version No. = &%3X)\n", callregs.r[0]);
+                DebugMessage("mK","               (Driver features    = &%8X)\n", callregs.r[1]);
+                DebugMessage("mK","               (Driver data modes  = &%8X)\n", callregs.r[2]);
+            #endif
+
+            /** Ok, got the s/w info, now let's ask for the h/w info **/
+            if(HardwareFunction(HARDWARE_FUNCTION__GET_HARDWARE_CONFIG, &callregs, &DRV_Error) == NULL) {
+                HardwareDriver[loop].NumberOfSlots     = callregs.r[0];
+                HardwareDriver[loop].PageSize          = callregs.r[1];
+                HardwareDriver[loop].IOPageSize        = callregs.r[2];
+                HardwareDriver[loop].CycleSpeed_Long   = callregs.r[3];
+                HardwareDriver[loop].CycleSpeed_Short  = callregs.r[4];
+                #if Debug == TRUE && Verbose == TRUE
+                    DebugMessage("mK","               (Number of slots      = %d)\n", callregs.r[0]);
+                    DebugMessage("mK","               (Page Size            = &%8X bytes)\n", callregs.r[1]);
+                    DebugMessage("mK","               (I/O Page Size        = %d bytes)\n", callregs.r[2]);
+                    DebugMessage("mK","               (Longest cycle speed  = %d ns)\n", callregs.r[3]);
+                    DebugMessage("mK","               (Shortest cycle speed = %d ns)\n", callregs.r[4]);
+                #endif
+
+                /****************************************************************************************/
+                /**** Now the driver is physically registered ok,  we'd better let it know we handle ****/
+                /**** memory IRQs. We should also deal with any inserted cards.                      ****/
+                /****************************************************************************************/
+
+                /** Search slots one by one for cards. When found, call
+                    insert_card interrupt handler to pretend it has just been inserted.
+                    Then, keep searching until all slots covered **/
+
+                HardwarePresent = TRUE; /** bit of a bodge, but necessary **/
+
+                for(slotloop = 0; slotloop < HardwareDriver[loop].NumberOfSlots; slotloop++) {
+                    callregs.r[1] = slotloop;
+                    #if Debug == TRUE
+                        DebugMessage("mK","Checking slot %d (hardware driver %d)\n", slotloop, loop);
+                    #endif
+                    HardwareFunction(HARDWARE_FUNCTION__CARD_PRESENT, &callregs, &DRV_Error);
+                    if(callregs.r[0] != 0) {
+                        irq_regs.r[1] = callregs.r[1]; /* slot handle */
+                        irq_regs.r[2] = loop;          /* Hw driver id */
+                        #if Debug == TRUE
+                            DebugMessage("mK","There is a card in slot %d\n", slotloop);
+                            DebugMessage("mK","Its slot handle is %d\n", callregs.r[1]);
+                        #endif
+                        error = IRQ_CardInsert(&irq_regs);  /* Pretend it has just been inserted... **/
+                    }
+                }
+
+                HardwarePresent = FALSE;
+
+                /*****************************************************************/
+                /***    Sets up the default card insert/remove handler routine ***/
+                /*****************************************************************/
+                callregs.r[2] = (int)irq_cdentry;  /* Veneer address */
+                callregs.r[3] = (int)Private_Word; /* Memory R12 value */
+                callregs.r[6] = loop;              /* Id's the hw adaptor */
+                callregs.r[7] = 0xffffffff;        /* Special Value - noone beats us on price! */
+                #if Debug == TRUE
+                    DebugMessage("mK","Memory IRQ entry point is &%8X, ", callregs.r[2]);
+                    DebugMessage("mK","with R12 &%8X.\n", callregs.r[3]);
+                    DebugMessage("mK","Real routine address is &%8X\n",(int)IRQ_CardHandler);
+                #endif
+                HardwareFunction(HARDWARE_FUNCTION__IRQ_HANDLER_INSTALL, &callregs, &DRV_Error);
+                /*****************************************************************/
+                /***    End of section that deals with initialisation of cards.***/
+                /*****************************************************************/
+            }
+            else error = ERROR__BAD_REGISTRATION;
+        }
+        else error = ERROR__BAD_REGISTRATION;
+    }
+    else error = ERROR__BAD_REGISTRATION;
+
+    #if Debug == TRUE
+        #if Verbose == TRUE
+            DebugMessage("mK","\n    SWI &47501 (reason code 0), Exit:\n");
+        #endif
+        DebugMessage("mK","\n******************************************************************\n");
+    #endif
+    if(error == NO_ERROR) HardwarePresent = TRUE;
+
+    return(error);
+}
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/*** Drivers_DeRegisterHardwareDriver(regs)                                            ***/
+/***                                                                                   ***/
+/***  Allows a Driver to de-register itself with the support code. This may occur      ***/
+/***  when a driver module is killed.                                                  ***/
+/***                                                                                   ***/
+/***    On Entry:                                                                      ***/
+/***       R0 = 1 (reason code)                                                        ***/
+/***       R1 = Driver's Function routine address.                                     ***/
+/***       R3 = Private Word Pointer.                                                  ***/
+/***                                                                                   ***/
+/***    On Exit:                                                                       ***/
+/***       None.                                                                       ***/
+/***                                                                                   ***/
+/***  DeRegistration performs the following functions:-                                ***/
+/***       - Removes the drivers calling address.                                      ***/
+/***       - Can't do anything else, or can we?                                        ***/
+/***         yes - sort out the cards that expect to use this driver!!!!               ***/
+/***                                                                                   ***/
+/***  Return Value:                                                                    ***/
+/***    NO_ERROR, if succesfully.                                                      ***/
+/***    PCMCIA Error Code, if an error occured.                                        ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode Drivers_DeRegisterHardwareDriver(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+    int                         loop = 0;
+    int                         driverloop;
+    DRIVER_REGISTERS            drvregs;
+
+
+    #if Debug == TRUE
+        DebugMessage("mK","\n\n********         SWI PCMCIA_Drivers 1 (&47501)  Entry     ********\n");
+        DebugMessage("mK","                   (De-Register Hardware Driver)\n");
+        #if Verbose == TRUE
+        DebugMessage("mK","    SWI &47501, Entry:\n");
+        DebugMessage("mK","        R1  = &%8X    (PCMCIA Driver's Routine handler code {address} )\n", reg ->r[1]);
+        #endif
+    #endif
+
+
+    /*********************************************************************************/
+    /***    See if we can find the entry in the list of registered drivers.        ***/
+    /*********************************************************************************/
+    while((loop < MAX_HARDWARE_DRIVERS) && (HardwareDriver[loop].Functions != reg ->r[1])) loop++;
+
+    /** Ok, so either we found it, or it's not there! **/
+    if (HardwareDriver[loop].Functions == reg ->r[1]) {
+        /************************************************************************************************************/
+        /***    Yes, this is my driver - I'd recognise it anywhere! So clear the Functions code and PW addresses. ***/
+        /************************************************************************************************************/
+        #if Debug == TRUE
+            DebugMessage("mK","FOUND IT!!!! (driver number %d)\n",loop);
+        #endif
+        HardwareDriver[loop].Functions = 0;
+        HardwareDriver[loop].PrivateWord = 0;
+
+        /** Quick check to see whether that was the last driver we just deregistered **/
+        HardwarePresent = FALSE; /** Let's pretend & correct it if we're wrong **/
+        for(driverloop=0; driverloop < MAX_HARDWARE_DRIVERS; driverloop++) if(HardwareDriver[loop].Functions != 0) HardwarePresent = TRUE;
+
+        /** Now for the tricky bit.... search through _all_ carddrives to see who was using this driver **/
+        /** then, 'remove' them, and inform the relevant pccard-drivers that the card has gone.... **/
+        for(driverloop = 0; driverloop < MAX_CARDDRIVES; driverloop++) {
+            if(CardDrive[driverloop].HardwareDriver == loop) {
+                if(CardDrive[driverloop].PCCardDriver != MAX_PCCARD_DRIVERS) { /* It must have a driver then */
+                    /** Inform the PCCard driver that a card it controls has gone **/
+                    SetUpPCCDriver_CallRegs(driverloop, &drvregs);
+                    drvregs.r[0] = PCCARD_FUNCTION__CARD_REMOVED;
+                    drvregs.r[1] = CardDrive[driverloop].SlotHandle;
+                    drvregs.r[2] = (int)(&(HardwareDriver[loop].NumberOfSlots));
+                    PCCardFunction(PCCardDriver[loop].FunctionAddress, PCCardDriver[loop].R12Value, &drvregs, &DRV_Error);
+                }
+                CardDrive[loop].HardwareDriver = -1; /** Mark as unused **/
+            }
+        }
+    }
+    else error = ERROR__BAD_DEREGISTRATION;
+
+    #if Debug == TRUE
+        #if Verbose == TRUE
+            DebugMessage("mK","\n    SWI &47501 (reason code 1), Exit:\n");
+        #endif
+        DebugMessage("mK","\n******************************************************************\n");
+    #endif
+
+
+    return(error);
+}
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/*** Drivers_RegisterPCCardDriver(regs)                                                ***/
+/***                                                                                   ***/
+/***  Allows a PCCard driver to register itself with the support code. If no PCCard    ***/
+/***  driver is found for an unknown device, standard SRAM accesses are used.          ***/
+/***                                                                                   ***/
+/***    On Entry:                                                                      ***/
+/***       R0 = 2 (reason code)                                                        ***/
+/***       R1 = Pointer to null-terminated ID.                                         ***/
+/***       R2 = Driver version number & driver type.                                   ***/
+/***       R3 = 'Function' call address                                                ***/
+/***       R4 = 'Read' call address (memory only)                                      ***/
+/***       R5 = 'Write' call address (memory only)                                     ***/
+/***       R6 = 'Erase' call address (memory only)                                     ***/
+/***       R7 = 'Interrupt' call address (I/O only)                                    ***/
+/***       R8 = Value to use for R12 on calling above routines.                        ***/
+/***                                                                                   ***/
+/***    On Exit:                                                                       ***/
+/***       None.                                                                       ***/
+/***                                                                                   ***/
+/***  Return Value:                                                                    ***/
+/***    NO_ERROR, if succesfully.                                                      ***/
+/***    PCMCIA Error Code, if an error occured. - the calling driver should die.       ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode Drivers_RegisterPCCardDriver(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+    char                        loop = 0;
+    DRIVER_REGISTERS            driver_regs;
+
+#if Debug == TRUE
+    DebugMessage("mK","\n\n********         SWI PCMCIA_Drivers 2 (&47501)  Entry     ********\n");
+    DebugMessage("mK","                     (Register PCCard Driver)\n");
+    DebugMessage("mK","    SWI &47501, Entry:\n");
+    DebugMessage("mK","        R1  = %s    (ID string)\n", (char *)reg ->r[1]);
+    DebugMessage("mK","        R2  = &%8X    (Version number/type)\n", reg ->r[2]);
+    DebugMessage("mK","        R3  = &%8X    \n", reg ->r[3]);
+    DebugMessage("mK","        R4  = &%8X    \n", reg ->r[4]);
+    DebugMessage("mK","        R5  = &%8X    \n", reg ->r[5]);
+    DebugMessage("mK","        R6  = &%8X    \n", reg ->r[6]);
+    DebugMessage("mK","        R7  = &%8X    \n", reg ->r[7]);
+    DebugMessage("mK","        R8  = &%8X    \n", reg ->r[8]);
+#endif
+
+    while((strcmp((char *)reg ->r[1], PCCardDriver[loop].DriverID) != 0)
+                && (PCCardDriver[loop].FunctionAddress != 0)
+                && (loop < MAX_PCCARD_DRIVERS)) loop++;
+
+    /** So here, we are either out of room, or at the insertion spot... ***/
+    if(loop == MAX_PCCARD_DRIVERS) error = ERROR__BAD_REGISTRATION; /** No room at the inn **/
+    else
+    {
+        if(PCCardDriver[loop].FunctionAddress == 0) {    /** New PCCard driver, so straightforward **/
+            strncpy(PCCardDriver[loop].DriverID, (char *)reg ->r[1], 15);
+            PCCardDriver[loop].PCCardType = (reg ->r[2] && 0x10000) >> 16;
+            PCCardDriver[loop].VersionNumber = (reg ->r[2] && 0xffff);
+            PCCardDriver[loop].FunctionAddress = reg ->r[3];
+            PCCardDriver[loop].ReadAddress = reg ->r[4];
+            PCCardDriver[loop].WriteAddress = reg ->r[5];
+            PCCardDriver[loop].EraseAddress = reg ->r[6];
+            PCCardDriver[loop].IRQAddress = reg ->r[7];
+            PCCardDriver[loop].R12Value = reg ->r[8];
+            #if Debug == TRUE
+                DebugMessage("mK","Driver registered at position %d.\n", (int)loop);
+            #endif
+            ScanCardsToDrive(loop);   /** See who we can control..... **/
+        }
+        else                     /** Replacement device driver? **/
+        {
+            if((reg ->r[2] & 0xff) > PCCardDriver[loop].VersionNumber) { /** Newer, so replace! **/
+                #if Debug == TRUE
+                    DebugMessage("mK","Oh look, there's one of me here already, at %d but I'm newer!\n", (int)loop);
+                #endif
+                /** Tell old one to quit & link up the new one **/
+                SetUpPCCDriver_CallRegs(0, &driver_regs); /** Don't care what slot handle is - it's only for a quit! **/
+                driver_regs.r[0] = PCCARD_FUNCTION__QUIT;
+                driver_regs.r[1] = 0; /** don't care **/
+                driver_regs.r[2] = 0; /* don't care */
+                PCCardFunction(PCCardDriver[loop].FunctionAddress, PCCardDriver[loop].R12Value, &driver_regs, &DRV_Error);
+
+                ScanCardsToUnDrive(loop);  /** Well, that's the old ones gone... **/
+
+                /** Now, overwrite the old info with the new info....  **/
+                strncpy(PCCardDriver[loop].DriverID, (char *)reg ->r[1], 15);
+                PCCardDriver[loop].PCCardType = (reg ->r[2] && 0x10000) >> 16;
+                PCCardDriver[loop].VersionNumber = (reg ->r[2] && 0xffff);
+                PCCardDriver[loop].FunctionAddress = reg ->r[3];
+                PCCardDriver[loop].ReadAddress = reg ->r[4];
+                PCCardDriver[loop].WriteAddress = reg ->r[5];
+                PCCardDriver[loop].EraseAddress = reg ->r[6];
+                PCCardDriver[loop].IRQAddress = reg ->r[7];
+                PCCardDriver[loop].R12Value = reg ->r[8];
+                /** New info written, let's see who we can control.. Resistance is useless...Exterminate!!!! ('scuse me) **/
+                ScanCardsToDrive(loop);
+            }
+            else
+            {
+                error = ERROR__BAD_REGISTRATION;    /** Refuse registration (older version than that present) **/
+            }
+        }
+    }
+    return(error);
+}
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/*** Drivers_DeRegisterPCCardDriver(regs)                                              ***/
+/***                                                                                   ***/
+/***  Allows a PCCard driver to deregister itself from the support code.               ***/
+/***                                                                                   ***/
+/***    On Entry:                                                                      ***/
+/***       R0 = 3 (reason code)                                                        ***/
+/***       R3 = 'Function' call address                                                ***/
+/***       R8 = Value to use for R12 on calling above routines.                        ***/
+/***                                                                                   ***/
+/***    On Exit:                                                                       ***/
+/***       None.                                                                       ***/
+/***                                                                                   ***/
+/***  DeRegistration performs the following functions:-                                ***/
+/***       - Removes the drivers calling address.                                      ***/
+/***                                                                                   ***/
+/***  Return Value:                                                                    ***/
+/***    NO_ERROR, if succesfully.                                                      ***/
+/***    PCMCIA Error Code, if an error occured. - the calling driver should die.       ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+PCMCIAManager_ErrorCode Drivers_DeRegisterPCCardDriver(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+    char                        loop = 0;
+
+#if Debug == TRUE
+    DebugMessage("mK","\n\n********         SWI PCMCIA_Drivers 3 (&47501)  Entry     ********\n");
+    DebugMessage("mK","                     (Deregister PCCard Driver)\n");
+    DebugMessage("mK","    SWI &47501, Entry:\n");
+    DebugMessage("mK","        R1  = &%8X    \n", reg ->r[1]);
+    DebugMessage("mK","        R2  = &%8X    \n", reg ->r[2]);
+#endif
+
+    while((!(PCCardDriver[loop].FunctionAddress == reg ->r[1]
+                && PCCardDriver[loop].R12Value == reg ->r[2]))
+              && (loop < MAX_PCCARD_DRIVERS)) loop++;
+
+    if(loop == MAX_PCCARD_DRIVERS) error = ERROR__BAD_DEREGISTRATION;
+    else
+    {
+        #if Debug == TRUE
+            DebugMessage("mK"," PCCDrv being deregistered:\n");
+            DebugMessage("mK","        IDString = %s\n", PCCardDriver[loop].DriverID);
+            DebugMessage("mK","     DeviceType  = &%8X\n", PCCardDriver[loop].PCCardType);
+            DebugMessage("mK","     VersnNumbr  = &%8X\n", PCCardDriver[loop].VersionNumber);
+            DebugMessage("mK","     FuncAddres  = &%8X\n", PCCardDriver[loop].FunctionAddress);
+            DebugMessage("mK","     ReadAddres  = &%8X\n", PCCardDriver[loop].ReadAddress);
+            DebugMessage("mK","     WriteAddrs  = &%8X\n", PCCardDriver[loop].WriteAddress);
+            DebugMessage("mK","     EraseAddrs  = &%8X\n", PCCardDriver[loop].EraseAddress);
+            DebugMessage("mK","     IRQAddress  = &%8X\n", PCCardDriver[loop].IRQAddress);
+            DebugMessage("mK","     R12Value    = &%8X\n", PCCardDriver[loop].R12Value);
+        #endif
+
+        /** Remove all traces of the device driver from the list **/
+        ScanCardsToUnDrive(loop);  /** First disassociate ourselves with devices **/
+        PCCardDriver[loop].DriverID[0] = 0;
+        PCCardDriver[loop].PCCardType = 0;
+        PCCardDriver[loop].VersionNumber = 0;
+        PCCardDriver[loop].FunctionAddress = 0;
+        PCCardDriver[loop].ReadAddress = 0;
+        PCCardDriver[loop].WriteAddress = 0;
+        PCCardDriver[loop].EraseAddress = 0;
+        PCCardDriver[loop].IRQAddress = 0;
+        PCCardDriver[loop].R12Value = 0;
+        #if Debug == TRUE
+            DebugMessage("mK","Device driver %d deregistered.\n", (int)loop);
+        #endif
+    }
+
+    return(error);
+}
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  SetUpHWDriver_CallRegs(HardwareDriverIndex, registers)                           ***/
+/***                                                                                   ***/
+/***  Sets various registers to specific values which can be used to perform a driver  ***/
+/***  operation (function), does not actually call the driver but provides the         ***/
+/***  necessary information to do so. The registers set are:-                          ***/
+/***                                                                                   ***/
+/***            R9  = value to set R12 to before calling driver.                       ***/
+/***            R10 = driver's address to call, to perform driver function.            ***/
+/***                                                                                   ***/
+/***  registers - an array of registers (_kernel_swi_registers), which to set the      ***/
+/***              register values to.                                                  ***/
+/***                                                                                   ***/
+/***  (This routine must be called prior to changing communication to a different      ***/
+/***   driver, but not between driver calls.)                                          ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    None.                                                                          ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+void SetUpHWDriver_CallRegs(int HWIndex, DRIVER_REGISTERS *driver_register)
+    {
+
+#if Debug == TRUE
+        DebugMessage("mK","SetUpHW_CallRegs entered.\n");
+#endif
+
+    /*************************************************************************************/
+    /***    Set R9 = R12 Value.                                                        ***/
+    /*************************************************************************************/
+    driver_register ->r[9] = HardwareDriver[HWIndex].PrivateWord;
+
+#if Debug == TRUE
+        DebugMessage("mK","    Driver Register R9 set to &%8X (pw)\n", driver_register ->r[9]);
+#endif
+
+    /*************************************************************************************/
+    /***    Set R10 = Call address of drivers function routine handler.                ***/
+    /*************************************************************************************/
+    driver_register ->r[10] = HardwareDriver[HWIndex].Functions;
+
+#if Debug == TRUE
+        DebugMessage("mK","    Driver R10 (entry address) = &%8X\n", driver_register ->r[10]);
+        DebugMessage("mK","SetUpDriverCalls exited.\n");
+#endif
+
+    }
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  SetUpPCC_CallRegs(PCCardDriverIndex, registers)                                  ***/
+/***                                                                                   ***/
+/***  Sets various registers to specific values which can be used to perform a driver  ***/
+/***  operation (function), does not actually call the driver but provides the         ***/
+/***  necessary information to do so. The registers set are:-                          ***/
+/***                                                                                   ***/
+/***            R3  = value to set R12 to before calling driver.                       ***/
+/***            R4 = driver's address to call, to perform driver function.             ***/
+/***                                                                                   ***/
+/***  registers - an array of registers (_kernel_swi_registers), which to set the      ***/
+/***              register values to.                                                  ***/
+/***                                                                                   ***/
+/***  (This routine must be called prior to changing communication to a different      ***/
+/***   driver, but not between driver calls.)                                          ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    None.                                                                          ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+void SetUpPCCDriver_CallRegs(int carddrivenumber, DRIVER_REGISTERS *driver_register)
+    {
+
+#if Debug == TRUE
+        DebugMessage("mK","SetUpPCCDriver_CallRegs entered.\n");
+#endif
+
+    /*************************************************************************************/
+    /***    Set R4 = R12 Value.                                                        ***/
+    /*************************************************************************************/
+    driver_register ->r[4] = HardwareDriver[CardDrive[carddrivenumber].HardwareDriver].PrivateWord;
+
+#if Debug == TRUE
+        DebugMessage("mK","    Driver Register R4 set to &%8X (pw)\n", driver_register ->r[4]);
+#endif
+
+    /*************************************************************************************/
+    /***    Set R3 = Call address of drivers function routine handler.                ***/
+    /*************************************************************************************/
+    driver_register ->r[3] = HardwareDriver[CardDrive[carddrivenumber].HardwareDriver].Functions;
+
+#if Debug == TRUE
+        DebugMessage("mK","    Driver R3 (entry address) = &%8X\n", driver_register ->r[3]);
+        DebugMessage("mK","SetUpDriverCalls exited.\n");
+#endif
+
+    }
+
+
+
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  DriverFunction(function, registers, returned error)                              ***/
+/***                                                                                   ***/
+/***  Calls the driver; performing the specified function. This should only be called  ***/
+/***  after calling "SetUpDriverCalls" as the neccesary information will already have  ***/
+/***  been obtained and placed in the registers r7 - r10.                              ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  function  - driver's function value. Put into R0 before driver called.           ***/
+/***  registers - an array of registers (DRIVER_REGISTERS), which to set the           ***/
+/***              register values to.                                                  ***/
+/***                                                                                   ***/
+/***  (See "s.Driver" for the actual implementation which is in assembler)             ***/
+/***                                                                                   ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    NULL, if function performed sucessfully.                                       ***/
+/***    ERROR_MESSAGE, if error occured.                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  PCCardFunction(call address, r12 value, registers, returned error)               ***/
+/***                                                                                   ***/
+/***  Calls the driver; performing the specified function.                             ***/
+/***                                                                                   ***/
+/***  function  - driver's function value. Put into R0 before driver called.           ***/
+/***  registers - an array of registers (DRIVER_REGISTERS), which to set the           ***/
+/***              register values to.                                                  ***/
+/***                                                                                   ***/
+/***  (See "s.Driver" for the actual implementation which is in assembler)             ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    NULL, if function performed sucessfully.                                       ***/
+/***    ERROR_MESSAGE, if error occured.                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/

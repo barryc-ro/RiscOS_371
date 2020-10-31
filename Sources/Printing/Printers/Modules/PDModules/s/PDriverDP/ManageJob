@@ -1,0 +1,406 @@
+; > Sources.PDriverDP.ManageJob
+
+; ***********************************************************
+; printer specific allocation of workspace for a job
+; Entry: -
+;  Exit:  R11 = job's workspace pointer
+;
+; ***********************************************************
+
+managejob_allocate  ROUT
+        Push    "r0-r3, lr"
+
+        Debug   ManageJob,"managejob_allocate"
+        
+        LDR     r0, printer_pdumper_pointer
+        CMP     r0, #0
+        BNE     pdumper_module_loaded
+
+        ADR     r0, pending_pdumper_command
+        Debug   ManageJob,"Performing RMEnsure command",R0
+        SWI     XOS_CLI
+        Debuga  ManageJob,"Returned from command with WP of",R12
+        Debug   ManageJob," and R0 of",R0
+        DebugE  ManageJob,"Ensure command failed with"
+        BVS     %FT99
+
+        LDR     r0, printer_pdumper_pointer
+        CMP     r0, #0
+        BNE     pdumper_module_loaded
+        ADDR    r0, ErrorBlock_PDumperUndeclared
+        BL      LookupSingle                    ; Always sets the V bit
+  DebugE xx,"Error about undeclared PDumper"
+        BVS     %FT99
+
+pdumper_module_loaded
+        MOV      r0,#ModHandReason_Claim ;Claim workspace
+        LDR      r3,=jobwslength
+
+       
+
+        Debug   ManageJob,"managejob_allocate",R3
+
+        SWI     XOS_Module
+        MOV     r11, r2
+        BVS     %FT99
+
+; copy our global data to the job workspace
+
+        ADR     r0, printer_dump_depth
+        ADR     r1, job_dump_depth 
+        ADD     r1, r1, #jobwsoffset            ; MUST add jobwsoffset to get correct address in record
+        MOV     r2, #job_endconfigdata-job_dump_depth
+
+        Debug   ManageJob,"copying data from:",R0
+        Debug   ManageJob,"               to:",R1
+        Debug   ManageJob,"           length:",R2
+
+10      LDR      r3, [r0], #4
+        STR      r3, [r1], #4
+        SUBS     r2, r2, #4
+        BGE      %BT10
+
+; Get PDumper private word
+        
+        Push    "r9,r11"
+
+        ADD     r11, r11, #jobwsoffset                  ; IMPORTANT!! needed to obtain correct values from record
+
+        MOV     r0, #0
+        STR     r0, job_pdumper_word                    ; reset the private word to zero
+
+        ADR     r0, job_pdumper_word
+        LDR     r1, jobhandle                           ; NB: not sure this is actually valid
+ 
+        [ Libra1
+        LDR     r2, job_strip_type
+        |
+        LDRB    r2, job_strip_type
+        ]
+        MOV     r9, #PDumperReason_StartJob
+        BL      CallPDumperForJob
+
+        [ Medusa
+        BL      sprite_clear32Ktable            ; setup coloourtrans32K anchor block
+        ]
+
+        Pull    "r9,r11"
+99
+        DebugE  ManageJob,"managejob_allocate returns error"
+
+        STRVS    r0, [stack]
+        Pull    "r0-r3, pc"
+        LTORG
+
+
+
+; ***********************************************************
+; printer specific initialisation of a job
+;  Entry: R1 = zero or points to control or topbit character
+;              terminated title string.
+;         R10 = file handle of job
+;         R11 = job's workspace pointer
+; ***********************************************************
+
+managejob_init  ROUT
+       Push    "r0-r9, lr"
+
+       Debuga   ManageJob,"managejob_init on file handle",R10
+       DebugS   ManageJob,", job title",R1
+
+       MOV      r0, #0
+       STR      r0, job_VDUsavearea
+       STR      r0, job_savedVDUstate  ; no redirection yet
+       STR      r0, job_currentrect
+       STR      r0, job_dashstyle
+       STR      r0, job_sarea_change
+       STRB     r0, job_htonealign
+       BL       font_fontslost         ; clear the slave data
+
+       Debug    ManageJob,"Initialise job_spritearea to -1"
+
+       MOV      r0, #-1                ; no buffer yet
+       STR      r0, job_spritearea
+       CLRV
+
+  ; set up halftone data
+
+       LDR      r0, info_xpixelres
+       LDR      r1, info_xhtoneres
+
+       BL       Divide
+       CMP      r0, #256
+       BGE      %FT98
+       STRB     r0, job_halftoneX
+       MOV      r3, r0
+       
+       Debug    ManageJob,"halftoneX",R0
+
+       LDR      r0, info_ypixelres
+       LDR      r1, info_yhtoneres
+       BL       Divide
+       CMP      r0, #256
+       BGE      %FT98
+       STRB     r0, job_halftoneY
+
+        Debug   ManageJob,"HalftoneY",R0
+
+99      STRVS  r0, [stack]
+        DebugE ManageJob,"Error returned from managejob_init"
+        Pull   "r0-r9, pc"
+
+98      ADR     r0, ErrorBlock_PrintBadHalftone
+        BL      LookupSingle                    ; Always sets V
+        B       %BT99
+
+       MakeInternatErrorBlock PrintBadHalftone,,BadHton
+
+; ***********************************************************
+; printer specific suspension of a job
+;  Entry: R10 = file handle of job
+;         R11 = job's workspace pointer
+; This routine is not allowed to return an error,
+;    but it can set up a persistent error (to be reported later)
+; ***********************************************************
+
+managejob_suspend ROUT
+
+        Debug   ManageJob,"managejob_suspend on handle",R10
+
+          Push     "lr"
+          BL        restore_printer_ignore
+          Pull     "lr"
+
+restore_output_state             ; swap output away from our sprite
+          Push     "r0-r3, lr"
+          ADR       r0, job_savedVDUstate
+          LDMIA     r0, {r0-r3}
+          CMP       r0, #0
+
+        [ debugManageJob
+          BEQ       %FT80
+          Debug     ManageJob,"restore output state"
+          B         %FT81
+80
+          Debug     ManageJob,"restore output state - already done"
+81
+        ]
+          BEQ       %FT01                ;; ADDED BY NRAINE, 2-May-89
+
+          ADR       lr, jobspriteparams
+          STMIA     lr, {r0-r3}
+          BL        pass_spriteop
+
+; we must invalidate ColourTrans's cache, as output bitmap is changing
+; (also done in PDriverDP.Private2: redirect_output)
+
+          SWI       XColourTrans_InvalidateCache
+
+01
+          MOV       r3, #0
+          STR       r3, job_savedVDUstate
+
+          BLVS      makepersistenterror     ;; ADDED BY NRAINE, 2-May-89
+          Pull     "r0-r3, pc",,^
+
+
+; ***********************************************************
+; printer specific resumption of a job
+;  Entry: R10 = file handle of job
+;         R11 = job's workspace pointer
+; This routine is not allowed to return an error,
+;    but it can set up a persistent error (to be reported later)
+; ***********************************************************
+
+managejob_resume ROUT
+          Push   "r0, lr"
+
+          Debug   ManageJob,"managejob_resume on file handle",R10
+
+          LDR     r0, job_spritearea
+          CMP     r0, #0
+        [ debugManageJob
+          BGE     %FT80
+          Debug   ManageJob,"************** Resume: no sprite area."
+80
+        ]
+          BLGE    redirect_output
+          BLVC    set_printer_ignore
+          
+
+          BLVS    makepersistenterror     ;; ADDED BY NRAINE, 2-May-89
+          Pull   "r0, pc",,^
+
+; ***********************************************************
+; printer specific finalisation of a job
+;  Entry: R10 = file handle of job
+;         R11 = job's workspace pointer
+; ***********************************************************
+
+managejob_finalise ROUT
+          Push  "r0, lr"
+          
+          Debug   ManageJob,"managejob_finalise"
+
+        ; finalise is not a fatality, therfore we don't want to wipe
+        ; the output stream - have to go via abortalt
+        
+        Push    "R3"
+        MOV     R3, #1
+      
+        BL     managejob_abortalt          ; lose any blocks we hold
+        Pull    "R3"
+
+;          ADR    r0, job_job_epilogue
+;          BL     send_counted_string
+          STRVS  r0, [stack]
+          Pull  "r0, pc"
+
+; ***********************************************************
+; printer specific aborting of a job
+;  Entry: R10 = file handle of job
+;         R11 = job's workspace pointer
+; ***********************************************************
+
+managejob_abort ROUT
+        Push    "r3,lr"                 ; we must always preserve r3!
+        MOV     R3,#2                  ; into the tar pit time
+        [ Libra1
+        ORR     R3, R3, #1 :SHL: 24     ; we return the printer into a sane state
+        ]
+        BL      managejob_abortalt
+        Pull    "r3,pc"                 
+
+managejob_shrink_const
+        DCD     -1000*1024
+
+managejob_abortalt ROUT
+        Push  "r0-r2,r4,lr"
+
+        Debuga  ManageJob,"managejob_abort on file handle",R10
+        Debug   ManageJob,"fatility",R3
+        
+        BL      restore_printer_ignore
+        BL      restore_output_state     ; swap output away from our sprite
+
+        Push    "r9"
+
+        [ Medusa
+        BL     sprite_free32Ktable      ; freeup pointer in colourtrans32K anchor block
+        ]
+        [ Libra1
+        ; if printing to old strip type - might have big holes in RMA, try to shrink it
+
+        MOV     R0, #1
+;        LDR     R1, =-1000*1024
+        ADR     R1, managejob_shrink_const
+        LDR     R1, [R1]
+        SWI     XOS_ChangeDynamicArea
+        CLRV                            ; ignore any error
+        ]
+
+        ADR     r0, job_pdumper_word
+        LDR     r1, jobhandle
+        [ Libra1
+        LDR    r2, job_strip_type
+        |
+        LDRB    r2, job_strip_type
+        ]
+        ; remember r3 contains info used by abort-job
+        [ Libra1 
+        ; if printer is going to be set into a sane state need to provide
+        ; location of dumper config. data
+        TST     R3, #1 :SHL: 24
+        ADRNE   R4, job_dump_depth
+        ]
+        MOV     r9, #PDumperReason_AbortJob
+        BL      CallPDumperForJob
+
+        [ Libra1
+        ; set the output stream to 0 if the job is aborted
+        ; this stops pages being printed if background printing
+        ; is on!
+
+        Push    "R0-R2"
+        BIC     R3, R3, #1 :SHL: 24    
+        CMP     R3, #2
+        MOVEQ   R0, #3
+        MOVEQ   R1, R10
+        MOVEQ   R2, #0
+        SWIEQ   XOS_Args
+        Pull    "R0-R2"
+        ]
+        
+        Pull    "r9"                    ; preserve r9 it could be important
+
+      [ MultiplePasses
+        ADR     r0, job_linebuffer+12
+        LDRB    r2, job_strip_type
+        CMP     r2, #3                  ;multiple pass 16m colours
+        LDRB    r2, job_no_passes
+        ADDEQ   r2,r2,#1
+00
+        BL      losebuffersprite
+        ADD     r0, r0, #12
+        SUBS    r2, r2, #1
+        BGT     %BT00
+      |
+        ADR     r0, job_linebuffer
+        BL      losebuffersprite
+      ]
+        ADR     r0, job_rotationbuffer
+        BL      losebuffersprite
+
+        LDR     r2, job_VDUsavearea
+        CMP     r2, #0
+        MOVNE   r0, #ModHandReason_Free
+        SWINE   XOS_Module
+
+         LDR    r2, job_spritearea
+         CMP    r2, #0
+         MOVGT  r0, #ModHandReason_Free
+         SWIGT  XOS_Module
+
+         LDR    r0, job_sarea_change
+         RSBS   r1, r0, #0
+         MOVNE  r0, #3                ; system sprite area
+         SWINE  XOS_ChangeDynamicArea
+
+         Debug  ManageJob,"Sprite area deallocated"
+
+         MOV    r0, #-1                ; no buffer now
+         STR    r0, job_spritearea
+
+         SWI    XColourTrans_InvalidateCache ; ensure ColourTrans is in a kosher state
+
+         
+         Debug  ManageJob,"managejob_abort finished"
+
+         Pull  "r0-r2,r4,lr"
+         Return
+
+;.................................................................
+; routines to save/restore the printer ignore state.
+;.................................................................
+
+set_printer_ignore ROUT
+         Push   "r0-r2, lr"
+         MOV     r0, #182
+         MOV     r1, #255          ; we want NOIGNORE
+         MOV     r2, #0
+         SWI     XOS_Byte
+         STRVCB  r1, job_saved_pignore
+         STRVS   r0, [stack]
+         Pull   "r0-r2, pc"
+
+restore_printer_ignore ROUT
+         Push   "r0-r2, lr"
+         MOV     r0, #182
+         LDRB    r1, job_saved_pignore
+         MOV     r2, #0
+         SWI     XOS_Byte
+         STRVS   r0, [stack]
+         Pull   "r0-r2, pc"
+
+         END
+

@@ -1,0 +1,970 @@
+/*
+ * $Header: /ab/bsd:etc/scsidm/intcmds.c:bsd.riscix1_2  1.8  $
+ * $Source: /ab/bsd:etc/scsidm/intcmds.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	intcmds.c,v $
+ * Revision 1.8  91/10/16  14:36:40  kwelton
+ * Buffer devname in rdname() should be u_char: this prevents problems
+ * with sign extension when reading the number of additional length bytes.
+ * 
+ * Revision 1.7  90/08/13  15:25:11  jroach
+ * Bring Risc OS and RISCiX versions in line with each other.
+ * Fix bug in picking apart of mode sence response.
+ * 
+ * Revision 1.6  90/05/25  11:12:20  kwelton
+ * rdshape() has had support for optical drives added.  Also fixed a bug
+ * where start of data pages was being incorrectly calculated.
+ * 
+ * Revision 1.5  89/10/03  14:07:50  kwelton
+ * Fixed bug where rdname was dropping the last character of the device name.
+ * 
+ * Revision 1.4  89/06/26  16:04:40  kwelton
+ * Put in code to cope with the case where the reported number of blocks per
+ * track is zero. This means the code now reads the number of cylinders from
+ * the Mode Sense data rather than calculating it from the other disk shape
+ * parameters.
+ * 
+ * Revision 1.3  89/04/19  07:47:38  kwelton
+ * Only says it is writing UNIX partition table when this is the case.
+ * 
+ * Revision 1.2  89/04/18  17:42:54  kwelton
+ * struct scsiop flags (ps_scsi.h) changed from I_... to SC_...
+ * 
+ * Revision 1.1  89/04/06  11:22:30  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /ab/bsd:etc/scsidm/intcmds.c:bsd.riscix1_2  1.8  $";
+#endif
+
+#include <stdio.h>
+#include <ctype.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "time.h"        /*RCM>>>was <sys/time.h>      */
+#include "ps_scsi.h"     /*RCM>>>was <dev/ps_scsi.h>   */
+#include "ps_direct.h"   /*RCM>>>was <dev/ps_direct.h> */
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <sys/time.h>
+#include <dev/ps_scsi.h>
+#include <dev/ps_direct.h>
+#endif
+#include "scsidm.h"
+#include "dmcmds.h"
+#include "partition.h"
+
+/*
+ * optical disks do not have any consistent means of determining
+ * drive geometry - set values for the two known formats (512 &
+ * 1024 bytes per sector).
+ */
+#define OPTICAL_SPT512	31
+#define OPTICAL_SPT1024	16		/* GUESSTIMATE!! */
+
+	/* import externals */
+import bool fromatty;
+import struct d_parms *cdev;
+import DefectList defects;
+import UNIX_Info infoblock;
+import u_char part_gotmap;
+import bool optical;
+
+	/* declare external functions */
+import int runcmd(), runicmd();
+import u_char *addrpage(), fn_sum();
+import long fetchlong();
+import void *malloc(), storelong(), clrdef();
+import ADFS_bblock *read_bblock();
+
+	/* declare statics */
+static struct scsiop intcmd;
+
+static int rwdev(), cmpul();
+
+	/* declare routines defined this segment */
+u_int unixstartbyte();
+char *rdname();
+bool wrtptable(), wradfsboot();
+
+/**********************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, intcmds.c:
+ *
+ * 1) int rdshape() - read the device shape information
+ *
+ * 2) char *rdname() - read disk name using inquiry command
+ *
+ * 3) int rdmode() - read mode sense information
+ *
+ * 4) int wrtmode() - write mode select information
+ *
+ * 5) int readcap() - read disk capacity
+ *
+ * 6) bool wradfsboot() - write a minimal ADFS boot block
+ *
+ * 7) int wrtdev() - write data to SCSI device
+ *
+ * 8) int rddev() - read data from a SCSI device
+ *
+ * 9) static int rwdev() - read/write data in XFERLIM block lumps.
+ *
+ * 10) int sendglist() - ask device to map out bad blocks
+ *
+ * 11) static int cmpul() - u_long comparison routine for qsort()
+ *
+ * 12) bool wrtptable() - write partition table to disk
+ *
+ * 13) u_int unixstartbyte() - get 1st byte no. of UNIX area
+ *
+ */
+
+/**********************************************************************/
+
+int rdshape(dev)
+
+struct d_parms *dev;
+
+{
+    /*
+     * subroutine rdshape() -
+     *
+     * routine reads the device shape parameters into the passed
+     * dev. returned value is:
+     *
+     *	GOOD		Routine successful
+     *	BAD		SCSI command failed
+     *	BADARG		bad SCSI device in cdev
+     *
+     */
+
+    /* declare autos */
+    u_char dataptr[MDBUFLEN];
+    register u_char *pagedata, *pptr;
+    register int retc, pagespace;
+    register long senselength, scratch;
+
+    if( !optical )
+    {
+	/* read the mode sense data */
+	if( (retc = rdmode(dataptr,ALLPAGES,REPCURRENT,TRUE)) != GOOD )
+	    return(retc);
+
+	/* test the medium type */
+	if( *(dataptr + 1) != WINNYMED &&
+	   (cdev->d_type == OMPTYPE && *(dataptr + 1) != OPTICALMED) )
+	{
+	    /* can only support winchesters at the moment */
+	    printf("device %s is not a winchester - cannot support it\n",
+		   dev->d_name);
+	    return(BADARG);
+	}
+
+	/* set pointer to start of data pages */
+	senselength = fetchlong(dataptr, 1) + 1;
+	scratch = fetchlong(dataptr + 3, 1);
+	pagedata = dataptr + scratch + 4;
+	pagespace = senselength - (pagedata - dataptr);
+
+	/* address page 3 */
+	if( (pptr = addrpage(pagedata,pagespace,3)) == NULL ||
+	   ((u_char)*(pptr + 1)) < 11 )
+	{
+	    /* cannot find this page/it is not long enough */
+	    printf("rdshape: cannot find page 3 of Mode Sense data\n");
+	    return(BAD);
+        }
+
+	/* pull out the number of blocks per track */
+	dev->d_blokstrk = (u_char)fetchlong(pptr + 10,2);
+
+	/* address page 4 */
+	if( (pptr = addrpage(pagedata,pagespace,4)) == NULL ||
+	   ((u_char)*(pptr + 1)) < 3 )
+	{
+	    /* cannot find this page/it is not long enough */
+	    printf("rdshape: cannot find page 4 of Mode Sense data\n");
+	    return(BAD);
+        }
+
+	/* pull out the number of heads */
+	dev->d_heads = (u_char)fetchlong(pptr + 5,1);
+
+	/* now get the number of cylinders */
+	dev->d_cyls = fetchlong(pptr + 2, 3);
+
+	/* calculate the disk size */
+	if( (retc = readcap(dev)) != GOOD )
+	    /* command failed */
+	    return(retc);
+
+	/* calculate the number of blocks per track if necessary */
+	if( dev->d_blokstrk == 0 )
+	{
+	    /*
+	     * zero blocks per track in mode sense field indicates that
+	     * this parameter is variable. The programs for creating a new
+	     * filesystem cannot cope with this, so round number down
+	     * to the nearest integer.
+	     */
+	    dev->d_blokstrk = (u_char)((dev->d_size / dev->d_cyls) /
+				       (dev->d_heads * dev->d_bloksize));
+	    dev->d_size = dev->d_bloksize * dev->d_blokstrk *
+		dev->d_heads * dev->d_cyls;
+	}
+    }
+
+    else
+    {
+	/*
+	 * use Read Capacity to get no. of blocks & block size,
+	 * then use guesstimate for no. of blocks per track to
+	 * determine no. of cylinders.
+	 */
+	if( (retc = readcap(dev)) != GOOD )
+	    /* command failed */
+	    return(retc);
+
+	dev->d_blokstrk = (dev->d_bloksize == 512) ? 
+	    OPTICAL_SPT512 : OPTICAL_SPT1024;
+	dev->d_heads = 1;
+	dev->d_cyls = dev->d_size / (dev->d_bloksize * dev->d_blokstrk);
+
+	/*
+	 * will probably get integer truncation on calculation
+	 * for d_cyls: recompute disk size
+	 */
+	dev->d_size = dev->d_cyls * dev->d_bloksize * dev->d_blokstrk;
+    }
+
+    /* finished */
+    return(GOOD);
+
+}
+
+/************************************************************************/
+
+char *rdname(perphtype)
+
+u_char *perphtype;
+
+{
+	/*
+	 * subroutine rdname() -
+	 *
+	 * routine uses the inquiry command to read a device's name.
+	 * this is no hard & fast SCSI rule, but bytes 8 - 35 of the
+	 * inquiry data are, by convention, reserved for text. returned
+	 * value is a pointer to the device name, NULL if one could not
+	 * be found.
+	 *
+	 */
+
+	/* declare autos */
+	register int nbytes;
+	register char *cptr, *retc;
+	register struct scsiop *cmdptr;
+	static u_char devname[MAXINQ];
+
+	/* build skeleton control block */
+	cmdptr = &intcmd;
+	bldskelcb(INQUIRE,cmdptr);
+
+	/* fill in command specific stuff */
+	cmdptr->cdb[4] = MAXINQ;
+	cmdptr->xfer = MAXINQ;
+	cmdptr->addr = (char *)devname;
+	cmdptr->timeout = INQTIMEO;
+	cmdptr->flags |= SC_READ;
+	
+	/* try to read this data */
+	if( runicmd(cmdptr) != GOOD )
+	{
+	 *perphtype = NOPTYPE;
+	 return(NULL);
+	}
+
+	/* set peripheral device type */
+	*perphtype = *devname;
+
+	/* read the number additional length bytes */
+	if( (nbytes = *(devname + 4)) < 4 )
+	 /* no textual information */
+	 return(NULL);
+
+	/* scan along list until no more suitable text */
+	for( retc = cptr = (char *)(devname + 8);
+	     isprint(*cptr) && *cptr && cptr <= (char *)(devname + 35);
+	     ++cptr )
+	 /* do nothing */
+	 ;
+
+	/* null terminate the string */
+	*cptr = '\0';
+
+	/* only return the string if at least 1 printable char */
+	return( isprint(*retc) ? retc : NULL );
+}
+
+/************************************************************************/
+
+int rdmode(opdata,pageno,rtype,useinternal)
+
+u_char *opdata;
+int pageno, rtype;
+bool useinternal;
+
+{
+	/*
+	 * subroutine rdmode() -
+	 *
+	 * routine reads the mode information from the SCSI device into
+	 * modedata. opdata is set to address the start of the data.
+	 * returned value is:
+	 *
+	 *	GOOD		Routine successful
+	 *	BAD		SCSI command failed
+	 *	BADARG		bad SCSI device in cdev
+	 *
+	 */
+
+	/* declare autos */
+	register struct scsiop *cmdptr;
+	register int (*runfunc)();
+
+	/* build the skeleton command block */
+	cmdptr = &intcmd;
+	bldskelcb(MODESEN,cmdptr);
+
+	/* fill in the command specific stuff */
+	if( optical )
+	    /* set the PF bit */
+	    cmdptr->cdb[1] = (1 << 4);
+
+	cmdptr->cdb[2] = (pageno | (rtype << 6));
+	cmdptr->cdb[4] = MDLEN;
+	cmdptr->xfer = MDLEN;
+	cmdptr->addr = (char *)opdata;
+	cmdptr->timeout = MSNTIMEO;
+	cmdptr->flags |= SC_READ;
+
+	/* decide which function to use */
+	runfunc = useinternal ? runicmd : runcmd;
+
+	/* run the command & return the status */
+	return((*runfunc)(cmdptr));
+}
+
+/************************************************************************/
+
+int wrtmode(ipdata,dosave,useinternal)
+
+u_char *ipdata;
+int dosave;
+bool useinternal;
+
+{
+	/*
+	 * subroutine wrtmode() -
+	 *
+	 * routine writes the mode select data to the current SCSI
+	 * device. returned value is GOOD if all OK, BAD if SCSI
+	 * command fails, BADARG if a bad SCSI device in cdev.
+	 *
+	 */
+
+	/* declare autos */
+	register u_char *cptr;
+	register struct scsiop *cmdptr;
+	register int (*runfunc)();
+
+	/* build the skeleton command block */
+	cmdptr = &intcmd;
+	bldskelcb(MODESEL,cmdptr);
+
+	/* fill in the command specific stuff */	
+	cmdptr->cdb[1] = PAGEFORMAT | (dosave ? SAVEPAGE : 0);
+	cmdptr->cdb[4] = *(ipdata + 3) + 4;
+	cptr = ipdata + cmdptr->cdb[4];
+	cmdptr->cdb[4] += *(cptr + 1) + 2;
+	cmdptr->addr = (char *)ipdata;
+	cmdptr->xfer = cmdptr->cdb[4];
+	cmdptr->timeout = MSLTIMEO;
+	cmdptr->flags |= SC_WRITE;
+
+	/* decide which function to use */
+	runfunc = useinternal ? runicmd : runcmd;
+
+	/* run the command, return the status */
+	return((*runfunc)(cmdptr));
+}
+
+/************************************************************************/
+
+int readcap(dev)
+
+struct d_parms *dev;
+
+{
+	/*
+	 * subroutine readcap() -
+	 *
+	 * routine reads a disks capacity & places the result in dev.
+	 * returned value is:
+	 *
+	 *	GOOD		Routine successful
+	 *	BAD		SCSI command failed
+	 *	BADARG		bad SCSI device in cdev
+	 *
+	 */
+
+	/* declare autos */
+	register int retc;
+	register long scratch;
+	register struct scsiop *cmdptr;
+	char capdata[DCDBLEN];
+
+	/* read disk capacity - build skeleton command block */
+	cmdptr = &intcmd;
+	bldskelcb(RDCAP,cmdptr);
+
+	/* fill in command specific stuff */
+	cmdptr->xfer = DCDBLEN;
+	cmdptr->addr = capdata;
+	cmdptr->timeout = DCTIMEO;
+	cmdptr->flags |= SC_READ;
+
+	/* run the command & decide whether to continue */
+	if( (retc = runicmd(cmdptr)) != GOOD )
+	 /* abort this operation */
+	 return(retc);
+
+	/* read the disk capacity */
+	dev->d_bloksize = (u_long)fetchlong(capdata + 4,4);
+	scratch = (u_long)fetchlong(capdata,4);
+	dev->d_size = ++scratch * dev->d_bloksize;
+
+	/* finished */
+	return(GOOD);
+}
+
+/************************************************************************/
+
+int wrtdev(diskaddr,data,dlen,blocks)
+
+long diskaddr, dlen;
+char *data;
+bool blocks;
+
+{
+	/*
+	 * subroutine wrtdev() -
+	 *
+	 * routine writes the data out to the current device. returned
+	 * value is:
+	 *
+	 *	GOOD - Routine successful,
+	 *	BAD - SCSI command failed,
+	 *	BADARG - bad SCSI device in cdev.
+	 *
+	 */
+
+	/* declare autos */
+	register int retc;
+	register int nbloks;
+	register int blokaddr, blokresid;
+	register u_long *bloksiz;
+	register char *dptr = NULL;
+	register struct scsiop *cmdptr;
+
+	/* get the disk block size */
+	bloksiz = &(cdev->d_bloksize);
+
+	/* are the addresses given in bytes? */
+	if( !blocks )
+	{
+	 register int overlap;
+
+	 /* convert to blocks */
+	 nbloks = dlen / *bloksiz;
+	 if( (overlap = (dlen % *bloksiz)) != 0 )
+	  ++nbloks;
+
+	 /* calculate block address & residual no. of bytes */
+	 blokaddr = diskaddr / *bloksiz;
+	 blokresid = diskaddr % *bloksiz;
+
+	 /*
+	  * if the data does not exactly fit an integer number
+	  * of blocks, it must be merged with what is already
+	  * written on the disk.
+	  */
+	 if( (dlen % *bloksiz) != 0 || blokresid != 0 )
+	 {
+	  /*
+	   * if the data crosses a block boundary then, obviously,
+	   * the number of blocks we are dealing with increases
+	   */
+	  if( (blokresid + overlap) > *bloksiz )
+	   ++nbloks;
+
+	  /* try to allocate some RAM to hold the data */
+	  if( (dptr = malloc(nbloks * *bloksiz)) == NULL )
+	   /* cannot do it */
+	   return(BAD);
+
+	  /* now read in the data */
+	  if( (retc = rddev(blokaddr,dptr,nbloks,TRUE)) != GOOD )
+	   return(retc);
+
+	  /* now write in the new data */
+	  bcopy(data,dptr + blokresid,dlen);
+	 }
+	}
+
+	else
+	{
+	 /* addresses are given in blocks */
+	 nbloks = dlen;
+	 blokaddr = diskaddr;
+	 blokresid = 0;
+	}
+
+	/*
+	 * write the data to disk. this is complicated by SCSI only
+	 * allowing transfers of up to XFERLIM logical blocks at a time,
+	 * forcing the transfers to be broken up into lumps.
+	 */
+	 
+	/* build as much of the command block as possible */
+	cmdptr = &intcmd;
+	bldskelcb(NEWRITE,cmdptr);
+	cmdptr->flags |= SC_WRITE;
+	cmdptr->timeout = RWTIMEO;
+
+	/* send the data */
+	if( (retc = rwdev(cmdptr,(dptr) ? dptr : data,
+			  nbloks,blokaddr,*bloksiz)) != GOOD )
+	{
+	 if( dptr )
+	  free(dptr);
+	 return(retc);
+	}
+
+	/* finished */
+	if( dptr )
+	 free(dptr);
+	return(GOOD);
+}
+
+/************************************************************************/
+
+int rddev(diskaddr,data,dlen,blocks)
+
+long diskaddr, dlen;
+char *data;
+bool blocks;
+
+{
+	/*
+	 * subroutine rddev() -
+	 *
+	 * routine reads data from the current device. returned value
+	 * is:
+	 *
+	 *	GOOD - Routine successful,
+	 *	BAD - SCSI command failed,
+	 *	BADARG - bad SCSI device in cdev.
+	 *
+	 */
+
+	/* declare autos */
+	register int retc;
+	register int nbloks;
+	register int blokaddr, blokresid;
+	register u_long *bloksiz;
+	register char *dptr = NULL;
+	register struct scsiop *cmdptr;
+
+	/* get the disk block size */
+	bloksiz = &(cdev->d_bloksize);
+
+	/* are the addresses given in bytes? */
+	if( !blocks )
+	{
+	 register int overlap;
+
+	 /* convert to blocks */
+	 nbloks = dlen / *bloksiz;
+	 if( (overlap = (dlen % *bloksiz)) != 0 )
+	  ++nbloks;
+
+	 /* calculate block address & residual no. of bytes */
+	 blokaddr = diskaddr / *bloksiz;
+	 blokresid = diskaddr % *bloksiz;
+
+	 /*
+	  * if the data does not exactly fit an integer number
+	  * of blocks, we need to allocate some buffer memory
+	  * to hold the extra data coming in
+	  */
+	 if( (dlen % *bloksiz) != 0 || blokresid != 0 )
+	 {
+	  /*
+	   * if the data crosses a block boundary then, obviously,
+	   * the number of blocks we are dealing with increases
+	   */
+	  if( (blokresid + overlap) > *bloksiz )
+	   ++nbloks;
+
+	  /* try to allocate some RAM to hold the data */
+	  if( (dptr = malloc(nbloks * *bloksiz)) == NULL )
+	   /* cannot do it */
+	   return(BAD);
+	 }
+	}
+	else
+	{
+	 /* addresses are given in blocks */
+	 nbloks = dlen;
+	 blokaddr = diskaddr;
+	 blokresid = 0;
+	}
+
+	/*
+	 * read the data from disk. this is complicated by SCSI only
+	 * allowing transfers of up to XFERLIM logical blocks at a time,
+	 * forcing the transfers to be broken up into lumps.
+	 */
+	 
+	/* build as much of the command block as possible */
+	cmdptr = &intcmd;
+	bldskelcb(NEREAD,cmdptr);
+	cmdptr->flags |= SC_READ;
+	cmdptr->timeout = RWTIMEO;
+
+	/* send the data */
+	if( (retc = rwdev(cmdptr,(dptr) ? dptr : data,
+			  nbloks,blokaddr,*bloksiz)) != GOOD )
+	{
+	 if( dptr )
+	  free(dptr);
+	 return(retc);
+	}
+
+	/* copy data across if necessary */
+	if( dptr )
+	{
+	 bcopy(dptr + blokresid,data,dlen);
+	 free(dptr);
+	}
+
+	/* finished */
+	return(GOOD);
+}
+
+/************************************************************************/
+
+static int rwdev(cmdptr,data,nbloks,blokaddr,bloksiz)
+
+struct scsiop *cmdptr;
+char *data;
+int nbloks, blokaddr, bloksiz;
+
+{
+	/*
+	 * subroutine rwdev() -
+	 *
+	 * routine handles the process of reading/writing data in lumps
+	 * of XFERLIM blocks at a time. returned value is GOOD if
+	 * transfer OK, BAD if transfer failed, or BADARG if a bad SCSI
+	 * device in cdev.
+	 *
+	 */
+
+	/* declare autos */
+	register int retc, nlumps, i;
+
+	/* work out the no. of lumps required */
+	nlumps = nbloks / XFERLIM;
+	if( (nbloks % XFERLIM) )
+	 ++nlumps;
+
+	/* send/receive the data a lump of blocks at a time */
+	for( i = 0; i < nlumps; ++i )
+	{
+	 /* set the block number & length */
+	 storelong((cmdptr->cdb) + 1,
+		   (long)(blokaddr + (i * XFERLIM)),3);
+	 storelong((cmdptr->cdb) + 4,
+		   (long)((nbloks - (i * XFERLIM)) % XFERLIM),1);
+
+	 /* calculate transfer address & no. of bytes */
+	 cmdptr->addr = data + ((i * XFERLIM) * bloksiz);
+	 cmdptr->xfer = (*((cmdptr->cdb) + 4) != 0) ?
+			 *((cmdptr->cdb) + 4) : XFERLIM;
+	 cmdptr->xfer *= bloksiz;
+
+	 /* try to send this lump */
+	 if( (retc = runcmd(cmdptr)) != GOOD )
+	  return(retc);
+	}
+
+	/* all data transferred OK */
+	return(GOOD);
+}
+
+/************************************************************************/
+
+int sendglist()
+
+{
+	/*
+	 * subroutine sendglist() -
+	 *
+	 * routine sends the list of bad blocks held in defects to
+	 * the current device as additions to its glist. returned value
+	 * is GOOD if the command succeeds, BAD if it fails, or BADARG
+	 * if the current device rejects the SCSI command. if all goes
+	 * well, the current list of defects is cleared.
+	 *
+	 */
+
+	/* declare autos */
+	register int retc, i;
+	register u_int ndef;
+	register char *deflist;
+	register long *dstptr;
+	register u_long *srcptr;
+	register struct scsiop *cmdptr;
+
+	/* build the defect list in SCSI format */
+	ndef = defects.dl_header & (u_int)0xffff;
+
+	/* try to allocate some space */
+	if( (deflist = malloc((ndef + 1) * sizeof(long))) == NULL )
+	{
+	 printf("sendglist(): out of core\n");
+	 return(BAD);
+	}
+
+	/* set source & destination pointers */
+	dstptr = ((long *)deflist) + 1;
+	srcptr = defects.dl_data;
+
+	/* sort the glist in ascending order */
+	qsort((char *)dstptr,ndef,sizeof(u_long),cmpul);
+
+	/* fill in the defect header */
+	storelong(deflist,(defects.dl_header * 4),4);
+
+	/* now fill in all the defect blocks */
+	for( i = 0; i < ndef; ++i )
+	 storelong((char *)(dstptr++),*srcptr++,4);
+
+	/* build a skeleton command block */
+	cmdptr = &intcmd;
+	bldskelcb(REASGN,cmdptr);
+
+	/* fill in command specific stuff */
+	cmdptr->xfer = (ndef + 1) * sizeof(u_long);
+	cmdptr->addr = deflist;
+	cmdptr->timeout = REASNTIMEO;
+#if defined(SCSIDM_FOR_RISCOS)
+	cmdptr->flags |= SC_WRITE;
+#elif defined(SCSIDM_FOR_RISCiX)
+	cmdptr->flags |= (SC_WRITE | SC_ALLOW_DISCONNECT);
+#endif
+
+	/* run the command */
+	retc = runicmd(cmdptr);
+
+	/* free the SCSI format defect list then test return code */
+	free(deflist);
+	if( retc != GOOD )
+	 return(retc);
+
+	/* all OK - clear the defect list */
+	clrdef();
+	return(GOOD);
+}
+
+/************************************************************************/
+
+static int cmpul(el1,el2)
+
+u_long *el1, *el2;
+
+{
+	/*
+	 * subroutine cmpul() -
+	 *
+	 * routine compares the passed u_longs for qsort(): returns < 0,
+	 * 0, or > 0 depending upon whether *e1 is less than, equal to,
+	 * or greater than, *e2.
+	 *
+	 */
+
+	/* compare & return */
+	return((int)(*el1 - *el2));
+}
+
+/************************************************************************/
+
+bool wrtptable(newblock,tableaddr,newtable)
+
+UNIX_Info *newblock;
+u_int tableaddr;
+bool newtable;
+
+{
+	/*
+	 * subroutine wrtptable() -
+	 *
+	 * routine writes the partition table out to each partition that
+	 * is marked as having a spare block allocated for this purpose.
+	 * even partitions that think they butt up to the end of the disk
+	 * are safe as the end of the disk has been reserved for the
+	 * partition table. returned value is TRUE if all OK, else FALSE.
+	 *
+	 */
+
+	/* declare autos */
+	register int i, nbloks;
+	register Partition *pptr;
+	register u_long *bloksize;
+	struct timeval tstamp;
+
+	/* copy new data across to infoblock */
+	bcopy(newblock,&infoblock,sizeof(UNIX_Info));
+
+	/* add the time stamp & magic number if necessary */
+	if( newtable )
+	{
+	 gettimeofday(&tstamp,NULL);
+	 infoblock.pt.time_stamp = tstamp.tv_sec;
+	 infoblock.id = ID_MARK;
+	}
+	
+	/* reference device block size */
+	bloksize = &(cdev->d_bloksize);
+
+	if( tableaddr != -1 )
+	{
+	 /* print diagnostics */
+	 fputs("Writing RISCiX partition table...",stdout);
+	 fflush(stdout);
+
+	 /* try to write the default partition table */
+	 nbloks = sizeof(infoblock) / *bloksize;
+	 if( (sizeof(infoblock) % *bloksize) != 0 )
+	  ++nbloks;
+
+	 if( wrtdev(tableaddr,(char *)&infoblock,
+		    (long)(sizeof(infoblock)),FALSE) != GOOD )
+	 {
+	  /* this is serious */
+	  printf("failed to write default partition table\n");
+	  return(FALSE);
+	 }
+
+	 /* loop over all partitions */
+	 for( i = 0; i < MAX_PARTITION; ++i )
+	 {
+	  /* set pointer to this partition */
+	  pptr = ((Partition *)(infoblock.pt.pt)) + i;
+
+	  /* ignore invalid partitions or those with no space */
+	  if( ((pptr->flags & PT_VALID) != PT_VALID) ||
+	      !(part_gotmap & (1 << i)) )
+	   continue;
+
+	  /* calculate the byte address for this partition table */
+	  tableaddr = (pptr->start + pptr->length) * *bloksize;
+
+	  if( wrtdev(tableaddr,(char *)&infoblock,
+		     (long)(sizeof(infoblock)),FALSE) != GOOD )
+	    /* this is annoying */
+	    printf("failed to write backup copy of partition table\n");
+	 }
+	 fputs("done\n",stdout);
+	}
+
+	/* write a new RAM copy of the partition table */
+	if( !wrtramptable(&(infoblock.pt)) )
+	{
+	 fputs("\n\tDriver will not load new copy "
+	       "of the partition table into\n",
+		stdout);
+	 fputs("\tRAM, this can be solved by forcing "
+	       "a RESET,  i.e. turning\n",
+		stdout);
+	 fputs("\tthe disk off then on again\n\n", stdout);
+	}
+
+	/* finished */
+	return(TRUE);
+}
+
+/************************************************************************/
+
+u_int unixstartbyte(verbose)
+
+bool verbose;
+
+{
+	/*
+	 * subroutine unixstartbyte() -
+	 *
+	 * routine determines the first byte of the UNIX area.
+	 * returned value is the byte number, or -1 if something
+	 * went wrong.
+	 *
+	 */
+
+	/* declare autos */
+	u_int bytespercyl, unixcyl;
+	ADFS_bblock *bbptr;
+	ADFS_drecord *adrptr;
+
+	/* read the ADFS boot block */
+	if( (bbptr = read_bblock()) == NULL )
+	{
+	 if( verbose )
+	  printf("unixstartbyte: cannot read the boot block\n");
+	 return(-1);
+	}
+	else
+	{
+	 adrptr = &(bbptr->bb_discrec);
+	 if( adrptr->dr_UNIXformat != RISCiXDISCFORMAT )
+	 {
+	  if( verbose )
+	   printf("There are no RISCiX partitions on device %s\n",
+		   cdev->d_name);
+	  free(bbptr);
+	  return(-1);
+	 }
+	}
+
+	/* calculate the no. of bytes per cylinder */
+	bytespercyl = 1 << adrptr->dr_log2secsize;
+	bytespercyl *= adrptr->dr_secstrk;
+	bytespercyl *= adrptr->dr_heads;
+
+	/* get the start cylinder of the UNIX partition */
+	unixcyl = adrptr->dr_UNIXcylstart;
+	unixcyl += adrptr->dr_UNIXcylstartHI << 8;
+
+	/* return the number of bytes */
+	free(bbptr);
+	return(bytespercyl * unixcyl);
+}
+
+/************************************************************************/

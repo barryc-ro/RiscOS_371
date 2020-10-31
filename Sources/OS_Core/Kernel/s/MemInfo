@@ -1,0 +1,598 @@
+; > MemInfo
+
+        LTORG
+
+;----------------------------------------------------------------------------------------
+; MemorySWI
+;
+;       In:     r0 = reason code and flags
+;                       bits 0-7  = reason code
+;                       bits 3-31 = reason specific flags
+;       Out:    specific to reason codes
+;
+;       Perform miscellaneous operations for memory management.
+;
+MemorySWI       ROUT
+        Push    lr                              ; Save real return address.
+        AND     lr, r0, #&FF                    ; Get reason code.
+        CMP     lr, #(%40-%30):SHR:2            ; If valid reason code then
+        ADDCC   lr, lr, #(%30-%10):SHR:2        ;   determine where to jump to in branch table,
+        ADDCC   lr, pc, lr, LSL #2
+        Push    lr, CC                          ;   save address so we can
+10
+        ADRCC   lr, MemReturn                   ;   set up default return address for handler routines
+        Pull    pc, CC                          ;   and jump into branch table.
+20
+        ADRL    r0, ErrorBlock_HeapBadReason    ; Otherwise, unknown reason code.
+        SETV
+        ; Drop through to...
+
+MemReturn
+ [ International
+        BLVS    TranslateError
+ ]
+        Pull    lr                              ; Get back real return address.
+        BVS     SLVK_SetV
+        ExitSWIHandler
+
+30
+        B       MemoryConvert
+        B       %BT20                           ; Reason codes 1-5 are reserved.
+        B       %BT20
+        B       %BT20
+        B       %BT20
+        B       %BT20
+        B       MemoryPhysSize
+        B       MemoryReadPhys
+        B       MemoryAmounts
+        B       MemoryIOSpace
+40
+
+
+;----------------------------------------------------------------------------------------
+; MemoryConvert
+;
+;       In:     r0 = flags
+;                       bit     meaning
+;                       0-7     0 (reason code)
+;                       8       page number provided when set
+;                       9       logical address provided when set
+;                       10      physical address provided when set
+;                       11      fill in page number when set
+;                       12      fill in logical address when set
+;                       13      fill in physical address when set
+;                       14-15   0,1=don't change cacheability
+;                               2=disable caching on these pages
+;                               3=enable caching on these pages
+;                       16-31   reserved (set to 0)
+;               r1 -> page block
+;               r2 = number of 3 word entries in page block
+;
+;       Out:    r1 -> updated page block
+;
+;       Converts between representations of memory addresses. Can also set the
+;       cacheability of the specified pages.
+;
+
+; Declare symbols used for decoding flags (given and wanted are used
+; so that C can be cleared by rotates of the form a,b). We have to munge
+; the flags a bit to make the rotates even.
+;
+ppn             *       1:SHL:0         ; Bits for address formats.
+logical         *       1:SHL:1
+physical        *       1:SHL:2
+all             *       ppn :OR: logical :OR: physical
+given           *       24              ; Rotate for given fields.
+wanted          *       20              ; Rotate for wanted fields.
+ppn_bits        *       ((ppn :SHL: 4) :OR: ppn)
+logical_bits    *       ((logical :SHL: 4) :OR: logical)
+physical_bits   *       ((physical :SHL: 4) :OR: physical)
+cacheable_bit   *       1:SHL:15
+alter_cacheable *       1:SHL:16
+flush_cache     *       1:SHL:31        ; Internal flag.
+
+MemoryConvert   ROUT
+        ENTRY   "r0-r11"                ; Need lots of registers!!
+
+        BIC     lr, r0, #all,given      ; Need to munge r0 to get rotates to work (must be even).
+        AND     r0, r0, #all,given
+        ORR     r0, r0, lr, LSL #1      ; Move bits 11-30 to 12-31.
+
+        TST     r0, #all,given          ; Check for stupid caller (no fields provided)
+        TEQNE   r2, #0                  ;   (no entries in table).
+        ADREQL  r0, ErrorBlock_BadParameters
+        BEQ     %FT95
+
+        EOR     lr, r0, r0, LSL #given-wanted   ; If flag bits 8-10 and 12-14 contain common bits then
+        AND     lr, lr, #all,wanted             ;   clear bits in 12-14 (ie. don't fill in fields already given).
+        EOR     lr, lr, #all,wanted   
+        BIC     r0, r0, lr
+
+        MOV     r6, #0
+        LDR     r7, [r6, #MaxCamEntry]
+        LDR     r6, [r6, #CamEntriesPointer]
+        LDR     r8, =L2PT
+
+        BIC     r0, r0, #flush_cache    ; Bit set if any page is really made uncacheable (we must flush the cache).
+10
+        SUBS    r2, r2, #1
+        BCC     %FT70
+
+        LDMIA   r1!, {r3-r5}            ; Get next three word entry (PN,LA,PA) and move on pointer.
+
+        TST     r0, #physical,wanted    ; If PA not wanted
+        BEQ     %FT20                   ;   then skip.
+        TST     r0, #logical,given      ; If LA not given (rotate clears C) then
+        BLEQ    ppn_to_logical          ;   get it from PN (PA wanted (not given) & LA not given => PN given).
+        BLCC    logical_to_physical     ; Get PA from LA.
+        BCS     %FT80
+        TST     r0, #logical,wanted
+        STRNE   r4, [r1, #-8]           ; Store back LA if wanted.
+        STR     r5, [r1, #-4]           ; Store back PA.
+20
+        TST     r0, #alter_cacheable    ; If altering cacheability
+        EORNE   lr, r0, #ppn,given      ;   and PN not given
+        TSTNE   lr, #ppn,given
+        TSTEQ   r0, #ppn,wanted         ;   OR PN wanted then don't skip
+        BEQ     %FT30                   ; else skip.
+        TST     r0, #physical_bits,given        ; If PA not given and PA not wanted (rotate clears C) then
+        BLEQ    logical_to_physical             ;   get it from LA (PN wanted/not given & PA not given => LA given).
+        BLCC    physical_to_ppn         ; Get PN from PA.
+        BCS     %FT80
+        TST     r0, #ppn,wanted
+        STRNE   r3, [r1, #-12]          ; Store back PN if wanted.
+30
+        TST     r0, #logical,wanted     ; If LA wanted
+        EORNE   lr, r0, #physical,wanted
+        TSTNE   lr, #physical,wanted    ;   and PA not wanted then don't skip
+        BEQ     %FT40                   ; else skip.
+        TST     r0, #alter_cacheable    ; If not changing cacheability (already have PN)
+        TSTEQ   r0, #ppn_bits,given     ;   and PN not given and PN not wanted (rotate clears C) then
+        BLEQ    physical_to_ppn         ;   get it from PA (LA wanted (not given) & PN not given => PA given).
+        BLCC    ppn_to_logical          ; Get LA from PN.
+        BCS     %FT80
+        STR     r4, [r1, #-8]           ; Store back LA.
+40
+        TST     r0, #alter_cacheable
+        BEQ     %BT10
+
+        CMP     r7, r3                  ; Make sure page number is valid (might not have done any conversion).
+        BCC     %FT80
+
+        ADD     r3, r6, r3, LSL #3      ; Point to CAM entry for this page.
+        LDMIA   r3, {r4,r5}             ; Get logical address and PPL.
+
+        AND     lr, r5, #PageFlags_TempUncacheableBits
+        TST     r0, #cacheable_bit
+        BNE     %FT50
+
+        TEQ     lr, #PageFlags_TempUncacheableBits      ; Make uncacheable (increment count).
+        BEQ     %BT10                                   ; If count has reached max then go no further (should not happen).
+        TEQ     lr, #0                                  ; EQ => we have to change L2.
+        ADD     r5, r5, #1:SHL:TempUncacheableShift
+        B       %FT60
+50
+        TEQ     lr, #0                                  ; Make cacheable (decrement count).
+        BEQ     %BT10                                   ; If count is already 0 then go no further (page already cacheable).
+        SUB     r5, r5, #1:SHL:TempUncacheableShift
+        TST     r5, #PageFlags_TempUncacheableBits      ; EQ => we have to change L2.
+60
+        STR     r5, [r3, #4]            ; Write back new PPL.
+        BNE     %BT10                   ; Do next entry if we don't have to change L2.
+
+        MOV     r4, r4, LSR #12
+        ADD     r4, r8, r4, LSL #2      ; Address of L2 entry for logical address.
+        LDR     r5, [r4]                ; Get L2 entry (safe as we know address is valid).
+        TST     r0, #cacheable_bit
+        BICEQ   r5, r5, #L2_C           ; Disable/enable cacheability.
+        ORREQ   r0, r0, #flush_cache    ; If disable then we must flush cache later.
+        ORRNE   r5, r5, #L2_C
+        STR     r5, [r4]                ; Write back new L2 entry.
+
+        B       %BT10                   ; Do next entry.
+
+70
+        TST     r0, #flush_cache        ; If any page has been made uncacheable in L2 then flush!
+        BLNE    meminfo_flushplease
+75
+        EXIT
+
+80
+        TST     r0, #alter_cacheable    ; If we haven't changed any cacheability stuff then
+        BEQ     %FT90                   ;   just return error.
+
+        AND     lr, r0, #all,wanted             ; Get wanted flags.
+        LDMIA   sp, {r0,r1,r3}                  ; Get back original flags, pointer and count.
+        ORR     r0, r0, lr, LSR #given-wanted   ; Wanted fields are now also given as we have done the conversion.
+        BIC     r0, r0, #all:SHL:11             ; Clear wanted flags, we only want to change cacheability.
+        EOR     r0, r0, #cacheable_bit          ; If we made them uncacheable then make them cacheable again & v.v.
+        SUB     r2, r3, r2
+        SUBS    r2, r2, #1              ; Change back the entries we have changed up to (but excluding) the error entry.
+        BLNE    MemoryConvert
+90
+        ADRL    r0, ErrorBlock_BadAddress
+95
+        STR     r0, [sp]
+        SETV
+        EXIT
+
+
+;----------------------------------------------------------------------------------------
+; ppn_to_logical
+;
+;       In:     r3 = page number
+;               r5 = physical address if given
+;               r6 = CamEntriesPointer
+;               r7 = MaxCamEntry
+;
+;       Out:    r9 corrupted
+;               CC => r4 = logical address
+;               CS => invalid page number
+;
+;       Convert physical page number to logical address.
+;
+ppn_to_logical
+        CMP     r7, r3                  ; Validate page number.
+        ORRCCS  pc, lr, #C_bit          ; Invalid so return C set.
+
+        LDR     r4, [r6, r3, LSL #3]    ; If valid then lookup logical address.
+        TST     r0, #physical,given     ; If physical address was given then
+        LDRNE   r9, =&FFF
+        ANDNE   r9, r5, r9              ;   mask off page offset
+        ORRNE   r4, r4, r9              ;   and combine with logical address.
+        BICS    pc, lr, #C_bit          ; Return C clear.
+
+
+;----------------------------------------------------------------------------------------
+; logical_to_physical
+;
+;       In:     r4 = logical address
+;               r8 = L2PT
+;
+;       Out:    r9 corrupted
+;               CC => r5 = physical address
+;               CS => invalid logical address, r5 corrupted
+;
+;       Convert logical address to physical address.
+;
+logical_to_physical
+        MOV     r9, r4, LSR #12         ; r9 = logical page number
+        ADD     r9, r8, r9, LSL #2      ; r9 -> L2PT entry for logical address
+        MOV     r5, r9, LSR #12         ; r5 = page offset to L2PT entry for logical address
+        LDR     r5, [r8, r5, LSL #2]    ; r5 = L2PT entry for L2PT entry for logical address
+        EOR     r5, r5, #2_10           ; Check for valid page.
+        TST     r5, #3
+        ORRNES  pc, lr, #C_bit
+
+        LDR     r5, [r9]                ; r5 = L2PT entry for logical address
+        EOR     r5, r5, #2_10           ; Check for valid page.
+        TST     r5, #3
+        ORRNES  pc, lr, #C_bit
+
+        LDR     r9, =&FFF               ; Valid so
+        BIC     r5, r5, r9              ;   mask off bits 0-11,
+        AND     r9, r4, r9              ;   get page offset from logical page
+        ORR     r5, r5, r9              ;   combine with physical page address.
+        BICS    pc, lr, #C_bit
+
+
+;----------------------------------------------------------------------------------------
+; physical_to_ppn
+;
+;       In:     r5 = physical address
+;               r7 = MaxCamEntry
+;
+;       Out:    r9-r11 corrupted
+;               CC => r3 = page number
+;               CS => invalid physical address, r3 corrupted
+;
+;       Convert physical address to physical page number.
+;
+physical_to_ppn ROUT
+        MOV     r9, #PhysRamTable
+        MOV     r3, #0                  ; Start at page 0.
+10
+        CMP     r7, r3                  ; Stop if we run out of pages
+        ORRCCS  pc, lr, #C_bit          ;   (return with C set).
+
+        LDMIA   r9!, {r10,r11}          ; Get start address and size of next block.
+        SUB     r10, r5, r10            ; Determine if given address is in this block.
+        CMP     r10, r11
+        ADDCS   r3, r3, r11, LSR #12    ; Move on to next block.
+        BCS     %BT10
+
+        ADD     r3, r3, r10, LSR #12
+        BICS    pc, lr, #C_bit          ; Return with C clear.
+
+
+;----------------------------------------------------------------------------------------
+; Symbols used in MemoryPhysSize and MemoryReadPhys
+;
+
+; Shifts to determine number of bytes/words to allocate in table.
+BitShift        *       10
+ByteShift       *       BitShift + 3
+WordShift       *       ByteShift + 2
+
+; Bit patterns for different types of memory.
+NotPresent      *       &00000000
+DRAM_Pattern    *       &11111111
+VRAM_Pattern    *       &22222222
+ROM_Pattern     *       &33333333
+IO_Pattern      *       &44444444
+NotAvailable    *       &88888888
+
+
+;----------------------------------------------------------------------------------------
+; MemoryPhysSize
+;
+;       In:     r0 = 6 (reason code with flag bits 8-31 clear)
+;
+;       Out:    r1 = table size (in bytes)
+;               r2 = page size (in bytes)
+;
+;       Returns information about the memory arrangement table.
+;
+MemoryPhysSize
+        MOV     r1, #PhysSpaceSize :SHR: ByteShift
+        MOV     r2, #4*1024
+        MOV     pc, lr
+
+
+;----------------------------------------------------------------------------------------
+; MemoryReadPhys
+;
+;       In:     r0 = 7 (reason code with flag bits 8-31 clear)
+;               r1 -> memory arrangement table to be filled in
+;
+;       Out:    r1 -> filled in memory arrangement table
+;
+;       Returns the physical memory arrangement table in the given block.
+;
+MemoryReadPhys  ROUT
+        ENTRY   "r1-r10"
+
+ [ OSROM_ImageSize = 4096
+        ; &00000000 to &00400000 is ROM.
+        MOV     r2, #(&00400000-&00000000) :SHR: WordShift
+        LDR     r3, =ROM_Pattern :OR: NotAvailable
+        BL      fill_words
+
+        ; &00400000 to &02000000 is allocated to ROM but is not present.
+        MOV     r2, #(&02000000-&00400000) :SHR: WordShift
+        LDR     r3, =NotPresent :OR: NotAvailable
+        BL      fill_words
+ |
+        ; &00000000 to &00200000 is ROM.
+        MOV     r2, #(&00200000-&00000000) :SHR: WordShift
+        LDR     r3, =ROM_Pattern :OR: NotAvailable
+        BL      fill_words
+
+        ; &00200000 to &02000000 is allocated to ROM but is not present.
+        MOV     r2, #(&02000000-&00200000) :SHR: WordShift
+        LDR     r3, =NotPresent :OR: NotAvailable
+        BL      fill_words
+ ]
+
+        ; &02000000 to &02200000 is VRAM or not present.
+        MOV     r4, #0
+        LDR     r4, [r4, #VRAMSize]     ; Get amount of VRAM (in bytes).
+        TEQ     r4, #0
+        MOVNE   r2, r4, LSR #WordShift  ; If there is some then fill part of table.
+        LDRNE   r3, =VRAM_Pattern :OR: NotAvailable
+        BLNE    fill_words
+
+        ; End of VRAM to &03000000 is not present.
+        RSB     r4, r4, #&03000000-&02000000
+        MOV     r2, r4, LSR #WordShift
+        LDR     r3, =NotPresent :OR: NotAvailable
+        BL      fill_words
+
+        ; &03000000 to &03800000 is I/O.
+        MOV     r2, #(&03800000-&03000000) :SHR: WordShift
+        LDR     r3, =IO_Pattern :OR: NotAvailable
+        BL      fill_words
+
+        ; &03800000 to &08000000 is not present.
+        MOV     r2, #(&08000000-&03800000) :SHR: WordShift
+        LDR     r3, =NotPresent :OR: NotAvailable
+        BL      fill_words
+
+        ; &08000000 to &10000000 is I/O (EASI space).
+        MOV     r2, #(&10000000-&08000000) :SHR: WordShift
+        LDR     r3, =IO_Pattern :OR: NotAvailable
+        BL      fill_words
+
+        ; &10000000 to &20000000 is DRAM or not present.
+        MOV     r2, #&10000000          ; Current physical address.
+        MOV     r3, #0                  ; Next word to store in table.
+        MOV     r4, #32                 ; How much more we have to shift r3 before storing it.
+        MOV     r5, #0                  ; Current page number.
+        MOV     r6, #PhysRamTable
+        LDR     r7, [r3, #CamEntriesPointer]
+        ADD     r7, r7, #4              ; Point to PPL entries.
+        LDR     r8, [r3, #MaxCamEntry]
+10
+        LDMIA   r6!, {r9,r10}           ; Get physical address and size of next block.
+
+        CMP     r9, #&10000000          ; If not DRAM then
+        ADDCC   r5, r5, r10, LSR #12    ;   adjust current page number
+        BCC     %BT10                   ;   and try next block.
+
+        ADD     r10, r10, r9            ; Add amount of unused space between current and start of block.
+        SUB     r10, r10, r2            ; size = size + (physaddr - current)
+20
+        SUBS    r4, r4, #4              ; Reduce shift.
+        MOVCS   r3, r3, LSR #4          ; If more space in current word then shift it.
+        STRCC   r3, [r1], #4            ; Otherwise, store current word
+        MOVCC   r3, #0                  ;   and start a new one.
+        MOVCC   r4, #28
+
+        CMP     r2, r9                  ; If not reached start of block then page is not present.
+        ORRCC   r3, r3, #(NotPresent :OR: NotAvailable) :SHL: 28
+        BCC     %FT30
+        LDR     lr, [r7, r5, LSL #3]    ; Page is there so get PPL and determine if it's available or not.
+        TST     lr, #PageFlags_Unavailable
+        ORREQ   r3, r3, #DRAM_Pattern :SHL: 28
+        ORRNE   r3, r3, #(DRAM_Pattern :OR: NotAvailable) :SHL: 28
+        ADD     r5, r5, #1              ; Increment page count.
+30
+        ADD     r2, r2, #&1000          ; Increase current address.
+        SUBS    r10, r10, #&1000        ; Decrease size of block.
+        BGT     %BT20                   ; Stop if no more block left.
+
+        CMP     r8, r5                  ; Stop if we run out of pages.
+        BCS     %BT10
+
+        TEQ     r3, #0                          ; If not stored last word then
+        MOVNE   r3, r3, LSR r4                  ;   put bits in correct position
+        ADDNE   r2, r2, r4, LSL #BitShift       ;   adjust current address
+        RSBNE   r4, r4, #32                     ;   rest of word is not present
+        LDRNE   lr, =NotPresent :OR: NotAvailable
+        ORRNE   r3, r3, lr, LSL r4
+        STRNE   r3, [r1], #4                    ;   and store word.
+
+        ; End of last block of DRAM to &20000000 is not present.
+        RSBS    r2, r2, #&20000000
+        MOVNE   r2, r2, LSR #WordShift
+        LDRNE   r3, =NotPresent :OR: NotAvailable
+        BLNE    fill_words
+
+        EXIT
+
+
+fill_words
+        STR     r3, [r1], #4
+        SUBS    r2, r2, #1
+        BNE     fill_words
+        MOV     pc, lr
+
+
+;----------------------------------------------------------------------------------------
+; MemoryAmounts
+;
+;       In:     r0 = flags
+;                       bit     meaning
+;                       0-7     8 (reason code)
+;                       8-11    1=return amount of DRAM
+;                               2=return amount of VRAM
+;                               3=return amount of ROM
+;                               4=return amount of I/O space
+;                       12-31   reserved (set to 0)
+;
+;       Out:    r1 = number of pages of the specified type of memory
+;               r2 = page size (in bytes)
+;
+;       Return the amount of the specified type of memory.
+;
+MemoryAmounts   ROUT
+        ENTRY   "r3"
+
+        BICS    lr, r0, #&FF            ; Get type of memory required (leave bits 12-31, non-zero => error).
+        BEQ     %FT30                   ; Don't understand 0 (so the spec says).
+
+        TEQ     lr, #4:SHL:8            ; Check for IO space.
+        LDREQ   r1, =136*1024*1024      ; Just return 136M (includes VIDC and EASI space).
+        BEQ     %FT20
+
+        TEQ     lr, #3:SHL:8            ; Check for ROM.
+        LDREQ   r1, =OSROM_ImageSize*1024
+        BEQ     %FT20
+
+        TEQ     lr, #2:SHL:8            ; Check for VRAM.
+        MOVEQ   r1, #0                  ; Return amount of VRAM.
+        LDREQ   r1, [r1, #VRAMSize]
+        BEQ     %FT20
+
+        TEQ     lr, #1:SHL:8            ; Check for DRAM.
+        BNE     %FT30
+        MOV     r1, #0
+        LDR     lr, [r1, #RAMLIMIT]
+        LDR     r1, [r1, #VRAMSize]
+        SUB     r1, lr, r1              ; Return amount of RAM - amount of VRAM.
+
+20
+        MOV     r1, r1, LSR #12         ; Return as number of pages.
+        MOV     r2, #4*1024             ; Return page size.
+        EXIT
+
+30
+        ADRL    r0, ErrorBlock_BadParameters
+        SETV
+        EXIT
+
+
+;----------------------------------------------------------------------------------------
+; MemoryIOSpace
+;
+;       In:     r0 = 9 (reason code with flag bits 8-31 clear)
+;               r1 = controller ID
+;                       bit     meaning
+;                       0-7     controller sequence number
+;                       8-31    controller type:
+;                               0 = EASI card access speed control
+;                               1 = EASI space
+;                               2 = VIDC1
+;                               3 = VIDC20
+;
+;       Out:    r1 = controller base address or 0 if not present
+;
+;       Return the location of the specified controller.
+;
+MemoryIOSpace   ROUT
+        ENTRY   "r2"
+
+        AND     r2, r1, #&FF            ; Get sequence number.
+        MOV     r1, r1, LSR #8          ; Get controller type.
+        CMP     r1, #4                  ; Make sure it's in range.
+        BCS     %FT20
+
+        ADR     lr, controller_types
+        LDR     r1, [lr, r1, LSL #2]    ; Get base address or offset to table.
+        TEQ     r1, #0                  ; If not present or
+        CMPNE   r1, #1024               ;     not offset to table then
+        EXIT    GE                      ;   return.
+
+        ADD     lr, lr, r1              ; Point to table indexed by sequence number.
+        LDR     r1, [lr], #4            ; Get sequence number limit.
+        CMP     r2, r1                  ; Make sure it's in range.
+        BCS     %FT20
+        LDR     r1, [lr, r2, LSL #2]    ; Get base address.
+        EXIT
+
+20
+        ADRL    r0, ErrorBlock_BadParameters
+        SETV
+        EXIT
+
+
+controller_types
+ [ IO_Type = "IOMD"
+        DCD     IOMD_Base + IOMD_ECTCR  ; Expansion card timing control.
+        DCD     easi_space_table - controller_types
+ |
+        DCD     0
+        DCD     0
+ ]
+ [ VIDC_Type = "VIDC20"
+        DCD     0
+        DCD     VIDC
+ |
+        DCD     VIDC
+        DCD     0
+ ]
+
+ [ IO_Type = "IOMD"
+easi_space_table
+        DCD     8                       ; Maximum of 8 expansion cards.
+        DCD     PhysSpace + IOMD_EASI_Base0
+        DCD     PhysSpace + IOMD_EASI_Base1
+        DCD     PhysSpace + IOMD_EASI_Base2
+        DCD     PhysSpace + IOMD_EASI_Base3
+        DCD     PhysSpace + IOMD_EASI_Base4
+        DCD     PhysSpace + IOMD_EASI_Base5
+        DCD     PhysSpace + IOMD_EASI_Base6
+        DCD     PhysSpace + IOMD_EASI_Base7
+ ]
+
+        END

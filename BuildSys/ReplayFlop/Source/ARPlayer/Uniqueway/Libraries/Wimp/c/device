@@ -1,0 +1,169 @@
+/* > device.c
+
+ * © SJ Middleton, 1992
+   
+ * Device claiming in the Wimp.
+
+ */                                             
+                
+
+#include "alarm.h"
+#include "event.h"
+#include "msgs.h"
+#include "werr.h"
+#include "wimpx.h"
+#include "wimpt.h"
+#include "win.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "device.h"
+
+struct device__str
+{
+    wimp_msgdevice      w;
+
+    device_releasefn    release_fn;
+    void                *release_handle;
+};
+
+#define DEVICE_IN_USE   msgs_lookup("Edevice0:Cannot claim %s (%d): %s.")
+#define WE_ARE_USING    msgs_lookup("Edevice1:Device is in use by %s")
+#define NO_MEM          msgs_lookup("Odevice0:device claim structure")
+#define DEVICE_NUM      msgs_lookup("devtype:device %d")
+
+static int device_msgref = -1;         
+static BOOL claim_in_progress;
+static BOOL claim_succeeded;
+
+static char *device_name(int major)
+{
+    static char buffer[12], *a;
+    sprintf(buffer, "devtype%d:", major);
+    a = msgs_lookup(buffer);
+    if (a == NULL || a[0] == '\0')
+    {
+        sprintf(buffer, DEVICE_NUM, major);
+        a = buffer;
+    }
+    return a;
+}
+
+static BOOL device_events(wimp_eventstr *e, void *handle)
+{
+    device dev = handle;
+    switch (e->e)
+    {
+        case wimp_ESEND:
+        case wimp_ESENDWANTACK:
+        {
+            wimp_msgstr *mp = &e->data.msg;
+            switch (mp->hdr.action)
+            {
+                case wimp_MDEVICECLAIM:
+                    if (mp->hdr.my_ref != device_msgref &&
+                        mp->data.device.major == dev->w.major &&
+                        mp->data.device.minor == dev->w.minor)
+                    {
+                        if (dev->release_fn == 0 ||
+                            !dev->release_fn(dev, mp->data.device.information, dev->release_handle))
+                        {
+                            sprintf(mp->data.device.information, WE_ARE_USING, dev->w.information);
+                            mp->hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdevice);
+                            mp->hdr.your_ref = mp->hdr.my_ref;
+                            mp->hdr.action = wimp_MDEVICEINUSE;
+                            no_err(wimp_sendmessage(wimp_ESEND, mp, mp->hdr.task));
+                        }
+                        return TRUE;
+                    }
+                    break;
+
+                case wimp_MDEVICEINUSE:
+                    if (mp->hdr.your_ref == device_msgref)
+                    {
+                        claim_in_progress = claim_succeeded = FALSE;
+                        dev->w = mp->data.device;
+                        return TRUE;
+                    }
+                    break;
+            }
+            break;
+        }
+
+        case wimp_EACK:
+            if (e->data.msg.hdr.my_ref == device_msgref)
+            {
+                claim_in_progress = FALSE;
+                claim_succeeded = TRUE;
+                return TRUE;
+            }
+            break;
+    }
+    return FALSE;
+}
+
+static device device__claim(device_number major, device_number minor, const char *info, device_releasefn fn, void *handle, BOOL give_msg)
+{
+    device dev = malloc(sizeof(struct device__str));
+    if (dev)
+    {
+        wimp_msgstr msg;
+        msg.data.device.major = major;
+        msg.data.device.minor = minor;
+        strcpy(msg.data.device.information, info ? info : wimpt_programname());
+
+        dev->w = msg.data.device;
+        dev->release_fn = fn;
+        dev->release_handle = handle;
+
+        msg.hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdevice);
+        msg.hdr.your_ref = 0;
+        msg.hdr.action = wimp_MDEVICECLAIM;
+
+        no_err(wimp_sendmessage(wimp_ESENDWANTACK, &msg, 0));
+        device_msgref = msg.hdr.my_ref;
+
+        win_add_unknown_event_processor(device_events, dev);
+        claim_in_progress = TRUE;
+
+        do
+            event_process();
+        while (claim_in_progress);
+
+        if (!claim_succeeded)
+        {
+            if (give_msg)
+                werr(0, DEVICE_IN_USE, device_name(dev->w.major), dev->w.minor, dev->w.information);
+            device_release(&dev);
+        }
+    }
+    else if (give_msg)
+        oom_err(NO_MEM, sizeof(struct device__str));
+
+    return dev;
+}
+
+device device_claim(device_number major, device_number minor, const char *info, device_releasefn fn, void *handle)
+{
+    return device__claim(major, minor, info, fn, handle, TRUE);
+}
+
+device device_claim_nomsg(device_number major, device_number minor, const char *info, device_releasefn fn, void *handle)
+{
+    return device__claim(major, minor, info, fn, handle, FALSE);
+}
+
+void device_release(device *pdev)
+{
+    device dev = *pdev;
+    if (dev)
+    {
+        win_remove_unknown_event_processor(device_events, dev);
+        free(dev);
+        *pdev = NULL;
+    }
+}
+
+/* eof device.c */

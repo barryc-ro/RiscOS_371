@@ -1,0 +1,4097 @@
+;**************************************************************************
+;* CDFSFiler - source
+;**************************************************************************
+; Procedures in this file:
+; Desktop_CDFSFiler_Code
+; CDFSFiler_Service
+; CDFSFiler_Service_StartedFiler
+; CDFSFiler_Service_StartFiler
+; CDFSFiler_Service_Reset
+; CDFSFiler_Die
+; CDFSFiler_Service_FilerDying
+; freeworkspace
+; CloseDownAndExit
+; ErrorAbort
+; Abort
+; CDFSFiler_Start
+; repollwimp
+; event_mouse_click
+; click_select_iconbar
+; messagetoFiler
+; click_menu_iconbar
+; matchdriveicon
+; CreateMenu
+; CopyMenus
+; event_menu_select
+; DecodeMenu
+; decodelp
+; go_cd_dismount
+; go_cd_configure
+; go_cf_buffers
+; go_cf_drives
+; gocommand_window
+; dismountit
+; copycommand
+; GetMediaName
+; checkambiguous
+; GetMediaName_nochecks
+; GetPointerInfo
+; SetUpIconBar
+; strcat
+; strcpy
+; strcpy_space
+; strcpy_advance
+; strlen
+; event_user_message
+; ReportError
+;**************************************************************************
+
+Module_BaseAddr
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:ModHand
+        GET     Hdr:FSNumbers
+        GET     Hdr:HighFSI
+        GET     Hdr:NewErrors
+        GET     Hdr:Wimp
+        GET     Hdr:WimpSpace
+        GET     Hdr:Messages
+        GET     Hdr:Sprite
+        GET     Hdr:VduExt
+        GET     Hdr:Variables
+        GET     Hdr:Proc
+        GET     Hdr:Services
+        GET     Hdr:ShareD
+        GET     Hdr:MsgMenus
+        GET     Hdr:MsgTrans
+        GET     Hdr:ResourceFS
+        GET     Hdr:CDROM
+        GET     Hdr:CDErrors
+        GET     Hdr:CDFS
+        GET     Hdr:Hourglass
+
+        GET     Hdr:HostFS
+        GET     Hdr:NdrDebug
+        GET     Hdr:DDVMacros
+
+; local headers
+;
+        GET     hdr.Icons
+
+        GET     Version
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Options
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+                        GBLL    CheckConfiguredDrives   ; don't start up if conf.drives=0
+CheckConfiguredDrives   SETL    {TRUE}
+
+                        GBLL    ReadCDIDiscs            ; read CDI discs and change icon if TRUE
+ReadCDIDiscs            SETL    {FALSE}
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Debugging options
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        GBLL    hostvdu
+hostvdu SETL    true
+
+        GBLL    debug
+debug   SETL    false
+
+startup SETD    false
+click   SETD    false
+media   SETD    false
+service SETD    false
+menus   SETD    false
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Register names
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+; sp            RN      r13             ; FD stack
+; wp            RN      r12
+
+scy             RN      r11
+scx             RN      r10
+y1              RN      r9
+x1              RN      r8
+y0              RN      r7
+x0              RN      r6
+cy1             RN      r5              ; Order important for LDMIA
+cx1             RN      r4
+cy0             RN      r3
+cx0             RN      r2
+
+; r0,r1 not named
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Macro definitions
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        MACRO
+$label  FixDCB  $n, $string
+        ASSERT  ((:LEN:"$string")<$n)
+$label  DCB     "$string"
+        LCLA    cnt
+cnt     SETA    $n-:LEN:"$string"
+        WHILE   cnt>0
+        DCB     0
+cnt     SETA    cnt-1
+        WEND
+        MEND
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Constants
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+TAB     *       9
+LF      *       10
+CR      *       13
+space   *       32
+delete  *       127
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Data structure offsets
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+; format of icon description blocks
+
+                ^       -1
+icb_validation  #       1               ; "S" for validation string
+icb_drivetype   #       12              ; first byte is "h" or "f"
+                ^       0
+icb_drivenumber #       4               ; ":nn",0
+        ALIGN
+        
+; format of disc name blocks (fixed size, held in main workspace)
+
+                ^       0
+drv_number      #       4               ; ":nn",0
+drv_iconblock   #       4
+drv_namelen     #       1               ; length of ":discname"
+drv_name        #       32              ; "discname",0 
+drv_reserved    #       23              ;to pad to 64 bytes
+drv_size        #       0                     
+drv_shift       *       6
+        ASSERT  drv_size = (1 :SHL: drv_shift)
+        ASSERT  (drv_iconblock :AND: 3) = 0
+
+len_colon       *       0               ; don't include ":" in discname
+len_mediaprefix *       :LEN:"CDFS::"-len_colon
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Workspace allocation
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+                ^       0, wp
+mywimpversion   #       4               ; another wimp version
+ [ Version >= 213
+loop            #       4
+ ]
+
+mytaskhandle    #       4               ; id so we can kill ourselves
+FilerHandle     #       4               ; id so we can contact Filer
+privateword     #       4
+wimpversion     #       4
+
+ [ Version > 201
+messagedata     #       4
+ ]
+
+mousedata       #       0
+mousex          #       4
+mousey          #       4
+buttonstate     #       4
+windowhandle    #       4
+iconhandle      #       4
+
+menuhandle      #       4
+
+
+
+ndrives         *       28               ; allow for drives 0..27
+iconbaricons    #       ndrives*4        ; associate icon handle with index
+discnames       #       ndrives*drv_size ; associate index with drive spec.
+
+matchedindex    #       4               ; index of last icon matched
+
+; FIXME MENU (modify after menu)
+ROOT_MENU_ITEMS *       4
+
+ram_menustart   #       0
+m_cdromdisc     #       m_headersize + mi_size*ROOT_MENU_ITEMS
+m_configure     #       m_headersize + mi_size*2
+m_sharedisc     #       m_headersize + mi_size*2
+m_buffers       #       m_headersize + mi_size*8
+m_drives        #       m_headersize + mi_size*1
+ram_menuend     #       0
+
+mb_drives       #       4              ; aligned, with room for terminator
+mb_buffers      #       4              ; aligned, with room for terminator
+
+; ---------------------------
+cd_namedisc     #       4    ; for indirect data
+; ---------------------------
+
+;-----------------------------------
+; structures for access
+;-----------------------------------
+
+sharebufferind             #       4
+sharewin_handle            #       4   ; Window handle
+
+buffershare             #       96
+buffertemp              #       96
+buffertemp2             #       96
+m_tempdisc              #       32
+m_tempdisc2             #       32
+sharename               #       32
+bufferlen               #       4
+bufferlen2              #       4
+
+;-----------------------------------
+; structures for volume
+;-----------------------------------
+
+volumebufferind         #       4
+volumewin_handle        #       4
+volume_title_text       #       4
+volume_title_length     #       4
+CurrentVolumeDrive      #       4
+OldVolumeSetting        #       4
+
+;-----------------------------------
+;-----------------------------------
+;-----------------------------------
+
+dirnamebuffer   #       &100
+
+userdata        #       &100
+
+stackbot        #       &200
+stacktop        #       0
+
+ [ Version >= 213
+sprite_name_list #      12*ndrives
+ ]
+
+CDFSFiler_WorkspaceSize *  :INDEX: @
+
+ ! 0, "CDFSFiler workspace is ":CC:(:STR:(:INDEX:@)):CC:" bytes"
+
+
+driveno *       m_cdromdisc + m_title + :LEN:"CDFS:"
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Module header
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        LEADR   Module_LoadAddr
+
+ ASSERT (.=Module_BaseAddr)
+
+        DCD     CDFSFiler_Start        -Module_BaseAddr
+        DCD     CDFSFiler_Init         -Module_BaseAddr
+        DCD     CDFSFiler_Die          -Module_BaseAddr
+        DCD     CDFSFiler_Service      -Module_BaseAddr
+        DCD     CDFSFiler_TitleString  -Module_BaseAddr
+        DCD     CDFSFiler_HelpString   -Module_BaseAddr
+        DCD     CDFSFiler_CommandTable -Module_BaseAddr
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+ [ International_Help <> 0
+        DCD     str_messagefile        -Module_BaseAddr
+ |
+        DCD     0
+ ]
+
+CDFSFiler_HelpString
+        DCB     "CDFSFiler"
+        DCB     TAB
+        DCB     "$VString ($Date)", 0
+
+ [ International_Help <> 0
+Desktop_CDFSFiler_Help
+        DCB     "HCFLDCF",0
+Desktop_CDFSFiler_Syntax
+        DCB     "SCFLDCF",0
+ |
+Desktop_CDFSFiler_Help
+        DCB   "The CDFSFiler provides the CDFS icons on the icon bar, and "
+        DCB   "uses the Filer to display CDFS directories.",13,10
+        DCB   "Do not use *Desktop_CDFSFiler, use *Desktop instead.",0
+
+Desktop_CDFSFiler_Syntax  DCB   "Syntax: *Desktop_"       ; drop through!
+ ]
+
+CDFSFiler_TitleString     DCB   "CDFSFiler", 0
+
+        [ Version > 201
+CDFSFiler_Banner          DCB   "CDFS Filer", 0
+        ]
+
+                          ALIGN
+
+CDFSFiler_CommandTable
+              ; Name                   Max Min Flags
+
+CDFSFiler_StarCommand
+        Command Desktop_CDFSFiler,     0,  0,  International_Help
+
+
+        DCB     0                       ; End of table
+
+
+;-----------------------------------------------
+; This is now in the Resources FS
+;-----------------------------------------------
+
+        [ Version > 201
+spritefile = "IconSprites <CDFSFiler$Path>Sprites", 0
+        |
+spritefile = "IconSprites CDFS::29.$.SPRITES", 0
+        ]
+
+        ALIGN
+;-----------------------------------------------
+
+        LTORG 
+
+;-----------------------------------------------------------------
+; Set the 'CDFSFiler$Path' variable
+;-----------------------------------------------------------------
+
+        [ Version > 201
+
+CDFSFiler_Init  ENTRY "r1-r5"
+
+; initialise CDFSFiler$Path if not already done
+
+        Debug   startup, "CDFSFiler_Init"
+
+        ADR     r0, Path
+        MOV     r2, #-1
+        MOV     r3, #0
+        MOV     r4, #VarType_Expanded
+        SWI     XOS_ReadVarVal          ; returns R2=0 if doesn't exist
+        CMP     r2, #0                  ; clears V as well!
+
+        ADREQ   r0, Path
+        ADREQ   r1, PathDefault
+        MOVEQ   r2, #?PathDefault
+        MOVEQ   r3, #0
+        MOVEQ   r4, #VarType_String
+        SWIEQ   XOS_SetVarVal
+        EXIT    VS
+
+
+        EXITS
+
+Path            DCB     "CDFSFiler$Path"
+                DCB     0
+PathDefault     DCB     "Resources:$.Resources.CDFSFiler."
+                DCB     0
+                ALIGN
+
+        ]
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Had *command to enter CDFSFiler, so start up via module handler
+
+
+        [ Version > 201
+
+
+Desktop_CDFSFiler_Code ENTRY
+
+        Debug   startup, "Desktop_CDFSFiler_Code"
+
+        LDRB    r14,[r0]
+        CMP     r14,#32
+        TEQGE   r14,r14
+        MOVEQ   r2,r0
+        BEQ     %FT00
+
+        LDR     r14, [r12]
+        CMP     r14, #0
+        BLE     %FT01
+                     
+
+        LDR     r14, [r14, #:INDEX:mytaskhandle]
+        CMP     r14, #0            
+
+        MOV     r2,r0
+
+00
+        MOVEQ   r0, #ModHandReason_Enter
+        ADREQL  r1, CDFSFiler_TitleString
+        SWIEQ   XOS_Module
+01
+        BL      MkCantStartError
+        EXIT
+
+
+ErrorBlock_CantStartCDFSFiler
+        DCD     0
+        DCB     "UseDesk", 0
+        ALIGN
+
+        |                  ;  Old way
+
+Desktop_CDFSFiler_Code ENTRY
+
+        LDR     r14, [r12]
+        CMP     r14, #0
+        BLE     %FT01
+
+        LDR     r14, [r14, #:INDEX:mytaskhandle]
+        CMP     r14, #0
+        MOVEQ   r0, #ModHandReason_Enter
+        ADREQ   r1, CDFSFiler_TitleString
+        SWIEQ   XOS_Module
+01
+        ADR     r0, ErrorBlock_CantStartCDFSFiler
+        SETV
+        EXIT
+
+ErrorBlock_CantStartCDFSFiler
+        DCD     0
+        DCB     "Use *Desktop to start CDFSFiler", 0
+        ALIGN
+
+
+        ] ; Old RISC OS 2 way
+
+
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+CDFSFiler_Service ROUT
+
+        TEQ     r1, #Service_Reset            ; &27
+        BEQ     CDFSFiler_Service_Reset
+
+      [ Version > 201
+        TEQ     r1, #Service_MessageFileClosed
+        BEQ     CDFSFiler_Service_MessageFileClosed
+      ]
+
+        TEQ     r1, #Service_FilerDying       ; &4f
+        BEQ     CDFSFiler_Service_FilerDying
+
+        TEQ     r1, #Service_StartFiler       ; &4b
+        BEQ     CDFSFiler_Service_StartFiler
+
+        TEQ     r1, #Service_StartedFiler     ; &4c
+        MOVNE   pc, lr
+        ; Drop through to...
+
+
+CDFSFiler_Service_StartedFiler ENTRY
+
+        Debug   startup, "CDFSFiler_Service_StartedFiler"
+
+        LDR     r14, [r12]              ; cancel 'don't start' flag
+        CMP     r14, #0
+        MOVLT   r14, #0
+        STRLT   r14, [r12]
+
+        EXIT
+
+CDFSFiler_Service_StartFiler ENTRY "r0-r3"
+
+        Debug   startup, "CDFSFiler_Service_StartFiler"
+
+        LDR     r2, [r12]
+        CMP     r2, #0
+        EXIT    NE                      ; don't claim service unless = 0
+
+ [ CheckConfiguredDrives
+        SWI     XCDFS_GetNumberOfDrives ; Try to get number of configured drives.
+        EXIT    VS                      ; Give up if it fails
+        TEQ     r0, #0                  ; or no drives configured.
+        EXIT    EQ
+ ]
+
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =CDFSFiler_WorkspaceSize
+        SWI     XOS_Module
+        MOVVS   r2, #-1                 ; avoid looping
+        STR     r2, [r12]
+        EXIT    VS
+
+        MOV     r0, #0
+
+        [ Version > 201
+        STR     r0, [r2, #:INDEX:messagedata]
+        ]
+
+        STR     r0, [r2, #:INDEX:mytaskhandle]
+        STR     r12, [r2, #:INDEX:privateword]
+        LDR     r0, [sp]
+        STR     r0, [r2, #:INDEX:FilerHandle]
+
+        PullEnv
+        ADRL    r0, CDFSFiler_StarCommand
+        MOV     r1, #0                  ; Claim service
+        MOV     pc, lr
+
+
+CDFSFiler_Service_Reset ENTRY "r0-r6"
+
+        LDR     r2, [r12]               ; cancel 'don't start' flag
+        CMP     r2, #0
+        MOVLT   r2, #0
+        STRLT   r2, [r12]
+
+        MOVGT   wp, r2
+        MOVGT   r0, #0                  ; Wimp has already gone bye-bye
+        STRGT   r0, mytaskhandle
+        BLGT    freeworkspace
+
+        EXITS                           ; Sorry, but no can do errors here
+
+ 
+      [ Version > 201
+CDFSFiler_Service_MessageFileClosed ENTRY "r0-r2,r12"
+
+        LDR     r12, [r12]              ; are we active?
+        CMP     r12, #0
+        EXITS   LE
+
+        Debug   service,"Service_MessageFileClosed r0=",r0
+
+        [ Version >=236
+        ADRL    r1, driveno+1           ; preserve drive number across menu creation
+        LDRB    r2, [r1]
+        ]
+
+        BL      CopyMenus               ; re-open message file etc.
+
+        [ Version >= 236
+        STRB    r2, [r1]
+        ]
+
+        EXITS
+      ]
+
+        LTORG
+
+CDFSFiler_Die ROUT
+
+CDFSFiler_Service_FilerDying ENTRY "r0-r6"
+
+        LDR     wp, [r12]
+        BL      freeworkspace
+
+        EXITS                          ; Sorry, but no can do errors here
+
+
+
+; ------------------------------------------------------------------------------
+
+; Corrupts r0-r6
+
+freeworkspace ROUT
+
+        CMP     wp, #0                 ; clears V
+        MOVLE   pc, lr
+
+        MOV     r6, lr                 ; can't use stack on exit if USR mode
+
+        LDR     r0, mytaskhandle
+        CMP     r0, #0
+        LDRGT   r1, taskidentifier
+        SWIGT   XWimp_CloseDown        ; ignore errors from this
+
+
+        [ Version > 201
+        BL      deallocatemessagedata   ; well actually we can until we free
+        ]
+
+
+        MOV     r2, r12
+        LDR     r12, privateword
+        MOV     r14, #0                ; reset flag word anyway
+        STR     r14, [r12]
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+
+        MOV     pc, r6
+
+taskidentifier
+        DCB     "TASK"                 ; Picked up as a word
+        ALIGN
+
+
+;-------------------------------------------
+; Added for RISC OS 3
+;-------------------------------------------
+
+ [ Version > 201
+
+MessagesList    DCD     Message_HelpRequest
+                DCD     Message_MenuWarning
+                DCD     0
+ ]
+
+;-------------------------------------------
+
+CloseDownAndExit ROUT
+
+        BL      freeworkspace
+        SWI     OS_Exit
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;                   CDFSFiler application entry point
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+ErrorAbort
+        MOV     r1, #2_010              ; 'Cancel' button
+        BL      ReportError             ; stack is still valid here
+
+Abort
+        Debug   startup, "Abort"
+
+        BL      freeworkspace           ; exits with r12 --> private word
+        MOV     r0, #-1
+        STR     r0, [r12]               ; marked so doesn't loop
+
+        SWI     OS_Exit
+
+;------------------------------------------------------------
+; Get text from the messages file
+;------------------------------------------------------------
+
+        [ Version > 201
+
+MkCantStartError
+        MOV     r8, lr
+        ADR     r0, ErrorBlock_CantStartCDFSFiler
+        MOV     r1, #0
+        MOV     r2, #0
+        addr    r4, CDFSFiler_TitleString
+        MOV     r5, #0
+        MOV     r6, #0
+        MOV     r7, #0
+        SWI     XMessageTrans_ErrorLookup
+        MOV     pc, r8
+
+        ]
+
+;------------------------------------------------------------
+
+w_share         DCB     "Share",0                 ; menu handle
+                DCD     0,0,0
+                ALIGN
+w_volume        DCB     "Configure",0,0,0
+                ALIGN
+
+;------------------------------------------------------------
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; OSS New function to copy template name onto the stack and then call
+; Wimp_LoadTemplate since the wimp may over-write the name. We were
+; lucky to get away with this previously.
+
+; In    r1 -> user block to put template
+;       r2 -> core to put indirected icons for template
+;       r3 -> end of this core
+;       r4 -> font reference array
+;       r5 -> name of relevant entry
+;       r6 = position to search from
+
+load_template ENTRY , 16                ; 16 bytes of stack for name
+        MOV     lr, sp
+        Push    "r1, r2"
+        MOV     r1, lr
+        MOV     r2, r5
+        BL      strcpy
+        MOV     r5, r1                  ; And use this name instead
+        Pull    "r1, r2"
+        SWI     XWimp_LoadTemplate
+        EXIT
+
+
+CDFSFiler_Start ROUT
+
+        LDR     wp, [r12]
+
+        CMP     wp, #0
+
+;----------------------------------------------
+; Get an error message from the 'Messages' file
+;----------------------------------------------
+
+        [ Version > 201
+        BLLE    MkCantStartError                         ; New way
+        SWIVS   OS_GenerateError                         ;
+        |
+        ADRLE   r0, ErrorBlock_CantStartCDFSFiler        ; Old way
+        SWILE   OS_GenerateError                         ;
+        ]
+
+;----------------------------------------------
+
+        ADRL    sp, stacktop            ; STACK IS NOW VALID!
+
+        LDR     r0, mytaskhandle        ; close any previous incarnation
+        CMP     r0, #0
+        LDRGT   r1, taskidentifier
+        SWIGT   XWimp_CloseDown         ; ignore errors from this
+
+;--------------------------------------------------
+; We know about wimp 3.00 and have a messages list.
+;--------------------------------------------------
+
+        [ Version > 201
+        MOV     r0, #300                 ; NEW - know about wimp 3.00 and have a messages list.
+        LDR     r1, taskidentifier
+        BL      MkBannerIn_userdata
+
+        ADRVC   r3, MessagesList
+        SWIVC   XWimp_Initialise
+        STRVC   r0, wimpversion
+        STRVC   r1, mytaskhandle
+        |
+        MOV     r0, #200                 ; OLD - latest known Wimp version number
+        LDR     r1, taskidentifier
+        addr    r2, CDFSFiler_Banner
+        SWI     XWimp_Initialise
+        STRVC   r0, wimpversion
+        STRVC   r1, mytaskhandle
+        ]
+
+;--------------------------------------------------
+
+        BLVC    CopyMenus               ; copy menus into ram
+        BVS     ErrorAbort
+
+        ADR     r1, iconbaricons        ; initialise all icon handles to -1
+        MOV     r2, #ndrives            ; (used in AddToIconBar)
+        MOV     r14, #-1
+01      STR     r14, [r1], #4
+        SUBS    r2, r2, #1
+        BNE     %BT01
+        
+;        MOV     r0, #11
+;        ADRL    r2, spritefile
+;        SWI     XWimp_SpriteOp
+
+        addr    r0, spritefile
+        SWI     XOS_CLI
+
+
+        BL      SetUpIconBar
+        BVS     ErrorAbort            ; frees workspace but marks it invalid
+
+        LDR     R14,iconbaricons      ; give up if no drives (or error)
+        CMP     R14,#-1
+        BEQ     Abort
+
+        ADRL    R1,str_templatefile
+        SWI     XWimp_OpenTemplate
+        BVS     ErrorAbort
+
+; OSS Ask the Wimp how much memory we need for share window.
+        MOV     r1,#-1
+        MOV     r4,#-1
+        ADR     r5,w_share
+        MOV     r6,#0
+        BL      load_template           ; get size required for template
+        BVS     TemplateErrorAbort
+
+        Push    r2
+
+; Now ask the Wimp how much memory we need for volume window.
+        MOV     r1,#-1
+        MOV     r4,#-1
+        ADR     r5,w_volume
+        MOV     r6,#0
+        BL      load_template           ; get size required for template
+        Pull    r4
+        BVS     TemplateErrorAbort
+
+        ADD     r3, r2, r4
+
+; OSS Claim memory for the inderected data.
+        MOV     r0,#ModHandReason_Claim
+        SWI     XOS_Module
+        BVS     TemplateErrorAbort
+        STR     r2,sharebufferind
+        ADD     r4, r2, r4
+        STR     r4, volumebufferind
+
+; OSS Now load the template and create the window - the main window buffer
+; is in userdata as it can be thrown away as soon as the window has been
+; created.
+        ADR     r1,userdata
+        ADD     r3,r2,r3                ; Add size to pointer to give limit
+        MOV     r4,#-1
+        ADR     r5,w_share
+        MOV     r6,#0
+        BL      load_template
+        SWIVC   XWimp_CreateWindow
+        STRVC   r0,sharewin_handle
+        BVS     TemplateErrorAbort
+
+        ADR     r1, userdata
+        LDR     r2, volumebufferind
+        ADR     r5, w_volume
+        MOV     r6, #0
+        BL      load_template           ; r3,r4 preserved from above
+        SWIVC   XWimp_CreateWindow
+        STRVC   r0, volumewin_handle
+        BVS     TemplateErrorAbort
+
+        ADRL    lr, userdata+72
+        LDMIA   lr, {r1-r3}
+        STR     r1, volume_title_text
+        STR     r3, volume_title_length
+        SWI     XWimp_CloseTemplate
+        BVS     ErrorAbort
+
+        B       %FT01
+
+TemplateErrorAbort
+           
+        Push    "r0"
+        SWI     XWimp_CloseTemplate
+        Pull    "r0"
+        SETV
+        B       ErrorAbort
+01                 
+
+        BL      check_access
+
+; ..........................................................................
+; The main polling loop!
+
+repollwimp ROUT
+
+        MOVVS   r1, #2_001            ; 'Ok' button
+        BLVS    ReportError
+        BVS     ErrorAbort            ; error from reporterror!
+
+        MOV     r0, #pointerchange_bits + null_bit
+        ADRL    r1, userdata
+        SWI     XWimp_Poll
+        BVS     repollwimp
+
+; In    r1 -> wimp_eventstr
+        CMP     r0, #Open_Window_Request
+        BNE     %FT01
+        SWI     XWimp_OpenWindow
+        B       repollwimp
+01
+        CMP     r0, #Redraw_Window_Request
+        LDREQ   lr, [r1]
+        LDREQ   r2, volumewin_handle
+        TEQEQ   lr, r2
+        BEQ     event_redraw_volume
+
+        ADR     lr, repollwimp
+
+        CMP     r0, #Mouse_Button_Change
+        BEQ     event_mouse_click
+
+ [ Version >= 236
+        CMP     r0, #Key_Pressed
+        BEQ     event_key_pressed
+ ]
+
+        CMP     r0, #Menu_Select
+        BEQ     event_menu_select
+
+        CMP     r0, #User_Message
+        CMPNE   r0, #User_Message_Recorded
+        BEQ     event_user_message
+
+        B       repollwimp
+
+ [ Version >= 236
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; event_key_pressed
+; =================
+
+; In    r1 -> wimp_eventstr
+;             [r1, #0]  window handle
+;             [r1, #4]  icon handle (-1 if none)
+;             [r1, #8]  x offset of caret
+;             [r1, #12] y offset of caret
+;             [r1, #16] caret height and flags
+;             [r1, #20] index of caret into string (if in an icon)
+;             [r1, #24] character code of key pressed (word not byte)
+
+; Out   all regs may be corrupted - going back to PollWimp
+
+event_key_pressed
+        LDR     r0, [r1]                ; Make sure it's the share window.
+        LDR     r2, sharewin_handle
+        TEQ     r0, r2
+        MOVNE   pc, lr
+
+        LDR     r0, [r1, #24]           ; If Return pressed then share.
+        TEQ     r0, #13
+        BEQ     GoShare_disc
+
+        ENTRY                           ; Otherwise, process key.
+        SWI     XWimp_ProcessKey
+        EXIT
+
+ ]
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; event_mouse_click
+; =================
+
+; In    r1 -> wimp_eventstr
+;             [r1, #0]  pointer x
+;             [r1, #4]          y
+;             [r1, #8]  new button state
+;             [r1, #12] window handle (-1 if background/icon bar)
+;             [r1, #16] icon handle (-1 if none)
+
+; Out   all regs may be corrupted - going back to PollWimp
+
+event_mouse_click  ENTRY
+
+        LDMIA   r1, {r0-r4}             ; set mousex, mousey, buttonstate
+        ADR     r14, mousedata          ; windowhandle, iconhandle
+        STMIA   r14, {r0-r4}
+
+        LDR     lr, volumewin_handle
+        TEQ     r3, lr
+        BEQ     event_volume_window_click
+
+        CMP     r3, #iconbar_whandle    ; window handle of icon bar
+        BNE     Share_MouseClick        ; could be share window
+
+        TST     r2, #button_left :OR: button_right ; select or adjust ?
+        BNE     click_select_iconbar
+
+        TST     r2, #button_middle      ; menu ?
+        BNE     click_menu_iconbar
+
+        EXIT
+
+Share_MouseClick
+
+        CMP     r4,#5                   ; Is it the cancel button ?
+        BNE     %FT01
+
+        ADR     r1, userdata            ; close share window
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        SWI     XWimp_CloseWindow
+        B       %FT99
+01
+        CMP     r4, #3
+        PullEnv EQ
+        BEQ     GoShare_disc
+99
+        EXIT
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; event_volume_window_click
+; =========================
+;
+; In    r0 =  pointer x
+;       r1 =          y
+;       r2 =  new button state
+;       r3 =  window handle (-1 if background/icon bar)
+;       r4 =  icon handle (-1 if none)
+;
+; This deals with mouse button clicks on the volume window
+;
+
+event_volume_window_click
+
+      TST       r2, #button_left :OR: button_right ; select or adjust ?
+      EXIT      EQ
+
+      TEQ       r4, # VOLUME__SET
+      BEQ       event_volume_set
+
+      TEQ       r4, # VOLUME__CANCEL
+      BEQ       event_volume_cancel
+
+      TEQ       r4, # VOLUME__TOUCH_BAR
+      BEQ       event_volume_bar
+
+      EXIT
+
+;--------------------------------------------------
+event_volume_set
+; In    r0 =  pointer x
+;       r1 =          y
+;       r2 =  new button state
+;       r3 =  window handle (-1 if background/icon bar)
+;       r4 =  icon handle (-1 if none)
+;
+; This closes the window 'cause volume set already !
+;
+;--------------------------------------------------
+
+; Set the current volume
+      LDR       r0, CurrentVolumeDrive
+      BL        get_volume_level
+      MOVVS     r0, # 0
+      STR       r0, OldVolumeSetting
+
+; If right hand button then exit
+      TST       r2, # button_right
+      EXIT      NE
+
+
+      ADRL      r1, userdata
+      LDR       r0, volumewin_handle
+      STR       r0, [ r1 ]
+      SWI       XWimp_CloseWindow
+      EXIT
+
+;--------------------------------------------------
+event_volume_cancel
+; In    r0 =  pointer x
+;       r1 =          y
+;       r2 =  new button state
+;       r3 =  window handle (-1 if background/icon bar)
+;       r4 =  icon handle (-1 if none)
+;
+; This sets the old volume back then closes the window
+;
+;--------------------------------------------------
+
+; Set the original volume level back
+      LDR       r0, CurrentVolumeDrive
+      LDR       r1, OldVolumeSetting
+      BL        set_volume_level
+
+; Update the icon
+      LDR       r0, volumewin_handle
+      MOV       r3, # VOLUME__DRAW_BAR
+      MOV       r4, # 0
+      MOV       r5, # 0
+      ADRL      r1, userdata
+      STMIA     r1, { r0, r3, r4, r5 }
+      SWI       XWimp_SetIconState
+
+
+; If right hand button then exit
+      TST       r2, # button_right
+      EXIT      NE
+
+      ADRL      r1, userdata
+      LDR       r0, volumewin_handle
+      STR       r0, [ r1 ]
+      SWI       XWimp_CloseWindow
+      EXIT
+
+
+;--------------------------------------------------
+event_volume_bar
+; In    r0 =  pointer x
+;       r1 =          y
+;       r2 =  new button state
+;       r3 =  window handle (-1 if background/icon bar)
+;       r4 =  icon handle (-1 if none)
+;
+; This deals with clicks on the volume bar
+;
+;--------------------------------------------------
+
+      MOV       r5, r0
+
+      ADRL      r1, userdata
+      LDR       r2, volumewin_handle
+      STR       r2, [ r1 ]
+      SWI       XWimp_GetWindowState
+      EXIT      VS
+
+      LDR       r2, [ r1, # 4 ]             ; min. x
+      LDR       r3, [ r1, # 20 ]            ; scroll x
+
+      SUB       r2, r5, r2
+      ADD       r2, r2, r3
+
+; r2 = x position in bar icon
+
+; Get the width of the icon
+      MOV       r3, # VOLUME__DRAW_BAR
+      STR       r3, [ r1, # 4 ]
+
+      SWI       XWimp_GetIconState
+      LDR       r3, [ r1, # 8 + 8 ]
+      LDR       r4, [ r1, # 8 + 0 ]
+      SUB       r3, r3, r4
+
+      SUBS      r2, r2, r4
+      MOVLT     r2, # 0
+
+; r2 = r2 * MAX_VOLUME (or close enough)
+      MOV       r2, r2, LSL # 16
+
+; r4 = r2 / icon width
+      DivRem    r4, r2, r3, r14
+
+; make sure that min.(0) and max.(&ffff) values not exceeded
+      CMP       r4, # 0 
+      MOVLT     r4, # 0
+      CMP       r4, # &10000
+      MOVGE     r4, # &ffffffff
+      MOVGE     r4, r4, LSR # 16
+
+      LDR       r0, CurrentVolumeDrive
+      MOV       r1, r4
+      BL        set_volume_level
+
+
+; Redraw the bar
+      ADRL      r1, userdata
+      LDR       r2, volumewin_handle
+      MOV       r3, # VOLUME__DRAW_BAR
+      MOV       r4, # 0
+      MOV       r5, # 0
+      STMIA     r1, { r2, r3, r4, r5 }
+
+      SWI       XWimp_SetIconState
+
+      EXIT
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; event_redraw_volume
+; =========================
+;
+; In
+;       void
+; Out
+;       void
+;
+; This draws the volume bar
+;
+
+event_redraw_volume
+
+
+      LDR       r0, CurrentVolumeDrive
+      BL        get_volume_level
+      MOVVS     r0, # 0
+      MOV       r2, r0
+
+      ADRL      r1, userdata
+      LDR       r0, volumewin_handle
+      STR       r0, [ r1 ]
+      SWI       XWimp_RedrawWindow           ; r1 -> buffer and window handle
+      TEQ       r0, # 0
+      BEQ       repollwimp                   ; nothing to redraw (so why call me ?)
+      BVS       repollwimp
+
+; r1-> redraw block
+; r2 = current volume level
+
+ERV_Loop
+
+; Choose a colour
+      MOV       r0, # BC__CENTRE
+      SWI       XWimp_SetColour
+
+; Get icon information
+      Push      "r1"
+      ADRL      r3, userdata + 128
+      LDR       r0, volumewin_handle
+      MOV       r14, # VOLUME__DRAW_BAR
+      STMIA     r3, { r0, r14 }
+      MOV       r1, r3
+      SWI       XWimp_GetIconState
+      BVS       ERV_ErrorInLoop
+      Pull      "r1"
+
+
+; Find x
+;x = (( icon.box.x1 - icon.box.x0 ) * settings[ a ] ) / 100 + icon.box.x0 ;
+
+; r1-> redraw block
+; r2 = current volume level
+; r3 -> icon info
+; r4 = x
+
+      LDR       r4, [ r3, # 8 + 8 ]      ; max icon x
+      LDR       r5, [ r3, # 8 + 0 ]      ; min icon x
+      SUB       r4, r4, r5               ; = icon width
+      MUL       r4, r2, r4
+      MOV       r4, r4, LSR # 16
+      ADD       r4, r4, r5
+
+; draw_bar
+;#define draw_bar( x0, y0, x1, y1 )
+; os_swi3( XOS_Plot, 68, x0 + 1, y0 + 1 ) ;
+; os_swi3( XOS_Plot, 0x65, x1, y1 - 2);
+
+      Push      "r1-r6"
+
+; move
+      LDR       r5, [ r1, # 20 ]         ; window scroll x
+      LDR       r14, [ r1, # 4 ]         ; window min x
+      SUB       r5, r14, r5
+
+; r5 = (r.box.x0-r.scx)
+
+      LDR       r0, [ r1, # 16 ]         ; window max. y
+      LDR       r7, [ r1, # 24 ]         ; window scroll y
+      SUB       r6, r0, r7
+
+; r6 = (r.box.y1-r.scy)
+
+
+
+;draw_bar( (r.box.x0-r.scx) + icon.box.x0, (r.box.y1-r.scy) + icon.box.y0,
+
+      Push      "r1-r2"
+
+      LDR       r1, [ r3, # 8 + 0 ]      ; min. x
+      ADD       r1, r1, r5
+      ADD       r1, r1, # 1
+
+      LDR       r2, [ r3, # 8 + 4 ]      ; min. y
+      ADD       r2, r2, r6
+      ADD       r2, r2, # 1
+
+
+      MOV       r0, # 68
+      SWI       XOS_Plot
+      Pull      "r1-r2"
+
+; plot
+
+;          (r.box.x0-r.scx) + x, (r.box.y1-r.scy) + icon.box.y1 ) ;
+
+      Push      "r1-r2"
+
+      ADD       r1, r5, r4
+
+      LDR       r2, [ r3, # 8 + 12 ]     ; max. y
+      ADD       r2, r2, r6
+      SUB       r2, r2, # 2
+
+
+      MOV       r0, # &65
+      SWI       XOS_Plot
+      Pull      "r1-r2"
+
+
+;draw_3d_bar( (r.box.x0-r.scx) + icon.box.x0, (r.box.y1-r.scy) + icon.box.y0,
+;             (r.box.x0-r.scx) + icon.box.x1, (r.box.y1-r.scy) + icon.box.y1, 0 ) ;
+
+
+      Pull      "r1-r6"
+
+
+ERV_ErrorInLoop
+      SWI       XWimp_GetRectangle
+      TEQ       r0, # 0
+      BNE       ERV_Loop
+
+      B         repollwimp
+
+
+EH__Driver_NoDrive      DCD CDFSDRIVERERROR__NO_DRIVE
+                         =  "NoDrive", 0
+ ALIGN
+
+;--------------------------------------------------
+get_volume_level
+;
+; In
+;       r0 = CD-ROM drive number
+; Out
+;       r0 = volume level (0 to 0xffff)
+;      if error then Vset r0->error block
+;
+; This deals with clicks on the volume bar
+;
+;--------------------------------------------------
+
+      Push      "r1-r7, r14"
+
+      SWI       XCDFS_ConvertDriveToDevice 
+      Pull      "r1-r7, pc", VS
+
+      MOV       r0, r1
+
+; r1 = composite device id, or -1 if not found
+      CMP       r0, #-1
+      ADREQ     r0, EH__Driver_NoDrive
+      Pull      "r1-r7, r14", EQ
+      BEQ       lookuperror
+
+
+; What is the volume ?
+      ADRL      r7, userdata + 64
+      AND       r2, r0, #2_00000111    ; device id
+
+      AND       r3, r0, #2_00011000    ; card
+      MOV       r3, r3, LSR #3
+
+      AND       r4, r0, #2_11100000    ; LUN
+      MOV       r4, r4, LSR #5
+
+      MOV       r5, r0, LSL #16        ; drive type
+      MOV       r5, r5, LSR #24
+
+      STMIA     r7, { r2, r3, r4, r5 }
+
+      SUB       r1, r7, #64
+
+      MOV       r0, # 0
+      MOV       r2, # 0
+      STMIA     r1, { r0, r2 }
+
+      SWI       XCD_GetAudioParms
+      Pull      "r1-r7, pc", VS
+
+      LDMIA     r1, { r0, r2 }
+
+; Take the highest channel
+      CMP       r2, r0
+      MOVGT     r0, r2
+
+      CLRV
+      Pull      "r1-r7, pc"
+
+
+;--------------------------------------------------
+set_volume_level
+;
+; In
+;       r0 = CD-ROM drive number
+;       r1 = volume level
+; Out
+;       void, all regs preserved
+;
+;
+; This sets the volume level
+;
+;--------------------------------------------------
+
+      Push      "r0-r7, r14"
+
+      MOV       r6, r1
+
+      SWI       XCDFS_ConvertDriveToDevice
+      BVS       SVL_End
+
+      MOV       r0, r1
+
+; r1 = composite device id, or -1 if not found
+      CMP       r0, #-1
+      BEQ       SVL_End
+
+; What is the volume ?
+      ADRL      r7, userdata + 64
+      AND       r2, r0, #2_00000111    ; device id
+
+      AND       r3, r0, #2_00011000    ; card
+      MOV       r3, r3, LSR #3
+
+      AND       r4, r0, #2_11100000    ; LUN
+      MOV       r4, r4, LSR #5
+
+      MOV       r5, r0, LSL #16        ; drive type
+      MOV       r5, r5, LSR #24
+
+      STMIA     r7, { r2, r3, r4, r5 }
+
+
+      SUB       r1, r7, #64
+
+      MOV       r14, r6
+      MOV       r0, # 0
+      STMIA     r1, { r6, r14 }
+      SWI       XCD_SetAudioParms
+
+SVL_End
+      CLRV
+      Pull      "r0-r7, pc"
+
+
+;--------------------------------------------------
+; Different way of opening filer directory
+;--------------------------------------------------
+
+      [ Version >= 201
+FilerOpenDirCommand     DCB     "%Filer_OpenDir ",0
+      ]
+
+; ..........................................................................
+; We get here if the user has double-clicked on a FS icon
+
+; In    lr stacked, Proc_RegList = "lr" for EXIT
+;       all regs trashable
+
+; 
+      [ Version >= 213
+photo_disc_sprite = "Spcddisc", 0
+audio_disc_sprite = "Sacddisc", 0
+       ALIGN
+      ]
+
+click_select_iconbar ROUT
+
+        Debug   click, "click_select_iconbar"
+
+        BL      matchdriveicon          ; r1 -> drive spec, eg. :4
+
+        DebugS  click, "drive spec = ", r1
+
+;--------------------------
+; Make into the normal icon
+;--------------------------
+; r4 = icon number on icon bar
+      [ Version >= 213
+        ADRL    r0, iconspritename
+        BL      change_icon_sprite
+
+;-------------------------------
+; Try to get the disc name
+;-------------------------------
+
+        SWI     XHourglass_On
+
+        BL      GetMediaName            ; r1 -> media name
+
+      [ debugclick
+        ADDVS   r0, r0, #4
+        DebugSIf VS,click,"Error from GetMediaName: ",r0
+        SUBVS   r0, r0, #4
+      ]
+
+        BVC     open_dir
+
+        Debug   click, "GetMediaName returned error"
+
+;---------------------------------------------------------------------------------------------
+; 
+; on entry:
+;           r0 -> error block
+; on exit:
+;          
+;---------------------------------------------------------------------------------------------
+
+ [ {TRUE}
+; Not good enough just to remember the pointer as MessageTrans reuses its error
+; buffers and we could get a completely different error. We must copy the error
+; into our workspace.
+        Push    "r1"
+        ADR     r1, dirnamebuffer       ; Use as temporary error buffer
+        LDR     r14, [r0], #4
+        STR     r14, [r1], #4
+10
+        LDRB    r14, [r0], #1
+        STRB    r14, [r1], #1
+        TEQ     r14, #0
+        BNE     %BT10
+        Pull    "r1"
+ |
+; Remember the error pointer
+        Push    "r0"
+ ]
+
+;-------------------------------
+; Is the CD in the drive audio ?
+;-------------------------------
+
+        Push    "r1"
+
+; What is the drive number ?
+        LDR     r1, matchedindex
+        SWI     XCDFS_GetNumberOfDrives
+
+; Could have 0 drives configured !
+        TEQ     r0, #0
+        SUBNE   r0, r0, r1
+        SUBNE   r0, r0, #1
+
+        SWI     XCDFS_ConvertDriveToDevice
+        MOVVC   r0, r1
+        Pull    "r1"
+        BVS     not_audio
+
+; r1 = composite device id, or -1 if not found
+        CMP     r0, #-1
+        BEQ     not_audio
+
+; Is track 0 audio ?
+        Push    "r1-r7"
+
+        ADRL    r7, userdata + 64
+        AND     r2, r0, #2_00000111    ; device id
+
+        AND     r3, r0, #2_00011000    ; card
+        MOV     r3, r3, LSR #3
+
+        AND     r4, r0, #2_11100000    ; LUN
+        MOV     r4, r4, LSR #5
+
+        MOV     r5, r0, LSL #16        ; drive type
+        MOV     r5, r5, LSR #24
+
+        STMIA   r7, { r2, r3, r4, r5 }
+
+        MOV     r0, #1
+
+        SUB     r1, r7, #64
+
+        SWI     XCD_EnquireTrack
+
+        Pull    "r1-r7"
+
+        BVS     not_audio
+
+        LDRB    r0, userdata + 4
+        TST     r0, #1
+        BNE     not_audio
+
+        addr    r0, audio_disc_sprite ; if zero then audio
+        BL      change_icon_sprite
+
+; Play from track 1 to the end of the disc
+        MOV     r0, #1
+        MOV     r1, #&ff
+        ADRL    r7, userdata + 64
+        SWI     XCD_PlayTrack
+
+        SWI     XHourglass_Off
+
+        CLRV
+
+ [ {FALSE}
+        ; No longer store the error on the stack.
+        Pull    "r0"
+ ]
+
+        EXIT
+
+
+not_audio ; - so must be an error
+
+        SWI     XHourglass_Off
+
+ [ {TRUE}
+        ; Error is now copied to our workspace.
+        ADR     r0, dirnamebuffer
+ |
+        Pull    "r0"
+ ]
+        SETV
+        EXIT
+
+       | ; old boring way
+        BLVC    GetMediaName            ; r1 -> media name
+        EXIT    VS
+
+      ]
+
+
+ [ Version >= 213
+
+; This is the pathame that indicates that it is a photocd
+photocd_filename = ".$.PHOTO_CD.INFO/PCD", 0
+
+  [ ReadCDIDiscs
+
+CDI_filename     = ".$.MPEGAV", 0
+ ALIGN
+
+  ]
+
+open_dir
+
+  [ ReadCDIDiscs
+
+;-------------------------------
+; Is the CD in the drive CD-I ?
+;-------------------------------
+
+; At this point the hourglass has already been turned on once
+
+; r1 -> 'CDFS::FRED
+        Push    "r1-r5"
+
+        MOV     r2, r1                 ; 'CDFS::FRED'
+        ADRL    r1, userdata
+        BL      strcpy_advance
+
+        ADRL    r2, CDI_filename       ; 'CDFS::FRED.$.MPEGAV'
+        BL      strcpy_advance
+
+        MOV     r0, # 5                ; see PRM p850
+        ADRL    r1, userdata
+        SWI     XOS_File
+
+        Pull    "r1-r5"
+
+; Was the object a directory (or even an error) ?
+        TEQ     r0, # 2
+        BNE     DiscCheck_NotCDI
+
+        ADR     r0, cdi_disc_sprite
+        BL      change_icon_sprite
+
+        SWI     XHourglass_Off
+
+;-------------------------
+; Display the file viewer
+;-------------------------
+        B       OpenDirectoryViewer
+
+cdi_disc_sprite   = "Scdidisc", 0
+ ALIGN
+
+DiscCheck_NotCDI
+
+  ]
+
+;-------------------------------------
+; Is this a photo cd ?
+;-------------------------------------
+
+; At this point the hourglass has been turned on once
+
+; r1 -> 'CDFS::FRED
+        Push    "r1"
+
+        MOV     r2, r1                 ; 'CDFS::FRED'
+        ADRL    r1, userdata
+        BL      strcpy_advance
+
+        ADRL    r2, photocd_filename   ; 'CDFS::FRED.$.PHOTO_CD.INFO/PCD'
+        BL      strcpy_advance
+
+        MOV     r0, #&40 + 2_0111   ; see PRM p881
+        ADRL    r1, userdata
+        SWI     XOS_Find
+
+; not photoCD
+        BVS     DiscCheck_NotPhotoCD
+
+        TEQ     r0, #0
+        BEQ     DiscCheck_NotPhotoCD
+
+
+; Is PhotoCD - so close the file
+        MOV     r1, r0
+        MOV     r0, #0
+        SWI     XOS_Find
+
+; Display the photocd icon
+        ADRL    r0, photo_disc_sprite
+        BL      change_icon_sprite
+
+
+DiscCheck_NotPhotoCD
+
+        SWI     XHourglass_Off
+
+        Pull    "r1"
+ ]
+
+;-------------------------------------
+; Try to open dir using Filer
+;-------------------------------------
+
+; on entry: r1 -> CDFS::FRED
+
+OpenDirectoryViewer
+
+      [ Version > 201
+        Push    "r1"
+        ADRL    r1,userdata
+        ADRL    r2,FilerOpenDirCommand
+        BL      strcpy_advance
+        Pull    "r2"
+        BL      strcpy_advance
+        ADR     r2, dotdollar
+        BL      strcpy_advance
+        ADRL    r0, userdata
+        SWI     XOS_CLI
+      |
+        LDR     r0, =Message_FilerOpenDir
+        BL      messagetoFiler
+      ]
+
+;-------------------------------------
+
+        EXIT
+
+;-----------------------------------------------------------------------------------------------
+; change_icon_sprite
+;
+; on entry:
+;          r0 -> sprite name
+;          r4 = icon number
+;          'matchedindex' = drive number
+; on exit:
+;          r0 corrupted
+;
+;    This changes the sprite used on the icon bar to the sprite name pointed to in r0.
+;
+;-----------------------------------------------------------------------------------------------
+
+      [ Version >= 213
+change_icon_sprite ROUT
+        Push    "r0-r4, r14"
+
+        MOV     r2, r0
+
+; Find out where the text should be written to
+        Push    "r0, r2, r3"
+        SUB     r1, sp, #4*12
+        MOV     r0, #-2
+        MOV     r2, r4
+        MOV     r3, #0
+        MOV     r4, #0
+        STMIA   r1, { r0, r2, r3, r4 }
+        SWI     XWimp_GetIconState
+
+        ADD     r4, r1, #4+4
+        LDR     r1, [ r1, #8 + 20 + 4 ]
+        Pull    "r0, r2, r3"
+
+; Write the Ssprite name
+        BL      strcpy
+
+; Update the icon
+        LDMIA   r4, { r1, r2, r3, r4 }
+
+        MOV     r0, #-2
+        SWI     XWimp_ForceRedraw
+
+
+
+;        SUB     r1, sp, #4*6
+;        MOV     r0, #-2
+;        MOV     r2, r4
+;        MOV     r3, #0
+;        MOV     r4, #0
+;        STMIA   r1, { r0, r2, r3, r4 }
+
+;        SWI     XWimp_SetIconState
+
+        Pull    "r0-r4, pc", AL, ^
+
+
+       ] ; only version 2.13 or greater
+
+
+;-----------------------------------------------------------------------------------------------
+
+
+; In    r0 = message action
+;       r1 -> media name
+
+messagetoFiler ENTRY
+
+        SUB     sp, sp, #256            ; make temp frame for message
+        STR     r0, [sp, #message_action]
+        MOV     r2, r1
+        ADD     r1, sp, #message_data
+        MOV     r14, #37                ; FileSystem = CDFS
+        STR     r14, [r1], #4
+        MOV     r14, #0                 ; bitset = 0
+        STR     r14, [r1], #4
+        BL      strcpy_advance
+        ADR     r2, dotdollar
+        BL      strcpy_advance
+        ADD     r1, r1, #1
+        ADR     r2, dollar
+        BL      strcpy_advance
+        ADD     r1, r1, #1
+        TST     r1, #3                  ; word aligned end ?
+        ADDNE   r1, r1, #3              ; round up to word size
+        BICNE   r1, r1, #3
+        SUB     r1, r1, sp
+        STR     r1, [sp, #message_size]
+        MOV     r0, #User_Message_Recorded
+        MOV     r1, sp
+        LDR     r2, FilerHandle        ; send it to the Filer
+        SWI     XWimp_SendMessage
+        ADD     sp, sp, #256            ; free temp frame
+        EXIT
+
+
+dotdollar       DCB     "."             ; share $ with ...
+dollar          DCB     "$", 0          ; directory title
+                ALIGN
+
+
+; Offsets of fields in a message block
+
+                ^       0
+message_size    #       4
+message_task    #       4               ; thandle of sender - filled by Wimp
+message_myref   #       4               ; filled in by Wimp
+message_yourref #       4               ; filled in by Wimp
+message_action  #       4
+message_hdrsize *       @
+message_data    #       0               ; words of data to send
+
+; ..........................................................................
+; In    lr stacked, Proc_RegList = "lr" for EXIT
+;       all regs trashable
+
+click_menu_iconbar ROUT
+
+        Debug   menus,"click_menu_iconbar"
+
+        BL      matchdriveicon          ; r1 -> drive number (eg. :0)
+        EXIT    VS
+
+     ;put the drives number into its buffer
+        SWI     XCDFS_GetNumberOfDrives
+        ADRL    r1, mb_drives
+        MOV     r2, #4
+        SWI     OS_ConvertCardinal1 
+
+     ;tick appropriate buffers item and clear all the others 
+        ADRL    r1, m_buffers + m_headersize
+
+        SWI     XCDFS_GetBufferSize 
+        MOV     r2, #0
+
+01      LDRB    r14, [r1]
+        CMP     r2, r0        
+        ORREQ   r14, r14, #1
+        ANDNE   r14, r14, #254
+        STRB    r14, [r1]
+        ADD     r1, r1, #24
+        ADD     r2, r2, #1
+        CMP     r2, #8
+        BNE     %BT01
+
+        MOV     r0, #ModHandReason_LookupName    ; call OS_Module 18 to check if ShareD
+        ADR     r1, Sharemodule                  ; module has been loaded; if not, then
+        SWI     XOS_Module                       ; shade share entry in the ADFS menu
+        LDRVS   r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+mi_iconflags
+        ORRVS   r14, r14, #is_shaded
+        STRVS   r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+mi_iconflags
+
+        ADRL    r1, m_cdromdisc
+        BL      CreateMenu
+        EXIT
+
+Sharemodule     DCB     "ShareFS"                ; module for sparrow share module
+                DCB     0
+                ALIGN
+
+; Entry:  R4 = icon handle (in icon bar)
+; Exit:   R1 --> drive spec for this drive
+
+matchdriveicon  ENTRY "r2"
+
+        Debug   menus,"matchdriveicon"
+
+        MOV     r2, #ndrives
+        ADR     r1, iconbaricons
+01
+        LDR     r14, [r1], #4
+        TEQ     r14, r4
+        RSBEQ   r2, r2, #ndrives
+        STREQ   r2, matchedindex            ; needed for namedisc
+        ASSERT  drv_number = 0
+        ADREQ   r1, discnames + drv_number
+        ADDEQ   r1, r1, r2, LSL #drv_shift
+        LDREQB  r14, [r1, #drv_number+1]    ; initialise drive # (for menu)
+        STREQB  r14, driveno+1
+        LDREQB  r14, [r1, #drv_number+2]    ; second digit (if any)
+        STREQB  r14, driveno+2
+
+        [ Version > 201
+        MOVEQ   r14, #0
+        STREQB  r14, driveno + 3
+        ]
+         
+        EXIT    EQ                          ; r1 -> drive spec
+        SUBS    r2, r2, #1
+        BNE     %BT01
+
+;---------------------------------------
+; Lookup error tag in Messages file
+;---------------------------------------
+
+        [ Version > 201
+        ADR     r0, err_noicon
+        BL      lookuperror
+        |
+        ADR     r0, err_noicon              ; OLD way of erroring
+        SETV                                ;
+        ]
+
+        EXIT
+
+;---------------------------------------
+; Lookup error tag in Messages file
+;---------------------------------------
+
+ [ Version > 201
+
+err_noicon
+        DCD     0
+        DCB     "UI",0
+        ALIGN
+
+ |
+
+err_noicon
+        DCD     0
+        DCB     "Unknown iconbar icon",0
+        ALIGN
+ ]
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; A menu is created with the title above the x,y values you feed it, with 
+; the top left hand corner being at the x,y position
+
+CreateMenu ENTRY "r2, r3"
+
+        STR     r1, menuhandle
+        LDR     r2, mousex
+        SUB     r2, r2, #4*16
+        MOV     r3, #96 + ROOT_MENU_ITEMS*44        ; FIXME MENU (96 + n*44) to clear icon bar
+        SWI     XWimp_CreateMenu
+        EXIT
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+;----------------------------------------------------------------
+; This is the new way to build menus up from the 'messages' file
+;----------------------------------------------------------------
+
+rom_menustart ; Note - must be defined bottom up
+
+; icon bar menu for CDFS discs
+
+m_cdromdisc     Menu     "T00"
+mo_cd_dismount  Item     "M00"
+mo_cd_configure Item     "M01",m_configure
+mo_cd_sharedisc Item     "M02",m_sharedisc     ; ,X
+mo_cd_volume    Item     "M03"
+
+m_configure     Menu     "T01"
+mo_cf_buffers   Item     "M10",m_buffers
+mo_cf_drives    Item     "M11",m_drives        ; ,X
+
+m_sharedisc     Menu     "T02"
+mo_cf_nshare    Item     "M20"
+mo_cf_shared    Item     "M21"
+
+m_buffers       Menu     "T03"
+mo_bf_1         Item     "M30"
+mo_bf_2         Item     "M31"
+mo_bf_3         Item     "M32"
+mo_bf_4         Item     "M33"
+mo_bf_5         Item     "M34"
+mo_bf_6         Item     "M35"
+mo_bf_7         Item     "M36"
+mo_bf_8         Item     "M37"
+
+m_drives        Menu     "T04"
+mo_dr_drives    Item     "BNK",,W       ; mb_drives,3,2,,X,mv_configure
+
+                DCB      0         ; terminator
+
+rom_menuend
+
+mv_configure    DCB     "A1234567890", 0    ; allow numbers only
+                ALIGN                       ; must come AFTER menus
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; CopyMenus
+; =========
+
+; Copy menu structures into ram, relocating as we go
+
+;--------------------------------------------------------------
+; New way of making international menus - RISC OS 3 ONLY
+;--------------------------------------------------------------
+
+CopyMenus ENTRY "r1-r11"
+
+        Debug   menus,"CopyMenus"
+
+        ADRL    r1, mb_drives                 ; fill in writeable fields now
+        ADR     r2, mv_configure
+        MOV     r3, #3                        ; allow only 3 characters
+        ADRL    r14, m_drives + m_headersize + 0*mi_size + mi_icondata
+        STMIA   r14, {r1-r3}
+
+        BL      allocatemessagedata             ; if not already done
+
+        LDRVC   r0, messagedata
+        ADRVC   r1, rom_menustart
+        ADRVCL  r2, ram_menustart
+        MOVVC   r3, #ram_menuend-ram_menustart
+        SWIVC   XMessageTrans_MakeMenus
+        EXIT    VS
+
+        EXITS
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; event_menu_select
+; =================
+
+; In    r1 -> wimp_eventstr
+
+; Out   all regs may be corrupted - going back to PollWimp
+
+event_menu_select ENTRY
+
+        MOV     r2, r1                  ; r2 -> menu selection list
+        LDR     r1, menuhandle          ; r1 = menu handle
+        BL      DecodeMenu
+
+        ADRVCL  r1, userdata            ; check for right-hand button
+        SWIVC   XWimp_GetPointerInfo
+        EXIT    VS
+
+        LDR     R14, userdata+8         ; get button state
+        TST     R14,#&01
+        LDRNE   R1, menuhandle
+        SWINE   XWimp_CreateMenu        ; here we go again!
+
+        EXITS
+                    
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+; In     r1 = menu handle
+;        r2 -> list of selections
+
+DecodeMenu ENTRY
+
+decodelp
+        LDR     r14, [r2], #4            ; r1 = selection no
+        ADD     pc, pc, r14, LSL #2
+        EXIT
+
+        B       go_cd_dismount
+        B       go_cd_configure
+        B       go_cd_share
+        B       go_cd_volume
+
+go_cd_volume
+
+; What is the drive number ?
+        LDR     r1, matchedindex
+        SWI     XCDFS_GetNumberOfDrives
+        BVS     GCV_Error
+
+; Could have 0 drives configured !
+        TEQ     r0, #0
+        SUBNE   r0, r0, r1
+        SUBNE   r0, r0, #1
+        MOV     r4, r0
+
+; r4 = drive number
+
+; Make sure that there is a drive there
+        SWI     XCDFS_ConvertDriveToDevice
+        BVS     GCV_Error
+
+        CMP     r1, # -1
+        ADREQL  r0, EH__Driver_NoDrive
+        BEQ     GCV_LookupError
+
+; Remember the volume if need to cancel
+        MOV     r0, r4
+        BL      get_volume_level
+        BVS     GCV_Error  
+
+        MOV     r5, r0
+
+
+; Get the current window state
+        LDR     r0, volumewin_handle
+        ADRL    r1, userdata + 64
+        STR     r0, [ r1 ]
+        SWI     XWimp_GetWindowState
+        BVS     GCV_Error
+
+; Close the window first
+        SWI     XWimp_CloseWindow
+
+; Remember which drive it belongs to
+        MOV     r0, r4
+        STR     r0, CurrentVolumeDrive
+        STR     r5, OldVolumeSetting
+
+
+; Put the drive number into the title bar
+        LDR     r3, volume_title_text
+        LDR     r5, volume_title_length
+        ADD     r3, r3, r5
+        SUB     r3, r3, # 3
+
+        LDRB    r5, driveno + 1
+        STRB    r5, [ r3 ], # 1
+        LDRB    r5, driveno + 2
+        STRB    r5, [ r3 ], # 1
+        MOV     r5, # 0
+        STRB    r5, [ r3 ], # 1
+
+; Make the window over the iconbar - y
+
+        MOV     r4, r1
+        ADRL    r1, userdata
+        SWI     XWimp_GetPointerInfo
+
+        LDR     r2, [ r4, # 4 + 12 ]        ; maximum y
+        LDR     r3, [ r4, # 4 + 4 ]         ; minimum y
+        SUB     r2, r2, r3
+        LDR     r3, [ r1, # 4 ]             ; mouse y
+        ADD     r2, r2, r3
+        STR     r2, [ r4, # 4 + 12 ]
+        STR     r3, [ r4, # 4 + 4 ]
+
+; x
+
+        LDR     r2, [ r4, # 4 + 8 ]         ; maximum x
+        LDR     r3, [ r4, # 4 + 0 ]         ; minimum x
+        SUB     r2, r2, r3
+        LDR     r3, [ r1, # 0 ]             ; mouse x
+        SUBS    r3, r3, r2, LSR # 1
+        MOVLT   r3, # 0
+        ADD     r2, r2, r3
+        STR     r2, [ r4, # 4 + 8 ]
+        STR     r3, [ r4, # 4 + 0 ]
+
+
+        MOV     r1, r4
+
+; Open the window and push it to the front
+        MOV     r14, # -1
+        STR     r14, [ r1, # 28 ]
+        SWI     XWimp_OpenWindow
+        BVS     GCV_Error
+
+
+        EXIT
+
+; r0->error block
+GCV_LookupError
+        BL      lookuperror
+GCV_Error
+        MOV     r1, #2_010              ; Cancel button
+        BL      ReportError
+        CLRV
+        EXIT
+
+go_cd_dismount
+        ADRL    r1, driveno             ; re-read media name
+        BL      GetMediaName_nochecks   ; r1 -> "CDFS::discname"
+        BLVC    dismountit
+        B       GoUnShare_CD
+
+        EXIT
+
+go_cd_configure
+        LDR     r14, [r2], #4           ;first submenu item
+        ADD     pc, pc, r14, LSL #2    
+        EXIT 
+
+        B       go_cf_buffers
+        B       go_cf_drives
+
+go_cf_buffers
+        LDR     r0, [r2]               ;second submenu item
+        SWI     XCDFS_SetBufferSize
+
+     ; tick appropriate buffers item and clear all the others 
+        ADRL    r1, m_buffers
+        ADD     r1, r1, #m_headersize
+        MOV     r2, #0 
+        
+01      LDRB    r14, [r1]
+        CMP     r2, r0
+        ORREQ   r14, r14, #1
+        ANDNE   r14, r14, #254
+        STRB    r14, [r1]
+        ADD     r1, r1, #24
+        ADD     r2, r2, #1
+        CMP     r2, #8
+        BNE     %BT01
+        EXIT
+         
+go_cf_drives
+        MOV     r1, #1
+        MOV     r0, r1, LSL #29
+        ADD     r0, r0, #10        
+        ADRL    r1, mb_drives
+        MOV     r2, #28
+        SWI     XOS_ReadUnsigned
+        BVS     %FT01
+        MOV     r0, r2
+        SWI     XCDFS_SetNumberOfDrives
+        EXIT
+
+01      MOV     r1, #2
+        addr    r2, CDFSFiler_Banner
+        SWI     Wimp_ReportError
+        EXIT      
+
+go_cd_share
+        LDR     r14, [r2], #4           ;first submenu item
+        ADD     pc, pc, r14, LSL #2    
+        EXIT 
+
+        B       go_cf_nshare
+        B       go_cf_shared
+
+go_cf_nshare
+        B       GoUnShare_CD
+        EXIT
+
+go_cf_shared
+        B       open_sharewin
+        EXIT
+
+CDFScolon       DCB     "CDFS:",0
+                ALIGN
+
+dismount        DCB     "Dismount n ",0         ; NB space still needed
+                ALIGN
+
+ [ {FALSE}
+
+;----------------------------------------
+; This is never used !
+;----------------------------------------
+
+gocommand_window
+        ADRL    r0, userdata+:LEN:"CDFS:"
+        SWI     XWimp_CommandWindow
+        EXIT    VS
+        ADRL    r0, userdata
+        SWI     XOS_CLI
+
+        BVC     %FT01
+
+        SWI     XOS_NewLine
+        ADD     r0, r0,#4
+        SWI     XOS_Write0
+        SWI     XOS_NewLine
+
+01
+        MOV     r0, #0
+        SWI     XWimp_CommandWindow
+        EXIT
+ ]
+
+;----------------------------------------
+
+; In    r1 -> "CDFS::discname"
+; Out   dismounted, and any dirs 'CDFS::discname' closed
+
+dismountit ENTRY "r1"
+
+        LDR     r0, =Message_FilerCloseDir
+        BL      messagetoFiler
+
+        [ Version >= 212
+        ; cause an event so that the filer closes it's windows before I *dismount
+        MOV     r3, r0
+        MOV     r0, #0
+        ADRL    r1, userdata
+        SWI     XWimp_Poll
+        MOV     r0, r3
+        ]
+
+        ADR     r3, dismount
+        BL      copycommand
+        SUB     r1, r1, #2              ; r1 -> original drive number
+        LDR     r2, [sp]                ; r2 -> "CDFS::discname"
+        ADD     r2, r2, #:LEN:"CDFS::"  ; r2 -> discname
+        BL      strcpy
+        ADRL    r0, userdata
+        SWI     XOS_CLI
+
+        EXIT
+
+; In    [driveno+1] = drive number
+;       r3 -> prototype command
+; Out   [userdata..] = "CDFS:<command> <drive no>"
+;       r1 -> terminator (drive number inserted at [r1,#-2])
+
+copycommand ENTRY
+        ADRL    r1, userdata
+        ADR     r2, CDFScolon
+        BL      strcpy_advance
+        MOV     r2, r3
+        BL      strcpy_advance
+        LDRB    r14, driveno+1          ; get drive number
+        STRB    r14, [r1,#-2]
+        EXIT
+
+
+;----------------------------------------
+;
+;      Here we go with share code!
+;
+;----------------------------------------
+
+        MACRO
+$l      checkac     $path, $action
+$l      ADR         r1, $path
+        MOV         r0, $action
+        SWI         XOS_File
+        MEND
+
+        MACRO
+$l      createf     $path, $action
+$l      MOV         r0, $action
+        ADR         r1, $path
+        SWI         XOS_Find
+        MEND
+
+open_sharewin
+        MOV     r11, #0
+
+        ADRL    r1, driveno               ; re-read media name
+        BL      GetMediaName ;_nochecks   ; returns with r1 -> "CDFS::discname"
+        ADD     r1, r1, #:LEN:"CDFS::"    ; r1 -> discname
+
+        Push    "r1"                      ; insert in icon #1 the name of the disc
+        ADR     r1, userdata+&100
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        MOV     r0, #1
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        ADDVS   sp, sp, #4
+        BVS     %FT01
+
+        ADR     r1,userdata+&100
+        LDR     r14,[r1,#28]
+
+        Pull    "r1"
+11
+        LDRB    r3, [r1], #1
+        STRB    r3, [r14], #1
+        CMP     r3, #32
+        BGE     %BT11
+
+        ADR     r1, userdata+&100
+        MOV     r0, #0
+        STR     r0, [r1, #8]
+        STR     r0, [r1, #12]
+        SWI     XWimp_SetIconState
+01
+        MOV     r7, #0                   ; Flag no file open
+
+        checkac Accpath, #17
+        CMP     r0, #2
+        BNE     %FT05
+        checkac  fname1, #17
+        CMP     r0, #1                   ; r0 = 1 -> file exists
+        BNE     %FT05
+        createf fname1, #&C3
+        MOV     r7, r0                   ; save file handle
+
+        MOV     r4, #0                   ; initialize buffer to 0
+        ADRL    r5, buffertemp
+        STRB    r4, [r5]
+        MOV     r9, r5
+        MOV     r4, #&0A                 ; newline char
+        MOV     r6, #" "                 ; space char
+04
+        MOV     r1, r7                   ; get first byte from sharecd file
+        SWI     XOS_BGet
+        BCS     %FT05
+
+        ADRL    r1, driveno              ; read media name
+        ADD     r1, r1, #1
+        LDRB    r2, [r1]
+        CMP     r0, r2                   ; is the drive?
+        BNE     %FT06
+02
+        MOV     r1, r7
+        SWI     XOS_BGet
+        BCS     %FT05
+        SWI     XOS_BGet
+        BCS     %FT05
+02
+        SWI     XOS_BGet
+        CMP     r0, r6
+        BNE     %BT02
+        STRB    r0, [r5, #-1]
+01
+        SWI     XOS_BGet
+        CMP     r0, r4
+        BEQ     %FT98
+        STRB    r0, [r5], #1
+        B       %BT01
+98
+        MOV     r3, #0
+        STRB    r3, [r5]
+        Push    "r1"                     ; insert in icon #1 the name of the disc
+        ADR     r1, userdata+&100
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        MOV     r0, #2
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        ADDVS   sp, sp, #4
+        BVS     %FT05
+        ADR     r1,userdata+&100
+        LDR     r14,[r1,#28]
+        Pull    "r1"
+11
+        LDRB    r3, [r9], #1
+        CMP     r3, #" "
+        STRGEB  r3, [r14], #1
+        ADD     r11, r11, #1        
+        BGE     %BT11
+
+        ADR     r1, userdata+&100
+        MOV     r0, #0
+        STR     r0, [r1, #8]
+        STR     r0, [r1, #12]
+        SWI     XWimp_SetIconState
+        B       %FT05
+06
+        MOV     r1, r7
+        SWI     XOS_BGet
+        BCS     %FT05
+        CMP     r0, r4
+        BNE     %BT06
+        B       %BT04
+05
+        CMP     r11, #0
+        BNE     %FT01
+
+        ADRL    r1, driveno               ; re-read media name
+        BL      GetMediaName ;_nochecks   ; returns with r1 -> "CDFS::discname"
+        ADD     r1, r1, #:LEN:"CDFS::"    ; r1 -> discname
+
+        MOV     r3, r1                  ; r3->string to copy.
+        ADR     r1, userdata+&100
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        MOV     r0, #2
+        STR     r0, [r1, #4]
+        SWI     XWimp_GetIconState
+        BVS     %FT01
+
+        LDR     r4, [r1, #28]           ; r4->indirect data
+        LDR     r14, [r1, #36]          ; r14 = length of indirect data
+
+        ADD     r5, r4, #1              ; So we can work out string length for Wimp_SetCaretPosition.
+11
+        LDRB    r0, [r3], #1
+        CMP     r0, #" "                ; If byte to copy is not terminator
+        SUBGTS  r14, r14, #1            ;   then reduce count.
+        MOVLE   r0, #0                  ; If byte to copy was terminator or count has reached 0 then terminate.
+        STRB    r0, [r4], #1
+        BGT     %BT11
+        SUB     r5, r4, r5              ; r5 = string length for Wimp_SetCaretPosition
+
+        ADR     r1, userdata+&100
+        MOV     r0, #0
+        STR     r0, [r1, #8]
+        STR     r0, [r1, #12]
+        SWI     XWimp_SetIconState        
+01
+        ADR     r1, userdata              ; open share window
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        SWI     XWimp_GetWindowState
+        MOVVC   r0,#-1
+        STRVC   r0, [r1,#28]
+        SWIVC   XWimp_OpenWindow
+
+        LDRVC   r0, sharewin_handle       ; give it the caret
+        MOVVC   r1, #2
+        MOVVC   r4, #-1
+        SWIVC   XWimp_SetCaretPosition
+
+        MOVS    r1, r7                  ; close file ShareCD (if open)
+        MOVNE   r0, #0
+        SWINE   XOS_Find
+
+        EXIT
+
+GoUnShare_CD
+        LDR     r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+0
+        BIC     r14, r14, #mi_it_tick
+        STR     r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+0
+
+        ADR     r1, userdata+&100           ; get icon #2 indirect data (shared name)
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        MOV     r0, #2
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        LDR     r3, [r1, #28]           ; Indirected icon at +20 icon data
+        MOV     r1, r3
+        SWI     XShareD_StopShare       ; calls shared_stopshare
+
+     ;   MOVVS   r1, #2_001              ; 'Ok' button
+     ;   BLVS    ReportError             ; error if shared_createshare fails
+     ;   BVS     ErrorAbort              ; error from reporterror!
+
+        ADR     r1, userdata            ; close share window
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        SWI     XWimp_CloseWindow
+
+        B       delete_entry
+ 
+        EXIT
+
+
+delete_entry                            ; delete the entry in sharecd file when the disc is unshared
+        checkac Accpath, #17
+
+        CMP     r0, #2
+        BNE     %FT03
+
+        checkac  fname1, #17
+        CMP     r0, #1                  ; r0 = 1 -> file exists
+        BNE     %FT03
+
+        createf fname1, #&C3
+        MOV     r7, r0                   ; save file handle
+
+        createf tname1, #&83              ; create temporary file (temp)
+        MOV     r8, r0                   ; save file handle
+
+        MOV     r4, #&0A                 ; newline char
+04
+        MOV     r1, r7                   ; get first byte from sharecd file
+        SWI     XOS_BGet
+        BCS     %FT05
+
+        ADRL    r1, driveno              ; read media name
+        ADD     r1, r1, #1
+        LDRB    r2, [r1]
+        CMP     r0, r2                   ; is the drive?
+        BNE     %FT01
+02
+        MOV     r1, r7
+        SWI     XOS_BGet                 ; get the related string ad store in
+        BCS     %FT05                    ; buffertemp
+        CMP     r0, #&0A
+        BNE     %BT02
+        B       %BT04  ; 6 (FT)
+01
+        MOV     r1, r8
+        SWI     XOS_BPut
+06      MOV     r1, r7
+        SWI     XOS_BGet
+        BCS     %FT05
+        CMP     r0, r4
+        BNE     %BT01
+        MOV     r1, r8
+        SWI     XOS_BPut
+        B       %BT04
+05
+        MOV     r0, #0                   ; close file
+        MOV     r1, r7
+        SWI     XOS_Find
+
+        MOV     r0, #0                   ; close file
+        MOV     r1, r8
+        SWI     XOS_Find
+
+        checkac fname1, #6                ; delete old sharecd file
+
+        createf fname1, #&83              ; create new sharecd file (empty so far)
+        MOV     r7, r0                   ; save file handle
+
+        createf tname1, #&43              ; open temp file to read from
+        MOV     r8, r0                   ; save file handle
+
+07      MOV     r1, r8
+        SWI     XOS_BGet
+        BCS     %FT08
+        MOV     r1, r7
+        SWI     XOS_BPut
+        B       %BT07
+08
+        MOV     r0, #0                   ; close file
+        MOV     r1, r8
+        SWI     XOS_Find
+
+        checkac tname1, #6                ; delete temp file
+
+        MOV     r0, #0                   ; close file
+        MOV     r1, r7
+        SWI     XOS_Find
+03
+        EXIT
+
+check_access ENTRY
+        checkac Accpath, #17
+        CMP     r0, #2
+        BLEQ    check_sharefile
+        EXITS
+
+check_sharefile ENTRY
+        checkac fname1, #17
+        CMP     r0, #1
+        BLEQ    issue_shares
+        EXITS
+
+Dpath   DCB     "<AccessCD$dir>"
+        DCB     0
+        ALIGN
+
+Accpath DCB     "<AccessCDS$dir>"
+        DCB     0
+        ALIGN
+
+tname   DCB     "<AccessCD$dir>.temp"
+        DCB     0
+        ALIGN
+
+tname1  DCB     "<AccessCDS$dir>.temp"
+        DCB     0
+        ALIGN
+
+fname   DCB     "<AccessCD$dir>.sharecd"
+        DCB     0
+        ALIGN
+
+fname1  DCB     "<AccessCDS$dir>.sharecd"
+        DCB     0
+        ALIGN
+
+        LTORG
+
+GoShare_disc
+        ENTRY
+        checkac Accpath, #17
+        CMP     r0, #2
+        BNE     %FT03
+        checkac fname1, #17
+        CMP     r0, #1                   ; r0 = 1 -> file exists
+        BEQ     %FT66
+
+        ; create sharecd file
+        createf fname1, #&83
+        MOV     r7, r0                   ; save file handle
+        ADRL    r1, driveno              ; re-read media name
+        ADD     r1, r1, #1
+        MOV     r4, #0
+        ADRL    r0, buffershare
+        STRB    r4, [r0]
+        MOV     r2, r1
+        ADRL    r1, buffershare          ; buffershare -> drive number
+        BL      strcat
+        MOV     r2, #" "
+        ADRL    r1, buffershare
+        STRB    r2, [r1, #1]
+
+        MOV     r2, #0
+        ADRL    r1, buffershare
+        STRB    r2, [r1, #2] 
+
+        ADRL    r1, driveno              ; re-read media name
+        BL      GetMediaName ;_nochecks  ; returns with r1 -> "CDFS::discname"
+        ADD     r1, r1, #:LEN:"CDFS::"   ; r1 -> discname
+        
+        MOV     r2, r1
+        ADRL    r1, buffershare
+        BL      strcat
+
+        BL      strlen
+      
+        MOV     r3, #" "
+        STRB    r3, [r1, r2]!
+
+        MOV     r3, #0
+        STRB    r3, [r1, #1]
+
+        ADR     r1, userdata+&100
+        LDR     r0, sharewin_handle      ; get icon #2 indirect data (shared name)
+        STR     r0, [r1]
+        MOV     r0, #2
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        LDR     r3, [r1, #28]            ; Indirected icon at +20 icon data
+
+        MOV     r2, r3
+        ADRL    r1, buffershare
+        BL      strcat
+
+        BL      strlen
+        ADD     r2, r2, #1
+        STR     r2, bufferlen            ; lenght of the string + return char (strlen + 1)
+
+        MOV     r4, #&0A
+        SUB     r2, r2, #1
+        STRB    r4, [r1, r2]
+
+        MOV     r0, #2
+        MOV     r2, r1
+        MOV     r1, r7
+        LDR     r3, bufferlen
+        SWI     XOS_GBPB
+
+        MOVVS   r1, #2_001              ; 'Ok' button
+        BLVS    ReportError
+        BVS     ErrorAbort              ; error from reporterror!
+
+        MOV     r0, #0                  ; close file
+        MOV     r1, r7
+        SWI     XOS_Find
+        B       %FT03
+66
+        ; Update sharecd file
+        createf fname1, #&C3
+        MOV     r7, r0
+        createf tname1, #&83
+        MOV     r8, r0
+
+        MOV     r4, #0                   ; initialize buffer to 0
+        ADRL    r5, buffertemp
+        STRB    r4, [r5]
+        MOV     r4, #&0A                 ; newline char
+04
+        MOV     r1, r7                   ; get first byte from sharecd file
+        SWI     XOS_BGet
+        BCS     %FT05
+
+        ADRL    r1, driveno              ; read media name
+        ADD     r1, r1, #1
+        LDRB    r2, [r1]
+        CMP     r0, r2                   ; is the drive?
+        BNE     %FT01
+02
+        MOV     r1, r7
+        STRB    r0, [r5], #1             ; if the drive number is the same then  
+        SWI     XOS_BGet                 ; get the related string ad store in
+        BCS     %FT05                    ; buffertemp
+        CMP     r0, #&0A
+        BNE     %BT02
+        MOV     r0,#0
+        STRB    r0,[r5]
+        B       %BT04
+01
+        MOV     r1, r8
+        SWI     XOS_BPut
+06      MOV     r1, r7
+        SWI     XOS_BGet
+        BCS     %FT05
+        CMP     r0, r4
+        BNE     %BT01
+        MOV     r1, r8
+        SWI     XOS_BPut
+        B       %BT04
+05
+        BL      unshare_previous
+
+        MOV     r0, #0                   ; close file
+        MOV     r1, r7
+        SWI     XOS_Find
+
+        MOV     r0, #0                   ; close file
+        MOV     r1, r8
+        SWI     XOS_Find
+
+        checkac fname1, #6               ; delete old sharecd file
+        createf fname1, #&83             ; create new sharecd file (empty so far)
+        MOV     r7, r0                   ; save file handle
+        createf tname1, #&43             ; open temp file to read from
+        MOV     r8, r0                   ; save file handle
+07
+        MOV     r1, r8
+        SWI     XOS_BGet
+        BCS     %FT08
+        MOV     r1, r7
+        SWI     XOS_BPut
+        B       %BT07
+08
+        MOV     r0, #0                   ; close file
+        MOV     r1, r8
+        SWI     XOS_Find
+        
+        checkac tname1, #6                ; delete temp file
+
+        MOV     r0, #0                   ; close file
+        MOV     r1, r7
+        SWI     XOS_Find
+03
+        ADR     r1, userdata+&100       ; get icon #2 indirect data (shared name)
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        MOV     r0, #2
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        LDR     r3, [r1, #28]           ; Indirected icon at +20 icon data
+        MOV     r1, r3                  ; r3 -> indirect_data of icon #2
+
+        MOV     r7, #0                  ; check str lenght
+05      LDRB    r14, [r1], #1
+        CMP     r14, #&20
+        ADDHS   r7, r7, #1              ; r7 -> str lenght
+        BHS     %BT05
+
+        ADRL    r1, driveno             ; read media name
+        BL      GetMediaName ;_nochecks ; returns with r1 -> "CDFS::discname"
+        ADD     r1, r1, #:LEN:"CDFS::"  ; r1 -> discname
+        MOV     r5, r1
+
+        MOV     r4, #0                  ; check str lenght
+05      LDRB    r14, [r1], #1
+        CMP     r14, #0
+        ADDNE   r4, r4, #1              ; r4 -> str lenght
+        BNE     %BT05
+
+        CMP     r4, r7                  ; have the 2 string the same lenght?
+        BNE     %FT99
+
+        MOV     r1, r3                  ; they have the same lenght: now let's cmp them
+        BL      strcmp
+        CMP     r2, #0                  ; r2 <> 0 -> strings are different
+        BNE     %FT99
+
+        ADR     r1, userdata+&100       ; get icon #1 indirect data (shared name)
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        MOV     r0, #1
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        LDR     r3, [r1, #28]           ; Indirected icon at +20 icon data
+
+        ADRL    r1, driveno             ; read media name
+        BL      GetMediaName ;_nochecks ; returns with r1 -> "CDFS::discname"
+        MOV     r8, r1
+        SUB     r1, r1, #0              ; r1 -> original drive number
+        ADD     r1, r1, #:LEN:"CDFS::"  ; r1 -> discname
+02
+        LDRB    r6, [r1], #1
+        TEQ     r6, #0
+        BNE     %BT02
+        SUB     r1, r1, #1
+        ADR     r2, dotdollar1
+        BL      strcpy_advance
+
+        MOV     r0, #16                 ; r0 -> 16 (bit 4 set to 1 -> -CDROM option set)
+        MOV     r2, r8
+        MOV     r1, r3
+        SWI     XShareD_CreateShare     ; calls shared_createshare
+        B       %FT98
+99
+        ADR     r1, userdata+&100            ; get icon #2 indirect data (shared name)
+        LDR     r0, sharewin_handle
+        STR     r0, [r1]
+        MOV     r0, #2
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        LDR     r3, [r1, #28]           ; Indirected icon at +20 icon data
+
+        ADRL    r1, driveno             ; read media name
+        BL      GetMediaName ;_nochecks   ; returns with r1 -> "CDFS::discname"
+        MOV     r8, r1
+        SUB     r1, r1, #0              ; r1 -> original drive number
+        ADD     r1, r1, #:LEN:"CDFS::"  ; r1 -> discname
+02
+        LDRB    r6, [r1], #1
+        TEQ     r6, #0
+        BNE     %BT02
+
+        ADR     r2, dotdollar1
+        BL      strcpy_advance
+
+        MOV     r0, #16                 ; r0 -> 16 (bit 4 set to 1 -> -CDROM option set)
+        MOV     r2, r8
+        MOV     r1, r3
+        SWI     XShareD_CreateShare     ; calls shared_createshare
+98
+     ;  tick share entry 
+        LDR     r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+0
+        ORR     r14,r14,#mi_it_tick
+        STR     r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+0
+
+        ADR     r1, userdata            ; close share window
+        LDR     r0, sharewin_handle
+        STR     r0, [r1, #mo_cf_shared]
+        SWI     XWimp_CloseWindow
+
+        EXIT
+
+issue_shares ENTRY "r0-r12"
+        createf fname1, #&43
+        MOV     r7, r0
+        MOV     r4, #&0A
+        MOV     r6, #" "
+        MOV     r3, #0
+        ADRL    r5, buffershare
+        STRB    r3, [r5]
+        ADRL    r8, buffertemp
+        STRB    r3, [r8]
+99
+        MOV     r1, r7
+        SWI     XOS_BGet
+        BCS     %FT05
+        SWI     XOS_BGet
+        BCS     %FT05
+02
+        SWI     XOS_BGet
+        STRB    r0, [r5], #1
+        CMP     r0, r6
+        BNE     %BT02
+        STRB    r3, [r5, #-1]
+01
+        SWI     XOS_BGet
+        CMP     r0, r4
+        BEQ     %FT98
+        STRB    r0, [r8], #1
+        B       %BT01
+98
+        STRB    r3, [r8]
+        ADRL    r2, drivecd
+        ADRL    r4, buffertemp2
+        STRB    r3, [r4]
+        MOV     r1, r4
+03
+        LDRB    r6, [r2], #1
+        STRB    r6, [r4], #1
+        CMP     r6, r3
+        BNE     %BT03
+
+        ADRL    r2, buffershare
+        BL      strcat
+        MOV     r3, r1
+02
+        LDRB    r6, [r1], #1
+        TEQ     r6, #0
+        BNE     %BT02
+
+        SUB     r1, r1, #1
+        ADR     r2, dotdollar1
+        BL      strcpy_advance
+        MOV     r2, r3
+        ADRL    r1, buffertemp
+
+        MOV     r0, #16                 ; r0 -> 16 (bit 4 set to 1 -> -CDROM option set)
+        SWI     XShareD_CreateShare       ; calls shared_createshare
+
+        MOVVS   r1, #2_001              ; 'Ok' button
+        BLVS    ReportError             ; error if shared_createshare fails
+        BVS     ErrorAbort              ; error from reporterror!
+                
+     ;  tick share entry 
+        LDR     r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+0
+        ORR     r14,r14,#mi_it_tick
+        STR     r14, m_cdromdisc+m_headersize+mi_size*mo_cd_sharedisc+0
+
+        B       %BT99
+05
+        MOV     r0, #0                   ; close file
+        MOV     r1, r7
+        SWI     XOS_Find
+
+        EXITS
+
+dotdollar1      DCB     "."             ; share $ with ...
+dollar1         DCB     "$", 0          ; directory title
+                ALIGN
+
+drivecd         DCB     "CDFS::"
+                DCB     0
+                ALIGN
+
+unshare_previous  ENTRY "r0-r12"
+        MOV     r6, #" "
+        MOV     r3, #0                  ; initialize buffer to 0
+        ADRL    r9, m_tempdisc
+        STRB    r3, [r9]
+        MOV     r11, #0
+01         
+        LDRB    r10, [r5,#-1]!
+        CMP     r10, r6
+        ADDNE   r11, r11, #1
+        BEQ     %FT02
+        STRB    r10, [r9], #1
+        B       %BT01
+02
+        MOV     r3, #0                  ; initialize buffer to 0
+        ADRL    r4, m_tempdisc2
+        STRB    r3, [r4]
+        MOV     r6, r4
+        MOV     r3, r11
+04
+        LDRB    r10, [r9,#-1]!
+        CMP     r3, #0
+        BEQ     %FT03
+        STRB    r10, [r4], #1
+        SUB     r3, r3, #1
+        B       %BT04
+03
+        MOV     r0, #0
+        MOV     r1, r6
+        SWI     XShareD_StopShare        ; calls shared_createshare
+
+;        MOVVS   r1, #2_001              ; 'Ok' button
+;        BLVS    ReportError             ; error if shared_createshare fails
+;        BVS     ErrorAbort              ; error from reporterror!
+01
+        MOV     r0, #0
+        STRB    r0, [r4]
+
+        ADRL    r1, driveno              ; re-read media name
+        ADD     r1, r1, #1
+        MOV     r4, #0
+        ADRL    r0, buffertemp2
+        STRB    r4, [r0]
+        MOV     r2, r1
+        ADRL    r1, buffertemp2          ; buffertemp2 -> drive number
+        BL      strcat
+
+        MOV     r2, #" "
+        ADRL    r1, buffertemp2
+        STRB    r2, [r1, #1]
+
+        MOV     r2, #0
+        ADRL    r1, buffertemp2
+        STRB    r2, [r1, #2] 
+
+        ADRL    r1, driveno             ; re-read media name
+        BL      GetMediaName ;_nochecks   ; returns with r1 -> "CDFS::discname"
+        ADD     r1, r1, #:LEN:"CDFS::"  ; r1 -> discname
+
+        MOV     r2, r1
+        ADRL    r1, buffertemp2
+        BL      strcat
+
+        BL      strlen
+      
+        MOV     r3, #" "
+        STRB    r3, [r1, r2]!
+
+        MOV     r3, #0
+        STRB    r3, [r1, #1] 
+
+        ADR     r1, userdata+&100      
+        LDR     r0, sharewin_handle     ; get icon #2 indirect data (shared name)
+        STR     r0, [r1]
+        MOV     r0, #2
+        STR     r0, [r1,#4]
+        SWI     XWimp_GetIconState
+        LDR     r3, [r1, #28]           ; Indirected icon at +20 icon data
+
+        MOV     r2, r3
+        ADRL    r1, buffertemp2
+        BL      strcat
+
+        BL      strlen
+        ADD     r2, r2, #1
+        STR     r2, bufferlen2           ; lenght of the string + return char (strlen + 1)
+
+        MOV     r4, #&0A
+        SUB     r2, r2, #1
+        STRB    r4, [r1, r2]
+        ADD     r2, r2, #1
+        MOV     r4, #0
+        STRB    r4, [r1, r2]
+
+        MOV     r0, #2
+        MOV     r2, r1
+        MOV     r1, r8
+        LDR     r3, bufferlen2
+        SWI     XOS_GBPB
+
+        MOVVS   r1, #2_001              ; 'Ok' button
+        BLVS    ReportError
+        BVS     ErrorAbort              ; error from reporterror!
+
+        EXITS
+
+strcmp  ENTRY
+01      LDRB    r10, [r1], #1
+        LDRB    r14, [r5], #1
+        CMP     r10, #0
+        BNE     %FT02
+        CMP     r14, #0
+        MOVEQ   r2, #0
+        BEQ     %FT99 
+02 
+        CMP     r14, r10
+        BEQ     %BT01
+        MOV     r2, #1
+99
+        EXITS
+
+
+; A couple of procedure to tick and check sharedisc submenu 
+; In    r1 -> menu
+
+EncodeMenu ENTRY "r0, r1"
+
+        ADD     r1, r1, #m_headersize     ; skip menu header
+
+01      LDR     r0, [r1, #mi_itemflags]
+
+        BIC     r0, r0, #mi_it_tick       ; ensure all unticked to start with
+        STR     r0, [r1, #mi_itemflags]
+
+        LDR     r14, [r1, #mi_iconflags]!
+        BIC     r14, r14, #is_shaded      ; ensure none greyed out
+        STR     r14, [r1], #(mi_size - mi_iconflags)
+
+        TST     r0, #mi_it_lastitem       ; last item in menu?
+        BEQ     %BT01                     ; [no]
+
+        EXIT
+
+; In    r1 -> menu
+;       r2 = item to tick
+; Out   item marked as ticked, flags preserved
+
+TickMenu ENTRY "r1, r2"
+        ADD     r1, r1, #m_headersize + mi_itemflags ; skip menu header
+                                          ; and item fields before itemflags
+   ASSERT mi_size = 24
+        ADD     r2, r2, r2, LSL #1        ; *3
+        LDR     r14, [r1, r2, LSL #3]     ; *24
+        ORR     r14, r14, #mi_it_tick     ; 'tick' corresponding entry
+        STR     r14, [r1, r2, LSL #3]
+        EXITS
+
+; In    r1 -> menu
+;       r2 = item to untick
+; Out   item marked as ticked, flags preserved
+UnTickMenu ENTRY "r1, r2"
+        ADD     r1, r1, #m_headersize + mi_itemflags ; skip menu header
+                                          ; and item fields before itemflags
+   ASSERT mi_size = 24
+        ADD     r2, r2, r2, LSL #1        ; *3
+        LDR     r14, [r1, r2, LSL #3]     ; *24
+        BIC     r14, r14, #mi_it_tick     ; 'tick' corresponding entry
+        STR     r14, [r1, r2, LSL #3]
+        EXITS
+
+;----------------------------------------
+;----------------------------------------
+;----------------------------------------
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In     r1 -> drive spec eg. :0
+
+; Out    r1 -> media name (in dirnamebuffer) - "CDFS::discname"
+
+GetMediaName ENTRY "r1-r3"
+
+getmedialoop
+
+        BL      GetMediaName_nochecks
+
+        DebugS  media,"GetMediaName returning ",r1
+
+        STR     r1, [sp]                ; ensure r1 correct on return
+
+        BL      checkambiguous
+        EXIT    VC
+        EXIT    NE                      ; V set, so don't worry about Z
+
+;*************
+; Ambiguous disc name error !
+;*************
+
+; generate suitable warning message for the user
+
+;****** Dismount drive number 'x'  This bit works fine '*cdfs:dismount 0'
+
+        addr    r3, dismount
+        BL      copycommand             ; dismount by drive number
+        ADRL    r0, userdata
+        SWI     XOS_CLI
+        EXIT    VS
+
+
+;--------------------------------------------------
+; Ambiguous disc name error not reported any more
+;--------------------------------------------------
+
+        [ Version <= 201
+
+;****** Ask if you wish to forget about the old disc  OK
+
+        ADR     r0, err_ambiguous
+        MOV     r1, #2_011
+        BL      ReportError
+        TEQ     r1, #1                  ; did the user say "OK"?
+        EXIT    NE                      ; no!
+
+        ]
+
+
+;***** *dismount cdfs::discname - this closes all of the windows on desktop
+
+        LDR     r1, [sp]                ; dismount by disc name (inc. dirs)
+
+
+;---------------------------------
+; Dismount the drive by name
+;---------------------------------
+
+        [ Version > 201
+        BL      dismountit_byname
+        |
+        BL      dismountit
+        ]
+
+;---------------------------------
+
+        ADRL    r1, driveno
+        B       getmedialoop            ; try again!
+
+
+      [ Version > 201
+dismountit_byname       ENTRY "r1"
+
+        ADRL    r3, dismount
+        BL      copycommand
+        SUB     r1, r1, #2              ; r1 -> original drive number
+        LDR     r2, [sp]                ; r2 -> "cdfs::discname"
+        ADD     r2, r2, #:LEN:"cdfs::"  ; r2 -> discname
+        BL      strcpy
+        ADRL    r0, userdata
+
+        SWI     XOS_CLI
+        EXIT
+
+      ]
+
+
+      ; NOEXIT
+
+
+checkambiguous ENTRY "r1-r5"
+
+        MOVVC   r0, #OSFile_ReadInfo    ; see if we get "ambiguous disc name"
+        SWIVC   XOS_File
+;        TEQVC   r0, r0                  ; ensure Z set!
+        TEQVC   pc, #0
+        EXIT    VC
+
+        LDR     r14, [r0]               ; check error number
+        LDR     r2, =&1089E             ; "ambiguous disc name"
+        TEQ     r14, r2
+        EXIT
+
+
+
+;--------------------------------------------
+; Ambiguous disc names are no longer reported
+;--------------------------------------------
+
+        [ Version <= 201
+err_ambiguous
+        DCD     1
+        DCB     "This disc has a name that has been seen before.  "
+        DCB     "Forget the old one?", 0
+        ALIGN
+        ]
+
+;-------------------------------------------------------------------------------
+; Old way of getting the disc name
+;-------------------------------------------------------------------------------
+
+        [ Version <= 201
+
+star_dir_CDFS   DCB     "%Dir CDFS:", 0
+star_back       DCB     "%Back", 0
+                ALIGN
+
+GetMediaName_nochecks ENTRY "r1-r7"
+
+        ADRL    r1, dirnamebuffer
+        ADR     r2, star_dir_CDFS       ; "%dir CDFS:" needed anyway
+        BL      strcpy                  ; (even if SCSI_DescribeDisc used)
+
+        MOV     r0, #0                  ; Read current FS
+        MOV     r1, #0  
+        SWI     XOS_Args                ; returns R0 = filing system number
+        EXIT    VS
+
+
+
+        MOV     r6, r0                  ; Preserve FS
+
+        ADRL    r1, dirnamebuffer
+        LDR     r2, [sp, #0]            ; r1in
+        BL      strcat                  ; r1 -> r1(string) + r2(string) +null
+        MOV     r0, r1                
+
+        SWI     XOS_CLI                 ; dir CDFS::0 or whatever drive
+        EXIT    VS
+
+ 
+        ADRL    r2, userdata+&80     ; r2 -> buffer
+        MOV     r3, #&80             ; r3 = buffer size        
+        MOV     r0, #OSGBPB_ReadDiscName  ; #5
+        SWI     XOS_GBPB
+      
+        MOV     r3, r0
+        MOV     r7, psr
+        addr    r0, star_back        ; issue '%back' always
+        SWI     XOS_CLI
+
+        MOV     r4, r0
+        MOV     r5, psr
+        MOV     r0, #FSControl_SelectFS ; restore FS always
+        MOV     r1, r6
+        SWI     XOS_FSControl
+        MOVVC   r0, r4
+        TEQVCP  r5, #0
+        MOVVC   r0, r3
+        TEQVCP  r7, #0
+        EXIT    VS
+
+        ADRL    r2, userdata+&80
+        LDRB    r3, [r2], #1           ; length of discname
+        MOV     r14, #0                ; if "Unnamed" SCSI returns null
+        STRB    r14, [r2, r3]          ; put in terminator. r2 -> discname
+
+gotdiscname
+        LDRB    r14, [r2]            ; r2 -> disc name
+        CMP     r14, #delete         ; (delete or <= space) = terminator
+        CMPNE   r14, #space          ; if null, recover drive number instead
+
+        LDRLS   r2, [sp, #0]         ; r1in = ':4' etc
+        ADDLS   r2, r2, #1           ; r2 -> '4' etc
+        ADRL    r3, dirnamebuffer
+        ADD     r1, r3, #:LEN:"%dir CDFS:"
+        MOV     r14, #":"             ; Append ':'
+        STRB    r14, [r1], #1
+        BL      strcpy_space          ; Append discname: not strcat !
+
+        ADD     r1, r3, #:LEN:"%dir "
+        STR     r1, [sp, #0]          ; return 'CDFS::DiscName' or 'CDFS::4'
+
+        EXIT
+
+        |
+
+;-----------------------------------------------------------------------------------------
+; New way of getting the disc name
+;-----------------------------------------------------------------------------------------
+
+GetMediaName_nochecks ENTRY "r1-r7"
+
+; Build up a buffer of 'CDFS::x.$'
+
+
+; 'CDFS:'
+        ADRL    r1, dirnamebuffer
+        addr    r2, CDFScolon
+        BL      strcpy_advance
+
+; 'CDFS::'
+        addr    r2, CDFScolon + (?CDFScolon) - 1
+        BL      strcpy_advance
+
+; 'CDFS::xxxx'
+        LDR     r2, [ sp ]
+        BL      strcpy_advance
+
+; 'CDFS::xxxx.$'
+        addr    r2, dotdollar
+        BL      strcpy_advance
+
+; Get the canonical disc name
+        MOV     r5, #&80
+        ADD     r2, r1, #2
+        ADRL    r1, dirnamebuffer
+        MOV     r0, #37
+        MOV     r3, #0
+        MOV     r4, #0
+
+        SWI     XOS_FSControl
+
+; Terminate the disc name to give 'CDFS::xxxxx' from 'CDFS::xxxxx.$'
+        MOV     r14, #0
+        RSBVC   r5, r5, #&80 - 2
+        STRVCB  r14, [ r2, r5 ]
+        STRVSB  r14, [r2, #-4]
+        MOVVS   r2, r1
+
+; Return a pointer to the name
+        STR     r2, [ sp ]
+
+         EXIT
+        ]
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Out   cx0, cy0 = coords of mouse pointer
+;       other regs corrupt
+
+GetPointerInfo ROUT
+
+        Push    "r1, r2-r6, lr"         ; poke pointer info into stack
+
+        ADD     r1, sp, #4
+        SWI     XWimp_GetPointerInfo
+        LDMVCIA r1, {cx0, cy0}
+
+        LDR     r1, [sp], #6*4          ; Restore r1, kill temp frame
+        Pull    "pc"
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Set up icon bar entries for CDFS
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Out   much corruption
+
+        LTORG
+
+        [ Version > 201
+ic_player0
+ = ":0",0,0,":1",0,0,":2",0,0,":3",0,0,":4",0,0,":5",0,0,":6",0,0,":7",0,0,":8",0,0,":9",0,0
+ = ":10",0,":11",0,":12",0,":13",0,":14",0,":15",0,":16",0,":17",0,":18",0
+ = ":19",0,":20",0,":21",0,":22",0,":23",0,":24",0,":25",0,":26",0,":27",0
+
+        |
+
+ic_player0
+ = ":0",0,":1",0,":2",0,":3",0,":4",0,":5",0,":6",0,":7",0,":8",0,":9",0
+ = ":10",0,":11",0,":12",0,":13",0,":14",0,":15",0,":16",0,":17",0,":18",0
+ = ":19",0,":20",0,":21",0,":22",0,":23",0,":24",0,":25",0,":26",0,":27",0
+
+        ]
+
+SetUpIconBar ENTRY
+        
+        SWI     XCDFS_GetNumberOfDrives
+        MOVS    r2, r0
+        BNE     dont_worry   ;don't worry if there is at least one drive
+        SWI     XCDFS_ConvertDriveToDevice
+        BVS     dont_worry
+
+        CMP     r1, #-1  ;if there is at least one drive...
+        MOVNE   r2, #1   ;...then set up one icon  
+
+dont_worry
+
+        [ Version > 201
+
+        addr    r1, ic_player0 - 4         ; r1->:<drive number>,0
+        ADD     r1, r1, r2, LSL #2
+
+        |
+
+        addr    r1, ic_player0 - 3         ; r1->:<drive number>,0
+        ADD     r14, r2, r2, ASL #1
+        ADD     r1, r1, r14
+        SUBS    r14, r2, #10
+        ADDGT   r1, r1, r14
+
+        ]
+
+
+        MOV     r4, #-1
+
+more_drives
+        ADD     r4, r4, #1             ; r4 = icon handle index
+        CMP     r4, r2
+        EXIT    GE
+
+       [ Version >= 213
+        STR     r4, loop
+       ]
+
+;-------- AddToIconBar routine
+
+        Push   "r1-r2"
+
+        ADD     r2, r1, #icb_drivenumber    ; for later
+        [ icb_drivenumber<>0
+        ADD     r1, r1, #icb_drivenumber
+        ]
+        ADD     r3, r1, #len_mediaprefix    ;r3 -> disc name (colon incl)
+
+        ADR     r5, discnames
+        ADD     r5, r5, r4, LSL #drv_shift
+        ADD     r1, r5, #drv_number
+        BL      strcpy                      ; copy in drive number
+
+        ADD     r1, r5, #drv_number
+        BL      strlen
+        STRB    r2, [r5, #drv_namelen]
+
+        ADR     r2, iconbaricons          ; r2 -> iconbaricons
+        LDR     r3, [r2, r4, LSL #2]!     ; r2 -> [icon to open next to]
+        ADR     r1, cddiscname
+
+;-----------------------------
+;        BL      AllocateIcon              ; r5 -> drive number/name
+;
+;AllocateIcon ENTRY "r1-r5, x0, y0, x1, y1"
+;-----------------------------
+        Push    "r1-r5,x0,y0,x1,y1"
+                    
+        MOV     r2, r1 
+        MOV     r0, #SpriteReason_ReadSpriteSize
+        SWI     XWimp_SpriteOp                ; r3, r4 = pixel size
+
+        MOVVC   r0, r6                        ; creation mode of sprite
+
+        MOVVC   r1, #VduExt_XEigFactor
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   x0, #0
+        ADDVC   x1, x0, r3, LSL r2            ; pixel size depends on sprite
+
+        MOVVC   r1, #VduExt_YEigFactor
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   y0, #20                       ; sprite baseline
+        ADDVC   y1, y0, r4, LSL r2
+        MOVVC   y0, #-16                      ; text baseline
+
+       ; EXIT    VS
+        BVS     %FT11
+
+        ASSERT  x0 > r5
+        LDMIA   sp,{r1-r5}                    ; we need r1 and r5
+
+        LDRB    r4, [r5, #drv_namelen]        ; include name in icon
+        CMP     x1, r4, LSL #4                ; 16 OS units per char
+        MOVLT   x1, r4, LSL #4
+
+        ADRL    r14, userdata
+        MOV     r0, #-2                       ; lhs of icon bar
+        STMIA   r14!, {r0, x0, y0, x1, y1}    ; window handle, icon coords
+        LDR     r0, iconbariconflags          ; r0 = icon flags
+        ADD     r2, r5, #drv_number           ; r2 -> drive number
+;        ADD     r3, r1, #icb_validation       ; r3 -> validation string
+
+;----------------------------------------------------------------------------------
+; Need to build up a sprite name so that it can be changed for photocd, or audio cd
+;----------------------------------------------------------------------------------
+; r4 = drive number
+       [ Version >= 213
+        LDR     r1, loop
+        ADRL    r3, sprite_name_list
+        ADD     r3, r3, r1, LSL #3
+        ADD     r3, r3, r1, LSL #2
+        Push    "r0-r3, r14"
+        MOV     r1, r3
+        ADR     r2, iconspritename
+        BL      strcpy
+        Pull    "r0-r3, r14"
+       |
+        ADR     r3, iconspritename           ; r3->"Scddisc"
+       ]
+;----------------------------------------------------------------------------------
+
+        STMIA   r14, {r0, r2-r4}              ; r4 = length of text
+        
+        
+        ADRL    r1, userdata
+        LDR     r14, wimpversion      ; if Wimp version 2.21 or later,
+        CMP     r14, #221
+        BLT     %FT01
+        LDMIA   sp, {r0, r2-r4}       ; check previous icon handle
+        LDR     r0, [r2]              ; [r2] = previous handle
+        CMP     r0, #0                ; if creating for the first time,
+        RSBLTS  r14, r4, #0           ; if this is not the first icon,
+        LDRLT   r0, [r2, #-4]         ; open to right of previous icon
+        MOVLT   r14, #-4              ; -4 => open to right of icon
+        MOVGE   r14, #-3              ; -3 => open to left of icon / iconbar
+        STR     r14, [r1, #u_handle]
+01
+        SWI     XWimp_CreateIcon
+
+11
+        Pull    "r1-r5, x0, y0, x1, y1"
+
+;---------------
+;;;;;;;;;;;;
+        STRVC   r0, [r2]                  ; save new handle
+
+        Pull    "r1-r2"   ; r3 and r5 corrupted
+
+        EXIT    VS
+
+
+        [ Version > 201
+
+        SUB     r1, r1, #4          ; Move to next icon def
+
+        |
+
+;        ADD     r1, r1, #3         ; Move to next icon def
+;        SUB     r5, r2, r4
+;        CMP     r5, #11
+        SUB     r1, r1, #3
+        CMP     r4, #10
+;        ADDGE   r1, r1, #1
+        SUBGE   r1, r1, #1
+
+
+        ]
+
+        B       more_drives
+
+iconspritename = "S"            ; ALLOW TO RUN ON
+cddiscname = "cddisc",0
+ ALIGN
+
+iconbariconflags
+        DCD     &1700310B       ; text
+                                ; sprite
+                                ; h-centred
+                                ; indirected
+                                ; button type 3
+                                ; fcol 7, bcol 1
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; strcat
+; ======
+;
+; Concatenate two strings
+
+; In    r1, r2 -> CtrlChar/r3 terminated strings
+
+; Out   new string in r1 = "r1" :CC: "r2" :CC: 0
+
+strcat ENTRY "r1-r3"
+
+        MOV     r3, #space-1
+
+05      LDRB    r14, [r1], #1           ; Find where to stick the appendage
+        CMP     r14, #delete            ; Order, you git!
+        CMPNE   r14, r3
+        BHI     %BT05
+        SUB     r1, r1, #1              ; Point back to the term char
+
+10      LDRB    r14, [r2], #1           ; Copy from *r2++
+        CMP     r14, #delete            ; Order, you git!
+        CMPNE   r14, r3                 ; Any char <= r3 is a terminator
+        MOVLS   r14, #0                 ; Terminate dst with 0
+        STRB    r14, [r1], #1           ; Copy to *r1++
+        BHI     %BT10
+
+        EXITS
+
+; ..........................................................................
+;
+; strcpy
+; ======
+;
+; Copy a string and terminate with 0
+
+; In    r1 -> dest area, r2 -> CtrlChar / r3 terminated src string
+
+strcpy ALTENTRY
+
+        MOV     r3, #space-1            ; terminate on ctrl-char
+        B       %BT10
+
+strcpy_space ALTENTRY
+
+        MOV     r3, #space              ; terminate on space or ctrl-char
+        B       %BT10
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; strcpy_advance
+; ==============
+
+; In    r1 -> dest string
+;       r2 -> source string
+
+; Out   r1 -> terminating null
+
+strcpy_advance ENTRY "r2"
+
+10      LDRB    r14, [r2], #1           ; Copy from *r2++
+        CMP     r14, #delete            ; Order, you git!
+        CMPNE   r14, #space-1           ; Any char < space is a terminator
+        MOVLS   r14, #0                 ; Terminate dst with 0
+        STRB    r14, [r1], #1           ; Copy to *r1++
+        BHI     %BT10
+
+        SUB     r1, r1, #1
+        EXITS
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; strlen
+; ======
+;
+; Return the length of a null-terminated string
+
+; In    r1 -> null terminated string
+
+; Out   r2 length 
+
+strlen ENTRY "r1"
+                      
+        MOV     r2, #0
+05      LDRB    r14, [r1], #1      
+        CMP     r14, #0
+        ADDNE   r2, r2, #1
+        BNE     %BT05
+
+        EXITS
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; event_user_message (and _recorded)
+; ==================
+
+; In    r1 -> wimp_eventstr
+;             [r1, #0]     block size
+;             [r1, #12]    your ref
+;             [r1, #16]    message action
+;             [r1, #20...] message data
+
+; Out   all regs may be corrupted - going back to PollWimp
+
+event_user_message ENTRY
+
+        LDR     r0, [r1, #message_action]
+
+;----------------------------------------
+; Interactive help for menus
+;----------------------------------------
+
+      [ Version > 201
+        LDR     r14, =Message_HelpRequest
+        CMP     r0, r14
+        BEQ     returnhelp
+      ]
+
+;----------------------------------------
+
+        CMP     r0, #Message_Quit
+        EXIT    NE
+
+        B       CloseDownAndExit
+;       NOEXIT
+
+
+
+        [ Version > 201
+
+; Token used by the XMessage_Lookup SWI for interactive help
+
+cdi_tag               DCB "CDI", 0
+dismount_tag          DCB "DIS", 0
+configure_tag         DCB "CON", 0
+share_tag             DCB "SHR", 0
+buffers_tag           DCB "BUF", 0
+drives_tag            DCB "DRV", 0
+configure_buffers_tag DCB "CBF", 0
+configure_drives_tag  DCB "CDR", 0
+notshare_tag          DCB "NSH", 0
+sharep_tag            DCB "SHP", 0
+volume_tag            DCB "VOL", 0
+
+         ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r1 -> message block containing help request
+;       LR stacked
+; Out   Message_HelpReply sent
+
+returnhelp
+        LDR     r4, matchedindex        ; preserve old values
+        LDRB    r5, driveno+1
+        Push    "r4, r5"
+
+        LDR     r2, [r1, #ms_data + b_window]
+        LDR     r3, [r1, #ms_data + b_icon]
+
+        CMP     r2, #iconbar_whandle
+        BNE     %FT01
+
+        Push    "R1"
+        MOV     r4, r3
+        BL      matchdriveicon          ; must match: [matchedindex] = which one
+        Pull    "R1"
+        MOV     r0, #&FF                ; "HFF" is the token for the iconbar
+        B       gothelpindex
+01
+
+        CMP     r3, #0                  ; if null icon, don't bother
+        BLT     %FT99                   ; (avoid confusion with parent node)
+
+
+; This bit loads the menu selections r2, r3 , r4 = menu selections
+
+        MOV     r5, r1
+        ADRL    r1, userdata + &80      ; r1 -> buffer for result
+        MOV     r0, #1
+        SWI     XWimp_GetMenuState
+
+        BVS     %FT99
+
+        LDMIA   r1, { r2, r3, r4 }
+
+        MOV     r1, r5
+
+; Which window ?
+        CMP     r3, #-1
+        BEQ     first_window_help
+
+        CMP     r4, #-1
+        BEQ     second_window_help
+
+; Third window : Buffer menu, or drive caret
+third_window_help
+        TEQ     r3, #0
+        ADREQ   r0, configure_buffers_tag
+        ADRNE   r0, configure_drives_tag
+        MOV     r3, #0
+        ADD     r1, r1, #ms_data
+        B       quick_peek
+
+; First window  : Dismount, Configure =>
+first_window_help
+        ADR     r0, configure_tag
+        TEQ     r2, # 1
+        ADREQ   r0, dismount_tag
+        TEQ     r2, # 0
+        ADREQ   r0, volume_tag
+
+        MOV     r3, #0
+        ADD     r1, r1, #ms_data
+        B       quick_peek
+
+; Second window : Buffers =>, Drives =>
+second_window_help
+        TEQ     r3, #0
+        ADREQ   r0, buffers_tag
+        ADRNE   r0, drives_tag
+        MOV     r3, #0
+        ADD     r1, r1, #ms_data
+        B       quick_peek
+
+;------------------------------------------------------------------------------------
+; Display help for the icon on the icon bar, 'This is the CD-ROM drive xx icon ...'
+;------------------------------------------------------------------------------------
+
+gothelpindex
+
+        ADRVCL  r3, userdata + &80     ; r3 -> parameter 0 (drive name)
+
+        LDRVCB  r0, driveno + 1
+        LDRVCB  r2, driveno + 2
+
+        STRVCB  r0, [ r3, #0 ]
+        STRVCB  r2, [ r3, #1 ]
+        TEQVC   r2, #0
+        MOVNE   r2, #0
+        STRVCB  r2, [ r3, #2 ]
+
+        ADRVC   r0, cdi_tag             ; r0 -> "CDI" token
+        ADDVC   r1, r1, #ms_data        ; r1 -> data field of message
+
+;------------------------------------------------------------------------------------
+; Send back a help message for icon on icon bar or menus
+;------------------------------------------------------------------------------------
+
+quick_peek
+
+        MOVVC   r2, #256-ms_data        ; r2 = buffer size
+
+        BLVC    lookuptoken             ; on exit r2 = length of string (ex. 0)
+
+        ADDVC   r2, r2, #4 + ms_data    ; include terminator
+        BICVC   r2, r2, #3
+
+SendHelpMessage
+
+        STRVC   r2, [r1, #ms_size-ms_data]!
+        LDRVC   r14, [r1, #ms_myref]
+        STRVC   r14, [r1, #ms_yourref]
+        LDRVC   r14, =Message_HelpReply
+        STRVC   r14, [r1, #ms_action]
+        MOVVC   r0, #User_Message
+        LDRVC   r2, [r1, #ms_taskhandle]
+        SWIVC   XWimp_SendMessage
+99
+        Pull    "r4, r5"                ; restore static data
+        STR     r4, matchedindex
+        STRB    r5, driveno+1
+
+        EXIT
+
+        ]
+
+
+;..............................................................................
+
+; In    r0 -> token string
+;       r1 -> buffer to copy message into
+;       r2 = size of buffer (including terminator)
+;       r3 -> parameter 0
+;       [messagedata] -> message file descriptor (0 => not yet loaded)
+; Out   message file loaded if not already loaded
+;       [r1..] = message, terminated by 0
+;       r2 = size of string, including the terminator
+
+        [ Version > 201
+str_messagefile DCB     "CDFSFiler:Messages", 0           ;  "<CDFSFilerCompile$Dir>.Messages", 0
+str_templatefile DCB     "CDFSFiler:Templates", 0
+        ]
+
+                ALIGN
+
+
+lookuptoken ENTRY "r0-r7"
+
+        BL      allocatemessagedata             ; r0 -> file desc on exit
+
+        LDMVCIA sp, {r1-r4}
+        MOVVC   r5, #0                          ; parameters 1..3 not used
+        MOVVC   r6, #0
+        MOVVC   r7, #0
+
+        SWIVC   XMessageTrans_Lookup
+
+        STRVC   r3, [sp, #2*4]                  ; r2 on exit = string length
+99
+        STRVS   r0, [sp]
+        EXIT
+
+lookuperror ENTRY "r0-r7"
+
+        BL      allocatemessagedata             ; r0 -> file desc on exit
+
+        MOVVC   r1, r0
+        LDRVC   r0, [sp]
+        MOVVC   r2, #0
+        MOVVC   r4, #0
+        MOVVC   r5, #0                          ; parameters 1..3 not used
+        MOVVC   r6, #0
+        MOVVC   r7, #0
+        SWIVC   XMessageTrans_ErrorLookup
+
+        STR     r0, [sp]
+        EXIT
+
+
+;..............................................................................
+
+; In    [messagedata] -> message file desc (0 => not yet opened)
+; Out   r0 = [messagedata] -> message file desc (opened if not already open)
+
+allocatemessagedata ENTRY "r1, r2"
+
+        LDR     r0, messagedata
+        CMP     r0, #0
+        EXIT    NE
+
+        MOV     r0, #ModHandReason_Claim
+        MOV     r3, #16
+        SWI     XOS_Module
+
+        STRVC   r2, messagedata
+
+        MOVVC   r0, r2
+        ADRVC   r1, str_messagefile
+        MOVVC   r2, #0                          ; no user buffer
+        SWIVC   XMessageTrans_OpenFile
+
+        BLVS    deallocatemessagedata           ; preserves error state
+
+        LDRVC   r0, messagedata
+        EXIT
+
+;..............................................................................
+
+; In    [messagedata] -> message file desc, or = 0 if not loaded
+; Out   [messagedata] = 0, OS_Module (Free) called if required, error preserved
+
+deallocatemessagedata ENTRY "r0,r2"
+
+        LDR     r2, messagedata
+        MOVS    r0, r2
+        EXITS   EQ
+
+        MOV     r14, #0
+        STR     r14, messagedata
+
+        SWI     XMessageTrans_CloseFile         ; tell the MessageTrans module
+
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+
+        EXITS
+
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r1 = state for ReportError
+; Out   r1 = 1 (OK) or 2 (Cancel)
+
+ReportError ENTRY "r2"
+
+
+;----------------------------------------------------
+; Get title from 'Messages' file
+;----------------------------------------------------
+
+        [ Version > 201
+        BL      MkBannerIn_userdata
+        SWI     XWimp_ReportError
+        |
+        addr    r2, CDFSFiler_Banner
+        SWI     XWimp_ReportError
+        ]
+
+;----------------------------------------------------
+
+        EXIT
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Out r2->userdata
+Banner  DCB "Banner", 0
+        ALIGN
+
+MkBannerIn_userdata ENTRY "r0,r1,r3"
+
+        ADR     r0, Banner
+        ADRL    r1, userdata
+        MOV     r2, #?userdata
+        MOV     r3, #0
+        BL      lookuptoken
+
+        ADRVCL  r2, userdata
+        STRVS   r0, [sp]
+        EXIT
+
+
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+ [ debug
+        InsertNDRDebugRoutines
+ ]
+
+        END

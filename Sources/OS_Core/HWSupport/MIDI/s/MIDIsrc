@@ -1,0 +1,4157 @@
+    TTL MIDI ; -> MIDI.MIDIsrc
+;******************************************************************
+;**                                                              **
+;**                  Acorn RISCOS MIDI Software                  **
+;**                                                              **
+;**    MODULE: MIDI for use with MIDI/io podule                  **
+;**            or MIDI podule or MIDI/user port                  **
+;**                                                              **
+;**    AUTHOR: J. Sutton                                         **
+;**            Cherry Hinton x5272                               **
+;**                                                              **
+;**    DATE:   Last edit 30-May-89                               **
+;**                                                              **
+;**    VERSION: 3.11                                             **
+;**                                                              **
+;**    DESCRIPTION: Musical Instruments Digital Interface (MIDI) **
+;**                                                              **
+;**    ENTRIES: SWIs for system level interface                  **
+;**             IRQ  to load and store UART/ACIA                 **
+;**             SIRQ from SoundDMA module to drive sound         **
+;**                  and realtime stuff, approx every 0.01s      **
+;**             Escape Event to update VoiceStates byte, since   **
+;**                    voices are turned off automatically       **
+;**             Sound Event to update bar counter for time-      **
+;**                    stamping of incoming MIDI data.           **
+;**             Uses Sound System modules 0, 1 and 2             **
+;**                  (SoundDMA, SoundChannels, and               **
+;**                   SoundScheduler)                            **
+;**                  these must therefore be loaded for          **
+;**                     proper function of this module.          **
+;**             OSCLI for simple command-line control            **
+;**                                                              **
+;**    CHANGES:                                                  **
+;**      16/5/88 : Release 2                                     **
+;**       5/5/89 : Release 3.05                                  **
+;**      15/5/89 : fixed bugs reported from SQA                  **
+;**              : Release 3.06                                  **
+;**      22/5/89 : fixed bug midi interpreter buffer pointer set **
+;**                and initialisation (in SWI MIDI_SoundEnable)  **
+;**              : Release 3.08                                  **
+;**      25/5/89 : STR [MonoChanels] changed to STRB in          **
+;**        interpreter.                                          **
+;**        In TxNoteOff changed LDRB [SendStatus] to load from   **
+;**        the correct port offset (was 0).                      **
+;**        In ResetHardware specifically disable ACIA IRQ, to    **
+;**        cure a specific problem of IRQ causing machine to     **
+;**        stiff on reset when receiving data. (IO podule only)  **
+;**      26/5/89  : disable irq AND fiq when changing IOCIRQMSKB **
+;**               : Release 3.10                                 **
+;**      30/5/89  : intercept_services, service_sound, check     **
+;**        for and invalidate return from sound_configure with   **
+;**        centisecond_code address. (rmreinit sounddma does not **
+;**        reinstall level2 handler)                             **
+;**               : Release 3.11                                 **
+;**                                                              **
+;******************************************************************
+
+        GET     Hdr:ListOpts  ; These first three must be in this order
+        GET     Hdr:Macros
+        GET     Hdr:System    ; SWI declarations, register names
+
+        GET     Hdr:Services
+        GET     Hdr:ModHand
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+
+        GET     Hdr:PublicWS
+        GET     Hdr:Sound
+        GET     Hdr:Podule
+        GET     Hdr:PoduleReg
+        GET     Hdr:DevNos
+
+        GET     Hdr.MIDI
+        GET     Hdr.MIDIStatus   ; values of midi status bytes as defined by MIDI spec. 1.0
+        GET     Hdr.ACIA   ; details of register offsets, addresses etc. for acia
+        GET     Hdr.UART   ; ditto for uart
+        GET     Hdr.VIA    ; ditto for VIA in MIDI/IO podule
+        GET     Version
+
+    LEADR Module_LoadAddr
+
+MySWIChunkBase * Module_SWISystemBase + MIDISWI * Module_SWIChunkSize
+
+ ASSERT MySWIChunkBase      = MIDI_SoundEnable
+ ASSERT MySWIChunkBase+37-1 = MIDI_Interface ; check SWI numbers
+
+Module_Base                 ; Label for calculating offsets
+     &   0                               ; This module is not an application
+     &   Initialise_Module  - Module_Base
+     &   Finalise_Module    - Module_Base
+     &   Intercept_Services - Module_Base
+     &   Title_String       - Module_Base
+     &   Help_String        - Module_Base
+     &   Module_Keywords    - Module_Base
+     &   MySWIChunkBase                       ; SWI chunk number
+     &   MIDI_SWI_Code      - Module_Base     ; SWI handler code
+     &   MIDI_SWI_Table     - Module_Base     ; SWI decoding table
+     &   0                                    ; no SWI decoding code
+
+Title_String = "MIDI",0
+
+Help_String
+   =       "MIDI podule", 9, Version
+   =       " (", CurrentDate, ")"
+   =       0
+
+; to make SURE the assembled module is the correct version
+check_version = "*V3.11/30/5/89*",0
+
+MIDI_SWI_Table
+  = "MIDI",0
+  = "SoundEnable",0             ;1
+  = "SetMode",0                 ;2
+  = "SetTxChannel",0            ;3
+  = "SetTxActiveSensing",0      ;4
+  = "InqSongPositionPointer",0  ;5
+  = "InqBufferSize",0           ;6
+  = "InqError",0                ;7
+  = "RxByte",0                  ;8
+  = "RxCommand",0               ;9
+  = "TxByte",0                  ;10
+  = "TxCommand",0               ;11
+  = "TxNoteOff",0               ;12
+  = "TxNoteOn",0                ;13
+  = "TxPolyKeyPressure",0       ;14
+  = "TxControlChange",0         ;15
+  = "TxLocalControl",0          ;16
+  = "TxAllNotesOff",0           ;17
+  = "TxOmniModeOff",0           ;18
+  = "TxOmniModeOn",0            ;19
+  = "TxMonoModeOn",0            ;20
+  = "TxPolyModeOn",0            ;21
+  = "TxProgramChange",0         ;22
+  = "TxChannelPressure",0       ;23
+  = "TxPitchWheel",0            ;24
+  = "TxSongPositionPointer",0   ;25
+  = "TxSongSelect",0            ;26
+  = "TxTuneRequest",0           ;27
+  = "TxStart",0                 ;28
+  = "TxContinue",0              ;29
+  = "TxStop",0                  ;30
+  = "TxSystemReset",0           ;31
+  = "IgnoreTiming",0            ;32
+  = "SynchSoundScheduler",0     ;33
+  = "FastClock",0               ;34
+  = "Init",0                    ;35
+  = "SetBufferSize",0           ;36
+  = "Interface",0               ;37
+  = 0
+
+Module_Keywords
+
+  =     "MidiSound",0
+  ALIGN
+  &      MidiSound_Code   - Module_Base
+  =      1,0,2,0                       ; 1 parameter
+  &      MidiSound_Syntax - Module_Base
+  &      MidiSound_Help   - Module_Base
+
+  =     "MidiTouch",0
+  ALIGN
+  &      MidiTouch_Code   - Module_Base
+  =      1,0,1,0                       ; one parameter
+  &      MidiTouch_Syntax - Module_Base
+  &      MidiTouch_Help   - Module_Base
+
+  =     "MidiChannel",0
+  ALIGN
+  &      MidiChannel_Code   - Module_Base
+  =      1,0,1,0                       ; 1 parameter
+  &      MidiChannel_Syntax - Module_Base
+  &      MidiChannel_Help   - Module_Base
+
+  =     "MidiMode",0
+  ALIGN
+  &      MidiMode_Code   - Module_Base
+  =      1,0,1,0                       ; 1 parameter
+  &      MidiMode_Syntax - Module_Base
+  &      MidiMode_Help   - Module_Base
+
+  =     "MidiStart",0
+  ALIGN
+  &      MidiStart_Code   - Module_Base
+  =      0,0,1,0                       ; no parameters
+  &      MidiStart_Syntax - Module_Base
+  &      MidiStart_Help   - Module_Base
+
+  =     "MidiContinue",0
+  ALIGN
+  &      MidiContinue_Code   - Module_Base
+  =      0,0,0,0                       ; no parameters
+  &      MidiContinue_Syntax - Module_Base
+  &      MidiContinue_Help   - Module_Base
+
+  =     "MidiStop",0
+  ALIGN
+  &      MidiStop_Code   - Module_Base
+  =      0,0,0,0                       ; no parameters
+  &      MidiStop_Syntax - Module_Base
+  &      MidiStop_Help   - Module_Base
+
+  = 0        ; no more keywords
+
+MidiSound_Help
+  =  "*MidiSound causes incoming or outgoing MIDI data to play the internal",13
+  =  "sound voices. Can also specify the Midi podule number.",13
+MidiSound_Syntax
+  =  "Syntax: *MidiSound <'off', 'in' or 'out'> (<1..4>)",0
+
+MidiTouch_Help
+  =  "*MidiTouch enables or disables touch response (key velocity) of the MIDI interpreter",13
+MidiTouch_Syntax
+  =  "Syntax: *MidiTouch <'off' or 'on'>",0
+
+MidiChannel_Help
+  =  "*MidiChannel sets the MIDI Basic Channel of the MIDI interpreter",13
+  =  "(enabled with *MidiSound)",13
+MidiChannel_Syntax
+  =  "Syntax: *MidiChannel <1..16>",0
+
+MidiMode_Help
+  =  "*MidiMode sets the Mode of the MIDI interpreter (enabled with *MidiSound)",13
+  =  " Mode 1 : OMNI ON,  POLY",9,9,"Mode 2 : OMNI ON,  MONO",13
+  =  " Mode 3 : OMNI OFF, POLY",9,9,"Mode 4 : OMNI OFF, MONO",13
+MidiMode_Syntax
+  =  "Syntax: *MidiMode <1..4>",0
+
+MidiStart_Help
+  =  "*MidiStart sends a MIDI Start message, resets the MIDI Song Position Pointer,",13
+  =  "and starts automatic transmission of Timing Clock messages every t milliseconds,",13
+  =  "where t is the parameter (if specified)",13
+MidiStart_Syntax
+  =  "Syntax: *MidiStart (<time>)",0
+
+MidiContinue_Help
+  =  "*MidiContinue sends a MIDI Continue message, and restarts automatic transmission",13
+  =  "of Timing Clock messages",13
+MidiContinue_Syntax
+  =  "Syntax: *MidiContinue",0
+
+MidiStop_Help
+  =  "*MidiStop sends a MIDI Stop message, and stops automatic transmission of",13
+  =  "Timing Clock messages",13
+MidiStop_Syntax
+  =  "Syntax: *MidiStop",0
+
+         ALIGN
+
+; NB The podule returns byte quantities
+PoduleZeroAddress * &033C0000  ; use this if not initialised by podule manager
+PoduleAddressMask & Podule_BaseAddressBICMask ; to mask value in r12 from podule manager
+
+WorkSpaceSize & WorkSpace
+
+TxBufferLen * 512 ; size of transmit buffer
+DefaultRxBufferLen * 1024 ; default size of receive buffer, is reprogrammable
+
+OsbyteSetEscapeCondition * &7D
+OsbyteDisableEvent       * &0D
+OsbyteEnableEvent        * &0E
+OsbyteReadLastBreak      * &FD
+OsbyteFlushBuffer        * &15
+KeyboardBufferNum        * 0
+
+SlowClock * 20 ; some things only need doing every 20 centiseconds
+
+PoduleNumberShift * 14 ; shift right the podule base address by this to get the podule number in the bottom 2 bits
+
+IDShift      * 24   ; shift the extended ID from SWI Podule_ReadHeader to get ID of podule in bottom byte (6 or 19)
+
+;convenient means of determining which type of podule from UART base address:
+PoduleTypeTestBit * &800  ; is 0 for stand-alone; 1 for MIDI/io podule
+
+MaxVoices * 8          ; maximum number of internal voices
+
+MaxRunningStatusAge * 4 ; maximum age of sent running status. It will miss
+                        ; this number of status bytes max
+
+MaxTxInactivity * 28 ; This is the number of cs interrupts of inactivity, if
+                     ; active sensing enabled (=280ms)
+MaxRxInactivity * 35 ; This is the max. no. of centisec interrupts without MIDI
+                  ; activity, if active sensing is enabled, before turning off
+                  ; all voices. (=350ms)
+
+; Internal Song Position Pointer is not true SPP. It is the number of MIDI
+; clocks since Start. True SPP = internal SPP/6
+
+TempoUnit      * &1000  ; this is 1 tempo count per centisecond
+BeatCount      * 16 ; this is number of sound system beats per MIDI
+                    ; Timing Clock transmitted
+
+; Ignore status, to determine which received commands to ignore:
+IgnoreTimingBit  * 2_00000001
+
+TimerTicksFor1ms * 1000*2 ;  = 1ms
+
+; ModeFlagBits definitions
+; a large amount of the global state is in 1-bit flags in 1 32-bit word (ModeFlagBits)
+
+; timing mode flags
+InternalCount * 1       ; internal count enabled (has priority)
+ExternalCount * 1:SHL:1 ; ext count enabled (only if InternalCount=0)
+
+BufferFilling * 1:SHL:2 ; set when receive buffer pointer is incremented from 0
+                        ; Used as a signal to generate an MidiBufferNotEmpty event
+
+; timing mode should always be set by the centisecond routine
+; These bits pass instructions to reset timing mode from the irq
+; routine to the centisecond routine on receipt of Real Time messages
+SetExternalC   * 1:SHL:3 ;centisecond routine should set External Timing mode
+ClearExternalC * 1:SHL:4 ;centisecond routine should clear External Timing mode
+
+; bits 5..7 are instructions from the centisecond routine to the
+; IRQ routine to send a real time message.
+InfoShift    * 5
+SendRT       * 7:SHL:InfoShift ;irq routine should send a real time message
+SendStart    * (1+StartVal-TimingClockVal):SHL:InfoShift ;irq routine should send a Start
+SendCont     * (1+ContinueVal-TimingClockVal):SHL:InfoShift ;irq routine should send a Continue
+SendStop     * (1+StopVal-TimingClockVal):SHL:InfoShift ;irq routine should send a Stop
+SendTC       * 1:SHL:InfoShift ;irq routine should send a Timing Clock
+; (ends at bit 7)
+
+BackgroundError     * 1:SHL:8 ; irq routine detected an error
+
+RxBufferOverflow    * 1:SHL:9 ; set on receive buffer overflowing; cleared on reporting
+                              ; error from SWI MIDI_RxByte or RxCommand
+
+; slight complication of internal state needed because Song Position Pointer
+; is updated by the irq routine, and it is received in 3 separate bytes.
+; status, then lsb, then msb.
+SPPawaitLsb         * 1:SHL:10 ; => SPP status received, awaiting lsbyte
+SPPawaitMsb         * 1:SHL:11 ; => SPP lsbyte received, awaiting msbyte
+
+; Sound enable flags:
+SoundEnableBit      * 1:SHL:12  ; sound system ENABLED/disabled
+ConnectionBit       * 1:SHL:13  ; sound sys connected to in/OUT
+
+FastClock           * 1:SHL:14 ; set if fast (1ms) clock is running
+WasFastClock        * 1:SHL:15 ; set if fast clock was running, and should be auto-restarted asap
+
+Version3Facilities  * 1:SHL:16 ; set after calling SWI MIDI_FastClock to enable new facilities
+                                ; ensuring compatibility with old software
+
+; flag set if sound scheduler is to be synchronised to the incoming MIDI Timing Clock messages
+SynchSoundScheduler * 1:SHL:17
+
+; other mode flags:
+ModeFlagsShift   * 18
+PolyBit          * 2_0001:SHL:ModeFlagsShift ; POLY/mono flag
+OmniBit          * 2_0010:SHL:ModeFlagsShift ; omni ON/off flag
+RxActiveSenseBit * 2_0100:SHL:ModeFlagsShift ; Rx active sensing ON/off
+TxActiveSenseBit * 2_1000:SHL:ModeFlagsShift ; Tx active sensing ON/off
+DefaultMode      * 2_0011:SHL:ModeFlagsShift ; no active sense, mode 1
+; (ends at bit 21)
+
+; irq re-entrancy prevention:
+InIrq            * 1:SHL:22 ; set during irq routine. Prevents re-entrancy
+              ; (irq can call scheduler which can call MIDI_Tx SWI, which can cause irq)
+
+WarnedEmptyScheduler * 1:SHL:23 ; set when EmptyingScheduler event given 
+
+; touch sensitivity of interpreter can now be disabled (inversion to give default value zero = on)
+TouchSenseOff       * 1:SHL:24
+
+NExtraPodulesShift * 25  ; bits 25 and 26 are a 0..3 count of how many extra
+                         ; (more than 1) midi podules are installed
+;NExtraPodules    * 2_11:SHL:25
+; (ends at bit 26)
+
+StoreSysRealTime     * 1:SHL:27 ; set if required (unusually) to store Real Time messages in the receive buffer
+SysRealTimeNoExec    * 1:SHL:28 ; set if required (unusually) not to execute system real time messages
+
+; record of which sound modules are installed
+Sound0Present * 1:SHL:29
+Sound1Present * 1:SHL:30
+Sound2Present * 1:SHL:31
+
+QEmptyWarningTime * 20  ; give scheduler emptying warning 20ms or 20 Timing Clocks
+                        ; before it happens
+
+         ALIGN
+
+; test if bottom byte of r0 is a char ('a'..'z' or 'A'..'Z')
+; presumes top 3 bytes of r0 are clear
+; return V_bit set if if true; clear if false;
+IsChar ROUT
+   CMP    r0, #"A"          ; 'A' < 'a'
+   BICLTS pc, lr, #V_bit    ; => is false
+   CMP    r0, #"z"
+   BICGTS pc, lr, #V_bit    ; => is false
+   CMP    r0, #"Z"
+   ORRLES pc, lr, #V_bit    ; => is true
+   CMP    r0, #"A"
+   ORRGES pc, lr, #V_bit    ; => is true
+   BICS   pc, lr, #V_bit    ; => is false
+
+; convert character in r0 bottom byte to lower case
+; presumes top 3 bytes are clear
+; changes only upper-case characters
+; affects only r0
+ToLower ROUT
+   CMP   r0, #"A"
+   MOVLT pc, lr
+   CMP   r0, #"Z"
+   MOVGT pc, lr
+   ADD   r0, r0, #"a"-"A" ; convert to lower case
+   MOV   pc, lr
+
+; case_insensitive comparison of 3 lsbytes of r0 and r1
+; r1 chars are presumed lower case
+; return Z set if equal
+Compare ROUT
+   STMFD sp!, {r0-r4, lr}
+   MOV    r4, r0
+   MOV    r3, #0
+10 MOV    r0, r4, LSR r3      ; get the current byte
+   AND    r0, r0, #&FF        ; mask out the char
+   MOV    r2, r1, LSR r3      ; get char from match string
+   AND    r2, r2, #&FF
+   CMP    r2, #0              ; is this less than 3 chars, 0-terminated?
+   BEQ    %FT30               ; exit loop with TRUE if match char is 0
+   BL     IsChar              ; check that it is a character
+   LDMVCFD sp!, {r0-r4, lr}
+   BVC    Parse_Error
+   BL     ToLower             ; convert to lower case if upper
+   CMP    r0, r2              ; compare characters
+   BNE    %FT30               ; exit with FALSE. char not equal
+   ADD    r3, r3, #8
+   CMP    r3, #24
+   BLT    %BT10       ; loop for 3 bytes
+
+30 LDMFD sp!, {r0-r4, lr} ; preserve z flag
+   ORREQS pc, lr, #Z_bit
+   BICS   pc, lr, #Z_bit
+
+SkipSpaces ROUT  ; string pointed to by r0,
+; returns with r0 points to after spaces + 1
+; r3 is char pointed to by r0 - 1
+   LDRB  r3, [r0], #1
+   CMP   r3, #" "
+   BEQ   SkipSpaces
+   MOVS  pc, lr
+
+;r0 is corrupted
+MidiSound_Code ROUT
+   STMFD  sp!, {r1-r4, lr}
+   LDR    r12, [r12]  ; get wp
+   MOV    r4, r1  ; number of parameters
+
+   ADD    r1, r12, #ScratchBuffer
+   MOV    r3, #0
+   STR    r3, [r1]    ; clear buffer
+
+   BL     SkipSpaces
+   MOV    r2, r0  ; string pointer
+   MOV    r0, r3  ; char after spaces
+
+ ; clear and put 2 or 3 chars into ScratchBuffer
+   BL     IsChar
+   BVC    Parse_Error
+   STRB   r0, [r1], #1
+   LDRB   r0, [r2], #1
+   BL     IsChar
+   BVC    Parse_Error    ; there must be 2 chars at least
+   STRB   r0, [r1], #1
+   LDRB   r0, [r2], #1
+   BL     IsChar
+   STRVSB r0, [r1]
+
+   CMP    r4, #1      ; number of parameters
+   MOV    r4, #0     ; midi podule number
+   BLE    %FT5
+
+   MOV    r0, r2
+   BL     SkipSpaces
+; read podule number if there is one
+   CMP    r3, #10   ; terminator?
+   CMPNE  r3, #13
+   CMPNE  r3, #0
+   BEQ    %FT5
+   CMP    r3, #"4"
+   BGT    Parse_Error
+   SUBS   r4, r3, #"1"  ; podule number (0..3)
+   BMI    Parse_Error ; error if less than 1
+; check there are no more chars
+   LDRB   r3, [r0]
+   CMP    r3, #10   ; terminator?
+   CMPNE  r3, #13
+   CMPNE  r3, #" "
+   CMPNE  r3, #0
+   BNE    Parse_Error
+   
+; translate "in", "off" or "out"
+5  LDR   r0, [r12, #ScratchBuffer]     ; 4 bytes of command tail is all I should need
+
+; decode parameter. Should be "off" "in" or "out"
+
+   MOV   r1, #"o"
+   ADD   r1, r1, #"f":SHL:8
+   ADD   r1, r1, #"f":SHL:16
+   BL    Compare
+   MOVEQ r0, #0
+   BEQ   %FT10
+  
+   MOV   r1, #"i"
+   ADD   r1, r1, #"n":SHL:8
+   BL    Compare
+   MOVEQ r0, #1
+   ADDEQ r0, r0, r4, LSL#1     ; combine podule number
+   BEQ   %FT10
+
+   MOV   r1, #"o"
+   ADD   r1, r1, #"u":SHL:8
+   ADD   r1, r1, #"t":SHL:16
+   BL    Compare
+   BNE   Parse_Error
+   MOV   r0, #2
+   ADD   r0, r0, r4, LSL#1     ; combine podule number
+   MOV   r1, #0
+10 SWI   XMIDI_SoundEnable
+   BVS   Parse_Error
+   LDMFD sp!, {r1-r4, pc}^
+
+; r0 is corrupted
+MidiChannel_Code
+   STMFD sp!, {r1-r4, lr}
+   MOV   r1, r0
+   MOV   r2, #16    ; restrict range to 0..16
+   MOV   r0, #10 + (2_111 :SHL: 29) ; flags
+   SWI   XOS_ReadUnsigned
+   BVS   Parse_Error
+   CMP   r2, #0
+   BEQ   Parse_Error  ; must be between 1 and 16
+   MOV   r1, r2   ; set basic channel, leave M unchanged
+   MOV   r0, #0   ; do not change mode
+   SWI   XMIDI_SetMode
+   LDMFD sp!, {r1-r4, pc}
+
+; r0 is corrupted
+MidiMode_Code
+   STMFD sp!, {r1-r4, lr}
+   MOV   r1, r0
+   MOV   r2, #4    ; restrict range to 0..4
+   MOV   r0, #10 + (2_111 :SHL: 29) ; flags
+   SWI   XOS_ReadUnsigned
+   BVS   Parse_Error
+   CMP   r2, #0
+   BEQ   Parse_Error  ; must be between 1 and 4
+   MOV   r1, #0   ; leave basic channel, N, and M, unchanged
+   MOV   r0, r2   ; change mode
+   SWI   XMIDI_SetMode
+   LDMFD sp!, {r1-r4, pc}
+
+; r0 is corrupted
+MidiStart_Code ROUT
+   STMFD sp!, {r1-r4, lr}
+   MOVS  r1, r1
+   BEQ   %FT10  ; if no parameters then presume timing mode already set
+   MOV   r1, r0
+   MOV   r2, #&FF
+   ORR   r2, r2, #&FF00    ; restrict range to 0..FFFF
+   MOV   r0, #10 + (2_101 :SHL: 29) ; flags
+   SWI   XOS_ReadUnsigned
+   BVS   Parse_Error
+   CMP   r2, #0
+   BEQ   Parse_Error  ; must be minimum of 1
+   MOV   r0, r2   ; set tc transmission rate
+   SWI   XMIDI_FastClock
+10 SWI   XMIDI_TxStart
+   LDMFD sp!, {r1-r4, pc}
+
+MidiContinue_Code ROUT
+   STMFD sp!, {lr}
+   SWI   XMIDI_TxContinue
+   LDMFD sp!, {pc}
+
+MidiStop_Code
+   STMFD sp!, {lr}
+   SWI   XMIDI_TxStop
+   LDMFD sp!, {pc}
+
+;r0 is corrupted
+MidiTouch_Code ROUT
+   STMFD sp!, {r1-r4, lr}
+   LDR   r12, [r12]  ; get wp
+   ADD   r1, r12, #ScratchBuffer  ; buffer address
+   MOV   r2, #4 + 3:SHL:29        ; buffer size, space terminates, and ignore '|'
+   SWI   XOS_GSTrans
+   BVS   Parse_Error
+   CMP   r2, #4
+   BGE   Parse_Error
+   LDR   r0, [r1]                 ; 4 bytes of command tail is all I should need
+
+; decode parameter. Should be "off" "on"
+
+   MOV     r1, #"o"
+   ADD     r1, r1, #"f":SHL:8
+   ADD     r1, r1, #"f":SHL:16
+   BL      Compare
+   BNE     %FT10
+   TEQP    pc, #I_bit:OR:3         ; disable irq for consistent mode state
+   LDR     r0, [r12, #ModeFlagBits]
+   ORR     r0, r0, #TouchSenseOff
+   STR     r0, [r12, #ModeFlagBits]
+   LDMFD   sp!, {r1-r4, pc}^
+10 MOV     r1, #"o"
+   ADD     r1, r1, #"n":SHL:8
+   BL      Compare
+   BNE     Parse_Error
+   TEQP    pc, #I_bit:OR:3         ; disable irq for consistent mode state
+   LDR     r0, [r12, #ModeFlagBits]
+   BIC     r0, r0, #TouchSenseOff
+   STR     r0, [r12, #ModeFlagBits]
+   LDMFD   sp!, {r1-r4, pc}^
+
+Parse_Error ROUT
+   ADR   r0, ErrorBlock_MIDI_BadParameter
+ReturnError   ; for * commands
+   LDMFD sp!, {r1-r4, lr}
+   ORRS  pc, lr, #V_bit
+
+   MakeErrorBlock  MIDI_BadParameter
+
+VIAprogram  ROUT  ;enable io podule irqs by poking values into the VIA
+     STMFD   sp!, {r0-r1, lr}
+     LDR     R1, [R12, #PoduleBase]
+     LDR     R0, =VIAPCROffset
+     ADD     R1, R1, R0
+     MOV     R0, #VIAInterruptEnable
+     STRB    R0, [R1]     ; enable interrupts in podule by driving CA2 low
+     LDMFD   sp!, {r0-r1, pc}^
+
+; calculate and store base address of acia
+GetACIAAddr
+; r1 = podule base
+; r5 = which podule
+     STMFD   sp!, {r1-r3, lr}
+     LDR     R2, =ACIA_Offset
+     ADD     r3, r12, r5, LSL#2     ; podule offset
+     STR     r2, [r3, #UARTOffset] ; ACIA offset from podule base
+     ADD     r1, r1, r2
+     STR     r1, [r3, #UARTbase]   ; ACIA base address
+     LDMFD   sp!, {r1-r3, pc}^
+
+   LTORG
+
+; calculate and store base address of acia
+; Routine presumes that the podule ID must be either
+; ProdType_MIDI or ProdType_UserPortAndMIDI
+; no other possibility is treated
+GetUARTAddr
+; r0 = podule ID;
+; r1 = podule base
+; r5 = which podule
+     STMFD   sp!, {r1-r3, lr}
+     CMP     r0, #ProdType_MIDI
+     LDREQ   r2, =MIDI_only_UARTOffset ; address depends on podule ID
+     LDRNE   r2, =MIDI_UP_UARTOffset
+     ADD     r3, r12, r5, LSL#2     ; podule offset
+     STR     r2, [r3, #UARTOffset]   ;UART offset from podule base
+     ADD     r1, r1, r2
+     STR     r1, [r3, #UARTbase]   ;UART base address
+     LDMFD   sp!, {r1-r3, pc}^
+
+UnknownPodule ROUT
+; podule id is unknown. Read the device address offset in the workspace and check it
+; is in the range <podule base addr .. podule end addr>. If it is, accept it as valid.
+; This way the module can support future hardware which just registers its device
+; base address offsets via a custom MidiLog module (must be loaded before the Midi module)
+; r5 = which podule
+     STMFD   sp!, {r1-r5, lr}
+     ADD     r2, r12, r5, LSL#2  ; podule offset
+     LDR     r1, [r2, #UARTOffset] ; alternative UART base address supplied by MidiLog module
+     CMP     r1, #0      ; check the supplied address offset is greater than 0
+     BLE     BadPod
+     CMP     r1, #1:SHL:PoduleNumberShift ; size of podule address space
+     BGE     BadPod   ; check the offset is less than the podule address space
+     LDR     R3, [R2, #PoduleBase]  ; base address of this podule
+     ADD     r1, r1, r3
+     TST     r1, #PoduleTypeTestBit
+     BNE     BadPod  ; else it cannot be recognised as a Signetics UART podule
+   ; accept existing address as OK
+     STR     R3, [R2, #UARTbase]  ; base address of this podule
+     LDMFD   sp!, {r1-r5, pc}^
+BadPod
+; Let the user know that something untoward happened in finding the podule
+; hardware base address.
+     ADR     R0, ErrorBlock_BadPod  ; Defined in error header file
+     STR     R0, [sp]
+     LDMFD   sp!, {R1-R5,lr}
+     ORRS    pc, lr, #V_bit
+     MakeErrorBlock BadPod
+
+; get hardware addresses
+GetDeviceAddresses ROUT
+     STMFD   sp!, {R1-R5,lr}
+     LDR     r2, [r12, #ModeFlagBits]
+     ADD     r3, r12, #UARTOffset
+; clear UART offsets and base addresses to zero to ensure they are recognised as uninitialised if read
+     MOV     r0, #0
+     STR     R0, [R3], #4
+     STR     R0, [R3], #4
+     STR     R0, [R3], #4
+     STR     R0, [R3]
+     ADD     r3, r12, #UARTbase
+     STR     R0, [R3], #4
+     STR     R0, [R3], #4
+     STR     R0, [R3], #4
+     STR     R0, [R3]
+     MOV     r5, r2, LSR#NExtraPodulesShift ; get number of podules installed
+     AND     r5, r5, #3  ; range 0-3 . decremented to 0
+20   ADD     r4, r12, r5, LSL#2
+     LDR     r4, [r4, #PoduleBase]    ; podule base address
+     MOV     r3, r4, LSR#PoduleNumberShift
+     AND     r3, r3, #3  ; podule number is in range 0 -> 3
+     ADD     r2, r12, #ScratchBuffer  ; put the podule ID in a buffer temporarily
+     SWI     XPodule_ReadHeader  ; read the extended ID of the podule
+     BVS     BadPod       ; give up if SWI returned error
+     LDR     r0, [r2]  ; this is the extended podule ID
+     MOV     r0, r0, LSR#IDShift
+     MOV     r1, r4       ; podule base address to r1
+     CMP     r0, #ProdType_BBCIO   ; which podule is it
+     BLEQ    GetACIAAddr  ; get acia base address
+     BLEQ    VIAprogram   ; (enable podule irq by writing to VIA)
+     BEQ     %FT10
+     CMP     r0, #ProdType_MIDI
+     CMPNE   r0, #ProdType_UserPortAndMIDI
+     BLEQ    GetUARTAddr ; get UART base address
+     BLNE    UnknownPodule ; podule ID is not directly supported; check the uart address supplied by MidiLog
+10   SUBS    r5, r5, #1
+     BPL     %BT20
+     LDMFD   sp!, {R1-R5,pc}^
+
+ResetACIA  ; r1 contains podule base
+; r5 = which podule
+     STMFD   sp!, {r0-r2, lr}
+     ADD     r2, r12, r5, LSL#2     ; podule offset
+     LDR     r1, [r2, #UARTbase]    ; ACIA base address
+     MOV     R0, #ACIAResetValue
+     STRB    R0, [R1]  ; poke reset value into ACIA control reg
+     MOV     R0, #ACIAControlValue
+     STRB    R0, [R1]  ; now poke control value into register
+     ADD     r2, r12, r5     ; podule offset
+     STRB    R0, [r2, #IMRCurrent] ; and store it in imrcurrent
+     LDMFD   sp!, {r0-r2, pc}^
+
+ResetUART  ; r0 contains podule ID; r1 contains podule base
+; r5 = which podule
+     STMFD   sp!, {r0-r2, lr}
+     ADD     r2, r12, r5, LSL#2     ; podule offset
+     LDR     R1, [R2, #UARTbase]   ;UART base address
+     MOV     R0, #0
+     STRB    R0, [R1, #IROffset]    ;mask all interrupts
+     MOV     R0, #CRResetMR         ;reset MR pointer
+     STRB    R0, [R1, #CROffset]
+     MOV     R0, #CRResetRx         ;reset receiver
+     STRB    R0, [R1, #CROffset]
+     MOV     R0, #CRResetTx         ;reset transmitter
+     STRB    R0, [R1, #CROffset]
+     MOV     R0, #CRResetEr         ;reset error
+     STRB    R0, [R1, #CROffset]
+     MOV     R0, #CRResetBk         ;reset break bit in ISR
+     STRB    R0, [R1, #CROffset]
+     MOV     R0, #MR1               ;program default MR1 value
+     STRB    R0, [R1, #MROffset]
+     MOV     R0, #MR2               ;program default MR2 value
+     STRB    R0, [R1, #MROffset]
+     MOV     R0, #CSR               ;program default CSR value
+     STRB    R0, [R1, #SROffset]
+     MOV     R0, #ACR               ;program default ACR value
+     STRB    R0, [R1, #ACROffset]
+     MOV     R0, #CRenable          ; enable rx&tx
+     STRB    R0, [R1, #CROffset]
+     MOV     R0, #CTUR
+     STRB    R0, [R1, #CTUOffset]   ; counter/timer upper byte
+     MOV     R0, #CTLR
+     STRB    R0, [R1, #CTLOffset]   ; counter/timer lower byte
+     MOV     R0, #CRStartCT         ; load and start counter/timer
+     STRB    R0, [R1, #CROffset]
+     MOV     R0, #RxRDYirq
+     STRB    R0, [R1, #IROffset]    ; program default interrupt mask
+     ADD     r2, r12, r5            ; podule offset
+     STRB    R0, [r2, #IMRCurrent]
+     LDMFD   sp!, {r0-r2, pc}^
+
+ResetSystem  ROUT  ; *****R12 must contain workspace pointer on entry*******
+     STMFD   sp!, {R0-R5,lr}
+     TEQP    pc, #I_bit:OR:3  ; disable interrupts, presume entered in svc mode
+; get state that must be preserved through reset
+     LDR     r2, [r12, #ModeFlagBits]
+     LDR     r4, [r12, #Tuning]
+     LDR     r5, [r12, #SoundConfiguration]
+     MOV     R0, #0
+     ADD     R3, R12, #SystemResetClearStart ; start of workspace to clear
+     ADD     R1, R12, #SystemResetClearEnd ; end of workspace to clear.
+ClearWorkSpace            ; nb must clear workspace BEFORE writing to it!
+     STR     R0, [R3], #4
+     CMP     R3, R1
+     BLT     ClearWorkSpace
+; restore previous state
+     STR     r0, [r12, #Slot_p] ; reset scheduler
+     MOV     r0, #-1
+     STR     r0, [r12, #next_schedule_t]
+     STR     r4, [r12, #Tuning]
+     STR     r5, [r12, #SoundConfiguration]
+; make a mask of state flag bits to keep
+     MOV     r3, #Sound0Present:OR:Sound1Present:OR:Sound2Present ; preserve sound modules presence flags
+     ORR     r3, r3, #ConnectionBit:OR:SoundEnableBit ; preserve sound connection state
+     ORR     r3, r3, #FastClock:OR:Version3Facilities ; preserve fast clock state and new facilities
+     ORR     r3, r3, #3:SHL:NExtraPodulesShift ; preserve info on number of podules installed
+     AND     r3, r3, r2  ; state bits to be preserved
+     MOV     r2, #DefaultMode
+     ORR     r2, r2, r3
+     MOV     r0, #7
+     STRB    r0, [r12, #MonoChannels]   ; default 8 channels in mode 4
+     MOVS    r0, #0 ; set Z
+     BL      ClaimReleaseTimer ; enter with z set to release timer. Ignore any error
+     BIC     r2, r2, #FastClock:OR:Version3Facilities ; reset fast clock state and new facilities
+     STR     r2, [r12, #ModeFlagBits]
+     MOV     r5, r2, LSR#NExtraPodulesShift ; get number of podules installed
+     AND     r5, r5, #3  ; range 0-3 . decremented to 0
+20   ADD     r4, r12, #UARTbase
+     LDR     r4, [r4, r5, LSL#2]    ; uart base address
+     TST     r4, #PoduleTypeTestBit     ; which podule it is
+     BLNE    ResetACIA  ; these routines reset ACIA or..
+     BLEQ    ResetUART  ; ..UART
+     SUBS    r5, r5, #1
+     BPL     %BT20
+     MOV     R0, #IOC
+     TEQP    pc, #F_bit:OR:I_bit:OR:3 ; disable fiq and irq
+     LDRB    R1, [R0, #IOCIRQMSKB]  ; (this is modified in econet fiq code!)
+     ORR     R1, R1, #podule_IRQ_bit
+     STRB    R1, [R0, #IOCIRQMSKB]  ; enable podule irqs in ioc
+     LDMFD   sp!, {R0-R5,pc}^   ; return with previous flags and mode
+
+IRQVectorCode ROUT
+; Note that R12 contains direct workspace pointer, NOT indirected.
+; This routine has to look at all midi podules installed and service
+; their interrupts
+     STMFD   sp!, {r0-r5, lr} ; n.b. lr for irq accepted is already pushed onto stack
+;  MOV   r1, #IOC
+;  STRB  r1, [r1, #Timer1LR]         ; load timer value into latch
+;  LDRB  r0, [r1, #Timer1CH]
+;  LDRB  r2, [r1, #Timer1CL]
+;  ORR   r0, r2, r0, LSL#8   ; timer time
+;  STR   r0, [r12, #thistime]  ; store timer time here
+     MOV     r5, #0
+; r5 bit 0 is flag to record if this routine serviced any irq
+; r5 bits 8 and 9 are number of this podule (0..3)
+; first look at podule 1 which we know is installed
+     ADD     r4, r12, #UARTbase
+     LDR     r0, [r4], #4 ; ACIA/UART address .. update r4
+;***N.B. IMRcurrent is now whole word; not 1 byte ****
+     LDR     r2, [r12, #IMRCurrent] ; 4 current (uart) IMRs in case they are needed
+
+     TST     r0, #PoduleTypeTestBit ; test podule type using UART base address
+     LDREQB  r1, [r0, #IROffset] ; uart, Check interrupt status reg
+     ANDEQ   r3, r2, #&FF    ; IMR copy
+     LDRNEB  r1, [r0]            ; acia
+     MOVNE   r3, #IRQBit
+; r3 contains bit(s) to test to see if this device generating the irq
+     TST     r1, r3     ; generating irq?
+     ORRNE   r5, r5, #1  ; irq was serviced
+     BLNE    DoIRQ
+
+; loop and read each MIDI podule (2nd to 4th) and service any requesting irq
+10   ADD     r5, r5, #&100 ; increment podule number
+     LDR     r0, [r4], #4 ; ACIA/UART address, update r4
+; check uart address is sensible otherwise exit
+     AND     r1, r0, #&FF000000 ; get top byte of in-podule address to check validity
+     CMP     r1, #&03000000 ; check if it is in the right range
+     BNE     %FT30         ; exit irq
+
+20   MOVS    r2, r2, LSR#8  ; next IMR byte
+     BEQ     %FT30          ; if 0 then finished
+     TST     r0, #PoduleTypeTestBit ; test podule type using UART base address
+     LDREQB  r1, [r0, #IROffset] ; uart, Check interrupt status reg
+     ANDEQ   r3, r2, #&FF    ; IMR copy
+     LDRNEB  r1, [r0]            ; acia
+     MOVNE   r3, #IRQBit
+; r3 contains bit(s) to test to see if this device generating the irq
+     TST     r1, r3     ; generating irq?
+     ORRNE   r5, r5, #1     ; irq was serviced
+     BLNE    DoIRQ
+     B       %BT10  ; loop for max 4 midi ports
+
+; exit irq
+30 ;MOV   r1, #IOC
+   ;STRB  r0, [r1, #Timer1LR]         ; load timer value into latch
+   ;LDRB  r0, [r1, #Timer1CH]
+   ;LDRB  r1, [r1, #Timer1CL]
+   ;ORR   r0, r1, r0, LSL#8   ; timer time
+   ;LDR   r1, [r12, #thistime]  ; get start value
+   ;SUBS  r0, r1, r0
+   ;STR   r0, [r12, #thistime]  ; get start value
+   ;TST   r5, #1     ; irq was serviced?
+   ;STREQ r0, [r12, #irqnotserviced]
+   ;STRNE r0, [r12, #irqtime]
+   ;LDR   r1, [r12, #maxirqtime]
+   ;CMP   r0, r1
+   ;STRGT r0, [r12, #maxirqtime]
+     LDR     r2, [r12, #ModeFlagBits]
+     TST     r2, #SendRT ; was there a request to send a Real Time message?
+     BEQ     %FT01
+     AND     r3, r2, #SendRT
+     MOV     r3, r3, LSR#InfoShift  ; move command to bottom byte
+     ADD     r3, r3, #TimingClockVal - 1 ; convert to Midi Real Time byte
+     CMP     r3, #TimingClockVal   ; IF Timing Clock THEN
+     LDREQ   r4, [r12, #SongPosPointer]
+     ADDEQ   r4, r4, #1            ; increment SPP
+     STREQ   r4, [r12, #SongPosPointer]
+     BIC     r2, r2, #SendRT    ; clear rt request. It must have been serviced
+     STR     r2, [r12, #ModeFlagBits]
+01   TST     r5, #1         ; test if any irq was serviced
+     LDMNEFD sp!, {r0-r5, lr, pc}^; if so return with pc on stack
+     LDMFD   sp!, {r0-r5, lr}
+     MOVS    pc, lr         ; else return with pc in r14 (no irq servicd here)
+
+DoIRQ ROUT  ; interrupt code now. r5 byte 1 contains number of podule (0-3)
+     STMFD   sp!,{r0-r10, lr}
+     MOV     r9, r5, LSR#8 ; number of podule
+     LDR     R7, [R12, #SongPosPointer] ; get song pos pointer
+     LDR     r2, [r12, #ModeFlagBits]     ; and mode flags
+     ORR     r2, r2, #InIrq  ; set flag preventing re-entrant irq enable
+IRQloop
+     TST     r2, #FastClock
+     LDRNE   r8, [r12, #ms_count]  ; get value of hi res time, or..
+     LDREQ   r8, [r12, #CurrentQBeat]  ; get value of soundsys bar/beat counter
+     CMP     r8, #-1
+     CMPNE   r8, #-2  ; these 2 values in timestamp are used to indicate receive error
+     MOVEQ   r8, #0  ; prevent them occurring normally
+; R0 = uart address
+; r9 = number of podule being serviced,
+; R7 = Song position pointer
+; R8 = Current bar/beat value, or ms_count for time stamp
+; r2 = mode flags
+; Check the data error bits
+     MOV     r3, #0
+     TST     r0, #PoduleTypeTestBit
+     LDREQB  R1, [R0, #SROffset] ; uart status register
+;     LDRNEB  R1, [R0]            ; acia status register loaded in calling routine
+     TSTEQ   r1, #&F0      ; is there a uart error? (top 4 bits of status)
+     BEQ     %FT33         ; no error
+     TST     r0, #PoduleTypeTestBit
+     MOVEQ   r4, #CRResetEr         ;reset error
+     STREQB  r4, [r0, #CROffset]
+; R1 = status register of UART or ACIA
+     MOVEQ   r4, #SRRxOE      ; uart
+     MOVNE   r4, #OVRNBit     ; acia
+     TST     r1, r4  ; Overrun error?
+     MOVNE   r3, #"O"     ; irq latency is too long
+     MOVNE   r8, #-1      ; set timestamp to -1 to indicate overrun error
+     TST     r0, #PoduleTypeTestBit
+     MOVEQ   r4, #SRRxFE      ; uart
+     MOVNE   r4, #FEBit       ; acia
+     TST     r1, r4 ; Framing error indicates garbage received
+     MOVNE   r3, #"F"  ; Incoming MIDI data is corrupted or asynchronous
+     MOVNE   r8, #-2      ; set timestamp to -2 to indicate framing error
+     CMP     r3, #0
+     ADDNE   r4, r12, #ErrorFlag
+     STRNEB  r3, [r4, r9] ; set error flag if not to zero
+     ORRNE   r2, r2, #BackgroundError ; set error flag. Event will be generated by centisecond code
+; take the data from the uart/acia receive buffer and put it in the receive
+; fifo buffer.
+33   TST     r0, #PoduleTypeTestBit ; = 1 for io podule
+     MOVNE   r3, #RDRFBit
+     MOVEQ   r3, #SRRxRDY
+     TST     r1, r3       ; received data?
+     BEQ     TxData
+     ADD     r3, r12, r9, LSL#2 ; buffer offset for this podule
+     LDR     r4, [r3, #RxBufferPntrs]   ; buffer in and out pointers
+     MOV     r10, r4, LSR#16      ; out pointer
+     BIC     r4, r4, #&FF000000
+     BIC     r4, r4, #&00FF0000   ; in
+     ADD     R6, R4, #1      ; increment buffer in pointer for pre check
+     LDR     r5, [r12, #RxBufferLen] ; size of buffer
+     CMP     r6, r5
+     MOVGE   r6, #0     ; circular buffer, reset pointer
+;Check for rx buffer overflow. Note that I only test the SWI getbyte outpointer
+; and not the soundsys outpointer. The sound system is presumed to keep up with
+; the MIDI data rate, and it isnt worth knowing about if it doesnt!
+     CMP     R6, r10  ; check that buffer is not full (outpntr=inpntr)
+     MOVEQ   R3, #"B" ;  MIDI receive data buffer full error
+     ADDEQ   r5, r12, r9 ; podule offset
+     STREQB  R3, [r5, #ErrorFlag] ; set error flag. Data will be overwritten
+     ORREQ   r2, r2, #BackgroundError:OR:RxBufferOverflow ; set error flags
+     TST     r0, #PoduleTypeTestBit ; = 1 for io podule
+     LDRNEB  r5, [r0, #DataRegOffset]    ; get received data
+     LDREQB  r5, [r0, #HROffset]    ; get received data
+     TST     r2, #StoreSysRealTime ; special mode; store real time data too
+     BNE     %FT22
+     CMP     r5, #SystemResetVal   ; system reset is only realtime that is ignored and stored in buffer
+     BEQ     %FT22
+     CMP     r5, #&F8 ;system realtime? (TC, start, cont, stop, AS)
+     BGE     ExecSysRealTime
+22   ADD     r3, r12, r9, LSL#2 ; buffer offset for this podule
+     ORR     r6, r6, r10, LSL#16 ; combine in and out buffer pointers into 1 word
+     STR     r6, [r3, #RxBufferPntrs]   ; store incremented pointer
+     CMP     r4, r10
+     ORREQ   r2, r2, #BufferFilling ; set flag if receive buffer was empty. cs will generate an event
+     LDR     r6, [r3, #RxBufferStarts]  ; get address of start of buffer
+     STRB    r5, [r6, r4]   ; store data in buffer
+     LDR     r6, [r3, #RxTimesBufferStarts]  ; get address of start of timestamp buffer
+     CMP     r8, #-1 ; ensure error is stored as code in timestamp
+     CMPNE   r8, #-2
+     STREQ   r8, [r6, r4, LSL#2] ; error code
+     BEQ     %FT12
+     TST     r2, #ExternalCount ; will be stamped with SPP if receiving TCs
+     STRNE   R7, [R6, R4, LSL#2] ; 32bit received time of data (SPP)
+     BNE     %FT12
+     TST     r2, #InternalCount ; will be stamped with SPP if sending TCs
+     ANDNE   r3, r2, #FastClock
+     TEQNE   r3, #FastClock   ; if fastclock modify to stamp with ms_count if sending
+     STRNE   R7, [R6, R4, LSL#2] ; 32bit received time of data (SPP)
+     STREQ   r8, [r6, r4, LSL#2] ; ms_count or bar/beat counter received time of data
+12   CMP     r5, #&F8 ;system realtime? (TC, start, cont, stop, AS, sys reset)
+     BGE     ExecSysRealTime
+     TST     R5, #&80    ; status byte?
+     BNE     %FT15    ; check for spp, then exit rx code
+; is not status. Check if it is spp data byte
+; Song Position Pointer is transmitted as Status, lsb, msb.
+     TST     r2, #SPPawaitLsb:OR:SPPawaitMsb ; awaiting rest of spp?
+     BEQ     RxEnd
+     LDRB    r3, [r12, #SPPchannel] ; which podule was it received in?
+     CMP     r3, r9                 ; this one?
+     BNE     RxEnd
+     TST     r2, #SPPawaitMsb
+     BICNE   r2, r2, #SPPawaitLsb:OR:SPPawaitMsb ; msb received... finished
+     EOREQ   r2, r2, #SPPawaitLsb:OR:SPPawaitMsb ; swap bits
+     STREQB  R5, [R12, #SPPlsb]  ; store lsb
+     LDRNEB  R7, [R12, #SPPlsb]  ; overwrite old spp with new
+     ORRNE   R7, R7, R5, LSL#7   ; combine received msb with stored lsb
+     MOVNE   R7, R7, LSL#1       ; x2
+     RSBNE   R7, R7, R7, LSL#2   ; x3  (multiply by 6)
+     B       RxEnd
+15   CMP     R5, #SongPosPointerVal
+     ORREQ   r2, r2, #SPPawaitLsb   ; next byte will be lsb
+     BICEQ   r2, r2, #SPPawaitMsb
+     STREQB  r9, [r12, #SPPchannel]
+     BEQ     RxEnd
+     TST     r2, #SPPawaitLsb:OR:SPPawaitMsb ; awaiting rest of spp?
+     BEQ     RxEnd                           ; no
+     LDRB    r3, [r12, #SPPchannel] ; status byte. should I clear SPP waiting status? Check channel
+     CMP     r3, r9
+     BICEQ   r2, r2, #SPPawaitLsb:OR:SPPawaitMsb ; this is the almost-never contingency of receiving spp status
+     B       RxEnd     ; in a podule, then getting a new status before the spp data. Clear SPP waiting state
+;Deal with System RealTime data immediately, and do not store it in the buffer
+ExecSysRealTime
+     TST     r2, #SysRealTimeNoExec ; is special flag set asking for no System Real Time auto-execution?
+     BNE     RxEnd
+; System Reset is ignored. It is up to the application to deal with it.
+     CMP     R5, #ActiveSensingVal
+     ORREQ   r2, r2, #RxActiveSenseBit  ; set active sensing bit
+     MOVEQ   r6, #1
+     ADDEQ   r3, r12, r9
+     STREQB  r6, [r3, #RxInactiveTime] ; and set counter to 1
+     BEQ     RxEnd
+     TST     r2, #InternalCount:OR:SendRT ; (internal count has priority)
+     BICNE   r2, r2, #ExternalCount  ; if internal, clear external count bit
+     BNE     RxEnd    ; if internal count, then ignore TC, start, cont, stop
+     LDRB    R3, [R12, #IgnoreState]
+     TST     R3, #IgnoreTimingBit   ; should I ignore timing messages?
+     BICNE   r2, r2, #ExternalCount  ; clear external count bit
+     BNE     RxEnd
+
+; timing clock message can trigger Midi Scheduler or Sound Scheduler (NOT both)
+     CMP     R5, #TimingClockVal ; if Timing Clock message
+     BNE     %FT10
+     TST     r2, #ExternalCount:OR:SetExternalC
+     ADDNE   R7, R7, #1   ; inc SPP if external count bit set or about to be set
+     TST     r2, #ExternalCount ; do nothing more if ext not set yet
+     BEQ     RxEnd
+     TST     r2, #Version3Facilities   ; new facilities?
+     BEQ     %FT5     ; SoundScheduler tick required?
+     LDR     r3, [r12, #next_schedule_t]
+     MOVS    r3, r3
+     BMI     %FT5     ; - = disabled MIDI scheduler
+     CMP     r7, r3   ; has the next schedule time arrived?
+     BLT     RxEnd    ; disallow SoundScheduler tick if MidiScheduler is activated
+
+; Dispatch Midi Scheduler
+; NB this calls SchedulerTake which will re-enable irqs before returning
+; disable uart interrupts to ensure this routine is not re-entered
+     MOV     r8, r2, LSR#NExtraPodulesShift
+     AND     r8, r8, #3        ; number of installed podules
+     BL      DisableUartIrqs
+     STR     r2, [r12, #ModeFlagBits]     ; save mode flags
+; change to svc mode to call SchedulerTake
+     TEQP    pc, #I_bit + SVC_mode  ; check mode-change delay
+     MOVNV   r0, r0
+     STMFD   sp!, {r0, lr} ; save svc-mode link register
+     MOV     r0, r7  ; current time in r0
+     BL      SchedulerTake  ; execute the scheduled commands up to this time
+     LDMFD   sp!, {r0, lr} ; restore lr
+     TEQP    pc, #I_bit + IRQ_mode  ; check delay
+     MOVNV   r0, r0
+     LDR     r2, [r12, #ModeFlagBits]     ; restore mode flags
+; re-enable uart interrupts
+     MOV     r8, r2, LSR#NExtraPodulesShift
+     AND     r8, r8, #3        ; number of installed podules
+     BL      EnableUartIrqs
+     B       RxEnd  ; disallow tick of BOTH schedulers on Timing Clock reception
+       
+5    TST     r2, #SynchSoundScheduler ; is external synch of sound scheduler required?
+     TSTNE   r2, #Sound2Present ; ensure sound scheduler module is present
+     BEQ     RxEnd
+
+; Dispatch Sound Scheduler
+; NB this calls SoundScheduler which could call a SWI which could re-enable irqs
+; disable uart interrupts to ensure this routine is not re-entered
+     MOV     r8, r2, LSR#NExtraPodulesShift
+     AND     r8, r8, #3        ; number of installed podules
+     BL      DisableUartIrqs
+     STR     r2, [r12, #ModeFlagBits]     ; save mode flags
+     STMFD   sp!, {r0,r12,lr}
+     LDR     r0, [r12, #Sound_QTick]
+ ; ensure does not enter centisecond code here (a plausible address in Sound_QTick)
+     CMP      r0, r12
+      MOVEQ    r0, #SoundSystemNIL  ; and the next test will fail with NE
+      STREQ    r0, [r12, #Sound_QTick]
+     TST     r0, #SoundSystemNIL    ; test for installed scheduler
+     MOVEQ   r12, r0                ; wp
+     LDREQ   r0, [r12]
+     TSTEQ   r0, #SoundSystemNIL     ; Valid Level2?
+     MOVEQ   lr, pc
+     MOVEQ   pc, r0                  ; Call Level2
+     LDMFD   sp!, {r0,r12,lr}  ; ..and return to here
+     LDR     r2, [r12, #ModeFlagBits]     ; restore mode flags
+; re-enable uart interrupts
+     MOV     r8, r2, LSR#NExtraPodulesShift
+     AND     r8, r8, #3        ; number of installed podules
+     BL      EnableUartIrqs
+     B       RxEnd
+
+10   CMP     R5, #StartVal     ; if Start message
+     MOVEQ   r7, #0            ; reset SPP and..
+     ORREQ   r2, r2, #SetExternalC ; ask for ExternalCount
+     BEQ     RxEnd
+
+     CMP     R5, #ContinueVal  ; if Continue message
+     ORREQ   r2, r2, #SetExternalC ; ask for ExternalCount
+     BEQ     RxEnd
+
+     CMP     R5, #StopVal      ; if Stop message
+     BNE     RxEnd             ; byte unrecognized
+     ORREQ   r2, r2, #ClearExternalC ; clear external count
+     LDREQ   r8, [r12, #CurrentQBeat]
+     BICEQ   r8, r8, #&FF000000  ; clear bar count
+     BICEQ   r8, r8, #&00FF0000
+     STREQ   r8, [r12, #CurrentQBeat]
+RxEnd
+     ADD     r3, r12, r9
+     TST     r2, #RxActiveSenseBit
+     LDRNEB  r6, [r3, #RxInactiveTime] ; get rx active sense counter
+     MOVNES  r6, r6   ; is this counter enabled ( <> 0 =>enabled )
+     MOVNE   r6, #1
+     STRNEB  r6, [r3, #RxInactiveTime] ; reset rx active sense counter
+
+; if the transmit buffer is not empty then transfer data from the buffer to
+; the UART/ACIA transmit register.
+TxData                           ; RealTime transmission has priority
+     TST     r0, #PoduleTypeTestBit ; = 1 for io podule
+     MOVNE   r6, #TDREBit
+     MOVEQ   r6, #SRTxRDY
+     ADD     r3, r12, r9
+     LDREQB  r3, [r3, #IMRCurrent]
+     TSTEQ   r3, #TxRDYirq      ; is td irq enabled?
+     TSTNE   r1, r6    ; sic!   ; is UART/ACIA ready for more transmit data
+     BEQ     IRQExit
+     ANDS    r6, r2, #SendRT    ;have I got an order to send a RealTime Byte?
+     BEQ     GetBufferedData
+; send real time
+     MOV     r6, r6, LSR#InfoShift  ; move command to bottom byte
+     ADD     r6, r6, #TimingClockVal - 1 ; convert to Midi Real Time byte
+     CMP     r6, #StartVal
+     MOVEQ   r7, #0                ; if Start clear spp
+     CMP     r6, #StopVal          ; IF Stop
+     BICEQ   r2, r2, #InternalCount ; clear InternalCount flag
+     ORRNE   r2, r2, #InternalCount ; else set InternalCount flag
+     LDREQ   r8, [r12, #CurrentQBeat]
+     BICEQ   r8, r8, #&FF000000  ; clear bar count
+     BICEQ   r8, r8, #&00FF0000
+     STREQ   r8, [r12, #CurrentQBeat]
+     BL      SendThisByte ; in r6
+     B       IRQExit
+GetBufferedData     
+     ADD     r3, r12, r9, LSL#2 ; offset for current podule
+     LDR     R4, [r3, #TxBufferPntrs]
+     MOV     r5, r4, LSR#16       ; out pointer
+     BIC     r4, r4, #&FF000000   ; in pointer
+     BIC     r4, r4, #&00FF0000
+     CMP     R4, R5   ; Check if buffer has data and send it
+     BNE     GetTD    ; there is data to send
+  ; tx buffer empty
+     TST     r0, #PoduleTypeTestBit  ; =1 for MIDI / IO podule
+     MOVEQ   R4, #RxRDYirq
+     MOVNE   R4, #ACIAControlValue
+     STREQB  R4, [R0, #IROffset] ; Disable TxRDY interrupts now TX buffer empty
+     STRNEB  R4, [R0] ; Disable TDRE interrupts now TX buffer is empty
+     ADD     r3, r12, r9 ; offset for current podule
+     STRB    R4, [R3, #IMRCurrent] ; preserve local copy of uart imr, or acia status
+; transmit active sensing ?
+     TST     r2, #TxActiveSenseBit
+     BEQ     IRQExit  ; If no data to tx then return
+     LDRB    R4, [R3, #TxInactiveTime]
+     CMP     R4, #MaxTxInactivity
+     MOVGE   R6, #ActiveSensingVal ;Time has expired. Send actv sensing status
+     BLGE    SendThisByte
+     B       IRQExit
+GetTD
+     ADD     r3, r12, r9, LSL#2
+     LDR     r3, [r3, #TxBufferStarts]
+     LDRB    R6, [R3, R5]   ; load byte from tx buffer
+     BL      SendThisByte
+     ADD     R5, R5, #1     ; increment buffer pointer
+     CMP     R5, #TxBufferLen
+     MOVGE   R5, #0          ; circular buffer, reset pointer
+     ADD     r3, r12, r9, LSL#2 ; offset for current podule
+     LDR     r4, [r3, #TxBufferPntrs]
+     BIC     r4, r4, #&FF000000
+     BIC     r4, r4, #&00FF0000
+     ORR     r5, r4, r5, LSL#16  ; combine pointers
+     STR     r5, [r3, #TxBufferPntrs]
+IRQExit
+     TST     r0, #PoduleTypeTestBit
+     LDREQB  r1, [r0, #IROffset]   ;  get ISR value
+     LDRNEB  r1, [r0]       ;  get status value
+     MOVNE   r4, #IRQBit
+     ADDEQ   r3, r12, r9 ; offset for current podule
+     LDREQB  r4, [r3, #IMRCurrent]
+     TST     r1, r4             ; check irq is serviced
+     BNE     IRQloop            ; if not do it again
+     STR     R7, [R12, #SongPosPointer]
+     BIC     r2, r2, #InIrq  ; clear irq re-entrancy flag
+     STR     r2, [R12, #ModeFlagBits]
+     LDMFD   sp!, {r0-r10,pc}^      ; return
+
+SendThisByte  ROUT ; r6 contains byte to send, r0 is uartbase;
+     STMFD   sp!, {r3, r4, lr}
+     TST     r0, #PoduleTypeTestBit
+     STREQB  R6, [R0, #HROffset] ;write transmit data to UART transmit register
+     STRNEB  R6, [R0, #DataRegOffset]  ;write tx data to ACIA transmit register
+  ; reset active sensing counter
+     TST     R2, #TxActiveSenseBit
+     LDMEQFD sp!, {r3, r4, pc}^
+     ADD     r3, r12, r9 ; offset for current podule
+     LDRB    r4, [r3, #TxInactiveTime] ; get tx active sense counter
+     MOVS    r4, r4      ; is it non-zero? => enabled
+     MOVNE   r4, #1      ; min is 1; 0 is reserved for disabled state
+     STRNEB  r4, [r3, #TxInactiveTime] ; reset tx active sense counter
+     LDMFD   sp!, {r3, r4, pc}^
+
+DisableUartIrqs ROUT
+; disable all irqs from all uarts or acias in midi podules
+; enter with:
+; r8 = number of midi podules installed
+; r12 = wp 
+     STMFD   sp!, {r2-r3, lr}
+10   ADD     r2, r12, r8, LSL#2   ; podule address offset
+     LDR     r2, [r2, #UARTbase] ; ACIA/UART base address
+     TST     r2, #PoduleTypeTestBit
+     MOVNE   r3, #ACIAIRQdisable
+     STRNEB  r3, [r2]             ; disable all interrupts
+     MOVEQ   r3, #0
+     STREQB  r3, [r2, #IROffset]  ; disable all interrupts
+     SUBS    r8, r8, #1
+     BPL     %BT10                ; for each midi podule
+; don't update IMR; this preserves the irq flags for re-enabling
+     LDMFD   sp!, {r2-r3, pc}^
+
+EnableUartIrqs ROUT
+; re-enable all irqs from all uarts or acias in midi podules
+; enter with:
+; r8 = number of midi podules installed
+; r12 = wp 
+     STMFD   sp!, {r2-r4, lr}
+     LDR     r3, [r12, #IMRCurrent]   ; 4 IMRs
+10   MOV     r4, r8, LSL#3      ; X 8 for byte-shift
+     MOV     r4, r3, LSR r4     ; IMR byte
+     ADD     r2, r12, r8, LSL#2   ; podule address offset
+     LDR     r2, [r2, #UARTbase] ; ACIA/UART base address
+     TST     r2, #PoduleTypeTestBit
+     STRNEB  r4, [r2]             ; enable acia interrupts
+     STREQB  r4, [r2, #IROffset]  ; enable uart interrupts
+     SUBS    r8, r8, #1
+     BPL     %BT10                ; for each midi podule
+; don't update IMR
+     LDMFD   sp!, {r2-r4, pc}^
+
+GetModuleWorkspacePointer
+; find workspace address of co-module MIDIlog. This should contain addresses
+; of any other podules that this module was loaded from
+     STMFD   sp!, {r1-r6,lr}
+     MOV     r0, #ModHandReason_LookupName
+     ADR     r1, MidiLogModuleName
+     SWI     XOS_Module ; affects r0-r6
+     LDMVSFD sp!, {r1-r6,lr}
+     ORRVSS  pc, lr, #V_bit  ; return v-set if error
+     CMP     r1, #0          ; module number should be > 0
+     LDMLEFD sp!, {r1-r6,lr}
+     ORRLES  pc, lr, #V_bit  ; return v-set if module not found
+; return workspace pointer in r0
+     MOV     r0, r4
+     LDMFD   sp!, {r1-r6,pc}^
+MidiLogModuleName  = "MIDILog",0
+     ALIGN
+
+TransferAddresses ROUT
+; enter with r0 = midilog module workspace pointer
+;            r1 = address of (this) podule from podule manager
+;            r2 = my workspace pointer
+; exit with r11 = number of midi podules installed - 1
+     STMFD   sp!, {r0-r6, lr}
+     MOV     r11, #0 ; assume this is the only podule
+     ADD     r2, r2, #PoduleBase
+     LDMIA   r0, {r3-r6}  ; get 4 words from the midi log workspace (podule base addresses)
+     STMIA   r2, {r3-r6}  ; store in my workspace
+; check for no addresses stored in MidiLog
+     CMP     r3, #0
+      ; 1st address is 0 => all zeroes in MidiLog workspace. No ports yet recorded
+      STREQ   r1, [r2] ; this podule's address
+      STREQ   r1, [r0] ; also store in midi podule log workspace
+      LDMEQFD sp!, {r0-r6, pc}^ ; all zeroes in MidiLog workspace. No ports yet recorded
+     CMP     r6, #0
+     MOVNE   r11, #3 ; count of number of midi ports
+     MOVEQ   r11, #2 ; => 3 previous ports
+     CMP     r5, #0
+     MOVEQ   r11, #1 ; => 2 previous ports
+     CMP     r4, #0
+     MOVEQ   r11, #0 ; => 1 previous ports
+     CMP     r11, #3
+     BEQ     %FT10   ; there are already 4 ports identified. Cannot add any more
+; add podule manager (this) podule address
+     CMP     r1, #0
+     CMPNE   r1, r3
+     CMPNE   r1, r4
+     CMPNE   r1, r5
+     CMPNE   r1, r6
+; if EQ  podule manager podule address is zero or already stored
+     ADDNE   r11, r11, #1    ; extra port
+     STRNE   r1, [r2, r11, LSL#2] ; higher address
+     STRNE   r1, [r0, r11, LSL#2] ; also store in midi podule log workspace
+10   ADD     r0, r0, #4*4  ; point to device address offsets
+     ADD     r2, r2, #4*4
+     LDMIA   r0, {r3-r6}  ; get 4 words from the midi log workspace (acia/uart address offsets)
+     STMIA   r2, {r3-r6}  ; store address offsets in my workspace
+     LDMFD   sp!, {r0-r6, pc}^
+
+Initialise_Module ROUT
+     STMFD   sp!, {r0-r6,lr}
+     LDR     R2, [R12]     ; check for reinitialisation
+     CMP     R2, #0   ; If R12^ contains zero then this is a new init
+     BNE     SoftStart
+     MOV     R0, #ModHandReason_Claim  ; claim space from module handler
+     LDR     R3, WorkSpaceSize         ; R3 is size of space claimed
+     SWI     XOS_Module
+     BVS     CantGetWorkSpace
+     STR     R2, [R12]
+SoftStart ; reset system and relink to the vectors
+     CMP     R11, #0      ; am I being initialised by the podule manager?
+     MOVEQ   R11, #PoduleZeroAddress  ; if not assume podule is in slot 0
+     LDR     R1, PoduleAddressMask ; a value supplied by Bruce
+     BIC     R1, R11, R1     ;R11 has the base address (from the pod. manager)
+;get workspace pointer of MIDILog module in r0
+     BL      GetModuleWorkspacePointer
+     MOV     r5, #0
+     ADDVS   r3, r2, #PoduleBase
+     STRVS   r1, [r3], #4 ; error midilog module not found, store this podule base
+     STRVS   r5, [r3], #4 ; store 0 for other 3 midi podule base addresses
+     STRVS   r5, [r3], #4
+     STRVS   r5, [r3], #4
+     STRVS   r5, [r3], #4 ; store 0 for 4 uart address offsets
+     STRVS   r5, [r3], #4
+     STRVS   r5, [r3], #4
+     STRVS   r5, [r3]
+; r0 = workspace pointer of MIDILog module
+; r1 = podule address from podule manager
+; transfer up to 4 podule base addresses + 4 acia/uart addresses
+; from the midi address log module workspace to my workspace
+     BLVC    TransferAddresses  ; get podule addresses from MidiLog module
+; returned with r11 = number of ports installed
+     CMP     r0, #0 ; clear v-flag
+
+; get buffer space for each podule
+; r11 = number of podules installed - 1
+     ADD     r6, r11, #1 ; number of podules installed
+; get tx buffer space
+     MOV     r5, #TxBufferLen
+     ADD     r4, r2, #TxBufferStarts
+; enter ClaimBuffers with
+;   r5 = size of buffers to claim
+;   r6 = number of buffers to claim
+;   r4 = address of workspace pointers to starts of 4 buffers (though there will usually be fewer)
+; exit with v - set if unable to claim buffers
+;   r5 = total space claimed (bytes) (ignored here)
+     BL      ClaimBuffers
+     BVS     CantGetWorkSpace
+     MOV     r5, #DefaultRxBufferLen
+     STR     r5, [r2, #RxBufferLen]
+     ADD     r4, r2, #RxBufferStarts
+     BL      ClaimBuffers
+; if error free tx buffers and exit
+     ADDVS   r4, r2, #TxBufferStarts
+     BLVS    FreeBuffers
+     BVS     CantGetWorkSpace
+     MOV     r5, #DefaultRxBufferLen:SHL:2
+     ADD     r4, r2, #RxTimesBufferStarts
+     BL      ClaimBuffers
+; if error free tx buffers and rx buffers
+     ADDVS   r4, r2, #TxBufferStarts
+     BLVS    FreeBuffers
+     ADDVS   r4, r2, #RxBufferStarts
+     BLVS    FreeBuffers
+     BVS     CantGetWorkSpace
+
+40   MOV     r12, r2
+     MOV     r5, #DefaultMode
+     ORR     r5, r5, r11, LSL#NExtraPodulesShift ; store number of extra installed podules
+     MOV     r0, #0
+     SWI     XSound_Tuning  ; get value of tuning parameter (sound level 1)
+     BLVS    FreeAllBuffers
+     STRVS   r0, [sp]        ; return error^
+     LDMVSFD sp!, {r0-r6, pc} ; go straight back to caller, as no vectors
+                              ; have been claimed. V is set
+     STR     R0, [R12, #Tuning]
+     ORR     r5, r5, #Sound1Present
+
+     BL      GetConfig    ; read sound sys channel num configuration
+     BLVS    FreeAllBuffers
+     STRVS   r0, [sp]        ; return error^
+     LDMVSFD sp!, {r0-r6, pc} ; go straight back to caller, as no vectors
+                              ; have been claimed. V is set
+     ADR     r0, IrqRoutinePos
+ ; can't do adr of IrqVectorCode since it is more than &FF words away
+     LDR     r1, [r0]       ; this location contains size of irq routine
+     SUB     r1, r0, r1  ; true address of irq vector code
+;       ADR     r1, IRQVectorCode
+     MOV     r0, #IrqV
+     SWI     XOS_Claim       ; link to the irq vector
+     BLVS    FreeAllBuffers
+     STRVS   r0, [sp]        ; return error^
+     LDMVSFD sp!, {r0-r6, pc} ; go straight back to caller, as no vectors
+                              ; have been claimed. V is set
+     ADR     r0, CentisecondCodePos
+     LDR     r1, [r0]
+     SUB     r0, r0, r1
+     STR     r0, [r12, #csRoutineAddr] ; start of workspace and contains pointer to cs rountine
+; read sound configure level 2 entry point, and send the sirq to the centisecond routine
+     MOV     r0, #0
+     MOV     r1, #0
+     MOV     r2, #0
+     MOV     r3, #0
+     MOV     r4, r12   ; centisecond routine address is here at the start of the workspace
+     SWI     XSound_Configure   ; sound level 0
+     BLVS    FreeAllBuffers
+     BVS     VectorClaimFail
+     STR     r4, [r12, #Sound_QTick]  ; (workspace) address to call sound scheduler with
+     ORR     r5, r5, #Sound0Present ; register presence of sound 0
+     CMP     r4, #SoundSystemNIL  ; check if sound scheduler has registered with sounddma
+     ORRNE   r5, r5, #Sound2Present ; if so presume sound scheduler is installed
+
+     MOV     r2, r12     ; restore wp pointer
+     MOV     r0, #EventV
+     ADR     r1, EventHandler
+     SWI     XOS_Claim       ; link to the event vector
+     BLVS    FreeAllBuffers
+     BVS     VectorClaimFail
+
+     MOV     r0, #OsbyteEnableEvent
+     MOV     r1, #Event_Escape
+     SWI     XOS_Byte        ; enable escape event
+     BLVS    FreeAllBuffers
+     BVS     VectorClaimFail ;but dont try to disable escape event if it failed
+
+     MOV     r0, #OsbyteEnableEvent
+     MOV     r1, #Event_Sound
+     SWI     XOS_Byte        ; enable sound system bar change event
+     BVC     NoInitErr
+     MOV     r0, #OsbyteDisableEvent
+     MOV     r1, #Event_Escape
+     SWI     XOS_Byte        ; must disable escape event if it failed
+     BL      FreeAllBuffers
+     B       VectorClaimFail
+NoInitErr
+     STR     r5, [r12, #ModeFlagBits]
+     BL      GetDeviceAddresses  ; this discovers which podule it is from the ID
+     BLVC    ResetSystem
+     BLVS    FreeAllBuffers
+     BVS     ResetFail   ;  if  V set then exit with fatal error
+     MOV     r0, #Service_MIDIAlive
+     MOV     r1, #Service_MIDI
+     SWI     XOS_ServiceCall   ; warn of initialisation to any applications using
+                               ; a tightly-coupled interface to MIDI
+     LDMFD   sp!, {r0-r6, PC}^ ; return if claimed OK
+VectorClaimFail
+     STR     r0, [sp]        ; return error^
+     MOV     r2, r12
+     BL      DiscardVectors
+     LDMFD   sp!, {r0-r6, lr}
+     ORRS    pc, lr, #V_bit  ; Ensure caller sees the error
+CantGetWorkSpace
+     ADR     r0, ErrorBlock_MHNoRoom  ; Defined in error header file
+     STR     R0, [sp]
+     LDMFD   sp!, {r0-r6, lr} ; return with error and V set
+     ORRS    pc, lr, #V_bit
+     MakeErrorBlock MHNoRoom
+ResetFail                 ; fatal error. Abort in initialise
+     STR     r0, [sp]        ; return error^
+     MOV     r0, #OsbyteDisableEvent
+     BL      SetEvents
+     BL      DiscardVectors
+     LDMFD   sp!, {r0-r6, lr}
+     ORRS    pc, lr, #V_bit  ; Ensure caller sees the error
+
+ClaimBuffers
+; enter with
+;   r5 = size of buffers to claim
+;   r6 = number of buffers to claim
+;   r4 = address of workspace pointers to 4 buffers
+; exit with v - set if unable to claim buffers
+;   r5 = total space claimed (bytes)
+     STMFD   sp!, {r0-r4, lr}
+; multiply r6 x BufferLen (r6 = 1..4)
+     CMP     r6, #2
+     MOVLT   r3, r5                             ; r6 = 1
+     MOVEQ   r3, r5, LSL#1     ; = 2*BufferLen  ; r6 = 2
+     RSBGT   r3, r5, r5, LSL#2 ; = 3*BufferLen  ; r6 = 3
+     CMPGT   r6, #3
+     MOVGT   r3, r5, LSL#2     ; = 4*BufferLen  ; r6 = 4
+; get space for n DefaultRxbuffers
+     MOVS    r0, #ModHandReason_Claim
+     SWI     XOS_Module
+     LDMVSFD sp!, {r0-r4, pc} ; return v-set if error
+; set up buffer pointers as if for four buffers (usually there will be fewer)
+     MOV     r0, r2
+     ADD     r1, r2, r5
+     STMIA   r4!, {r0-r1} ; store buffer pointers
+     ADD     r0, r1, r5
+     ADD     r1, r0, r5
+     STMIA   r4, {r0-r1} ; store buffer pointers
+     MOV     r5, r3      ; total space claimed
+     LDMFD   sp!, {r0-r4, pc}^
+
+FreeBuffers
+; enter with:
+;   r4 = address of workspace pointer to buffer block
+     STMFD   sp!, {r0-r4, lr}
+     LDR     r2, [r4] 
+     MOV     r0, #ModHandReason_Free
+     SWI     XOS_Module
+     LDMFD   sp!, {r0-r4, pc}^ ; ignore error
+
+FreeAllBuffers
+     STMFD   sp!, {r4, lr}
+     ADD   r4, r12, #TxBufferStarts
+     BL    FreeBuffers
+     ADD   r4, r12, #RxBufferStarts
+     BL    FreeBuffers
+     ADD   r4, r12, #RxTimesBufferStarts
+     BL    FreeBuffers
+     LDMFD   sp!, {r4, pc}^ ; ignore error
+
+IrqRoutinePos & . - IRQVectorCode  ; to bring distant label into adr range
+CentisecondCodePos & . - CentisecondCode
+
+Intercept_Services ROUT
+     CMP     r1, #Service_PreReset
+     BNE     %FT10
+; On a break it should reset the hardware in the podule to give the effect of a hard reset
+     STMFD   sp!, {lr}
+     LDR     r12, [r12]         ; workspace pointer
+     BL      ResetHardware
+     LDMFD   sp!, {pc}^    ; return
+
+10   CMP     R1, #Service_Reset ; check for the Reset service call
+     BNE     %FT20
+     STMFD   sp!, {R0-R3, lr}   ; if reset, then it is no longer linked to the vectors
+     LDR     R2, [R12]         ; workspace pointer
+     MOV     r12, r2
+     ADR     r0, IrqRoutinePos
+ ; can't do adr of IrqVectorCode since it is more than &FF words away
+     LDR     r1, [r0]       ; this location contains size of irq routine
+     SUB     r1, r0, r1  ; true address of irq vector code
+     MOV     R0, #IrqV
+     SWI     XOS_Claim     ; link to the irq vector
+     ADR     R1, EventHandler
+     MOV     R0, #EventV
+     SWI     XOS_Claim    ; link to the event vector
+     MOV     R0, #OsbyteReadLastBreak
+     MOV     R1, #0
+     MOV     R2, #255
+     SWI     XOS_Byte ; only re-enable events if the last break was soft,
+; hard breaks, and power-on reset do initialise first, so must not re-enable. 
+     CMP     R1, #0        ; => last break was soft, so enable events.
+     MOVEQ   R0, #OsbyteEnableEvent
+     BLEQ    SetEvents
+     BLEQ    ResetSystem        ; Not worth doing System Reset twice either
+     LDMFD   sp!, {R0-R3, PC}^ ; return
+
+20   CMP     R1, #Service_Sound ; check for the sound system dying service call
+     MOVNES  PC, lr
+     STMFD   sp!, {r0-r5,lr}
+     LDR     r12, [r12]         ; workspace pointer
+; fixup pointers on sound system initialise and die service calls
+; catch the sound scheduler initialise service call and reset its pointer in level 0
+     LDR     r5, [r12, #ModeFlagBits]
+
+     CMP     r0, #Service_SoundLevel0Alive
+     ORREQ   r5, r5, #Sound0Present
+     BEQ     %FT30
+
+     CMP     r0, #Service_SoundLevel0Dying
+     BICEQ   r5, r5, #Sound0Present
+     BEQ     %FT40
+
+; re-initialising Sound1 does not restore the voices.
+; once Sound1 disappears, voices will have to be reinitialised to restore voice function
+     CMP     r0, #Service_SoundLevel1Alive
+     ORREQ   r5, r5, #Sound1Present
+     BEQ     %FT40
+
+     CMP     r0, #Service_SoundLevel1Dying
+     BICEQ   r5, r5, #Sound1Present
+     BEQ     %FT40
+
+     CMP     r0, #Service_SoundLevel2Alive
+     ORREQ   r5, r5, #Sound2Present
+     BEQ     %FT30
+
+     CMP     r0, #Service_SoundLevel2Dying
+     BICEQ   r5, r5, #Sound2Present
+     MOVEQ   r0, #SoundSystemNIL
+     STREQ   r0, [r12, #Sound_QTick]
+     B       %FT40
+
+30   ADR     r0, CentisecondCode
+     STR     r0, [r12, #csRoutineAddr] ; start of workspace and contains pointer to cs rountine
+     MOV     r4, #SoundSystemNIL
+     STR     r4, [r12, #Sound_QTick]  ; reset tick entry
+; read sound configure level 2 entry point, and send the sirq to the centisecond routine
+     MOV     r0, #0
+     MOV     r1, #0
+     MOV     r2, #0
+     MOV     r3, #0
+     MOV     r4, r12   ; centisecond routine address is here at the start of the workspace
+     SWI     XSound_Configure   ; sound level 0
+     CMP     r4, #SoundSystemNIL
+     CMPNE   r4, r12   ; ensure centisecond code is not infinitely re-entered!
+     STRNE   r4, [r12, #Sound_QTick]  ; (workspace) address to call sound scheduler with
+     BICVS   r5, r5, #Sound0Present
+     ORRVC   r5, r5, #Sound0Present ; register presence of sound 0
+
+40   STR     r5, [r12, #ModeFlagBits]
+     LDMFD   sp!, {r0-r5,pc}^
+
+Finalise_Module  ROUT
+     STMFD   sp!, {r0-r4, lr}
+     LDR     R2, [R12]
+     MOV     r12, r2
+     MOV     r0, #Service_MIDIDying
+     MOV     r1, #Service_MIDI
+     SWI     XOS_ServiceCall   ; warn of impending doom to any applications using
+                               ; a tightly-coupled interface to MIDI
+     MOV     r0, #Timer1_DevNo ; timer 1 release
+     ADR     r1, Ms_Handler    ; millisecond handler
+     SWI     XOS_ReleaseDeviceVector ; release and ignore possible error
+; free 3 sets of buffers claimed from rma
+     BL      FreeAllBuffers
+     BL      DoAllNotesOff        ; switch off all midi-initiated notes when the module disappears
+     BL      ResetHardware
+     MOV     r0, #OsbyteDisableEvent
+     BL      SetEvents
+     BL      DiscardVectors
+; restore config.
+     MOV     r0, #0
+     MOV     r1, #0
+     MOV     r2, #0
+     MOV     r3, #0
+     LDR     r4, [r12, #Sound_QTick]
+     SWI     XSound_Configure ; ignore errors
+     LDR     r0, [r12, #ModeFlagBits]
+     TST     r0, #SoundEnableBit    ; test if sound sys is enabled
+     LDRNE   r3, [r12, #SoundConfiguration]
+     BLNE    SetConfig              ; restore number of channels enabled
+     LDMFD   sp!, {r0-r4, pc}^
+
+DiscardVectors ; Must enter with r2 pointing to workspace
+     STMFD   sp!, {r0,r1,lr}
+     ADR     r0, IrqRoutinePos
+ ; can't do adr of IrqVectorCode since it is more than &FF words away
+     LDR     r1, [r0]       ; this location contains offset of irq routine
+     SUB     r1, r0, r1  ; true address of irq vector code
+     MOV     R0, #IrqV
+     SWI     XOS_Release    ; release from the irq vector
+     ADR     R1, EventHandler
+     MOV     R0, #EventV
+     SWI     XOS_Release    ; release from the event vector
+     LDMFD   sp!, {r0,r1,PC}^  ; return without error.
+; Errors from XOS_Release should be ignored, as they may prevent this module
+; from being removed if it yielded an error from Finalise
+
+ResetHardware ROUT ; Disable podule irqs in all podules I know about.
+; Workspace pointer in r12
+     STMFD   sp!, {r0-r3, lr}
+     ADD     r1, r12, #UARTbase
+     ADD     r2, r1, #16  ; end of list of 4 addresses
+10   LDR     r0, [r1], #4 ; base address of uart/acia
+     AND     r3, r0, #&FF000000  ; detect invalid podule address
+     CMP     r3, #&03000000
+     LDMNEFD sp!, {r0-r3, pc}^   ; and exit
+     TST     r0, #PoduleTypeTestBit     ; which podule is it?
+; disable ACIA irqs
+     MOVNE   r3, #ACIAIRQdisable
+     STRNEB  r3, [r0] ; disable ACIA interrupts
+     MOVNE   r3, #ACIAResetValue
+     STRNEB  r3, [r0] ; reset ACIA
+; disable UART irqs
+20   MOVEQ   r3, #0
+     STREQB  r3, [r0, #IROffset] ; dont bother about imrcurrent; this is fatal.
+     MOVEQ   r3, #CRResetRx
+     STREQB  r3, [r0, #CROffset]
+     MOVEQ   r3, #CRResetTx
+     STREQB  r3, [r0, #CROffset]
+     MOVEQ   r3, #CRdisable
+     STREQB  r3, [r0, #CROffset]
+     CMP     r1, r2 
+     BLT     %BT10
+     LDMFD   sp!, {r0-r3, pc}^
+
+SetEvents ROUT ; enter with r0=disable or enable
+ ; Must only disable events if we've really enabled them, as enable/disable are
+ ; inc/dec calls on a counter. Someone else may need the event too !
+     STMFD   sp!, {r0-r3, lr}
+     MOV     r3, r0
+     MOV     r1, #Event_Escape
+     SWI     XOS_Byte                  ; osbyte corrupts r0-r2
+     MOV     r0, r3
+     MOV     r1, #Event_Sound
+     SWI     XOS_Byte
+     LDMFD   sp!, {r0-r3, pc}^
+
+EventHandler
+     CMP     r0, #Event_Escape
+     BEQ     EscapeHandler
+     CMP     r0, #Event_Sound
+     MOVNES  pc, lr
+; bar event handler
+     STMFD   sp!, {r0, lr}
+     LDR     r0, [r12, #CurrentQBeat]
+     ADD     r0, r0, #1:SHL:16      ; add 1 to bar count
+     STR     r0, [r12, #CurrentQBeat]
+     LDMFD   sp!, {r0, pc}^
+EscapeHandler
+     STMFD   sp!, {r0-r3, lr}
+;change to svc mode and save lr so that it can be restored at the end
+; in case it was interrupted from an svc-mode routine, since I make a swi
+; call which will corrupt lr_svc
+     MOV     r3, pc     ; remember caller's mode
+     TEQP    PC, #I_bit:OR:3    ; change to svc mode (mode3) retaining irq off
+     MOV     R0, #0       ; also does regbank delay
+     STRB    R0, [R12, #VoiceStates] ; escape kills voices so clear voicestates
+     STMFD   sp!, {lr}  ; stack lr_svc value
+; need to set escape condition as the OS only sets this if the escape event
+; is disabled ...
+     MOV     R0, #OsbyteSetEscapeCondition
+     SWI     XOS_Byte  ; set escape condition. corrupts r1,r2 !
+     LDMFD   sp!, {lr}  ; restore lr_svc value
+     TEQP    r3, #0     ; Back to caller's mode
+     MOVNV   R0, R0    ; delay for regbank to change
+     LDMFD   sp!, {r0-r3, pc}^  ;must save 3 regs because osbyte corrupts them
+
+; setup timer irq handler
+; r12 contains wp
+; claim or release device vector depending on z flag state
+; return errors from swis
+; r0 corrupted
+ClaimReleaseTimer ROUT ; enter with z clear to claim; z set to release
+     STMFD   sp!, {r0-r3,lr}
+; check that Fast Clock flag is set if releasing; clear if claiming; otherwise exit.
+; Reproduce expected state in r0
+     MOVEQ   r0, #FastClock  ; z-set  (release, so fc should be set) => set fc bit
+     MOVNE   r0, #0          ; z-clear (claim, so fc should be clear) => clear fc bit
+     TEQP    pc, #I_bit:OR:3  ; Disable irq for mode flags update. Entry must be in svc mode
+     LDR     r3, [r12, #ModeFlagBits]
+     AND     r1, r3, #FastClock  ; get fastclock bit
+     TEQ     r1, r0              ; test fastclock bit
+     LDMNEFD sp!, {r0-r3,pc}^ ; return if state of fc bit is not as expected
+     MOVS    r0, r0    ; set z if fc clear (claim) (z inverted from entry state)
+     MOV     r1, #IOC 
+     LDRB    r0, [r1, #IOCIRQMSKA]
+     BIC     r0, r0, #timer1_bit
+     STRB    r0, [r1, #IOCIRQMSKA]  ; disable timer irqs in ioc
+     MOV     r0, #Timer1_DevNo ; timer 1 interrupt me
+     ADR     r1, Ms_Handler    ; millisecond handler
+     MOV     r2, r12           ; workspace pointer
+     SWIEQ   XOS_ClaimDeviceVector
+     STRVS   r0, [sp]         ; push error back on stack
+     LDMVSFD sp!, {r0-r3,pc}  ; return with error
+     ORREQ   r3, r3, #FastClock ; set flag
+     SWINE   XOS_ReleaseDeviceVector
+     STRVS   r0, [sp]         ; push error back on stack
+     LDMVSFD sp!, {r0-r3,pc}  ; return with error
+     BICNE   r3, r3, #FastClock ; clear flag if error or not
+     STR     r3, [r12, #ModeFlagBits]
+     LDMFD   sp!, {r0-r3,pc}^
+
+; load value into timer and start it. IRQ will be generated
+; at 1ms intervals
+StartTimerIRQ ROUT
+     STMFD r13!, {r0-r1,lr}
+     MOV   r0, #0         ; reset ms_count
+     STR   r0, [r12, #ms_count]
+     MOV   r1, #IOC 
+     MOV   r0, #TimerTicksFor1ms:SHR:8 ; msb
+     STRB  r0, [r1, #Timer1LH]
+     MOV   r0, #TimerTicksFor1ms       ; lsb
+     STRB  r0, [r1, #Timer1LL]
+     STRB  r0, [r1, #Timer1GO]         ; start timer going
+     LDRB  r0, [r1, #IOCIRQMSKA]
+     ORR   r0, r0, #timer1_bit
+     STRB  r0, [r1, #IOCIRQMSKA]  ; enable timer irqs in ioc
+     LDMFD r13!, {r0-r1,pc}^
+
+; Note that r12 contains direct workspace pointer, NOT indirected.
+; r0-r3 corruptible
+; r3 contains IOC address
+; ms_count, tc_rate and ModeFlagBits must be adjacent in workspace for ldm
+; efficiency is IMPORTANT. This is called every ms
+; so it is highly optimised to use ldm/stm wherever possible. Loops are unwound
+Ms_Handler ROUT
+     LDRB    r0, [r3, #IOCIRQREQA]
+     TST     r0, #timer1_bit      ; is this my irq?
+     MOVEQS  pc, lr
+     STMFD   sp!, {r4-r5,lr}
+     MOV     r0, #timer1_bit
+     STRB    r0, [r3, #IOCIRQCLRA]  ; clear timer irq in ioc
+     ADD     r2, r12, #ms_count ; workspace address
+; load ms_count, tc_rate, ModeFlagBits and next_schedule_t quickly
+     LDMIA   r2, {r0, r1, r3, r4}
+     ADDS    r0, r0, #1         ; inc ms_count
+     MOVMI   r0, #0             ; reset when it goes negative
+; check if it is time to get the next scheduled command
+     MOVS    r4, r4       ; test if positive
+     BMI     %FT10        ; negative = disabled
+     CMP     r4, r0       ; compare next schedule time with current time
+     BGT     %FT10
+
+     TEQP    pc, #I_bit + SVC_mode  ; change to svc mode; (check mode-change delay)
+     MOVNV   r0, r0
+     STMFD   sp!, {r0, lr} ; save svc-mode lr
+    ; current time in r0
+; Does it need to disable uart irqs here? I don't think it is necessary, so let's not bother
+     BL      SchedulerTake  ; execute the scheduled commands up to this time
+     LDMFD   sp!, {r0, lr}
+     TEQP    pc, #I_bit + IRQ_mode  ; (check delay)
+
+10   TST     r3, #InternalCount  ;return if not internal count set
+     STMEQIA r2, {r0}           ; store ms_count
+     LDMEQFD sp!, {r4-r5,pc}^
+; check if it is time to send a timing clock message
+; top 16 bits is incrementing ms count.
+; bottom 16 bits is time at which to send TC
+     TST     r1, #&FF        ; return if tc_rate is 0
+     TSTEQ   r1, #&FF00
+     STMEQIA r2, {r0}       ; store ms_count
+     LDMEQFD sp!, {r4-r5,pc}^ ; return
+     ADD     r1, r1, #&10000    ; increment
+     CMP     r1, r1, LSL#16     ; compare with tc_rate
+     BICGE   r1,r1,#&FF000000   ; reset count if reached value
+     BICGE   r1,r1,#&00FF0000
+     STMLTIA r2, {r0, r1}       ; store ms_count and tc_rate quickly
+     LDMLTFD sp!, {r4-r5,pc}^
+; send a timing clock
+     TST     r3, #SendRT   ; preserve any existing rt instruction
+     ORREQ   r3, r3, #SendTC   ; else instruct irq routine to send a tc byte
+     STMIA   r2, {r0,r1,r3}    ; restore relevant data quickly
+; enable podule irqs to send tcs from all
+     MOV     r4, r3, LSR#NExtraPodulesShift
+     AND     r4, r4, #3        ; number of installed midi podules
+     MOV     r2, #0            ; this will be the 4 IMR bytes
+
+; unwound loop for speed
+     ADD     r1, r12, r4, LSL#2  ; podule offset
+     LDR     r0, [r1, #UARTbase]
+     TST     r0, #PoduleTypeTestBit
+; acia
+     MOVNE   r3, #ACIATxIRQEnable
+     STRNEB  r3, [r0]             ; enable TDRE interrupts
+; uart
+     MOVEQ   r3, #RxRDYirq:OR:TxRDYirq
+     STREQB  r3, [r0, #IROffset]  ; enable TxRDY interrupts
+     MOV     r1, r4, LSL#3       ; podule number X 8 for byte shift
+     ORR     r2, r2, r3, LSL r1  ; put IMR byte into word
+     SUBS    r4, r4, #1
+     STRMI   r2, [r12, #IMRCurrent]
+     LDMMIFD sp!, {r4-r5,pc}^  ; 1 podule return
+
+     ADD     r1, r12, r4, LSL#2  ; podule offset
+     LDR     r0, [r1, #UARTbase]
+     TST     r0, #PoduleTypeTestBit
+     MOVNE   r3, #ACIATxIRQEnable
+     STRNEB  r3, [r0]             ; enable TDRE interrupts
+     MOVEQ   r3, #RxRDYirq:OR:TxRDYirq
+     STREQB  r3, [r0, #IROffset]  ; enable TxRDY interrupts
+     MOV     r1, r4, LSL#3       ; podule number X 8 for byte shift
+     ORR     r2, r2, r3, LSL r1  ; put IMR byte into word
+     SUBS    r4, r4, #1
+     STRMI   r2, [r12, #IMRCurrent]
+     LDMMIFD sp!, {r4-r5,pc}^  ; 2 podules return
+
+     ADD     r1, r12, r4, LSL#2  ; podule offset
+     LDR     r0, [r1, #UARTbase]
+     TST     r0, #PoduleTypeTestBit
+     MOVNE   r3, #ACIATxIRQEnable
+     STRNEB  r3, [r0]             ; enable TDRE interrupts
+     MOVEQ   r3, #RxRDYirq:OR:TxRDYirq
+     STREQB  r3, [r0, #IROffset]  ; enable TxRDY interrupts
+     MOV     r1, r4, LSL#3       ; podule number X 8 for byte shift
+     ORR     r2, r2, r3, LSL r1  ; put IMR byte into word
+     SUBS    r4, r4, #1
+     STRMI   r2, [r12, #IMRCurrent]
+     LDMMIFD sp!, {r4-r5,pc}^  ; 3 podules return
+; last repeat
+; podule number must be 0 by now. there are some optimisations
+     LDR     r0, [r12, #UARTbase]
+     TST     r0, #PoduleTypeTestBit
+     MOVNE   r3, #ACIATxIRQEnable
+     STRNEB  r3, [r0]             ; enable TDRE interrupts
+     MOVEQ   r3, #RxRDYirq:OR:TxRDYirq
+     STREQB  r3, [r0, #IROffset]  ; enable TxRDY interrupts
+     ORR     r2, r2, r3           ; put IMR byte (0) into word
+     STR     r2, [r12, #IMRCurrent]
+     LDMFD   sp!, {r4-r5,pc}^  ; 4 podules return
+
+CentisecondCode ROUT
+; This is now called from SoundDMA. It intercepts the normal call to SoundScheduler
+; from there. It gets called once every SoundIRQ or approx 100 times per second
+     STMFD   sp!, {r0-r4,r9,lr}
+     LDR     r2, [R12, #ModeFlagBits]
+; r2 = Mode flags
+; ensure sound scheduler is present
+     TST     r2, #Sound2Present
+     BEQ     %FT10
+
+     TST     r2, #ExternalCount
+     TSTNE   r2, #SynchSoundScheduler ; is sound scheduler external synch wanted?
+     BNE     %FT10
+
+; dispatch sound scheduler as normal
+     MOV     r1, r12 ; save wp
+     LDR     r0, [r12, #Sound_QTick]
+ ; ensure no recursive re-entry of this routine
+     CMP     r0, r12
+      MOVEQ   r0, #SoundSystemNIL   ; ensure the next test fails with NE
+      STREQ   r0, [r12, #Sound_QTick]
+     TST     r0, #SoundSystemNIL   ; test for installed scheduler
+     MOVEQ   r12, r0               ; wp
+     LDREQ   r0, [r12]
+     TSTEQ   r0, #SoundSystemNIL     ; Valid Level2?
+     MOVEQ   lr, pc
+     MOVEQ   pc, r0                  ; Call Level2
+     MOV     r12, r1                 ; restore r12
+
+;change to svc mode and save lr so that it can be restored at the end
+; in case it was interrupted from an svc-mode routine, since I make swi
+; calls which will corrupt lr_svc
+10   TEQP    pc, #I_bit:OR:3    ; change to svc mode (mode3) retaining irq off
+     MOVNV   r0, r0    ; delay for regbank to change
+     STMFD   sp!, {lr}  ; stack lr_svc value
+
+; generate an event
+
+; A. if BufferFilling flag has been set by the irq routine
+     MOV     r0, #Event_MIDI
+     TST     r2, #BufferFilling
+     BIC     r2, r2, #BufferFilling ; clear the flag
+     MOVNE   r1, #MIDI_DataReceivedEvent
+     STRNE   r2, [r12, #ModeFlagBits] ; in case the SWI enables irqs
+     SWINE   XOS_GenerateEvent
+     LDRNE   r2, [r12, #ModeFlagBits] ; in case the SWI enables irqs
+
+; B. if Error flag has been set by the irq routine
+     TST     r2, #BackgroundError
+     BIC     r2, r2, #BackgroundError ; clear the flag
+     MOVNE   r1, #MIDI_ErrorEvent
+     STRNE   r2, [r12, #ModeFlagBits] ; in case the SWI enables irqs
+     SWINE   XOS_GenerateEvent
+     LDRNE   r2, [r12, #ModeFlagBits] ; in case the SWI enables irqs
+
+;C; if scheduler queue is 'nearly' empty
+; main test is for less than (10ms) of data in scheduler. But check for
+; silly cases, such as empty, or less than 4 free slots in scheduler
+     TST     r2, #Version3Facilities
+     BEQ     %FT110
+     TST     r2, #WarnedEmptyScheduler
+     BNE     %FT110
+     LDR     r1, [r12, #Slot_p]
+     MOV     r4, r1, LSR#16      ; top 16b = next free slot
+     BIC     r1, r1, #&FF000000
+     BIC     r1, r1, #&00FF0000  ;  bottom 16b = next slot to empty
+     SUBS    r1, r1, r4    ; slots free
+     BEQ     %FT110              ; if empty do nothing
+     ADDMI   r1, r1, #MaxSchedulerSlots  ; add buffer length if negative (circular buffer)
+     CMP     r1, #4   ; ensure there are at least 4 slots free before saying it is nearly empty
+     BLT     %FT110
+    ; get time of last event in scheduler
+     SUBS    r4, r4, #1         ; previous slot (last scheduled)
+     ADDMI   r4, r4,  #MaxSchedulerSlots ; wrap buffer
+     ADD     r3, r12, #SchedulerSpace ; start of scheduler buffer
+     ADD     r3, r3, r4, LSL#3  ; last scheduled slot
+     LDR     r3, [r3, #ScheduleTime]   ; get schedule time
+     TST     r2, #FastClock
+     LDRNE   r4, [r12, #ms_count]       ; get current time
+     LDREQ   r4, [r12, #SongPosPointer]
+     SUBS    r3, r3, r4     ; time of last scheduled event from current time
+     BMI     %FT110         ; some sort of error? Later than current time
+     CMP     r3, #QEmptyWarningTime
+     ; generate event. r0 is set to event_midi
+     MOVLE   r1, #MIDI_SchedulerEmptyingEvent
+     ORRLE   r2, r2, #WarnedEmptyScheduler
+     STRLE   r2, [r12, #ModeFlagBits] ; in case the SWI enables irqs
+     SWILE   XOS_GenerateEvent
+     LDRLE   r2, [r12, #ModeFlagBits] ; in case the SWI enables irqs
+
+110  LDRB    r0, [r12, #TimeCount]  ;how many cs have passed since last update?
+; r0 = TimeCount
+     SUBS    r0, r0, #1
+     MOVMI   r0, #SlowClock
+     STRB    r0, [r12, #TimeCount]
+     BLMI    DoRareUpdate
+     BLVS    SoundSWIError     ; if sound system returned V set = error
+     BVS     %FT40
+
+ ; get current value of sound beat counter
+     MOV     r0, #0
+     TST     r2, #FastClock
+     BNE     %FT45   ; don't bother about beat count if using fastclock
+     SWI     XSound_QBeat
+     BLVS    SoundSWIError ; abort if v set
+     BVS     %FT40
+
+; data timing. Must choose between internal and external timing
+     LDR     r1, [r12, #CurrentQBeat]
+; r0 = beat
+; r1 = current q beat
+     MOV     r1, r1, LSR#16 ; clear bottom 16 bits (beat count)
+     ORR     r1, r0, r1, LSL#16      ; update beat count
+     STR     r1, [r12, #CurrentQBeat]
+; set or unset external timing mode if requested from irq routine (if Real Time message received)
+45   TST     r2, #SetExternalC
+; set external timing mode
+     ORRNE   r2, r2, #ExternalCount  ; irq is off!
+     BICNE   r2, r2, #InternalCount
+     BEQ     %FT15
+; stop fast clock for external count
+     TST     r2, #FastClock
+     ORRNE   r2, r2, #WasFastClock    ; show that this was auto-disabled for the duration of the ext count
+     MOVS    r0, #0  ; set z flag to release
+     STR     r2, [r12, #ModeFlagBits]    ; irq is off!
+     BL      ClaimReleaseTimer ; enter with z set to release; ignore error
+     LDR     r2, [r12, #ModeFlagBits]    ; irq is off!
+
+15   TST     r2, #ClearExternalC
+     BICNE   r2, r2, #ExternalCount
+     TSTNE   r2, #WasFastClock      ; auto-restart fastclock
+     BEQ     %FT16
+; restart fast clock for internal count
+     BIC     r2, r2, #WasFastClock
+     MOVS    r0, #1   ; clear z flag to claim
+     STRNE   r2, [r12, #ModeFlagBits]    ; irq is off!
+     BLNE    ClaimReleaseTimer ; enter with z clear to claim; ignore error
+     LDREQ   r2, [r12, #ModeFlagBits]    ; irq is off!
+
+; clear instruction
+16   BIC     r2, r2, #SetExternalC:OR:ClearExternalC
+     STR     r2, [r12, #ModeFlagBits]    ; irq is off!
+     TST     r2, #FastClock    ; don't do fast clock internal count here
+     BNE     %FT20
+     TST     r2, #InternalCount ; is it being inc'd by internal clock?
+     BLNE    InternalTiming
+
+; check active sensing status
+; rx active sensing
+20   TST     R2, #RxActiveSenseBit
+     BEQ     %FT25    ; if active sensing is disabled
+
+; get number of installed podules
+     MOV     r9, r2, LSR#NExtraPodulesShift
+     ANDS    r9, r9, #3  ; number of podules - 1
+
+; check active sensing
+     LDR     r0, [r12, #RxInactiveTime] ; 4 counters
+     ANDEQ   r0, r0, #&FF ; only 1 podule; clear other counters
+     CMP     r9, #2
+     BICLE   r0, r0, #&FF000000 ; at most 3 podules; clear 4
+     BICLT   r0, r0, #&FF0000   ; at most 2 podules; clear 3
+
+22   MOV     r1, r9, LSL#3 ; podule number X 8 for byte-shift
+     MOV     r3, r0, LSR r1 ; move to lsb
+     ANDS    r3, r3, #&FF  ; mask it
+     MOV     r4, #1
+     ADDNE   r0, r0, r4, LSL r1 ; add 1 if non-zero
+     CMP     r3, #MaxRxInactivity     ; time expired?
+     MOV     r4, #&FF
+     BICGT   r0, r0, r4, LSL r1    ; clear byte if time expired
+     BLGT    RxActiveSenseFail ;set error flag, generate midi error event, and turn off any midi notes
+     SUBS    r9, r9, #1   ; podule number
+     BPL     %BT22
+
+     STR     r0, [r12, #RxInactiveTime]
+     MOVS    r0, r0              ; is it 0?
+     BICEQ   r2, r2, #RxActiveSenseBit  ; return to non-AS if all counters are 0
+     STREQ   r2, [r12, #ModeFlagBits]   ; irq is off!
+
+; tx active sensing
+25   TST     r2, #TxActiveSenseBit
+     BEQ     %FT30
+
+; increment all non-zero counters
+; (zero-byte means counter, and Active Sensing, in this channel is disabled)
+; go round all installed podules enabling transmit irqs if its active sensing time has expired
+
+; get number of installed podules
+     MOV     r9, r2, LSR#NExtraPodulesShift
+     AND     r9, r9, #3  ; number of podules - 1
+
+     TEQP    pc, #3 + I_bit  ; disable interrupts
+     LDR     r0, [R12, #TxInactiveTime] ; 4 counters
+
+     MOV     r4, #1
+27   MOV     r1, r9, LSL#3 ; podule number X 8 for byte-shift
+     MOV     r3, r0, LSR r1 ; required byte to lsb
+     ANDS    r3, r3, #&FF   ; mask it
+     ADDNE   r0, r0, r4, LSL r1 ; add 1 if non-zero
+     CMP     r3, #MaxTxInactivity     ; time expired?
+     BLGE    EnableTxIRQ
+     SUBS    r9, r9, #1   ; podule number
+     BPL     %BT27
+
+     STR     r0, [r12, #TxInactiveTime]
+     MOVS    r0, r0              ; is it 0?
+     BICEQ   r2, r2, #TxActiveSenseBit  ; return to non-AS if all counters are 0
+     STREQ   r2, [r12, #ModeFlagBits]   ; irq is off!
+
+30   TST     r2, #SoundEnableBit
+     BLNE    SoundInterpreter  ; if sound enabled, interpret data
+;nb this corrupts regs r0-r2
+; exit
+40   LDMFD   sp!, {lr}            ; get old lr_svc value
+     TEQP    pc, #I_bit:OR:2      ; change back to irq mode
+     MOVNV   r0, r0               ; regbank delay
+     LDMFD   sp!, {r0-r4,r9, pc}^
+
+SoundSWIError
+; If a sound swi causes an error in the centisecond routine then attempt to disable SIRQ,
+; find which sound module caused the error and mark it as not present
+     STMFD   sp!, {r0-r4,lr}
+     MOV     r0, #OsbyteFlushBuffer  ; flush keyboard buffer
+     MOV     r1, #KeyboardBufferNum ; this is needed to fix an os bug.
+     SWI     XOS_Byte  ; It uses the keyboard buffer to store an error message
+     MOV     r0, #0
+     MOV     r1, #0
+     MOV     r2, #0
+     MOV     r3, #0
+     LDR     r4, [r12, #Sound_QTick]
+     TEQP    pc, #I_bit:OR:3
+     SWI     XSound_Configure       ; disconnect centisecond routine
+     LDR     r2, [r12, #ModeFlagBits]
+     BICVS   r2, r2, #Sound0Present
+     MOV     r0, #0
+     MOV     r1, #0
+     SWI     XSound_InstallVoice    ; dummy call to sound1
+     BICVS   r2, r2, #Sound1Present
+     MOV     r0, #0
+     SWI     XSound_QBeat          ; dummy call to sound2
+     BICVS   r2, r2, #Sound2Present
+     STR     r2, [r12, #ModeFlagBits]
+     LDMFD   sp!, {r0-r4,pc}^      ; preserve old flags
+
+RxActiveSenseFail
+; Active Sensing reception has stopped
+; r9 is podule number (0..3)
+     STMFD   sp!, {r0-r1,r3, lr}
+; set the error flag
+     MOV     r1, #"A"
+     ADD     r3, r12, r9
+     STRB    r1, [r3, #ErrorFlag]
+; generate a midi error event
+     MOV     r0, #Event_MIDI
+     MOV     r1, #MIDI_ErrorEvent
+     SWI     XOS_GenerateEvent
+; and turn off any midi notes
+     TST     r2, #SoundEnableBit
+     BLNE    DoAllNotesOff
+     LDMFD   sp!, {r0-r1,r3, pc}^
+
+InternalTiming ROUT
+; Internal Timing Mode is set (not FastClock mode)
+;can read tempo to check for extreme setting of &FFFF =16 beats/bar and
+; ensure increment every centisecond. If possible use beat counter
+; (tricky!) because this should ensure bar alignment.
+; The bar count is updated on the bar event.
+; enter with r0 = current value of BEAT
+; r2 = mode flags
+; r12 = wp
+     STMFD   sp!, {r0-r1, r3-r5,lr}
+     TEQP    pc, #3    ; enable interrupts
+     LDR     r1, [r12, #Tempo]
+; r1 = tempo
+     CMP     r1, #&FF00    ; =16 beats per centisecond = maximum tempo
+     BGT     TCtimeUp ;if tempo set to max, then send a TC every centisecond
+     LDR     r5, [r12, #LastBeat]
+     LDR     r3, [r12, #BarLength]
+; r5 = last beat
+; r3 = bar length
+     CMP     r3, #1  ; if the bar count is 0 or 1 then use tempo value
+     BGT     %FT10
+
+; send a tick every n centiseconds
+     ADD     r5, r5, r1  ; increment counter by tempo = microbeat/cs * &1000
+     CMP     r5, #BeatCount:SHL:12 ; 16 whole microbeats passed?
+     MOVGE   r5, #0
+     STR     r5, [r12, #LastBeat]    ; new value
+     BGE     TCtimeUp
+     LDMFD   sp!, {r0-r1,r3-r5, pc}^    ; return
+
+10   MOV     r4, r5, LSR#16        ; incremental count in b31-b16 
+; r4 = incremental beats
+     MOV     r5, r5, LSL#16    ; clear top 16 bits
+     MOV     r5, r5, LSR#16    ; old value in b15-b0
+     CMP     r5, r0           ; compare with current beat
+     BNE     NewBeatValue
+     CMP     r1, #TempoUnit    ; this value is 1 tempo beat/centisecond
+     LDMLTFD sp!, {r0-r1,r3-r5, pc}^  ; return
+
+NewBeatValue      ; count beats elapsed since last TC sent
+     SUBS    r1, r0, r5      ; new beats-old beats, and check for bar wrap
+     ADDMI   r1, r1, r3      ; add a bar of beats
+     ADD     r4, r4, r1      ; add current beats to incrementing value
+     CMP     r4, #BeatCount  ; =16
+     MOV     r5, r0          ; new beat value
+     ORRLT   r5, r5, r4, LSL#16  ; update top 16b
+     STR     r5, [r12, #LastBeat]    ; new value
+     LDMLTFD sp!, {r0-r1,r3-r5, pc}^ ;return
+
+TCtimeUp
+     TEQP    PC, #I_bit:OR:3    ; disable interrupts for consistent flags
+     LDR     r2, [r12, #ModeFlagBits]
+     TST     r2, #SendRT ; test for an existing sendrt request
+     ORREQ   r2, r2, #SendTC  ; instruct irq routine to send a Timing Clock msg
+     STR     r2, [r12, #ModeFlagBits]
+     MOV     r1, r2, LSR#NExtraPodulesShift
+     AND     r1, r1, #3  ; number of podules installed - 1
+; transmit a tc from all podules
+20   ADD     r3, r12, r1, LSL#2  ; x 4
+     LDR     r0, [r3, #UARTbase] ; uart/acia base address
+; r0 = device base address
+     TST     r0, #PoduleTypeTestBit
+     MOVNE   r5, #ACIATxIRQEnable
+     STRNEB  r5, [r0]             ; enable TDRE interrupts
+     MOVEQ   r5, #RxRDYirq:OR:TxRDYirq
+     STREQB  r5, [r0, #IROffset]  ; enable TxRDY interrupts
+     ADD     r3, r12, r1
+     STRB    r5, [r3, #IMRCurrent]
+     SUBS    r1, r1, #1
+     BPL     %BT20      ; repeat for each installed podule
+     LDMFD   sp!, {r0-r1,r3-r5, pc}^ ; return
+
+DoRareUpdate ROUT; Collect here swis which don't have to happen every centisec.
+ ; enter with r2=mode flags                       SWIs are expensive!
+     STMFD   sp!, {r0-r1, lr}
+     MOV     r0, #-1        ; get max count of sound beat counter
+     SWI     XSound_QBeat
+     LDMVSFD sp!, {r0-r1, pc}  ; return with v-set if error.
+     LDR     r1, [r12, #BarLength]  ; to look for a bar length change
+     CMP     r0, r1          ; has value of beats/bar changed?
+     STRNE   r0, [r12, #BarLength] ; if so, store new value
+     MOV     r0, #0
+     STRNE   r0, [r12, #CurrentQBeat] ; and clear beat and bar counters
+     SWI     XSound_QTempo
+     LDMVSFD sp!, {r0-r1, pc}  ; return with v-set if error.
+     STR     r0, [r12, #Tempo]      ; update tempo setting
+     LDMFD   sp!, {r0-r1, pc}^
+
+MinMIDIPitch * 12   ; midi pitch value for sound system pitch of zero
+MaxMIDIPitch * 96   ; midi pitch value for (nearly) max sound system pitch
+MaxSoundPitch * &7000  ; max sound sys pitch (almost). Above this it sounds bad
+MinSoundPitch *  &100  ; below this it becomes bbc emulation mode
+MaxChannelNumber * 16    ; maximum MIDI channel number
+; duration values for note on and note off:
+OnDuration * &FF   ; = ever
+OffDuration * &1    ; = stop as quickly as possible
+ImmediateScheduleTime * 0
+Semitone  &  &10000/12   ; = 5461.3333, but actually stored and used as 5461.
+; This value is a sound system semitone, left-shifted 4 places to reduce the
+; worst-case incremental error when added 11 times to C to reach B.
+; This means that the semitone between B and C is approximately 0.07% wider
+; (instead of 1.2% wider) than all the other semitones. (This error only
+; affects the internal sound system, not the MIDI data). 
+
+GatedZeroAmplitude  * &100
+GatedOffAmplitude   * &104 ;zero amplitude doesnt work for wavesynth voice off
+SmoothZeroAmplitude * &180
+
+  ALIGN
+
+SoundInterpreter ROUT
+;Get byte from receive buffer fifo where the irq routine put it, and
+; translate it and control the sound system
+; R12 is pointer to workspace
+     STMFD   sp!, {r3-r11,lr}
+     LDR     r6, [r12, #ModeFlagBits]
+; r6 = mode flags
+; ensure necessary bits of sound system are present
+     TST     r6, #Sound0Present
+     TSTNE   r6, #Sound1Present
+     LDMEQFD sp!, {r3-r11,pc}^ ; return if not     
+     TEQP    pc, #3      ; enable irq
+     LDR     r4, [r12, #BufferSoundOutPntr]
+; refer to in or out buffer pointer depending on state of connection bit
+     LDRB    r9, [r12, #InterpretChannel] ; which buffer is it looking at?
+; ensure podule connection number is legal
+     MOV     r8, r6, LSR#NExtraPodulesShift
+     AND     r8, r8, #3
+     CMP     r9, r8
+     MOVGT   r9, #0
+     ADD     r3, r12, r9, LSL#2        ; buffer offset
+     TST     R6, #ConnectionBit
+     LDRNE   r5, [r3, #TxBufferPntrs]
+     LDREQ   r5, [r3, #RxBufferPntrs]
+     BIC     r5, r5, #&FF000000   ; buffer in pointer
+     BIC     r5, r5, #&00FF0000
+     ADD     r3, r12, r9, LSL#2        ; buffer offset
+     LDRNE   r11, [r3, #TxBufferStarts]
+     LDREQ   r11, [r3, #RxBufferStarts]
+; r4 = buffer out pointer
+; r5 = buffer in pointer
+; r11 = buffer start
+GetMore
+     CMP     r4, r5   ; Check if buffer has data and get it
+     BEQ     BufferEmpty
+     LDRB    R2, [r11, R4]    ; Load data from buffer
+; r2 = data byte
+     ADD     R4, R4, #1      ; increment buffer pointer
+     TST     R6, #ConnectionBit
+     LDREQ   r8, [r12, #RxBufferLen]
+     MOVNE   r8, #TxBufferLen
+     CMP     R4, r8
+     MOVGE   R4, #0        ; circular buffer, reset pointer
+  ; R2 contains byte
+  ; R4 and R5 contain buffer in and out pointers
+; Intercept system exclusive data quickly, and empty it from buffer.
+; start of exclusive is &F0, end of exclusive "EOX" is &F7 or any other
+; status byte
+     CMP     R2, #&F0   ; system exclusive
+     STREQB  R2, [R12, #RunningStatus]
+     BEQ     GetMore
+     LDRB    R0, [R12, #RunningStatus]  ;get previous status byte
+     CMP     R0, #&F0   ; was it system exclusive?
+     TSTEQ   R2, #&80   ; if so, is it now a status byte?
+     BEQ     GetMore ; if not then empty system excl data quickly from buffer
+;NotExclusive
+     TST     R2, #&80    ; Status byte ?  Test msb
+     BEQ     ReadDataByte  ; if not then read data byte
+     AND     R0, R2, #&F8
+     CMP     R0, #&F8     ; is it a real time message?
+     BEQ     GetMore   ; I dont do anything with system real time here
+     AND     R0, R2, #&F0
+     CMP     R0, #&F0    ; dont update RS with system common status
+     STRNEB  R2, [R12, #RunningStatus]  ; store status byte in runningstatus
+     BNE     NotSysMsg
+;System common
+     MOV     R3, #&1             ; pend for 1 data byte
+     CMP     R2, #SongPosPointerVal ; song position pointer status
+     MOVEQ   R3, #&2             ; pend for 2 bytes
+     CMPNE   R2, #SongSelectVal     ; song select status
+     STREQB  r3, [r12, #PendSysMsg] ; pending RS for system message
+     CMP     R2, #TuneRequestVal    ; tune request status
+     BEQ     TuneRequest  ; ignore "end of system exclusive" flag
+     B       GetMore
+NotSysMsg
+     MOV     r3, #0
+     STRB    r3, [r12, #PendSysMsg] ; clear possible sys common pend state
+     MOV     R3, #&20    ; default expect 2 bytes
+     CMP     R0, #ChannelPressureVal  ; IF Channel pressure
+     CMPNE   R0, #ProgramChangeVal    ; OR Program change
+     MOVEQ   R3, #&10    ; THEN expect 1 byte
+ExpectBytes
+     STRB    R3, [R12, #ByteCounter]  ; number of bytes for this status
+     B       GetMore
+ReadDataByte
+     LDRB    r0, [r12, #PendSysMsg] ; check if pending RS for system message
+     ANDS    r0, r0, #3
+     SUBNE   r0, r0, #1
+     STRNEB  r0, [r12, #PendSysMsg]
+     BNE     GetMore                ; if pending then ignore this data byte
+;If expected byte number has elapsed since status or cleared then do something
+  ; R2 contains data byte
+     LDRB    R0, [R12, #ByteCounter]  ;bits 3-0 is current byte number
+                                      ;bits 7-4 is expected byte number
+     ADD     R0, R0, #1   ; increment bytes-received counter
+     MOV     R1, R0, LSR#4  ; expected bytes
+     AND     R1, R1, #&3
+     AND     R3, R0, #&3
+     CMP     R1, R3   ; have I got enough data bytes yet?
+     BICEQ   R0, R0, #&F ; reset byte counter
+     STRB    R0, [R12, #ByteCounter]
+     STRNEB  R2, [R12, #FirstDataByte]
+     BNE     GetMore
+; Now a complete set of bytes should have been got. Translate and output
+     CMP     R1, #1
+     MOVEQ   R1, R2   ; for 1-byte commands move the byte to R1
+     LDRB    R0, [R12, #RunningStatus]
+     LDRNEB  R1, [R12, #FirstDataByte]
+     AND     R3, R0, #&F0
+     CMP     R3, #&F0    ; System message
+     BEQ     GetMore   ; ignored
+DecodeMode
+     AND     R3, R0, #&0F ;channel number; bottom 4 bits of status  =N
+     TST     R6, #OmniBit  ; test omni off/on
+     BNE     InterpretCommand  ; omni on
+     LDRB    R7, [R12, #CurrentChannel]
+     TST     R6, #PolyBit  ; Omni off. Test poly/mono
+     BEQ     OmniOffMono
+     CMP     R3, R7   ; compare command channel with currently set midi channel
+     BNE     GetMore     ; if omni off then ignore data not on current channel
+     B       InterpretCommand
+OmniOffMono
+     CMP     R3, R7  ; compare current channel
+     BLT     GetMore ; ignore data if channel no. < N
+     LDRB    r8, [r12, #MonoChannels] ; no. of channels in mono mode = M-1
+     ADD     R9, R7, R8
+     CMP     R3, R9  ; compare top of channel range (omni off / mono)
+     BGT     GetMore  ;ignore data if channel not in range N..M-1
+     SUB     R9, R3, R7            ; voice number-1
+     CMP     R9, #MaxVoices
+     BGE     GetMore              ; ignore attempts to control voices>8
+
+InterpretCommand
+; r1 = data byte 1
+; r2 = data byte 2
+; r3 = channel num
+     MOV     R0, R0, LSR #4    ; top 4bits of status
+     AND     R0, R0, #7         ; take 3 bits of status in LSB
+     ADD     PC, PC, R0, LSL #2
+     B       GetMore    ; dummy instruction
+     B       NoteOff
+     B       NoteOn              ; channel voice jump table
+     B       GetMore    ; PolyKeyPressure is ignored
+     B       ChannelMode
+     B       ProgramChange
+     B       GetMore    ; ChannelPressure is ignored
+     B       PitchWheel
+     B       GetMore
+
+TuneRequest
+     LDR     R0, [R12, #Tuning]
+     SWI     XSound_Tuning
+     BLVS    SoundSWIError ; abort if v set
+     LDMVSFD sp!, {r3-r11,pc}^
+     B       GetMore
+
+NoteOff   ;Ignores note off velocity. Labels within NoteOff are prefixed "NOf"
+     LDRB    R9, [R12, #VoiceStates]
+     MOV     R0, #0
+     MOV     R10, #1
+     MOV     R8, R1       ; midi pitch
+     TST     R6, #PolyBit ; sort out which voice assignment is needed from mode
+     BNE     NOfFindVoice ;mode 1 and 3 are same. chnl# has been tested 
+; Mono
+     TST     R6, #OmniBit
+; omni off
+     LDREQB  R7, [R12, #CurrentChannel]   ; this is 'N' in MIDI spec 1.0 p5
+     SUBEQ   R0, R3, R7            ; voice number-1
+NOfFindVoice      ; poly entry
+     TST     R9, R10, LSL R0    ; find an ON voice
+     BNE     NOfFoundVoice
+     ADD     R0, R0, #1
+     B       NOfLoopBack
+NOfFoundVoice
+     ADD     R7, R12, #VoiceMPitches
+     LDRB    R7, [R7, R0]
+     CMP     R7, R8        ; match pitch of note
+     ADDNE   R0, R0, #1
+     BNE     NOfLoopBack
+     BIC     R9, R9, R10, LSL R0   ; clear voice bit in voice states byte
+     ADD     R7, R12, #VoiceSPitches
+     LDR     R3, [R7, R0, LSL#2] ; load VoiceSPitches word (16b)
+     ADD     R7, R0, #1   ; channel number range 1 to 8
+     ORR     R2, R7, #GatedOffAmplitude:SHL:16  ; amplitude / channel
+     ORR     R3, R3, #OffDuration:SHL:16  ; duration/pitch
+     MOV     r0, r2
+     MOV     r1, r3
+     SWI     XSound_ControlPacked
+     BLVS    SoundSWIError ; abort if v set
+     LDMVSFD sp!, {r3-r11,pc}^
+
+     TST     R6, #PolyBit
+     BEQ     GetMore         ; exit immediately if mono mode
+     MOV     R0, R7           ; restore R0 state
+NOfLoopBack
+     CMP     R0, #MaxVoices  ; else look for more notes to switch off
+     BLT     NOfFindVoice
+     STRB    R9, [R12, #VoiceStates]    ; this should be clear now
+     B       GetMore
+
+NoteOn                     ; labels within NoteOn are prefixed "NOn"
+     CMP     R2, #0
+     BEQ     NoteOff    ; Note on with velocity of zero = note off
+     MOV     R10, #1
+     MOV     R0, #0
+     LDRB    R9, [R12, #VoiceStates]  ; byte containing on/off states of voices
+     TST     R6, #PolyBit ; sort out which voice assignment is needed from mode
+     BNE     NOnFindFreeVoice  ;No need to test omni. channel# is OK
+; Mono
+     TST     R6, #OmniBit
+     BNE     NOnMonoVoiceAssign
+     LDRB    R7, [R12, #CurrentChannel]   ; this is 'N' in MIDI spec 1.0 p5
+     SUB     R0, R3, R7           ; voice number-1. Range has been tested
+     B       NOnMonoVoiceAssign
+NOnFindFreeVoice        ;Poly Voice Assign
+     TST     R9, R10, LSL R0   ; find free voice (bit=0)
+     ADDNE   R0, R0, #1
+     BNE     NOnFindFreeVoice ;bit 8 upwards are 0, else possible infinite loop
+     CMP     R0, #MaxVoices
+     BGE     NoFreeVoice    ; no free voice found
+NOnMonoVoiceAssign                      ; mono assign
+     CMP     R1, #MaxMIDIPitch
+     BGT     NoteRangeError
+     CMP     R1, #MinMIDIPitch
+     BLE     NoteRangeError ; below &100 it reverts to bbc em. mode
+     ORR     R9, R9, R10, LSL R0  ; set bit for chosen voice
+     STRB    R9, [R12, #VoiceStates]
+     ADD     R7, R12, #VoiceMPitches
+     STRB    R1, [R7, R0] ;  store (MIDI) note value in #VoiceMPitches
+     SUB     R1, R1, #MinMIDIPitch  ; sound pitch of 0 is midi value 12
+     MOV     R3, #0     ; to reduce additive errors and increase accuracy,
+NOnFindOctave           ; do calcs left-shifted 4 places
+     SUBS    R7, R1, #12       ; MIDI octave = 12
+     ADDPL   R3, R3, #&1000:SHL:4   ; sound system octave = &1000
+     MOVPL   R1, R7
+     BEQ     NOnFoundNote      ; takes branch if note is c
+     BPL     NOnFindOctave
+     LDR     R7, Semitone
+NOnFindNote
+     SUBS    R1, R1, #1
+     ADDPL   R3, R3, R7
+     BPL     NOnFindNote
+NOnFoundNote
+     MOV     R3, R3, LSR#4    ; shift back 4 places to get correct value
+     ADD     R7, R12, #VoiceSPitches
+     STR     R3, [R7, R0, LSL#2] ; Store pitch in VoiceSPitches
+     LDR     r7, [R12, #ModeFlagBits]
+     TST     r7, #TouchSenseOff
+     MOVNE   r1, #&7f       ; only touch sensitive if mode bit set
+     MOVEQ   R2, R2, LSR#2    ; Ignore bottom 2 bits of velocity
+     ANDEQ   R2, R2, #&1F     ; top 5 bits range 0-31
+     ADREQ   R7, LogTable
+     LDREQB  R1, [R7, R2]     ; log of top 5 bits
+     ADD     R7, R12, #VoiceAmps
+     STRB    R1, [R7, R0]     ; store note-on amplitude in VoiceAmps
+     ORR     R1, R1, #GatedZeroAmplitude  ; gate on. Amp 00 to 7F
+     ADD     R0, R0, #1           ; channel range 1 to 8
+     ORR     R3, R3, #OnDuration:SHL:16  ; duration/pitch
+     ORR     R2, R0, R1, LSL#16   ; amplitude/channel
+     MOV     r0, r2
+     MOV     r1, r3
+     SWI     XSound_ControlPacked
+     BLVS    SoundSWIError ; abort if v set
+     LDMVSFD sp!, {r3-r11,pc}^
+     B       GetMore
+ChannelMode
+     LDRB    R7, [R12, #CurrentChannel]
+     CMP     R3, R7   ; compare command channel with currently set midi channel
+     BNE     GetMore  ; if not same channel then ignore mode message
+     SUBS    R1, R1, #&7A
+     BMI     GetMore
+     AND     R1, R1, #7   ; make sure it cant exceed jump table
+     ADD     PC, PC, R1, LSL #2
+     B       GetMore    ; dummy instruction
+     B       AllNotesOff    ; LocalControl does nothing now
+     B       AllNotesOff
+     B       OmniModeOff
+     B       OmniModeOn
+     B       MonoModeOn
+     B       PolyModeOn
+     B       GetMore
+
+OmniModeOff
+     TEQP    PC, #I_bit:OR:3  ; disable interrupts for consistent mode state
+     LDR     R6, [R12, #ModeFlagBits]
+     BIC     R6, R6, #OmniBit   ;   clear bit 1
+     STR     R6, [R12, #ModeFlagBits]
+     TEQP    PC, #3    ; re-enable interrupts
+     B       AllNotesOff
+
+OmniModeOn
+     TEQP    PC, #I_bit:OR:3  ; disable interrupts for consistent mode state
+     LDR     R6, [R12, #ModeFlagBits]
+     ORR     R6, R6, #OmniBit   ;   set bit 1
+     STR     R6, [R12, #ModeFlagBits]
+     TEQP    PC, #3    ; re-enable interrupts
+     B       AllNotesOff
+
+MonoModeOn
+     AND     R2, R2, #&F  ; number of channels in mono mode
+     CMP     R2, #0
+     MOVEQ   R2, #MaxVoices   ; default number of channels = 8
+     BEQ     ChannelSet
+     CMP     R2, #MaxVoices
+     MOVGT   R2, #MaxVoices
+     STRB    R2, [R12, #MonoChannels]
+ChannelSet
+     TEQP    PC, #I_bit:OR:3  ; disable interrupts for consistent mode state
+     LDR     R6, [R12, #ModeFlagBits]
+     BIC     R6, R6, #PolyBit   ;   clear poly bit
+     STR     R6, [R12, #ModeFlagBits]
+     TEQP    PC, #3    ; re-enable interrupts
+     B       AllNotesOff
+
+PolyModeOn
+     TEQP    PC, #I_bit:OR:3  ; disable interrupts for consistent mode state
+     LDR     R6, [R12, #ModeFlagBits]
+     ORR     R6, R6, #PolyBit   ;   set bit 0
+     STR     R6, [R12, #ModeFlagBits]
+     TEQP    PC, #3    ; re-enable interrupts
+
+AllNotesOff
+     BL      DoAllNotesOff
+     B       GetMore
+
+ProgramChange
+     ADD     R1, R1, #1
+     MOV     r0, #1      ; sound channel number (scans 1-8)
+     MOV     R7, #MaxVoices ; in poly mode all voices are changed
+     TST     R6, #PolyBit    ;  voice assignment from mode
+     BNE     %FT14       ;mode 1 and 3 are same. chnl# has been tested
+; Mono mode; only 1 voice is changed
+     TST     R6, #OmniBit  ; only voice 1 is changed in omni on / mono mode
+     LDREQB  R7, [R12, #CurrentChannel]   ; this is 'N' in MIDI spec 1.0 p5
+     SUBEQ   r0, r3, r7       ; voice number-1
+     ADDEQ   r0, r0, #1
+     MOV     r7, r0
+14   MOV     r2, r1
+15   MOV     r1, r2
+     SWI     XSound_AttachVoice
+     ADD     r0, r0, #1
+     CMP     r0, r7
+     BLE     %BT15
+     B       GetMore
+
+PitchWheel  ; Range of pitch wheel is &0000 to &3FFF. Centre position is &2000
+     LDRB    R9, [R12, #VoiceStates]
+     MOV     R0, #0         ; channel
+     AND     R1, R1, #&7F   ; range limit
+     AND     R2, R2, #&7F
+     ORR     R1, R1, R2, LSL #7 ; combine lsb and msb
+     SUB     R10, R1, #&2000
+     MOV     R8, #MaxVoices
+     TST     R6, #PolyBit ; sort out which voice assignment is needed from mode
+     BNE     PWFindVoice   ;No need to test omni. channel# is OK
+     TST     R6, #OmniBit  ; Mono
+     MOVNE   R8, #1
+     LDREQB  R7, [R12, #CurrentChannel]   ; this is 'N' in MIDI spec 1.0 p5
+     SUBEQ   R0, R3, R7           ; voice number-1. Range has been tested
+     MOVEQ   R8, R0
+     B       PWFoundVoice
+PWFindVoice  ; poly entry: check each of the 8 voices, if on then change pitch
+     MOV     R7, #1
+     TST     R9, R7, LSL R0
+     BNE     PWFoundVoice
+     ADD     R0, R0, #1
+     CMP     R0, #MaxVoices
+     BLT     PWFindVoice
+     B       GetMore     
+PWFoundVoice
+     ADD     R7, R12, #VoiceAmps
+     LDRB    R1, [R7, R0] ; load VoiceAmps byte
+     ADD     R7, R12, #VoiceSPitches
+     LDR     R2, [R7, R0, LSL#2] ; load VoiceSPitches word (32b)
+     ADD     R2, R2, R10, ASR#1  ; change pitch value      :PITCH
+     CMP     R2, #MaxSoundPitch  ; switch off note if it exceeds pitch range
+     MOVGT   R2, #MaxSoundPitch
+     MOVGT   R1, #1              ; reduce to a whisper
+     CMP     R2, #MinSoundPitch
+     MOVLT   R2, #MinSoundPitch
+     MOVLT   R1, #1              ; reduce to a whisper
+     ADD     R0, R0, #1      ;                            :CHANNEL
+     MOV     R7, R0          ; copy channel number
+     ORR     R1, R1, #SmoothZeroAmplitude ;               :AMPLITUDE
+     ORR     R3, R2, #OnDuration:SHL:16     ; duration/pitch
+     ORR     R2, R0, R1, LSL#16           ; amp/channel
+
+     MOV     r0, r2
+     MOV     r1, r3
+     SWI     XSound_ControlPacked
+
+     MOV     R0, R7
+     CMP     R0, R8
+     BLT     PWFindVoice
+     B       GetMore     
+
+NoteRangeError
+     MOV     R0, #"L"
+     STRB    R0, [R12, #ErrorFlag]
+     B       GetMore
+NoFreeVoice
+     MOV     R0, #"V"
+     STRB    R0, [R12, #ErrorFlag]
+     B       GetMore
+BufferEmpty
+     STR     R4, [R12, #BufferSoundOutPntr]
+     LDMFD   sp!, {r3-r11,pc}^
+
+; conversion table to convert velocity and pressure values into amplitudes for soundsys
+LogTable ; NB linear now rather than logarithmic, seems to give a better result with Casio CPS-101
+;     = &20,&28,&30,&37, &3e,&45,&4b,&40,  &42,&44,&46,&50, &56,&5b,&61,&65
+;     = &5a,&60,&64,&69, &6c,&70,&73,&75,  &77,&79,&7a,&7b, &7c,&7d,&7e,&7f
+     = &40,&42,&44,&46, &48,&4A,&4C,&4E,  &50,&52,&54,&56, &58,&5A,&5C,&5E
+     = &60,&62,&64,&66, &68,&6A,&6C,&6E,  &70,&72,&74,&76, &78,&7A,&7C,&7E
+
+     ALIGN
+
+DoAllNotesOff
+     STMFD   sp!, {R0-R5, lr}
+     LDR     r0, [r12, #ModeFlagBits]
+     AND     r0, r0, #Sound2Present:OR:Sound1Present:OR:Sound0Present
+     CMP     r0, #Sound2Present:OR:Sound1Present:OR:Sound0Present
+     LDMNEFD sp!, {R0-R5, pc}^ ; return if all of sound system not present
+     TEQP    pc, #I_bit:OR:3      ; disable irq
+     MOV     R0, #ImmediateScheduleTime ; schedule for immediate action
+     MOV     R5, #0      ; channel
+     LDRB    R4, [R12, #VoiceStates]
+NextVoice
+     MOV     R1, #1
+     TST     R4, R1, LSL R5  ; test if voice is on
+     ADDNE   R3, R12, #VoiceSPitches
+     LDRNE   R3, [R3, R5, LSL#2]  ; load pitch from VoiceSPitches
+     ADD     R5, R5, #1
+     ORRNE   R3, R3, #OffDuration:SHL:16         ; duration/pitch
+     ORRNE   R2, R5, #GatedOffAmplitude:SHL:16  ; amp/channel
+     MOV     R1, #0      ; cause a XSound_controlpacked swi
+     SWINE   XSound_QSchedule
+     LDMVSFD sp!, {R0-R5, PC}^  ; return if v set, but ignore error
+     CMP     R5, #MaxVoices
+     BLT     NextVoice
+     MOV     R4, #0
+     STRB    R4, [R12, #VoiceStates]
+     LDMFD   sp!, {R0-R5, PC}^
+
+ConnectAllVoices ROUT ; connect voice 2 to all channels (or voice 1 if 2 unavailable))
+; use voice 2 in preference because voice 1 is usually weedy beep,
+; while voice 2 is good stringlib
+     STMFD   sp!,{r0-r3, lr}
+     MOV     r0, #0
+     MOV     r1, #0
+     SWI     XSound_InstallVoice ; gives max voices + 1 in r1
+     LDMVSFD sp!,{r0-r3, pc}^    ; error return quietly
+     CMP     r1, #1
+     LDMLEFD sp!,{r0-r3, pc}^    ; no voices installed return quietly
+     CMP     r1, #2
+     MOV     r3, #1   ; voice
+     MOVGT   r3, #2   ; if more than 1 voice generator attach 2nd voice to all channels
+     MOV     r2, #1   ; channel
+10   MOV     r1, r3   ; voice -> r1
+     MOV     r0, r2   ; channel -> r0
+     SWI     XSound_AttachVoice
+     LDMVSFD sp!, {r0-r3, pc}^  ; exit quietly if error
+     ADD     r2, r2, #1 ; next channel
+     CMP     r2, #8
+     BLE     %BT10
+     LDMFD   sp!,{r0-r3, pc}^
+
+AddrInterfaceEntry ROUT
+     CMP     R11, #(EndOfSWIJumpTable-SWIJumpTable)/4
+     MOVCSS  PC, lr
+     STMFD   sp!, {R2-R10, lr}
+; R12 is workspace pointer
+     B       %FT01
+
+MIDI_SWI_Code
+     CMP     R11, #(EndOfSWIJumpTable-SWIJumpTable)/4
+     MOVCSS  PC, lr
+     STMFD   sp!, {R2-R10, lr}
+     LDR     R12, [R12]     ; workspace pointer
+01   TEQP    pc, #3   ; enable irq
+     MOV     r9, #0 ; default podule to use
+     LDR     r2, [r12, #ModeFlagBits]
+     MOV     r8, r2, LSR#NExtraPodulesShift
+     ANDS    r8, r8, #3  ; number of extra podules installed
+; enter all swis with:
+; svc mode; irq enabled
+; r2-r10,lr saved
+; r2 = modeflagbits (nb must not write back cos irq enabled)
+; r8 = n extra podules installed (0-3) (n+1 = number of podules)
+; z-bit set according to r8 (EQ is true for one podule only installed)
+; all SWIs should behave compatibly for 1 podule installed; and may
+; be slightly different for more than 1
+     ADD     PC, PC, R11, LSL #2
+     B       SWIExit            ; dummy instruction
+SWIJumpTable
+     B       SoundEnableSWI               ;1
+     B       SetModeSWI                   ;2
+     B       SetTxChannelSWI              ;3
+     B       SetTxActiveSensingSWI        ;4
+     B       InqSongPositionPointerSWI    ;5
+     B       InqBufferSizeSWI             ;6
+     B       InqErrorSWI                  ;7
+     B       RxByteSWI                    ;8
+     B       RxCommandSWI                 ;9
+     B       TxByteSWI                    ;10
+     B       TxCommandSWI                 ;11
+     B       TxNoteOffSWI                 ;12
+     B       TxNoteOnSWI                  ;13
+     B       TxPolyKeyPressureSWI         ;14
+     B       TxControlChangeSWI           ;15
+     B       TxLocalControlSWI            ;16
+     B       TxAllNotesOffSWI             ;17
+     B       TxOmniModeOffSWI             ;18
+     B       TxOmniModeOnSWI              ;19
+     B       TxMonoModeOnSWI              ;20
+     B       TxPolyModeOnSWI              ;21
+     B       TxProgramChangeSWI           ;22
+     B       TxChannelPressureSWI         ;23
+     B       TxPitchWheelSWI              ;24
+     B       TxSongPositionPointerSWI     ;25
+     B       TxSongSelectSWI              ;26
+     B       TxTuneRequestSWI             ;27
+     B       TxStartSWI                   ;28
+     B       TxContinueSWI                ;29
+     B       TxStopSWI                    ;30
+     B       TxSystemResetSWI             ;31
+     B       IgnoreTimingSWI              ;32
+     B       SynchSoundSchedulerSWI       ;33
+     B       FastClockSWI                 ;34
+     B       InitSWI                      ;35
+     B       SetBufferSizeSWI             ;36
+     B       InterfaceSWI                 ;37
+EndOfSWIJumpTable
+
+GetConfig  ; get and store current configured number of channnels
+     STMFD   sp!, {r0-r4, lr}
+     MOV     r0, #0
+     MOV     r1, #0
+     MOV     r2, #0
+     MOV     r3, #0
+     MOV     r4, #0
+     SWI     XSound_Configure
+     STRVC   r0, [r12, #SoundConfiguration]
+     LDMVCFD sp!, {r0-r4, pc}^
+     STR     r0, [sp]            ; return with error if error
+     LDMFD   sp!, {r0-r4, pc}
+SetConfig   ; set an arbitrary number of channels (number in r3)
+     STMFD   sp!, {r0-r4, lr}
+     MOV     r0, r3
+     MOV     r1, #0
+     MOV     r2, #0
+     MOV     r3, #0
+     MOV     r4, #0
+     SWI     XSound_Configure
+     LDMVCFD sp!, {r0-r4, pc}^
+     STR     r0, [sp]            ; return with error if error
+     LDMFD   sp!, {r0-r4, pc}
+
+InterfaceSWI
+; supply and return addresses to call for more efficient interface to this module
+;
+; Out: r0 = workspace pointer to call me with
+;      r1 = external accessible address of SWI MIDI_, with r11 = SWIoffset from SoundEnable
+     MOV     r0, r12
+     ADR     r1, AddrInterfaceEntry
+     B       SWIExit
+
+SoundEnableSWI ; enter with R0 =0 to disconnect sound system
+              ;                =1 for connection to MIDI IN data
+              ;                =2 for connection to MIDI OUT data
+              ;  + 2 x podule number if more than 1 podule
+; r1 = 1 to enable touch sensitivity
+;    = 2 to disable touch sensitivity
+     ANDEQ   r0, r0, #3        ; if only 1 podule installed
+     TEQP    pc, #I_bit:OR:3     ; disable irq
+     BL      DoAllNotesOff
+     MOV     R4, #0       ; first clear state of sound system driver
+     ADD     R2, R12, #ClearSpaceStart ; start of workspace to clear
+     ADD     R3, R12, #ClearSpaceEnd   ; end of wkspace to clear
+SSClearSoundSys
+     STR     R4, [R2], #4         ; clear sound system driver workspace
+     CMP     R2, R3
+     BLT     SSClearSoundSys
+     LDR     R4, [R12, #ModeFlagBits]
+     TST     r4, #SoundEnableBit
+     BLEQ    GetConfig     ; if sound not enabled store no. of channels set
+     BVS     SWIExit
+     SUBS    r0, r0, #1  ; minus if r0 was 0
+     BPL     %FT10
+; disable sound
+     ADD     r0, r0, #1  ; restore r0 value
+     BIC     r4, r4, #SoundEnableBit   ; disable sound
+     STR     r4, [r12, #ModeFlagBits]
+     LDR     r3, [r12, #SoundConfiguration]
+     BL      SetConfig   ; restore old number of channels
+     B       SWIExit
+10   ORR     r4, r4, #SoundEnableBit ; set sound enable bit if not 0
+     BL      ConnectAllVoices  ; ensure voices are connected to all channels if sound system is to be used
+     MOV     r3, #MaxVoices
+     BL      SetConfig   ; set new number of channels. Expect no error
+     MOV     r9, r0, LSR#1 ; podule number requested
+     CMP     r9, r8 ; check if it is in the range of the number of podules installed
+     MOVGT   r9, #0
+     TST     r0, #1      ; bit 0 is in/out connection
+     BICEQ   R4, R4, #ConnectionBit ; transfer value of R0 to connection bit
+     ORRNE   R4, R4, #ConnectionBit
+     ADD     r3, r12, r9, LSL#2 ; podule offset
+     LDREQ   R2, [r3, #RxBufferPntrs] ; attach to appropriate buffer
+     LDRNE   R2, [r3, #TxBufferPntrs] ; according to value of connection bit
+     BIC     r2, r2, #&FF000000
+     BIC     r2, r2, #&00FF0000  ; get IN pointer
+     STR     R2, [R12, #BufferSoundOutPntr]
+     BEQ     %FT01
+     ADD     r3, r12, r9   ; podule offset
+     LDRB    R2, [r3, #SendStatus] ; get the current running status if connecting to MIDI out
+     CMP     R2, #&F0                  ; ignore system real time
+     BGE     %FT01
+     STRB    R2, [r12, #RunningStatus]
+     MOV     R3, #&20    ; default expect 2 bytes
+     CMP     R2, #ChannelPressureVal  ; IF Channel pressure
+     CMPNE   R2, #ProgramChangeVal    ; OR Program change
+     MOVEQ   R3, #&10    ; THEN expect 1 byte
+     STRB    R3, [R12, #ByteCounter]  ; number of bytes for this status
+01   CMP     r1, #1            ; set or unset touch sensitivity bit
+     BICEQ   r4, r4, #TouchSenseOff
+     CMP     r1, #2
+     ORREQ   r4, r4, #TouchSenseOff
+     STR     R4, [R12, #ModeFlagBits]
+     STRB    r9, [r12, #InterpretChannel] ; which podule buffer to interpret data from
+     ADD     r0, r0, #1  ; restore r0 value
+     B       SWIExit
+
+SetTxChannelSWI ROUT ; input 1-16, 0 to read current setting
+; if multipodules are installed, input 17-32 for port 2, 33-48 for p3, 49-64 for p4
+     AND     R0, R0, #&FF
+     CMP     R0, #0
+     LDREQB  R0, [R12, #TxChannel]    ; if 0 then return current channel
+     ADDEQ   R0, R0, #1
+     BEQ     SWIExit
+     MOV     r9, #0 ; podule asked for
+     MOVS    r8, r8 ; n podules installed set flags
+     BEQ     %FT10  ; only 1 podule installed
+; multi podules..check number input against number of installed podules
+     SUB     r2, r0, #1   ; channel range 0-15
+     MOV     r9, r2, LSR#4 ; podule number
+     CMP     r9, r8
+     BLE     %FT20  ; valid multi-podule number. nb neednt test for -ve now
+10   CMP     R0, #MaxChannelNumber
+     MOVGT   R0, #MaxChannelNumber  ; = 16
+     SUB     R2, R0, #1   ; channel range 0-15
+20   STRB    R2, [R12, #TxChannel]
+     MOV     R2, #0
+     ADD     r3, r12, r9 ; podule offset
+     STRB    R2, [r3, #SendStatus]  ; reset running status 
+     B       SWIExit
+
+SetModeSWI ROUT; mode bits are inverted -1. R1 byte 0 is N, byte 1 is M
+     AND     R0, R0, #&FF    ; mode1 -> 11, 2 -> 10, 3 -> 01, mode4 -> 00
+     AND     R3, R1, #&FF    ; new N  (N is channel number)
+     MOV     R4, R1, LSR#8
+     AND     R4, R4, #&FF   ; new M  (M is number of channels in mode 4)
+     LDRB    R7, [R12, #CurrentChannel]
+     TEQP    pc, #I_bit:OR:3     ; disable irq
+     LDR     R6, [R12, #ModeFlagBits]   ; get mode byte
+;change mode
+     CMP     R0, #0
+     BEQ     ChangeChannel
+     CMP     R0, #4
+     MOVGT   R0, #4
+     SUB     R2, R0, #1
+     MOV     r2, r2, LSL#ModeFlagsShift
+     EOR     R2, R2, #OmniBit:OR:PolyBit ; invert new mode bits
+     BIC     R6, R6, #OmniBit:OR:PolyBit ; clear old mode bits
+     ORR     R6, R6, R2    ; Update mode
+ChangeChannel     
+     CMP     R3, #0        ; if R1=0 then return current N and M in R1
+     BEQ     ChangeM
+     CMP     R3, #16
+     MOVGT   R3, #16
+     SUB     R7, R3, #1    ; update current channel
+ChangeM
+     CMP     R4, #0
+     BEQ     ModeSetExit
+     CMP     R4, #8
+     MOVGT   R4, #8
+     SUB     R4, R4, #1    ; M-1
+     STRB    r4, [r12, #MonoChannels]  ; store new M
+ModeSetExit
+     STR     R6, [R12, #ModeFlagBits]
+     TEQP    pc, #3     ; enable irq
+     STRB    R7, [R12, #CurrentChannel]
+     EOR     R0, R6, #OmniBit:OR:PolyBit ; convert 2 mode bits to mode number
+     AND     R0, R0, #OmniBit:OR:PolyBit
+     MOV     r0, r0, LSR#ModeFlagsShift
+     ADD     R0, R0, #1    ; return current mode number in R0
+     ADD     R1, R7, #1    ; N+1 = channel number
+     LDRB    r4, [r12, #MonoChannels]
+     ADD     R4, R4, #1      ; convert from M-1 to M
+     ORR     R1, R1, R4, LSL#8 ; combine M into byte 1 of R1 to return
+     B       SWIExit
+
+SetTxActiveSensingSWI ROUT ;cause byte or AS to be sent every 20 cs (200ms)
+; if multi podules then send AS from podule number in r0 bits 1 and 2
+; return bits 0-3 of r0 set according to state of transmitted active sensing in podules 0-3
+; return bits 4-7 of r0 set according to state of received active sensing in podules 0-3
+     ANDEQ   r0, r0, #1  ; only one podule
+     TEQP    pc, #I_bit:OR:3     ; disable irq
+     MOVS    r0, r0
+     BMI     %FT10       ; negative input = just read current status
+     MOV     r9, #0
+     TST     r0, #1              ; AS on or off?
+     MOVEQ   r2, #0               ; clear count
+     MOVNE   r2, #MaxTxInactivity  ; set count to send AS byte immediately
+     MOV     r9, r0, LSR#1 ; podule number
+     CMP     r9, r8        ; max podules
+; non-zero inactive time indicates that this podule is active-sensing
+; count of zero means disabled
+     ADDLE   r3, r12, r9         ; offset
+; (do not update if invalid podule; just read current status
+     STRLEB  r2, [r3, #TxInactiveTime]  ; store byte
+; clear any unnecessary counters
+10   LDR     r2, [r12, #TxInactiveTime] ; get whole word
+     CMP     r8, #0     ; if only one podule clear all other active-sense counters
+     ANDEQ   r2, r2, #&FF
+     CMP     r8, #2
+     BICLT   r2, r2, #&FF0000   ; at most 2 podules
+     BICLE   r2, r2, #&FF000000 ; at most 3 podules
+     STR     r2, [r12, #TxInactiveTime] ; ( ensure consistency )
+     MOVS    r2, r2                     ; test if 0
+     LDR     R6, [R12, #ModeFlagBits]   ; get mode flags
+     BICEQ   R6, R6, #TxActiveSenseBit ; clear Tx active sense bit if AS off
+     ORRNE   R6, R6, #TxActiveSenseBit ; Set Tx AS bit
+     STR     R6, [R12, #ModeFlagBits]    ; set active sensing mode
+; return tx active sensing states in r0 bits 0-3
+     MOV     r0, #0
+     TST     r2, #&FF
+     ORRNE   r0, r0, #1
+     TST     r2, #&FF00
+     ORRNE   r0, r0, #2
+     TST     r2, #&FF0000
+     ORRNE   r0, r0, #4
+     TST     r2, #&FF000000
+     ORRNE   r0, r0, #8
+     TST     r6, #RxActiveSenseBit
+     BEQ     SWIExit
+     LDR     r2, [r12, #RxInactiveTime] ; get rx active sensing word = 4 counters
+; set rx active sensing bits 4-7
+     TST     r2, #&FF
+     ORRNE   r0, r0, #&10
+     TST     r2, #&FF00
+     ORRNE   r0, r0, #&20
+     TST     r2, #&FF0000
+     ORRNE   r0, r0, #&40
+     TST     r2, #&FF000000
+     ORRNE   r0, r0, #&80
+     B       SWIExit
+
+InqSongPositionPointerSWI ROUT
+     LDR     r0, [R12, #SongPosPointer]  ; must divide by 6
+     MOV     r2, r0          ; r2 = SPP
+     MOV     r3, #3
+     DivRem  r0, r2, r3, r4  ; r0 = r2 / 3
+     MOV     r0, r0, LSR#1   ; /2
+     LDR     r2, [R12, #ModeFlagBits]
+     MOV     r1, #0
+     TST     r2, #ExternalCount
+     ORRNE   r1, r1, #1:SHL:0
+     TST     r2, #InternalCount
+     ORRNE   r1, r1, #1:SHL:1
+     TST     r2, #FastClock
+     ORRNE   r1, r1, #1:SHL:2
+     TST     r2, #Version3Facilities
+     ORRNE   r1, r1, #1:SHL:3
+     TST     r2, #StoreSysRealTime
+     ORRNE   r1, r1, #1:SHL:4
+     TST     r2, #SysRealTimeNoExec
+     ORRNE   r1, r1, #1:SHL:5
+     B       SWIExit         ; r0 = SPP/6
+
+InqBufferSizeSWI ROUT
+; r0 = 0 for rx buffer, 1 for tx buffer of podule 1
+;    = 2 for rx buffer, 3 for tx buffer of podule 2  etc.
+     MOV     r9, #0
+     BEQ     %FT10 ; only 1 podule installed; behave as before
+     MOV     r9, r0, LSR#1 ; podule number -> r9    
+     CMP     r9, r8 ; compare input parameter with max podules
+     MOVGT   r0, #0
+     BGT     SWIExit       ; exit with zero if non-existent podule
+10   TST     r0, #1   ; rx buffer = 0; tx buffer = 1
+     ADD     r3, r12, r9, LSL#2 ; buffer offset
+     LDREQ   R0, [R3, #RxBufferPntrs]
+     LDRNE   R0, [R3, #TxBufferPntrs]
+     MOV     r4, r0, LSR#16        ; out pointer
+     BIC     r0, r0, #&FF000000
+     BIC     r0, r0, #&00FF0000    ; in pointer
+     LDREQ   r8, [r12, #RxBufferLen] ; length of rx buffer
+     MOVNE   r8, #TxBufferLen        ; length of tx buffer
+     SUBS    r0, r4, r0          ; r0 = out pointer - in pointer
+     ADDLE   r0, r0, r8          ; add buffer length if negative or zero (circular buffer)
+     B       SWIExit
+
+InqErrorSWI  ROUT
+; return and reset all 4 error bytes (for max 4 podules)
+     TEQP    pc, #I_bit:OR:3     ; disable irq
+     LDR     R0, [r12, #ErrorFlag]
+     MOV     R2, #0
+     STR     R2, [r12, #ErrorFlag]
+     B       SWIExit
+
+GetNextByte ; r9 = requested buffer; r2 = number of byte in command for rx error reporting
+; return r0 = byte; r1 = received time, or -1 or -2 for receive errors (Overrun and Framing)
+     CMP     r4, r5   ; Check if buffer has data
+     ORREQS  pc, lr, #V_bit   ; if not return with V-set = abort
+     STMFD   sp!, {r3,r5-r6, lr}
+     ADD     r3, r12, r9, LSL#2
+     LDR     r6, [r3, #RxBufferStarts]
+     LDRB    r0, [r6, r4]  ; Load rx'd data from rx buffer
+     LDR     r6, [r3, #RxTimesBufferStarts]
+     LDR     r1, [r6, r4, LSL#2]  ; load received time of byte
+     CMP     r1, #-1        ; overrun error when byte received
+     CMPNE   r1, #-2        ; framing error when byte received
+     MOVEQ   r3, #0
+     STREQ   r3, [r6, r4, LSL#2]  ; reset received time to zero to ensure error is ignored next time
+     LDMEQFD sp!, {r3,r5-r6, lr}
+     ORREQS  pc, lr, #V_bit   ; return V-set showing error
+     ADD     r2, r2, #1       ; byte number in this command for rx error reporting
+     ADD     R4, R4, #1    ; increment buffer pointer
+     LDR     r3, [r12, #RxBufferLen] 
+     CMP     R4, r3
+     MOVGE   R4, #0        ; circular buffer, reset pointer
+     TST     R0, #&80      ; status byte?
+     BEQ     GNBDataByte
+     AND     r5, R0, #&F0        ; clear bottom 4 bits of status byte
+     CMP     r5, #&F0            ; sys msg?
+     BNE     GNBNotSysMsg
+     MOV     r6, #&0             ; expect 0 data bytes for sys msg, except..
+     CMP     R0, #SongPosPointerVal ; song position pointer status
+     MOVEQ   r6, #&20             ; expect 2 data bytes
+     BEQ     GNBExpectBytes
+     CMP     R0, #SongSelectVal     ; song select status
+     CMPNE   R0, #&F0               ; system exclusive message.
+     MOVEQ   r6, #&10             ; expect 1 data byte
+     B       GNBExpectBytes
+GNBNotSysMsg
+     MOV     r6, #&20    ; default expect 2 bytes
+     CMP     r5, #ChannelPressureVal  ; IF Channel pressure
+     CMPNE   r5, #ProgramChangeVal    ; OR Program change
+     MOVEQ   r6, #&10    ; THEN expect 1 byte
+GNBExpectBytes
+     CMP     r6, #0      ; if data byte(s) expected 
+     ADD     r3, r12, r9 ; buffer offset for podule requested
+     STRNEB  R0, [r3, #RxStatus]    ; then store in running status
+     LDREQB  r6, [r3, #RxByteCounter]
+     ORREQ   r6, r6, #1:SHL:7        ; else set real-time status bit
+     STRB    r6, [r3, #RxByteCounter]  ; number of bytes for this status
+     LDMFD   sp!, {r3,r5-r6, pc} ; z-set = message finished
+GNBDataByte
+     ADD     r3, r12, r9 ; buffer offset for podule requested
+     LDRB    r5, [r3, #RxByteCounter] ;LS 4bits is counter : MS 4b is expected
+     ADD     r5, r5, #1   ; increment bytes-received counter
+     MOV     r6, r5, LSR#4  ; expected bytes
+     AND     R3, r5, #&F    ; received bytes
+     CMP     R3, r6   ; have I got enough data bytes yet?
+     BICEQ   r5, r5, #&F ; if so then reset byte counter
+     ADD     r3, r12, r9 ; buffer offset for podule requested
+     STRNEB  R0, [r3, #RxByte1]  ; else store first data byte
+     STRB    r5, [r3, #RxByteCounter] ; store byte counter
+     LDMFD   sp!, {r3,r5-r6, pc} ; z-set = message finished
+
+RxByteSWI ROUT; this must store running status and first data bytes for RxCommand
+     MOV     r10, #0  ; indicates that this is an rxbyte (not rxcommand)
+     B       RxByteEntry
+
+RxCommandSWI ROUT
+; if more than one podule is installed then read the number in r0 and read
+; the data from the buffer of that podule. If r0 = -1 read each podule until
+; data is found
+     MOV     r10, #1 ; to indicate later that this is rxcommand, not rxbyte
+RxByteEntry
+; 1st check for buffer full error
+     TEQP    pc, #3:OR:I_bit
+     LDR     r2, [r12, #ModeFlagBits]
+     TST     r2, #RxBufferOverflow  ; test..
+     BICNE   r2, r2, #RxBufferOverflow  ; ..and clear receive buffer full error
+     STRNE   r2, [r12, #ModeFlagBits]
+     BNE     RxBufOvrError
+     TEQP    pc, #3
+     MOV     r1, #0 ; clear r1 is expected
+     MOV     r9, #0 ; number of podule requested
+     MOVEQ   r0, #0 ; only one podule installed..clear r0
+     BEQ     %FT10  ; only 1 podule
+; more than 1 podule is installed so read the requested podule number in r0
+; check range is 0-max podule number (1-3)
+; set r0 to zero if invalid podule number (if greater than installed number)
+     CMP     r0, r8
+     MOVGT   r9, #0
+     BGT     %FT10   ; invalid r0 set to 0
+     MOVS    r9, r0  ; check r0 is positive
+     MOVMI   r9, #0  ; if negative, set requested podule number to 0
+10   ADD     r3, r12, r9, LSL#2 ; buffer pointer offset for podule requested
+     ADD     r3, r3, #RxBufferPntrs
+     LDR     r5, [r3] ; r3 will be updated on next load
+     MOV     r4, r5, LSR#16   ; out pointer
+     BIC     r5, r5, #&FF000000
+     BIC     r5, r5, #&00FF0000  ; in pointer
+     CMP     r4, r5   ; Check if buffer has data and get it
+     BNE     %FT20
+
+     CMP     r0, #-1  ;  -1 in r0 = look at all buffers
+     MOV     r0, #0   ; return with 0 if no data
+     BNE     SWIExit
+; special case of r0 = -1 on entry => test all receive buffers for data
+; test podule 1 .. there must be more than 1 installed to get here
+     MOV     r9, #1
+     LDR     r5, [r3, #4]!  ; pre-index, writeback
+     MOV     r4, r5, LSR#16   ; out pointer
+     BIC     r5, r5, #&FF000000
+     BIC     r5, r5, #&00FF0000  ; in pointer
+     CMP     r4, r5   ; Check if buffer 1 has data
+     BNE     %FT20
+     MOV     r9, #2
+     CMP     r8, r9        ; ensure at least 3 are installed
+     BLT     SWIExit
+     LDR     r5, [r3, #4]!
+     MOV     r4, r5, LSR#16   ; out pointer
+     BIC     r5, r5, #&FF000000
+     BIC     r5, r5, #&00FF0000  ; in pointer
+     CMP     r4, r5   ; Check if buffer 2 has data
+     BNE     %FT20
+     MOV     r9, #3
+     CMP     r8, r9        ; ensure at least 4 are installed
+     BLT     SWIExit
+     LDR     r5, [r3, #4]!
+     MOV     r4, r5, LSR#16   ; out pointer
+     BIC     r5, r5, #&FF000000
+     BIC     r5, r5, #&00FF0000  ; in pointer
+     CMP     r4, r5   ; Check if buffer 3 has data
+     BEQ     SWIExit
+
+; enter with r9 = requested podule, r8 = npodules
+20   MOV     r2, #0  ; count of byte number in command
+     CMP     r10, #0    ; was this entered from rxbyte?
+     BNE     %FT22      ; rxbyte gets only one byte
+     BL      GetNextByte  ; rxbyte
+     B       %FT26
+22   BL      GetNextByte  ; rxcommand start
+     BVS     %FT25     ; v if error or no more bytes to get yet
+     BLNE    GetNextByte  ; z flag is set when all instruction bytes are got
+     BVS     %FT25
+     BLNE    GetNextByte  ; max 3 bytes to get
+     MOVNE   r0, #-1  ; check enough bytes rxd. This doesn't happen to rxbyte
+25   MOVVS   r0, #-1   ; indicate error
+26   CMP     r1, #-1
+     CMPNE   r1, #-2  ; error values
+     BEQ     RxError
+; update buffer pointer
+30   TEQP    pc, #3:OR:I_bit ; disable irq
+     ADD     r3, r12, r9, LSL#2
+     LDR     r5, [r3, #RxBufferPntrs]   ; reload values (in pntr may have been changed in irq)
+     BIC     r5, r5, #&FF000000
+     BIC     r5, r5, #&00FF0000  ; preserve in pointer
+     ORR     r5, r5, r4, LSL#16 ; combine pointers
+     STR     r5, [r3, #RxBufferPntrs]    ; R4 is new value
+     TEQP    pc, #3   ; enable irq
+     CMP     r0, #-1
+     MOVEQ   r0, #0
+     MOVEQ   r1, #0
+     BEQ     SWIExit  ; if whole command not received then exit with zero
+     TST     r10, #1    ; was this entered from rxbyte?
+     ANDEQ   R2, R2, #1        ; 1 if byte received, else 0
+     ORREQ   R0, R0, R2, LSL#24 ; combine byte number into top byte
+     ORREQ   r0, r0, r9, LSL#28 ; combine podule number into top nibble
+     BEQ     SWIExit    ; if so exit now
+     ADD     r3, r12, r9 ; buffer offset for podule requested
+     LDRB    R2, [r3, #RxByteCounter]
+     TST     R2, #1:SHL:7      ; top bit set = real-time status msg
+     BICNE   R2, R2, #1:SHL:7  ; clear real-time status bit if set
+     STRNEB  R2, [r3, #RxByteCounter] ; and save
+     MOVNE   R2, #0            ; => no data bytes
+     MOV     R2, R2, LSR#4
+     AND     R2, R2, #3        ; number of data bytes expected (0, 1 or 2)
+     CMP     R2, #2
+     MOVGT   R2, #2            ; force max of 2
+     MOV     r4, R2, LSL#3     ; x8 ie shift in whole bytes in next instruction
+     MOV     R0, R0, LSL r4    ; get last byte in the right position in R0
+     ADD     R2, R2, #1        ; include status byte (count = 1, 2 or 3)
+     ORR     R0, R0, R2, LSL#24 ; combine byte number into top byte
+     ORR     r0, r0, r9, LSL#28 ; combine podule number into top nibble
+     CMP     R2, #2            ; R2 is 1, 2 or 3
+     BLT     SWIExit             ; exit if just status and no data
+     LDRB    r4, [r3, #RxStatus]
+     ORR     R0, R0, r4          ; combine status into byte 0
+     LDRGTB  r4, [r3, #RxByte1]
+     ORRGT   R0, R0, r4, LSL#8   ; combine first data byte if 2 data
+     B       SWIExit
+
+TxByteSWI ROUT; current running status is ignored and discarded
+     MOVNE   r9, r0, LSR#28 ; podule number requested in top nibble
+     MOVEQ   r9, #0
+     CMP     r9, r8   ; check podule number is not greater than number installed
+     MOVGT   r9, #0
+10   AND     R0, R0, #&FF ; ensure only bottom byte is used
+     ADD     r3, r12, r9, LSL#2
+     TEQP    pc, #I_bit:OR:3     ; disable irq
+     LDR     R4, [R3, #TxBufferPntrs]
+     MOV     r5, r4, LSR#16   ; out pntr
+     BIC     r4, r4, #&FF000000
+     BIC     r4, r4, #&00FF0000 ; in pntr
+     ADD     r6, r4, #1       ; increment buffer in pointer
+     CMP     r6, #TxBufferLen
+     MOVGE   r6, #0
+     CMP     r6, r5    ; Check if buffer is full (pointers are equal)
+     BEQ     TxBufferFull
+     ORR     r5, r6, r5, LSL#16
+     STR     r5, [r3, #TxBufferPntrs] ; update pointer
+     LDR     r5, [r3, #TxBufferStarts]
+     STRB    r0, [r5, r4]  ; put byte in transmit buffer
+     MOV     r6, #0
+     ADD     r3, r12, r9
+     STRB    r6, [r3, #SendStatus]  ; clear running status.
+     LDR     r2, [r12, #ModeFlagBits]
+     TST     r2, #InIrq
+     BLEQ    EnableTxIRQ
+ ; don't actually enable irqs if I am being called (indirectly) from the irq routine
+     BLNE    EnablePretendTxIRQ
+     B       SWIExit
+
+TxCommandSWI ROUT; This does use current running status, but does not make the
+; noteoff -> noteon optimisation, and does not use the value of TxChannel
+; if new facilities enabled then inspect r1 for schedule time
+     MOVNE   r9, r0, LSR#28 ; podule number requested in top nibble
+     MOVEQ   r9, #0
+     CMP     r9, r8         ; check podule number is not greater than number installed
+     MOVGT   r9, #0
+10   TST     R0, #&80       ; is there a status byte in the right place?
+     BEQ     SWIExit        ; if not then ignore it
+     MOVS    r1, r1         ; is there a schedule time in r1?
+     LDRNE   r2, [r12, #ModeFlagBits]
+     TSTNE   r2, #Version3Facilities ; check new facilities enabled
+     BLNE    Schedule       ; if so schedule it and exit
+     BNE     SWIExit   ; this will be re-entered in this routine when the schedule time arrives
+; find command byte number by comparing status with known values
+     MOV     R2, R0, LSR#24 ; this ensures that if I dont recognise the status
+     AND     R2, R2, #3     ; then it will default to using the supplied byte#
+     AND     R3, R0, #&F8   ; get status
+     CMP     R3, #&F8       ; sys real time?
+     MOVEQ   R2, #1         ; system real time has 1 byte
+     BEQ     AssembleCommand
+     AND     R3, R0, #&FF
+     CMP     R3, #TuneRequestVal
+     CMPNE   R3, #EOXVal
+     MOVEQ   R2, #1            ; 1 byte for these two
+     BEQ     AssembleCommand
+     CMP     R3, #SongSelectVal
+     MOVEQ   R2, #2            ; 2 byte for Song sel
+     BEQ     AssembleCommand
+     AND     R3, R0, #&F0
+     CMP     R3, #ControlChangeVal
+     MOVLE   R2, #3            ; 3 for <= ControlChange (=8,9,A,B)
+     BLE     AssembleCommand
+     CMP     R3, #PitchWheelVal
+     MOVEQ   R2, #3
+     BEQ     AssembleCommand
+     CMP     R3, #ProgramChangeVal
+     CMPNE   R3, #ChannelPressureVal
+     MOVEQ   R2, #2            ; only 2 bytes for these 2 commands
+     BEQ     AssembleCommand
+AssembleCommand  ROUT;  R2 contains number of bytes (including status)
+     SUBS    R4, R2, #1          ; 0, 1 or 2
+     MOV     R5, R4, LSL#3       ; x8   ie 0, 8 or 16
+     AND     R3, R0, #&FF        ; status in byte 0
+     MOV     R3, R3, LSL R5      ; shift status to right position
+     BEQ     SendBytes           ; if R4 = 0 and R2 = 1
+     SUBS    R4, R4, #1          ; 0 or 1
+     MOVEQ   R7, R0, LSR#8       ; shift data byte 1 to right position
+     ANDEQ   R7, R7, #&FF
+     ANDNE   R7, R0, #&FF00
+     ORR     R3, R3, R7
+     MOVNE   R7, R0, LSR#16      ; last byte
+     ANDNE   R7, R7, #&FF
+     ORRNE   R3, R3, R7
+     B       SendBytes
+
+; Channel voice messages
+Pack3Bytes
+     AND     R0, R0, #&7F    ; byte range lim
+     AND     R1, R1, #&7F
+     LDRB    R4, [R12, #TxChannel]  ; channel no. 0-63
+     MOV     r9, r4, LSR#4   ; requested podule number
+     AND     r4, r4, #&F     ; midi channel
+     ORR     R3, R3, R4, LSL#16 ; combine channel no. into word
+     ORR     R3, R3, R0, LSL#8 ; 2nd byte
+     ORR     R3, R3, R1        ; 3rd byte (last)
+     MOV     R2, #3        ; 3 bytes to send
+     MOV     PC, lr
+Pack2Bytes
+     AND     R0, R0, #&7F    ; byte range lim
+     LDRB    R4, [R12, #TxChannel]  ; channel no.
+     MOV     r9, r4, LSR#4   ; requested podule number
+     AND     r4, r4, #&F     ; midi channel
+     ORR     R3, R3, R4, LSL#8 ; combine channel no. into word
+     ORR     R3, R3, R0      ; 2nd byte
+     MOV     R2, #2          ; 2 bytes to send
+     MOV     PC, lr
+Pack1Byte
+     LDRB    R4, [R12, #TxChannel]  ; channel no.
+     MOV     r9, r4, LSR#4   ; requested podule number
+     MOV     R2, #1          ; 1 byte to send (in r3)
+     MOV     PC, lr
+
+TxNoteOffSWI ; can use NoteOn RS with V=0 if same channel no. and V=64
+     MOV     R3, #NoteOffVal:SHL:16 ; status in byte 3
+     BL      Pack3Bytes
+     ADD     R10, R12, R9    ; podule offset
+     LDRB    R10, [R10, #SendStatus]  ; running status
+     AND     R5, R10, #&F0
+     CMP     R5, #NoteOnVal  ; if running status noteon then set vel 0 if 64
+     ANDEQ   R5, R10, #&F    ; channel num
+     CMPEQ   R5, R4          ; compare channel number with current TxChannel
+     ANDEQ   R5, R3, #&7F    ; velocity
+     CMPEQ   R5, #64         ; check for velocity of 64 if RS is noteon
+     BICEQ   R3, R3, #&FF    ; set velocity to 0
+     MOVEQ   R2, #2          ; don't send status if noteon RS and v=64
+     B       SendBytes
+
+TxNoteOnSWI
+     MOV     R3, #NoteOnVal:SHL:16 ; status
+     BL      Pack3Bytes
+     B       SendBytes
+
+TxPolyKeyPressureSWI
+     MOV     R3, #PolyKeyPressureVal:SHL:16 ; status
+     BL      Pack3Bytes
+     B       SendBytes
+
+TxControlChangeSWI
+     MOV     R3, #ControlChangeVal:SHL:16 ; status
+     BL      Pack3Bytes
+     B       SendBytes
+
+; Channel mode messages
+ChannelModeMessage
+     MOV     R3, #ControlChangeVal:SHL:16 ; status
+     LDRB    R2, [R12, #TxChannel]  ; channel no.
+     MOV     r9, r2, LSR#4          ; podule number
+     AND     r2, r2, #&F
+     ORR     R3, R3, R2, LSL#16
+     MOV     R2, #3
+     MOV     PC, lr
+
+TxLocalControlSWI
+     AND     R0, R0, #&7F
+     BL      ChannelModeMessage
+     ORR     R3, R3, #LocalControlVal:SHL:8   ; =122    : data byte1
+     ORR     R3, R3, R0     ; data byte2
+     B       SendBytes
+
+TxAllNotesOffSWI
+     BL      ChannelModeMessage
+     ORR     R3, R3, #AllNotesOffVal:SHL:8    ; =123    : data byte1
+     B       SendBytes
+
+TxOmniModeOffSWI
+     BL      ChannelModeMessage
+     ORR     R3, R3, #OmniModeOffVal:SHL:8   ; =124    : data byte1
+     B       SendBytes
+
+TxOmniModeOnSWI
+     BL      ChannelModeMessage
+     ORR     R3, R3, #OmniModeOnVal:SHL:8   ; =125    : data byte1
+     B       SendBytes
+
+TxMonoModeOnSWI
+     BL      ChannelModeMessage
+     AND     R0, R0, #&FF  ; data byte 2 = number of channels lim 16
+     CMP     R0, #MaxChannelNumber
+     MOVGT   R0, #MaxChannelNumber
+     ORR     R3, R3, #MonoModeOnVal:SHL:8   ; =126    : data byte1
+     ORR     R3, R3, R0   ; data byte 2 = number of channels
+     B       SendBytes
+
+TxPolyModeOnSWI
+     BL      ChannelModeMessage
+     ORR     R3, R3, #PolyModeOnVal:SHL:8   ; =127    : data byte1
+     B       SendBytes
+
+; Channel voice messages
+TxProgramChangeSWI
+     MOV     R3, #ProgramChangeVal:SHL:8   ; status
+     BL      Pack2Bytes
+     B       SendBytes
+
+TxChannelPressureSWI
+     MOV     R3, #ChannelPressureVal:SHL:8 ; status
+     BL      Pack2Bytes
+     B       SendBytes
+
+TxPitchWheelSWI  ; converts 14bit data into two 7bits in two bytes
+     CMP     R0, #&4000
+     MOVGE   R0, #&3F00
+     ORRGE   R0, R0, #&FF             ; 3FFF is top of range
+     MOV     R2, R0, LSR#7  ; MSB
+     AND     R2, R2, #&7F
+     AND     R3, R0, #&7F ; LSB
+     ORR     R2, R2, R3, LSL#8
+     MOV     R3, #PitchWheelVal:SHL:16 ; status
+     ORR     R3, R3, R2
+     LDRB    R2, [R12, #TxChannel]  ; channel no.
+     MOV     r9, r2, LSR#4          ; podule number
+     AND     r2, r2, #&F
+     ORR     R3, R3, R2, LSL#16
+     BL      Pack1Byte
+     MOV     R2, #3
+     B       SendBytes
+
+; System common messages
+TxSongPositionPointerSWI
+     BIC     R0, R0, #&C000
+     MOV     R2, R0, LSL#1         ; x2
+     RSB     R2, R2, R2, LSL#2     ; x3
+     STR     R2, [R12, #SongPosPointer] ; update local SPP before transmitting
+     MOV     R3, R0, LSR#7  ; MSB
+     AND     R3, R3, #&7F
+     AND     R2, R0, #&7F
+     ORR     R3, R3, R2, LSL#8 ; LSB
+     ORR     R3, R3, #SongPosPointerVal:SHL:16
+     BL      Pack1Byte
+     MOV     R2, #3
+     B       SendBytes
+
+TxSongSelectSWI
+     AND     R3, R0, #&7F  ; song no.
+     ORR     R3, R3, #SongSelectVal:SHL:8
+     BL      Pack1Byte
+     MOV     R2, #2
+     B       SendBytes
+
+TxTuneRequestSWI
+     MOV     R3, #TuneRequestVal
+     BL      Pack1Byte
+     B       SendBytes
+
+; System real time messages
+TxStartSWI
+     MOV     R2, #SendStart
+     B       TxSysRealTime
+
+TxContinueSWI
+     MOV     R2, #SendCont
+     B       TxSysRealTime
+
+TxStopSWI
+     MOV     R2, #SendStop
+
+TxSysRealTime ROUT
+     TEQP    pc, #I_bit:OR:3     ; disable irq
+     LDR     R3, [R12, #ModeFlagBits]
+     ORR     R3, R3, #InternalCount ; enable internal count
+     BIC     R3, R3, #SendRT:OR:ExternalCount ; disable external count
+     ORR     R3, R3, R2
+     STR     R3, [R12, #ModeFlagBits]
+     MOV     r9, r8       ; midi podule number
+10   TST     r3, #InIrq   ; don't enable irqs if I am being called (indirectly) from the irq routine
+     BLEQ    EnableTxIRQ
+     BLNE    EnablePretendTxIRQ
+     SUBS    r9, r9, #1     ; midi podule number
+     BPL     %BT10
+     B       SWIExit
+
+TxSystemResetSWI ROUT
+     MOV     R3, #SystemResetVal
+     BL      Pack1Byte
+     B       SendBytes
+
+IgnoreTimingSWI
+     CMP     R0, #0
+     LDRB    R2, [R12, #IgnoreState]
+     ORRNE   R2, R2, #IgnoreTimingBit
+     BICEQ   R2, R2, #IgnoreTimingBit
+     STRB    R2, [R12, #IgnoreState]
+     B       SWIExit
+
+SynchSoundSchedulerSWI
+     TEQP    pc, #I_bit:OR:3     ; disable irq
+     LDR     r3, [r12, #ModeFlagBits]
+     TST     r3, #SynchSoundScheduler
+     MOVEQ   r2, #0 ; return r0 value. put in r2 for the moment
+     MOVNE   r2, #1
+     MOVS    r0, r0 ; test if r0 is 0
+     ORRNE   r3, r3, #SynchSoundScheduler ; enable Sound Scheduler sync to incoming Timing Clock messages
+     BICEQ   r3, r3, #SynchSoundScheduler ; disable Sound Scheduler sync
+     STR     r3, [r12, #ModeFlagBits]
+     MOV     r0, r2 ; return previous value of SynchSoundScheduler flag in r0
+     B       SWIExit
+
+FastClockSWI  ; value of r0 sets rate of sending timing clock messages (after start)
+; reset hi-res timing bit if r0 is zero, else set
+; if r0 < 0 just read current value of fast clock
+     TEQP    pc, #I_bit:OR:3  ; disable irq
+     LDR     r3, [r12, #ModeFlagBits]
+     ORR     r3, r3, #Version3Facilities
+     STR     r3, [r12, #ModeFlagBits]    ; enable new facilities
+     LDR     r3, [r12, #ms_count] ; get previous ms_count
+     MOVS    r0, r0
+     STRPL   r1, [r12, #ms_count] ; reset count
+     MOV     r1, r3               ; return with previous count
+     BMI     SWIExit              ; don't change anything if r0 is negative
+     STR     r0, [r12, #tc_rate]
+     BL      ClaimReleaseTimer  ; enter with z set to release; z clear to claim
+     BVS     SWIExit ; and error will be passed back
+     BLNE    StartTimerIRQ ; load value into timer and start it. IRQ will be generated at 1ms intervals
+     MOV     r2, #0
+     STR     r2, [r12, #Slot_p]
+     MOV     r2, #-1
+     STR     r2, [r12, #next_schedule_t]
+     B       SWIExit
+
+InitSWI ROUT
+; r0 = 0 do system reset
+; else
+;    bit 0 set to clear current transmitted runnning status
+;    bit 1 set to flush RxBuffers and reset interpreter,
+;    bit 2 set to flush TxBuffers and reset interpreter,
+;    bit 3 set to flush scheduler
+;    bit 4 set to reset current error
+;    bit 30 set to set StoreSysRealTime
+;    bit 31 set to set SysRealTimeNoExec
+
+; return r0 = number of midi podules installed
+     CMP     r0, #0
+     BLEQ    ResetSystem
+     ADDEQ   r0, r8, #1   ; number of podules installed
+     BEQ     SWIExit
+
+     MOV     r2, #0
+     TEQP    pc, #I_bit:OR:3   ; disable irq for consistent pointers
+
+     TST     r0, #1
+     STRNE   r2, [r12, #SendStatus]
+     STRNE   r2, [r12, #StatusAge]
+
+     TST     r0, #1:SHL:1
+     ADD     r3, r12, #RxBufferPntrs
+     STRNE   r2, [r3], #4
+     STRNE   r2, [r3], #4
+     STRNE   r2, [r3], #4
+     STRNE   r2, [r3]
+
+     TST     r0, #1:SHL:2
+     ADD     r3, r12, #TxBufferPntrs
+     STRNE   r2, [r3], #4
+     STRNE   r2, [r3], #4
+     STRNE   r2, [r3], #4
+     STRNE   r2, [r3]
+
+     TST     r0, #6
+     BLNE    DoAllNotesOff  ; only for bits 1 or 2 set
+     STRNE   r2, [r12, #BufferSoundOutPntr]
+
+     TST     r0, #1:SHL:3
+     STRNE   r2, [r12, #Slot_p]
+
+     TST     r0, #1:SHL:4
+     STRNE   r2, [r12, #ErrorFlag]
+
+     LDR     r2, [r12, #ModeFlagBits]
+
+     TST     r0, #1:SHL:1  ; side-effect of clearing the rx buffer is to clear the buffer overflow error
+     BICNE   r2, r2, #RxBufferOverflow
+
+     TST     r0, #1:SHL:3  ; requested clear scheduler
+     BICNE   r2, r2, #WarnedEmptyScheduler ; clear also event flag
+
+; test for special top bits set
+     TST     r0, #1:SHL:30
+     ORRNE   r2, r2, #StoreSysRealTime
+
+     TST     r0, #1:SHL:31
+     ORRNE   r2, r2, #SysRealTimeNoExec
+
+     STR     r2, [r12, #ModeFlagBits]
+
+     ADD     r0, r8, #1   ; number of podules installed
+     B       SWIExit
+
+SetBufferSizeSWI ROUT
+; enter with:
+;  r0 = 0 for set rx buffer size
+;  r1 = new buffer size
+;       0 ; interrogate current value
+; exit with:
+;  r0 = buffer size
+;  r1 = total size of new buffers
+     CMP     r0, #0  ; check r0 = 0 for rx buffer size
+     BNE     SWIExit
+     ADD     r6, r8, #1  ; number of podules installed
+     TEQP    pc, #3 + I_bit  ; disable irq
+; if r1 = 0 or same as current size exit with current info
+     CMP     r1, #0
+     LDR     r5, [r12, #RxBufferLen]
+     CMPNE   r1, r5
+     BNE     %FT10
+; get current info in r0 and r1
+     MOV     r0, r5
+     CMP     r6, #2
+     MOVLT   r1, r5            ; x 1
+     MOVEQ   r1, r5, LSL#1     ; x 2
+     RSBGT   r1, r5, r5, LSL#2 ; x 3
+     CMP     r6, #3
+     MOVGT   r1, r5, LSL#2     ; X 4
+     ADD     r1, r1, r1, LSL#2     ; X 5 conversion to bytes
+     B       SWIExit
+10   MOV     r8, #0
+; clear all Rx buffers
+     ADD     r9, r12, #RxBufferPntrs
+     STR     r8, [r9], #4
+     STR     r8, [r9], #4
+     STR     r8, [r9], #4
+     STR     r8, [r9]
+     ADD     r4, r12, #RxBufferStarts
+     BL      FreeBuffers
+     MOV     r5, r1       ; size to claim
+     MOV     r0, r5
+; enter ClaimBuffers with
+;   r5 = size of buffers to claim
+;   r6 = number of buffers to claim
+;   r4 = address of workspace pointers to starts of 4 buffers (though there will usually be fewer)
+; exit with v - set if unable to claim buffers
+;   r5 = total space claimed (bytes)
+     BL      ClaimBuffers
+     MOV     r7, r5  ; tally of total space claimed
+; if error put back old buffers and presume there won't be an error
+     LDRVS   r5, [r12, #RxBufferLen]
+     ADDVS   r4, r12, #RxBufferStarts
+     BLVS    ClaimBuffers
+     BVS     UnableToClaim
+; rx times buffers
+     ADD     r4, r12, #RxTimesBufferStarts
+     BL      FreeBuffers
+     MOV     r5, r1, LSL#2  ; size
+     BL      ClaimBuffers
+; finally update buffer size if no error
+     STRVC   r1, [r12, #RxBufferLen]
+     ADDVC   r1, r7, r5  ; total space claimed
+     BVC     SWIExit  ; no error exit
+; if error free rx buffers and reclaim old size
+     ADD     r4, r12, #RxBufferStarts
+     BL      FreeBuffers
+     LDR     r5, [r12, #RxBufferLen]
+     ADD     r4, r12, #RxBufferStarts
+     BL      ClaimBuffers
+     MOV     r7, r4         ; total size tally
+     MOV     r5, r5, LSL#2  ; size
+     ADD     r4, r12, #RxBufferStarts
+     BL      ClaimBuffers
+     ADD     r1, r7, r4
+UnableToClaim
+     ADR     R0, ErrBlockNoRoomPos ; used above by initialise_module
+     LDR     r1, [r0]
+     SUBS    r0, r0, r1   ; true address of error_block
+     TEQP    pc, #V_bit + 3   ; set v flag
+     B       SWIExit      ; return with error and V set
+
+ErrBlockNoRoomPos & . - ErrorBlock_MHNoRoom
+
+Schedule ROUT ; enter with r1 = schedule time, r0 = parameter to TxCommand
+; return with r0 = -1 if failed with queue full or -2 if schedule time<last schedule time
+; else r0 = number of slots free in queue
+     STMFD   sp!, {r2-r6,lr}
+     LDR     r2, [r12, #ModeFlagBits]
+     TST     r2, #WarnedEmptyScheduler
+     BICNE   r2, r2, #WarnedEmptyScheduler
+     STRNE   r2, [r12, #ModeFlagBits]
+     ADD     r3, r12, #SchedulerSpace ; pointer to scheduler array
+     LDR     r2, [r12, #Slot_p]
+     MOV     r4, r2, LSR#16      ; top 16b = next free slot
+     BIC     r2, r2, #&FF000000
+     BIC     r2, r2, #&00FF0000  ;  bottom 16b = next to empty slot
+     CMP     r4, r2   ; check if the buffer is not empty
+     BEQ     %FT10    ; buffer is empty...no need to check last slot time
+     SUBS    r5, r4, #1                ; get previous slot
+     ADDMI   r5, r5, #MaxSchedulerSlots  ; possible wrap
+     ADD     r5, r3, r5, LSL#3  ; pointer to previous free slot
+     LDR     r6, [r5, #ScheduleTime] ; previous schedule time
+     CMP     r1, r6           ; check that this time is not before previous time
+     MOVLT   r0, #-2
+     LDMLTFD sp!, {r2-r6,pc}^ ; if so return (fatal) error and do not schedule anything
+10   ADD     r5, r4, #1       ; increment to next free slot
+     CMP     r5, #MaxSchedulerSlots
+     MOVGE   r5, #0   ; wrap round circular buffer
+     CMP     r5, r2   ; check that the buffer is not full (inc'd ptr = to-empty ptr)
+     MOVEQ   r0, #-1   ; scheduler queue full error
+     LDMEQFD sp!, {r2-r6,pc}^  ; if so return (fatal) error and do not schedule anything
+     ORR     r6, r2, r5, LSL#16 ; combine next-to-empty and inc'd next-free ptrs
+     STR     r6, [r12, #Slot_p] ; and store them
+     ADD     r5, r3, r4, LSL#3  ; pointer to next free slot in array
+     STR     r0, [r5, #ScheduleValue]
+     STR     r1, [r5, #ScheduleTime]   ; put data in slot
+; put a copy of the next-to-schedule time in a convenient place for
+; the millisecond scheduler to get it quickly
+     ADD     r3, r3, r2, LSL#3  ; pointer to next-to-empty slot in array
+     LDR     r3, [r3, #ScheduleTime]
+     STR     r3, [r12, #next_schedule_t]
+     MOV     r4, r6, LSR#16      ; top 16b = next free slot
+     SUBS    r0, r2, r4
+     ADDLE   r0, r0, #MaxSchedulerSlots ; return number of free slots
+     LDMFD   sp!, {r2-r6,pc}^
+
+SchedulerTake ROUT; enter with r0 = current time,
+; exit with r0 = -1 if nothing done, -2 if txbuffer full error.
+; NB these error values are ignored by the caller as they are background (irq) routines
+; take all items off q that were scheduled for times earlier than or equal to now
+; or as many as will fit in tx buffer, and TxCommand them
+; enter in svc mode (3). Called in background from irq or ms routine
+     STMFD   sp!, {r1-r6,lr}
+     LDR     r2, [r12, #Slot_p]
+     MOV     r4, r2, LSR#16      ; top 16b = next free slot
+     BIC     r2, r2, #&FF000000
+     BIC     r2, r2, #&00FF0000  ;  bottom 16b = next to empty slot
+     CMP     r2, r4   ; check if the buffer is empty (free ptr = to-empty ptr)
+     MOVEQ   r0, #-1  ; if empty do nothing exit
+     STREQ   r0, [r12, #next_schedule_t] ; reset next schedule time
+     LDMEQFD sp!, {r1-r6,pc}^
+10   ADD     r5, r12, #SchedulerSpace
+     ADD     r5, r5, r2, LSL#3  ; pointer to next-to-empty slot in array
+     LDR     r6, [r5, #ScheduleTime]   ; get schedule time
+     CMP     r6, r0   ; compare schedule time with current time
+; Normal finished-up-to-current-time exit
+     STRGT   r6, [r12, #next_schedule_t] ; update copy of next schedule time
+     ORRGT   r6, r2, r4, LSL#16 ; combine inc'd next-to-empty and next-free ptrs
+     STRGT   r6, [r12, #Slot_p] ; store updated buffer pointers
+     LDMGTFD sp!, {r1-r6,pc}^   ; Normal finished exit (schedule time is later)
+
+     ADD     r2, r2, #1       ; increment to next slot to empty
+     CMP     r2, #MaxSchedulerSlots
+     MOVGE   r2, #0   ; wrap round circular buffer
+     MOV     r6, r0  ; save r0
+     LDR     r0, [r5, #ScheduleValue] ; get parameters
+     MOV     r1, #0                   ; immediate action (don't reschedule it!)
+     BL      CallTxCommandSWICode         ; and TxCommand
+     MOVVS   r0, #-2  ; tx buffer full error. This should be avoided. Data is lost!
+     LDMVSFD sp!, {r1-r6,pc}^
+     MOV     r0, r6  ; restore r0
+     CMP     r2, r4   ; check if the buffer is empty (free ptr = to-empty ptr)
+     BNE     %BT10       ; loop until finished
+     ORR     r6, r2, r4, LSL#16 ; combine inc'd next-to-empty and next-free ptrs
+     STR     r6, [r12, #Slot_p] ; store updated buffer pointers
+; empty scheduler exit
+     LDMFD   sp!, {r1-r6,pc}^
+
+CallTxCommandSWICode ; but don't re-enable irq
+; set up various necessary bits before calling the specific TxCommand code
+     STMFD   sp!, {R2-R10, lr}
+     LDR     r2, [r12, #ModeFlagBits]
+     MOV     r8, r2, LSR#NExtraPodulesShift
+     ANDS    r8, r8, #3  ; number of extra podules installed
+     B       TxCommandSWI
+
+EnableTxIRQ ROUT
+; enable transmit-irq in uart
+; enter with:
+; r9 = podule number (0..3)
+; r12 = wp 
+     STMFD   sp!, {r2-r3, lr}
+     TEQP    pc, #3:OR:I_bit      ; disable interrupts
+     ADD     r2, r12, r9, LSL#2   ; podule address offset
+     LDR     r2, [r2, #UARTbase] ; ACIA/UART base address
+     TST     r2, #PoduleTypeTestBit
+     MOVNE   r3, #ACIATxIRQEnable
+     STRNEB  r3, [r2]             ; enable TDRE interrupts
+     MOVEQ   r3, #RxRDYirq:OR:TxRDYirq
+     STREQB  r3, [r2, #IROffset]  ; enable TxRDY interrupts
+     ADD     r2, r12, r9  ; podule address offset for required byte of IMR
+     STRB    r3, [r2, #IMRCurrent]
+     LDMFD   sp!, {r2-r3, pc}^
+
+EnablePretendTxIRQ ROUT
+; just set flags in imr, and do not enable irq in uart
+; enter with:
+; r9 = podule number (0..3)
+; r12 = wp 
+     STMFD   sp!, {r2-r3, lr}
+     ADD     r2, r12, r9, LSL#2   ; podule address offset
+     LDR     r2, [r2, #UARTbase] ; ACIA/UART base address
+     TST     r2, #PoduleTypeTestBit
+     MOVNE   r3, #ACIATxIRQEnable
+     MOVEQ   r3, #RxRDYirq:OR:TxRDYirq
+     ADD     r2, r12, r9  ; podule address offset for required byte of IMR
+     STRB    r3, [r2, #IMRCurrent]
+     LDMFD   sp!, {r2-r3, pc}^
+
+SendBytes ROUT
+; enter with:
+; R2=number of bytes,
+; R3=bytes,LSB sent last
+; r9=podule to use
+; put bytes in transmit buffer fifo, to be transmitted by the irq routine.
+     AND     r2, r2, #3 ; limit of 3 bytes can be sent at once
+     ADD     r7, r12, r9, LSL#2   ; buffer offset
+     TEQP    pc, #3:OR:I_bit      ; disable interrupts for consistent buffer pointers
+     LDR     r4, [r7, #TxBufferPntrs]
+     ADD     r7, r12, r9  ; buffer offset
+     LDRB    r6, [r7, #SendStatus]  ; running status
+     LDRB    r7, [r7, #StatusAge]   ; age of running status
+     ORR     r6, r6, r7, LSL#8 ; status and status age
+; r9 = which podule to send from
+NextByte ; get next byte to send   preserve R2, R3, r4, r6
+     BIC     r5, r4, #&FF000000   ; in pointer
+     BIC     r5, r5, #&00FF0000
+     ADD     r7, r5, #1     ; increment buffer in pointer
+     CMP     r7, #TxBufferLen
+     MOVGE   r7, #0           ; circular buffer, reset pointer
+     CMP     r7, r4, LSR#16    ; Check if buffer is full
+; r4 bytes 0,1 = in pointer; bytes 2,3 = out pointer
+; r7 is incremented in pointer
+     BEQ     TxBufferFull
+     SUB     R2, R2, #1       ; number of parameters remaining
+     MOV     R8, R2, LSL #3    ; x8
+     MOV     R8, R3, LSR R8    ; shift to next byte to be sent
+     AND     R8, R8, #&FF
+; r8 is byte to be sent
+     TST     R8, #&80          ; status byte? (top bit set)
+     BEQ     StoreByte  ; data
+; decide whether to send this status byte
+     AND     r5, r8, #&F0
+     CMP     r5, #&F0 ; System common or system real-time message must be txd
+     BNE     %FT10
+     TST     r8, #8 ; system realtime doesnt interrupt RS but sys common does
+     MOVEQ   r6, #0 ; reset RS (and status age) to ensure new status is sent if sys common
+     B       StoreByte
+
+; 11/8/88 addition. Test for channel mode messages, and ensure no RS
+10   TEQ     r5, #&B0
+     BLEQ    TestChannelMode
+; end of addition
+
+     ADD     r6, r6, #&100   ; inc status age (number of status bytes missed under RS)
+     AND     r5, r6, #&FF    ; running status
+     CMP     r5, r8          ; compare with running status
+     MOVNE   r6, r8          ; reset RS, and set status age to 0
+     BNE     StoreByte       ; and send it,    if different
+     CMP     r6, #MaxRunningStatusAge:SHL:8 ; send status if more than (4)
+     BLT     LoopBack  ; if not (common or realtime or old) then RS, dont send
+     BIC     r6, r6, #&FF00  ; reset status age. Enough status bytes have been missed
+StoreByte
+     ADD     r5, r12, r9, LSL#2
+     LDR     r5, [r5, #TxBufferStarts]  ; start of txbuffer
+     BIC     r10, r4,  #&00FF0000
+     BIC     r10, r10, #&FF000000 ; in pntr
+     STRB    r8, [r5, r10]  ; put byte in transmit buffer
+     MOV     r4, r4, LSR#16    ; out pntr
+     ORR     r4, r7, r4, LSL#16 ; combine pre-incremented buffer in pointer
+LoopBack
+     CMP     R2, #0   
+     BGT     NextByte
+; store state and exit
+     ADD     r10, r12, r9   ; buffer offset
+     STRB    r6, [r10, #SendStatus]  ; store new status in RS
+     MOV     r6, r6, LSR#8
+     STRB    r6, [r10, #StatusAge]   ; age of running status
+     ADD     r10, r12, r9, LSL#2     ; podule buffer pointer offset
+     STR     r4, [R10, #TxBufferPntrs] ; save updated buffer in pointer
+; enable transmit-interrupt in uart; except if this is indirectly called from the irq routine
+; in which case set a flag in the mode flags, and in the appropriate IMR. The irq routine will
+; sort it out. This avoids accidently re-entering the irq routine.
+     LDR     r2, [r12, #ModeFlagBits]
+     TST     r2, #InIrq 
+     BLEQ    EnableTxIRQ
+ ; don't enable irqs, just set flags if I am being called (indirectly) from the irq routine
+     BLNE    EnablePretendTxIRQ
+SWIExit
+     LDMVCFD sp!, {R2-R10, PC}^   ; normal exit if no error
+     LDMFD   sp!, {r2-r10, lr}
+     ORRS    pc, lr, #V_bit      ; pass on any error
+TxBufferFull
+     ADR     r0, ErrorBlock_MIDI_TxBufferFull
+     LDMFD   sp!, {r2-r10, lr}
+     ORRS    pc, lr, #V_bit      ; pass on buffer full error
+RxError
+     CMP     r1, #-1  ; overrun error
+     ADREQ   r0, ErrorBlock_MIDI_RxOverrunError
+     CMP     r1, #-2  ; framing error
+     ADREQ   r0, ErrorBlock_MIDI_RxFramingError
+     MOV     r1, r2   ; pass on number of byte (0..2) with received error in r1
+     LDMFD   sp!, {r2-r10, lr}
+     ORRS    pc, lr, #V_bit      ; pass on error
+RxBufOvrError
+     ADR     r0, ErrorBlock_MIDI_RxBufferOverflowError
+     LDMFD   sp!, {r2-r10, lr}
+     ORRS    pc, lr, #V_bit      ; pass on error
+
+   MakeErrorBlock  MIDI_TxBufferFull
+   MakeErrorBlock  MIDI_RxFramingError
+   MakeErrorBlock  MIDI_RxOverrunError
+   MakeErrorBlock  MIDI_RxBufferOverflowError
+
+; 11/8/88 addition. Test for channel mode messages, and ensure no RS
+TestChannelMode ROUT
+; preserve state, and have a look at 1st data byte of channel mode message
+     STMFD   sp!, {r2, r8, lr}
+     SUBS    R2, R2, #1       ; number of parameters remaining
+     LDMMIFD sp!, {r2, r8, pc}^
+     MOV     R8, R2, LSL #3    ; x8
+     MOV     R8, R3, LSR R8    ; shift to next byte to be sent
+     AND     R8, R8, #&FF
+     TST     R8, #&80          ; status byte? (top bit set)
+     LDMNEFD sp!, {r2, r8, pc}^  ; if so then don't worry. This status (channel mode) is wasted. This should never happen.
+     CMP     r8, #LocalControlVal  ; check for channel mode data1 range 122-127
+     MOVGE   r6, #0            ; if channel mode then clear RS buffer to ensure this status is sent
+     LDMFD   sp!, {r2, r8, pc}^
+; end of addition
+
+; scheduler time and value struct
+; There is a block of 1024 of these allocated in the workspace below
+; The time is the schedule time by the millisecond clock
+; The value is the r1 parameter to MIDI_TxCommand
+                  ^  0
+ScheduleTime      #  4
+ScheduleValue     #  4
+SchedulerSlotSize #  0
+
+; The workspace definition
+
+                ^  0   ; set assembler memory var @ to 0
+; this must be at the start of the workspace
+csRoutineAddr   #  4 ; address of centisecond routine to pass to sound dma for sirq
+
+; permit 4 podules maximum => 4 hardware addresses
+; these should be here at the start of the workspace + 1 word for
+; access via the workspace pointer from another (address log) rm
+PoduleBase      #  4*4 ; this is stored here in Initialise_Module
+UARTOffset      #  4*4 ; offset from podule base address of acia or uart
+UARTbase        #  4*4 ; base address of acia or uart
+
+Sound_QTick     #  4 ; tick entry to sound scheduler normally used by sound dma rm.
+
+RxBufferLen     #  4 ; size of receive buffer (programmable)
+
+; pointers to buffers claimed separately from workspace
+TxBufferStarts      #  4*4
+RxBufferStarts      #  4*4
+RxTimesBufferStarts #  4*4
+
+SystemResetClearStart # 0
+
+IMRCurrent      #  4 ; current programmed value of interrupt mask reg in UART
+
+; buffer pointers: in = ms16b, out = ls16b.
+RxBufferPntrs   #  4*4 ; 4 receive FIFO buffer input and output pointers
+TxBufferPntrs   #  4*4 ; 4 transmit FIFO buffer input and output pointers
+
+; Workspace.
+ErrorFlag       #  4  ; various routines can set this flag to indicate that an
+                      ; error has occurred, and what type
+SendStatus      #  4  ; the running status (voice & mode only) of the
+                      ; transmitted midi data
+StatusAge       #  4  ; the age of the running status so it can be updated
+                      ; when it reaches MaxRunningStatusAge
+TxInactiveTime  #  4  ; time since last MIDI byte sent (in centiseconds)
+                      ; for active sensing monitor.
+RxStatus        #  4  ; Running status of received data (for RxCommand)
+RxByteCounter   #  4  ; bits 0-3 number of bytes Rx'd since status or exec
+                      ; bits 4-7 number of bytes expected for current status
+RxByte1         #  4  ; first received data byte after status
+TxChannel       #  4  ; channel no. (0..15) that MIDI data is currently sent on
+SongPosPointer  #  4  ; This is incremented on every TimingClock
+                      ; message received, reset and started on start, stopped
+                      ; on stop, and set on SongPositionPointer messages.
+                      ; It is divided by 6 to give true SPP value.
+
+; the following 3 words should be together to allow ldm of them
+; by the ms routine
+ms_count        #  4  ; hi-resolution timestamp, incremented every
+                      ; millisecond
+tc_rate         #  4  ; value for ms_count to reach before op of TC
+                      ; and incrementing value in top 16 bits
+ModeFlagBits    #  4  ; set of bits determining timing mode, MIDI mode, etc
+next_schedule_t #  4  ; Copy of next schedule time for quick load
+                      ; and compare with ms_count.
+
+LastBeat        #  4  ; Last value and incrementing value of sound
+                      ; system beat counter for Timing Clock transmission
+BarLength       #  4  ; Current value of sound sys BEATS. This enables
+                      ; us to check for bar length change, and reset bar
+                      ; counter to 0 
+Tempo           #  4  ; current value of sound sys TEMPO
+CurrentQBeat    #  4  ; This is the current value of the tempo beat
+               ; counter. Bar counter is top 2 bytes, beat counter is bottom 2
+IgnoreState     #  4  ; Define which received messages to ignore
+
+SPPlsb          #  4  ; this is used to store the lsb of a Song Position
+                      ; Pointer message, while awaiting the msb
+SPPchannel      #  4  ; which podule is the current SPP being received by (0-3)?
+
+TimeCount       #  4  ; Decremented every centisecond. After SlowClock it does
+                    ; those things which need doing regularly, but not every cs
+
+ClearSpaceStart *  @ ; workspace to clear on SWI MIDI_SoundEnable
+
+; workspace for MIDI control of sound system
+InterpretChannel # 4  ; which podule buffers is the interpreter looking at (0-3)?
+VoiceStates     #  4  ; 1 bit per note to account for ons and offs
+VoiceMPitches   #  8  ; 1 byte of midi pitch per voice
+VoiceSPitches   #  32 ; 1 word (32b) of pitch (XSound_Control value)
+                      ; per voice. Note: the size of this could be halved.
+VoiceAmps       #  8  ; 1 byte of XSound_Control amplitude value per voice.
+                      ; Note. Bit 8 should also be set when using.
+BufferSoundOutPntr # 4  ; sound interpreter getbyte pointer
+RunningStatus   #  1  ; the current status of the midi stream (for sound interpreter)
+FirstDataByte   #  1  ; the value of the second byte for 3-byte instructions
+ByteCounter     #  1  ; bits 0-3 number of bytes Rx'd since status or exec
+                      ; bits 4-7 number of bytes expected for current status
+PendSysMsg      #  1  ; bit 1 = 1 if pending system message (SPP or SSel status received)
+CurrentChannel  #  2  ; current MIDI channel for omni off channel check
+MonoChannels    #  2  ; M = number of channels in Omni-off/Mono mode
+
+ClearSpaceEnd   *  @
+
+RxInactiveTime  #  4  ; time since last MIDI byte received (in centiseconds)
+                      ; for active sensing monitors.
+SoundConfiguration # 4 ; number of configured channels before
+                       ; SWI MIDI_SoundEnable was called
+Tuning          #  4  ; Sound system tuning parameter
+
+ScratchBuffer   #  4  ; used for os_gstrans op buffer for * commands
+
+;maxirqtime # 4 ; max irq time recorded so far
+;irqtime    # 4 ; time of last irq in timer ticks
+;irqnotserviced # 4 ; time taken to discover that this irq was not generated by midi
+;thistime   # 4
+
+SystemResetClearEnd  # 0
+
+extrabit   # &8   ; this aligns buffers to &100 address and thus they are not
+                  ; out of immediate value address range
+; midi command scheduler workspace
+
+MaxSchedulerSlots * 1024
+
+; define an array of structs.. not very efficient in memory usage, but speed is
+; very important
+Slot_p          #  4  ; pointers to next free (top 16) and next to empty
+                      ; (bottom 16) scheduler slots.
+
+SchedulerSpace  # MaxSchedulerSlots * SchedulerSlotSize
+
+WorkSpace * @
+
+ ! 0, "Workspace size ":CC::STR:@
+
+      END

@@ -1,0 +1,220 @@
+Overview
+--------
+
+Resource file data may be used by modules to add builtin data to the Resource
+Filing System, 'Resource:'. The ability to do this is useful for a number of
+reasons.
+
+It allows the resource files associated with a particular module to be
+included in the same file as the binary image, which helps with release
+control.
+
+It also has an important application for podule modules, since it allows
+them to *IconSprites a sprite file which they put into Resources:.  This is
+important as there is no other way to introduce a sprite into the Wimp's
+free pool other than from a file.
+
+Another application is for certain resource files to be replaced on a
+selective basis, which is an additional technique to the path mechanism
+already in use (eg. Wimp$Path can be set up to reference a resource
+directory).
+
+
+Directory structure
+-------------------
+
+In order to avoid possible name clashes, it is important that a well-defined
+directory structure is adhered to by all concerned.  This is:
+
+        $.Apps.!<appname>               ; the ROM-resident applications
+        $.Fonts                         ; the ROM-resident fonts
+        $.Resources.<modulename>        ; resources for ADFSFiler etc.
+        $.Resources.<appname>           ; resources for PrinterDM etc.
+        $.ThirdParty.<appname>          ; resources for 3rd parties
+
+where <appname> is the name of the application concerned, without the "!" on
+the front (eg. Draw, Paint, Edit).
+
+The above all indicate directories, which normally contain files called
+"!Sprites", "Templates", "Messages" and so on.
+
+Where third party software is involved, the actual <appname> used must be
+registered with Acorn, to avoid clashes.
+
+
+Software interface
+------------------
+
+In order to register a group of files with ResourceFS, a module must have
+the files included in their image, with appopriate header information, and
+then call SWIs to register and de-register this area as appropriate.
+
+SWI ResourceFS_RegisterFiles
+        In:  R0 -> area of memory containing files (see below for format)
+
+        This SWI should be called when the module is initialised. 
+        ResourceFS will link the file(s) into its structure, and then issue
+        a Service_ResourceFSStarted (not to be confused with
+        Service_ResourceFSStarting - see below), which tells any programs
+        relying on ResourceFS files that the structure has changed.  The
+        Wimp responds to this service call by looking for its default sprite
+        pool again.
+
+SWI ResourceFS_DeregisterFiles
+        In:  R0 -> area of memory containing files
+
+        This SWI should be called when the area of memory containing the
+        files is about to be deallocated (eg. when the module containing
+        them is killed).
+
+        Note that it is not necessary to call this SWI on receipt of a
+        Service_ResourceFSDying, since the ResourceFS module 'loses' all
+        references to ResourceFS files when it dies anyway.
+
+Service_ResourceFSStarting (&60)
+        In:  R2 -> code address to call
+             R3 = workspace pointer for ResourceFS module
+        Out: all registers preserved (do not claim the service)
+
+        When the ResourceFS module is reloaded or re-initialised, it issues
+        this service call so that modules that provide ResourceFS files can
+        put them back into the structure.
+
+        The ResourceFS module is not linked into the module chain at this
+        point, so it is not possible to call ResourceFS_RegisterFiles.
+        Instead, the application should execute the following assembler code:
+
+                STMFD   SP!, {R0, LR}
+                ADR     R0, ResourceFSfiles ; R0 -> ResourceFS file structure
+                MOV     LR, PC          ; LR -> return address
+                MOV     PC, R2          ; call ResourceFS routine
+                LDMFD   SP!, {R0, PC}^
+
+        or the following C code:
+
+        typedef void (*P_FSStartingFN)(void *r0)
+
+        void service(int service_no, OS_RegSet *r, WorkSpace **r12)
+        {
+            switch (service_no) {
+                ...
+                case Service_ResourceFSStarting:
+                    ((P_FSStartingFN)(r->r[2])(&resourcefsfiles);
+                    break;
+                ...
+            }
+        }
+
+        Note that the cast will solicit a warning from the C compiler.
+
+        Note that the value of R3 passed in the service call must be given
+        to the ResourceFS routine intact, so it can find its workspace.
+
+        This call is subtly different from SWI ResourceFS_RegisterFiles, in
+        that it will not cause a Service_ResourceFSStarted to be issued. 
+        This is because the ResourceFS module waits until all modules have
+        received the Service_ResourceFSStarting before issuing a
+        Service_ResourceFSStarted to let the "clients" of Resources: know
+        about it.
+
+The format of the (word-aligned) file data is as follows:
+
+        Offset  Size    Meaning
+        ------  ----    -------
+         0       4      offset from here to the next file (contiguous),
+                        or 0 => end of list (no data follows)
+         4       4      load address of file  )
+         8       4      exec address of file  ) as returned by OS_File (5)
+        12       4      size of file          )
+        16       4      attributes of file    )
+        20       n      full filename, excluding "$.", terminated by 0
+        20+n     0..3   padded with 0s until word-aligned
+                 4      size of file + 4
+                 s      file data
+                 0..3   padded with 0s until word-aligned
+                        followed by more data in the same format
+                        (last entry must be a single 0 word)
+
+The file data must be contiguous - if this is not possible, then
+ResourceFS_RegisterFiles should be called once for each of the areas to be
+used (and an equivalent set of ResourceFS_DeRegisterFiles's later on).  Note
+that each area must be terminated by a single word containing 0.
+
+There are no directory objects, since the directory structure can be
+determined from the full filenames supplied.
+
+Note that where name clashes occur, the first occurrence of the filename in
+the most recently registered area will be used.
+
+The ResGen tool
+---------------
+
+ResGen is a tool for creating resource file data in a form suitable for
+use by ResourceFS from a set of input files and corresponding resource
+file names.
+
+The format of the ResGen command is:
+
+ResGen <Area name> <Object file> { <Binary file> <Resource file> }
+
+<Area name> is the name of an AOF AREA in which the resource file data is
+to be placed. This is exported as an external symbol which can be used in
+C or assembler code.
+
+<Object file> is the name of the object output file to be produced.
+
+<Binary file> is the name of a file to be included in the resource file
+data.
+
+<Resource file> is the name within the ResourceFS which is used by the
+application to refer to a file within the resource file data.
+
+Example usage in C
+------------------
+
+Extract from c.ADFSFiler
+------------------------
+
+...
+
+extern int resourcefsfiles;
+
+#define ADFSPATH  "ADFSFiler$Path"
+#define FILERPATH "Resources:$.Resources.ADFSFiler."
+
+OS_ErrorBlock *init(char *envstr, int instantiation, WorkSpace **r12)
+{
+    ...
+    s = ADFSPATH;
+/* Set up ADFSFiler$Path variable which may be changed by user to point to
+ * a different messages file.
+ */
+    if (!xos_readvarval(s, 0, -1, 0, 0))
+        xos_setvarval(s, FILERPATH, sizeof(FILERPATH), 0, 0);
+/* Register the block of data generated by the ResGen tool with the ResourceFS.
+ * This will create a file "Resources:Resources.ADFSFiler.Messages" which
+ * contains the message data.
+ *
+ * Note the use of '&' before 'resourcefsfiles'. Using resourcefsfiles on its
+ * own would pass the first word of the resource file data to registerfiles
+ * which is not what is required. Follow the declaration above and the usage
+ * below and all should be well.
+ */
+    xresourcefs_registerfiles((void *)&resourcefsfiles);
+    ...
+}
+
+...
+
+Extract from ADFSFiler Makefile
+-------------------------------
+
+...
+
+filer: o.adfsfiler o.messages o.lib
+    link -m -o ADFSFiler o.filer o.messages o.lib
+
+o.messages: m.messages
+    resgen resourcefsfiles o.messages m.messages Resources.ADFSFiler.Messages
+
+...

@@ -1,0 +1,286 @@
+
+/* arc.c */
+
+/* 23 Aug 96 MJS originated */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "swis.h"
+
+
+#define ObjType_Dir 2
+
+#define FlagsField     0x7f000000
+#define LengthField    0x00ffffff
+#define IsSquashed     0x01000000
+#define IsDirectory    0x02000000
+#define IsTruncated    0x04000000
+#define IsNotTruncated 0x7bffffff
+#define IsContinuation 0x08000000
+
+typedef struct
+{
+  unsigned int load;
+  unsigned int exec;
+  unsigned int length;
+  unsigned int attribs;
+  unsigned int otype;
+  char         name[256];
+} drec_t;
+
+
+
+static unsigned char *buff, *sqbuff, *sqwork;
+static drec_t drec;
+
+static int  Narcs, arcsize, totarcsize, maxobjsize, maxarcsize;
+static FILE *fo;
+
+static int  buffsize, maxarcsize1, maxarcsize2, verbose;
+static char sourcedir[256], arcname[256], *toincludelist;
+
+static _kernel_oserror sqerror  = { 0, "Squash compress failure" };
+static _kernel_oserror bigerror = { 0, "object too big for buffer" };
+
+/* ------------------------------------------------------------------------ */
+
+static void split(void)
+{
+  int  split_sentinel = -1;
+  char digits[4];
+
+  fwrite(&split_sentinel,4,1,fo);
+  arcsize += 4;
+  if (verbose)  printf("  brk\n  tot %8d\n",arcsize);
+  if (!verbose) printf("%s: %8d\n",arcname,arcsize);
+  fclose(fo);
+  Narcs++;
+  arcname[strlen(arcname)-2] = '\0';
+  sprintf(digits,"%02d",Narcs);
+  strcat(arcname,digits);
+  if (verbose) printf("new arc: %s\n",arcname);
+  fo = fopen(arcname,"wb");
+  if (fo == NULL)
+  {
+    fprintf(stderr,"failed to open '%s'\n",arcname);
+    exit(1);
+  }
+  totarcsize += arcsize;
+  arcsize = 0;
+  maxarcsize = maxarcsize2;
+}
+
+/* ------------------------------------------------------------------------ */
+
+/* handle splitting transparently */
+static void write_object(int length, int tag, unsigned char *data)
+{
+  int tlength, temp;
+
+  if (maxarcsize - arcsize < length)
+  {
+    tlength = maxarcsize - arcsize;
+    temp = (tag & FlagsField) | IsTruncated | (tlength);
+    fwrite(&temp,4,1,fo);
+    fwrite(data,tlength,1,fo);
+    arcsize += tlength+4;
+    split();
+    temp = (tag & FlagsField) | IsContinuation | (length-tlength);
+    write_object(length-tlength, temp | IsContinuation, data+tlength);
+  }
+  else
+  {
+    temp = tag & IsNotTruncated;
+    fwrite(&temp,4,1,fo);
+    fwrite(data,length,1,fo);
+    arcsize += length+4;
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static _kernel_oserror *arc_walk(char *dname, int nest, char *toincludelist)
+{
+  int    tag, blen, sqlen, sqstatus, temp;
+  char   deepername[256];
+  unsigned char *bp;
+  _kernel_oserror *e;
+
+  e = _swix(OS_GBPB,_INR(0,6)|_OUT(4),10,dname,&drec,1,0,sizeof(drec_t),0,&tag);
+  while (!e && tag != -1)
+  {
+
+    if ((nest == 0) && toincludelist)
+    {
+      strcpy(deepername,drec.name); /* deepername used as work string */
+      strcat(deepername,",");
+      if (strstr(toincludelist,deepername) == NULL)
+      {
+        if (verbose) printf("skip %s\n",drec.name);
+        e = _swix(OS_GBPB,_INR(0,6)|_OUT(4),10,dname,&drec,1,tag,sizeof(drec_t),0,&tag);
+        continue;
+      }
+      if (verbose) printf("include %s\n",drec.name);
+    }
+
+    strcpy(deepername,dname);
+    strcat(deepername,".");
+    strcat(deepername,drec.name);
+
+/*    printf("%8.8x  %8.8x %8.8x %8.8x %8.8x %8.8x %s\n",tag,drec.load,drec.exec,drec.length,
+             drec.attribs,drec.otype,deepername); */
+
+    if (drec.length > buffsize)
+    {
+      e = &bigerror;
+      return e;
+    }
+
+    if (drec.otype == ObjType_Dir)
+    {
+      bp = buff;
+      memcpy(bp,&drec.attribs,4); bp += 4;
+      strcpy((char *)bp,drec.name); bp += strlen(drec.name)+1;
+      blen = bp-buff;
+      temp = blen | IsDirectory;
+      write_object(blen,temp,buff);
+      if (verbose) printf("  dir %8d %s\n",4+blen,drec.name);
+      e = arc_walk(deepername, nest+1, toincludelist);
+      if (e) return e;
+    }
+    else
+    {
+      bp = buff;
+      memcpy(bp,&drec,5*4); bp += 5*4;
+      strcpy((char *)bp,drec.name); bp += strlen(drec.name)+1;
+      e = _swix(OS_File,_INR(0,3),16,deepername,bp,0);  bp += drec.length;
+      if (e) return e;
+      blen = bp-buff;
+      if (maxobjsize < blen+4) maxobjsize = blen+4;
+
+      e = _swix(Squash_Compress,_INR(0,5)|_OUT(0)|_OUT(5),
+                0,sqwork,buff,blen,sqbuff,buffsize,&sqstatus,&sqlen);
+      if (e) return e;
+      if (sqstatus != 0) return &sqerror;
+      sqlen = buffsize - sqlen;
+
+      if (sqlen < blen)
+      {
+        temp = sqlen | IsSquashed;
+        write_object(sqlen,temp,sqbuff);
+        if (verbose) printf("  sqf %8d %s\n",sqlen,drec.name);
+      }
+      else
+      {
+        write_object(blen,blen,buff);
+        if (verbose) printf("  uqf %8d %s\n",blen,drec.name);
+      }
+    }
+
+    e = _swix(OS_GBPB,_INR(0,6)|_OUT(4),10,dname,&drec,1,tag,sizeof(drec_t),0,&tag);
+  }
+
+  if (maxarcsize - arcsize < 8) split();
+  blen = 0;
+  fwrite(&blen,4,1,fo);
+  arcsize += 4;
+  if (verbose) printf("  <--\n");
+
+  return e;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int read_specfile(char *fname)
+{
+  int  i;
+  FILE *fp;
+  static char toincludelist_buff[256];
+
+  fp = fopen(fname,"r");
+  if (fp == NULL) return 0;
+
+  i =  fscanf(fp,"%d",&verbose);
+  i += fscanf(fp,"%d",&buffsize);
+  i += fscanf(fp,"%d %d",&maxarcsize1,&maxarcsize2);
+  i += fscanf(fp,"%s",sourcedir);
+  i += fscanf(fp,"%s",toincludelist_buff);
+  i += fscanf(fp,"%s",arcname);
+  fclose(fp);
+printf("%1d %1dk %1dk %1dk\n%s\n%s\n%s\n\n",
+       verbose,buffsize,maxarcsize1,maxarcsize2,
+       sourcedir,toincludelist_buff,arcname);
+  buffsize *= 1024;
+  maxarcsize1 = maxarcsize1*1024 - 8;
+  maxarcsize2 = maxarcsize2*1024 - 8;
+  if (strcmp(toincludelist_buff,"*") == 0)
+    toincludelist = NULL;
+  else
+  {
+    strcat(toincludelist_buff,",");
+    toincludelist = toincludelist_buff;
+  }
+  return (i == 7);
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+  int  sqworksize;
+  _kernel_oserror *e;
+
+  if (argc != 2)
+  {
+    fprintf(stderr,"usage: arc <spec file>\n");
+    exit(1);
+  }
+
+  if (!read_specfile(argv[1]))
+  {
+    fprintf(stderr,"bad spec file\n");
+    exit(1);
+  }
+
+  e = _swix(Squash_Compress,_INR(0,1)|_OUT(0),8,256,&sqworksize);
+  if (!e)
+  {
+    buff   = malloc(buffsize);
+    sqbuff = malloc(buffsize);
+    sqwork = malloc(sqworksize);
+    if ((buff == NULL) || (sqbuff == NULL) || (sqwork == NULL))
+    {
+      fprintf(stderr,"failed to allocate memory\n");
+      exit(1);
+    }
+
+    Narcs      = 1;
+    arcsize    = totarcsize = 0;
+    maxobjsize = 4096;
+    maxarcsize = maxarcsize1;
+    strcat(arcname,"01");
+    if (verbose) printf("new arc: %s\n",arcname);
+    fo = fopen(arcname,"wb");
+
+    if (fo == NULL)
+    {
+      fprintf(stderr,"failed to open '%s'\n",arcname);
+      exit(1);
+    }
+
+    e = arc_walk(sourcedir, 0, toincludelist);
+
+    totarcsize += arcsize;
+    if (verbose)  printf("  tot %8d\n",arcsize);
+    if (!verbose) printf("%s: %8d\n",arcname,arcsize);
+    fclose(fo);
+
+    if (e) fprintf(stderr,"%s\n",e->errmess);
+  }
+
+  printf("Narcs=%1d totalsize=%1d maxobjsize=%1d\n",Narcs,totarcsize,maxobjsize);
+
+  return 0;
+}

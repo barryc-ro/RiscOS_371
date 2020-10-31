@@ -1,0 +1,2185 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/ShareFS/daemon.c:networking  1.7  $
+ * $Source: /ax/networking:Starling/ShareFS/ShareFS/daemon.c: $
+ *
+ * Copyright (c) 1995 ANT Ltd., Cambridge, England
+ *
+ * $Log:	daemon.c,v $
+ * Revision 1.7  95/06/08  15:03:36  pwain
+ * Change to the undocumented -spin flag of *shares so that it outputs
+ * the PIN rather than encrypted PIN (since the pin is encrypted anyway).
+ * This is to aid the fix of !Access+ and its save/load options.
+ * 
+ * Revision 1.6  95/05/16  16:21:43  pwain
+ * *ShareFSCacheType now attempts to do a lookup of FileTypes where it
+ * is needed to provide a more "User Friendly" interface.
+ * 
+ * Revision 1.5  95/05/15  14:36:25  pwain
+ * *ShareFSCacheType now says in English if no filetypes are not being
+ * cached.
+ * 
+ * Revision 1.4  95/03/04  17:56:22  kwelton
+ * Altered defintion of FORHANDLES() macro to check that thehandles has been
+ * initialised.
+ * 
+ * Revision 1.3  95/02/27  16:40:46  pwain
+ * All existing malloc() calls changed to use rmalloc().
+ * This is because ShareFS uses a different module entry
+ * code which means that its stack is kept in RMA. DO NOT
+ * USE MALLOC IN ShareFS CODE.
+ * 
+ * Revision 1.2  95/01/17  09:03:02  pwain
+ * Removed compilation warning messages.
+ * 
+ * Revision 1.1  95/01/09  13:53:02  kwelton
+ * Initial revision
+ * 
+ */
+
+/* $Id: c.daemon 2.20 93/11/16 23:06:47 brian Exp $ */
+/*     remotedaemon code     */
+/*{{{  compile options*/
+/* #define UNIX */
+#define USEFREEWAY
+#ifndef NOTMODULE
+#define TRANSPORTLIST
+#endif
+
+/*{{{  includes*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <ctype.h>
+
+#include "debug.h"
+
+#ifdef __riscos
+# include "ker.h"
+# include "swis.h"
+# include "remswis.h"
+# include "ralloc.h"
+#endif
+
+#ifdef __unix
+# include "unistd.h"
+#endif
+
+#include "interface.h"
+#include "ModuleWrap.h"
+#include "util.h"
+#include "fscore.h"
+#include "evil.h"
+#include "ticker.h"
+#include "msgproc.h"
+#include "remote.h"
+#include "freeway.h"
+#include "modface.h"
+
+#include "how.h"
+
+/*{{{  errors*/
+#define ERRaccessRO ERRaccess
+#define ERRaccessL ERRaccess
+#define ERRaccessC ERRaccess
+#ifndef LOOKUPERR
+static DEFERR(Export, ERRExport, MSGExport);
+static DEFERR(NotVol, ERRNotVol, MSGNotVol);
+static DEFERR(badpath, ERRbadpath, MSGbadpath);
+static DEFERR(Stale, ERRStale, MSGStale);
+static DEFERR(readonly, ERRreadonly, MSGreadonly);
+static DEFERR(access, ERRaccess, MSGaccess);
+static DEFERR(accessRO, ERRaccessRO, MSGaccessRO);
+static DEFERR(accessL, ERRaccessL, MSGaccessL);
+static DEFERR(dcode, ERRdcode, MSGdcode);
+static DEFERR(dswi, ERRdswi, MSGdswi);
+static DEFERR(ddata, ERRddata, MSGddata);
+static DEFERR(dmany, ERRdmany, MSGdmany);
+static DEFERR(free, ERRfree, MSGfree);
+static DEFERR(NotDir, ERRNotDir, MSGNotDir);
+static DEFERR(dexport, ERRdexport, MSGdexport);
+static DEFERR(dirok, ERRdirok, MSGdirok);
+static DEFERR(DupExprt, ERRDupExprt, MSGDupExprt);
+static DEFERR(Recurse, ERRRecurse, MSGRecurse);
+#endif /* LOOKUPERR */
+
+/*{{{  vars*/
+static int duse = 0;		/* Recursion flag for server */
+extern int clientkey;
+#ifdef __riscos
+int killmedia = 0;
+int killclosefile = 0;
+static int sharesareoff = 0;
+#define UpCallV 0x1d
+#endif
+/*{{{  list of exported volumes*/
+typedef struct volume
+{
+    char *name;			/* name of the volume */
+    char *path;			/* Real path */
+    int pin;
+    struct how how;
+    struct volume *next;
+    FileDesc FileDesc;
+} VOLUME;
+static VOLUME *thevolumes;
+static FileDesc rootFileDesc;	/* datestamp for the list of volumes
+				 * dir */
+
+/*{{{  buffer space for file reads*/
+#define BUFFERS 2
+static char *buffer[BUFFERS];
+#define ROOTBUFFERSIZE 2*1024
+
+/*{{{  table of HANDLE information*/
+#define MAXHANDLE 256
+/* The handle value passed back us a 32 bit value, coded as follows
+ * The special handle 0 is always valid, and represents an imaginary
+ * directory containing images of all the exported points.
+ */
+#define INDEX(h)        ((h)&255)
+#define TOKEN(h)        ((unsigned)(h)>>8)
+#define HVALUE(h)       (((h)->token<<8)+((h)-thehandles))
+typedef struct HANDLE
+{
+    char *path;			/* real path of this handle */
+    struct how how;		/* mount detail */
+    unsigned int token:24;	/* secret token for this handle */
+    int useinfo:1;		/* Flag to set info on close */
+    int invalid:1;		/* this handle can die when
+				 * convenient */
+    int oshandle;		/* os handle for a file */
+    int client;			/* client by which handle was
+				 * refreshed */
+    Information_Fields info;	/* Info for file, saved until we
+				 * close */
+} HANDLE;
+static HANDLE *thehandles;	/* Table of all the handles */
+static int killhandle = 1;	/* Next one to discard */
+static int nexthandle = 1;	/* Next one to try to use */
+#define handle_used(p) (p)->path
+#define FORHANDLES(p) for (p=thehandles;p && p < &thehandles[MAXHANDLE];p++) if (handle_used(p))
+
+/*{{{  modified handles broadcast*/
+/* contains the table of modified handles */
+static union Message mods;
+#define MODSMAX 5
+static int modspos[MODSMAX];	/* decay indices into mods */
+static int killmods = 0;
+
+/*{{{  prototypes*/
+extern void upcall(void);
+static void modifyfile(char *name, int del);
+static void modhandle(HANDLE * h);
+msgproc d_msg1;
+
+static void encrypt_pin(char *buf, int pin)
+{
+    int timer, spin, pinh, spinh;
+    pinh = pin >> 16;
+    pin &= 0xffff;
+    timer = (rand() & 0xffff);
+    spin = (pin + timer) & 0x3ffff;
+    pin = (pin - timer) & 0x3ffff;
+    timer = (rand() & 0xffff);
+    spinh = (pinh + timer) & 0x3ffff;
+    pinh = (pinh - timer) & 0x3ffff;
+    spin ^= 0xaf35;
+    pin ^= 0xda6d;
+    spinh ^= 0x2aea;
+    pinh ^= 0x9512;
+    spin += 0xaaaa;
+    spin &= 0x3ffff;
+    pin += 0x7777;
+    pin &= 0x3ffff;
+    spinh += 0x9999;
+    spinh &= 0x3ffff;
+    pinh += 0xbbbb;
+    pinh &= 0x3ffff;
+    buf[9] = (char) ((int) 'A' + (spin & 0x3f));
+    buf[3] = (char) ((int) 'A' + ((spin >> 6) & 0x3f));
+    buf[5] = (char) ((int) 'A' + ((spin >> 12) & 0x3f));
+    buf[1] = (char) ((int) 'A' + (pin & 0x3f));
+    buf[8] = (char) ((int) 'A' + ((pin >> 6) & 0x3f));
+    buf[2] = (char) ((int) 'A' + ((pin >> 12) & 0x3f));
+    buf[4] = (char) ((int) 'A' + (spinh & 0x3f));
+    buf[10] = (char) ((int) 'A' + ((spinh >> 6) & 0x3f));
+    buf[7] = (char) ((int) 'A' + ((spinh >> 12) & 0x3f));
+    buf[0] = (char) ((int) 'A' + (pinh & 0x3f));
+    buf[11] = (char) ((int) 'A' + ((pinh >> 6) & 0x3f));
+    buf[6] = (char) ((int) 'A' + ((pinh >> 12) & 0x3f));
+    buf[12] = 0;
+    return;
+}
+
+static int encode_psw_char(char c)
+{
+    int i;
+    c = toupper(c);
+    if (isdigit(c))
+	i = ((int) c - (int) '0') + 1;
+    else
+    if (isalpha(c))
+	i = ((int) c - (int) 'A') + 11;
+    else
+	i = 0;
+    return i;
+}
+
+static int password_to_pin(char *buf)
+{
+    int pin = 0;
+    for (; *buf; buf++)
+    {
+	pin *= 37;
+	pin += encode_psw_char(*buf);
+    }
+    return pin;
+}
+
+static int usecache = 0, useprimarycache = 0, usesecondarycache = 0;
+
+struct cachetype
+{
+    struct cachetype *next;
+    int ct;
+    int type;
+};
+
+static struct cachetype *cachetypes = 0;
+
+#define CHECKERR(x) if ((ret=(x))==_kernel_ERROR) return _kernel_last_oserror()
+static void handle_free(HANDLE * p)	/* call modifyfile, os
+					 * close, datestamp */
+{
+    if (handle_used(p))		/* P:657 */
+    {
+	 DEBUGf("Free handle %x\n", HVALUE(p));	/* P:967 */
+	if (p->oshandle)
+	    _kernel_osfind(0, (char *) p->oshandle);	/* P:616 */
+	else
+	if (!killmods)		/* P:657 */
+	    modhandle(p);	/* P:41 */
+	if (p->useinfo)
+	{
+	    _kernel_osfile_block b;	/* P:10 */
+	    b.load = (int) p->info.load_exec.load_address;
+	    b.exec = (int) p->info.load_exec.execute_address;
+	    _kernel_osfile(2, p->path, &b);
+	    _kernel_osfile(3, p->path, &b);
+	}
+	free(p->path);
+	p->path = NULL;
+	p->token = NULL;
+    }
+    else
+	DEBUGf("****Free unused handle %d\n", HVALUE(p));	/* P:657 */
+}
+
+RETURNMETHOD upcall_handler(regs * r, void *private_word)	/**/
+{
+     private_word = private_word;	/* P:887 */
+    switch (r->r[0])		/* P:887 */
+    {
+	/* {{{  trap media not present/not known if killmedia set. */
+      case 1:			/* Media not present *//* P:0 */
+      case 2:			/* Media not known *//* P:11 */
+	if (killmedia)
+	{
+	    r->r[0] = -1;	/* P:9 */
+	    return VIASTACK;	/* P:9 */
+	}
+	break;
+
+	/* {{{  watch file updates and call modifyfile. */
+      case 3:			/* P:876 */
+	{
+	    char name[256];
+	    DEBUGf("Upcall fs %d:", r->r[9]);	/* P:39 */
+	    if (r->r[9] == 512 || r->r[9] == 259)	/* P:841 */
+	    {
+		DEBUGf("Handle %d\n", r->r[1]);	/* P:104 */
+		break;
+	    }
+	    _swix(OS_FSControl, _INR(0, 3), 33, r->r[8] & 255, name, 256);
+	    if (r->r[6])
+	    {
+		strcat(name, "#");	/* P:1 */
+		strcat(name, (char *) r->r[6]);
+	    }
+	    strcat(name, ":");
+	    strcat(name, (char *) r->r[1]);
+	    modifyfile(name, r->r[9] == 6 || r->r[9] == 520);	/* P:481 */
+	    if (520 == r->r[9])
+	    {
+		_swix(OS_FSControl, _INR(0, 3), 33, r->r[8] & 255, name, 256);	/* P:54 */
+		if (r->r[7])
+		{
+		    strcat(name, "#");	/* P:0 */
+		    strcat(name, (char *) r->r[7]);
+		}
+		strcat(name, ":");
+		strcat(name, (char *) r->r[2]);
+		modifyfile(name, 0);
+	    }
+	}
+	break;
+    }
+    return VIAR14;		/* P:878 */
+}
+
+static void modticker(void)	/* Transmit the modified list
+				 * each second */
+{
+    int i, k;			/* P:1431 */
+    HANDLE *h;
+    FORHANDLES(h)		/* P:735534 */
+	if (h->invalid)		/* P:63103 */
+	handle_free(h);		/* P:0 */
+    if (modspos[0] > 0)
+	/*
+	 * {{{  transmit the modified list, and discard those 5 secs
+	 * old. 
+	 */
+    {
+	mods.handletable.op = RDEADHANDLES;	/* P:139 */
+	inet_send(-1, (char *) &mods, sizeof(mods.handletable) - sizeof(mods.handletable.handles) + modspos[0] * sizeof(mods.handletable.handles[0]));
+	k = modspos[MODSMAX - 1];
+	if (k)
+	    memmove(&mods.handletable.handles[0], &mods.handletable.handles[k], sizeof(int) * (modspos[0] - k));	/* P:34 */
+	for (i = MODSMAX - 2; i >= 0; i--)	/* P:695 */
+	    modspos[i + 1] = modspos[i] - k;	/* P:556 */
+	modspos[0] = modspos[0] - k;
+    }
+    /* }}}  */
+}
+
+static void modhandle(HANDLE * h)	/* Add a handle to the
+						 * modified list */
+{
+	while (modspos[0] >= sizeof(mods.handletable.handles) / sizeof(int))	/* P:141 */
+	     modticker();	/* P:0 */
+	mods.handletable.handles[modspos[0]++] = HVALUE(h);
+}
+
+static void modifyfile(char *name, int del)	/* kill off any
+						 * directory handles
+						 * this changes */
+{
+    HANDLE *h;			/* P:826 */
+    int dirlen;
+    char *p;
+    p = strrchr(name, '.');
+    if (p)
+	dirlen = p - name;	/* P:779 */
+    else
+	dirlen = strlen(name);	/* P:826 */
+    DEBUGf("UpCall:%s %s\n", del ? "Delete" : "Modify", name);	/* P:39 */
+    FORHANDLES(h)		/* P:424564 */
+	if ((!strnicmp(h->path, name, dirlen) && !h->path[dirlen] ||
+	     (del && !stricmp(h->path, name)) && !h->oshandle))
+    {
+	handle_free(h);		/* P:41 */
+    }
+}
+
+static void register_exports(void)	/* Call
+						 * Service_RegisterExport
+						 * s */
+{
+     _swix(OS_ServiceCall, _INR(0, 1), SERVER_VERSION, Service_RegisterExports);	/* P:3 */
+}
+
+void remoted_clear(void)	/* Close down the daemon */
+{
+    VOLUME *v, *v1;		/* P:0 */
+    HANDLE *p;
+    _swix(OS_Release, _INR(0, 2), UpCallV, &upcall, private_word);
+    RemoveCallEvery(&modticker);
+    while (modspos[0] > 0)	/* P:0 */
+	modticker();		/* P:0 */
+    killmods = 1;
+    FORHANDLES(p)		/* P:0 */
+	handle_free(p);		/* P:0 */
+    killmods = 0;
+    for (v = thevolumes; v; v = v1)	/* P:0 */
+    {
+#ifdef USEFREEWAY
+	_swix(Freeway_Write, _INR(0, 2), Freeway_Write_Remove, DOMAIN_DISCS, v->name);	/* P:0 */
+#endif
+	free(v->name);
+	free(v->path);
+	v1 = v->next;
+	free(v);
+    }
+#ifdef USEFREEWAY
+    _swix(Freeway_Register, _INR(0, 1), Freeway_Register_Deregister, DOMAIN_DISCS);
+#endif
+    thevolumes = NULL;
+    _swix(OS_ServiceCall, _IN(0) | _IN(1), 0, Service_RemoteFSExport);
+    free(thehandles);
+}
+
+error *remoted_init(void)	/* Initialise the daemon */
+{
+    int i;			/* P:3 */
+    HANDLE *p;
+    thevolumes = NULL;
+    rootFileDesc.length = 0;
+    StampInfo(&rootFileDesc.info);
+    rootFileDesc.attr = Attr_R | Attr_r;
+    rootFileDesc.type = 2;
+    rootFileDesc.buffered = 1;
+    rootFileDesc.interactive = 0;
+    rootFileDesc.noosgbpb = 0;
+    thehandles = calloc(sizeof(HANDLE), MAXHANDLE);
+    p = &thehandles[0];
+    p->path = strdup("");
+    p->how.readonly = p->how.owner = 1;
+    p->how.buffersize = ROOTBUFFERSIZE;
+    p->token = 0;
+    p->client = -1;
+    for (i = 0; i < BUFFERS; i++)	/* P:9 */
+	buffer[i] = NULL;	/* P:6 */
+    _swix(OS_ServiceCall, _IN(0) | _IN(1), 0, Service_RemoteFSExport);
+    killmedia = 0;
+    _swix(OS_Claim, _INR(0, 2), UpCallV, &upcall, private_word);
+#ifdef USEFREEWAY
+    _swix(Freeway_Register, _INR(0, 6), Freeway_Register_Register, DOMAIN_DISCS);
+#endif
+    CallAfter(&register_exports, 0);
+    CallEvery(&modticker, 100);
+    return NULL;		/* P:3 */
+}
+
+#ifdef __riscos
+void remoted_service(regs * r)	/**/
+{
+    switch (r->r[1])		/* P:19884 */
+    {
+      case Service_Reset:	/**//* P:0 */
+	remoted_clear();
+	remoted_init();
+	break;
+
+      case Service_StartedFiler:	/* Reclaim our upcall to
+					 * have precedence over
+	 * wimp *//* P:0 */
+	_swix(OS_Claim, _INR(0, 2), UpCallV, &upcall, private_word);	/* we need this to be in
+									 * front of Wimp */
+	register_exports();	/* for restart after shutdown */
+	break;
+
+#define Service_Shutdown 0x7E
+      case Service_Shutdown:	/* Clear all exports *//* P:0 */
+	while (thevolumes)	/* P:0 */
+	    remoted_removeexport(thevolumes->name);	/* P:0 */
+	break;
+
+#ifdef TRANSPORTLIST
+      case Service_TransportOpen:	/**/
+	if (!stricmp((char *) r->r[0], "local"))
+	{
+	    r->r[0] = CONNECTION_LOCAL;	/* connection handle */
+	    r->r[1] = 0;	/* Claim service */
+	    r->r[2] = RemoteDaemon_Msg;	/* swi to use */
+	    r->r[3] = 24 * 1024 * 1024;	/* infinity is set to 24M */
+	    r->r[4] = SERVER_VERSION;
+	}
+	break;
+
+      case Service_TransportEnumerate:	/**/
+	if (!thevolumes)	/* We are not visible if we don't
+				 * have any exports */
+	    break;
+	if (r->r[0])
+	    --r->r[0];
+	else
+	{
+	    char *p = (char *) r->r[2];
+	    r->r[1] = 0;
+	    /*
+	     * Forget about length checking. If their buffer is too
+	     * small for this, they deserve to lose! 
+	     */
+	    strcpy(p, "local");
+	    r->r[3] = strlen("local");
+	}
+	break;
+#endif
+
+#ifdef USEFREEWAY
+      case Service_FreewayStarting:	/* Register all our
+	 * exports *//* P:3 */
+	{
+	    VOLUME *v;
+	    _swix(Freeway_Register, _INR(0, 1), Freeway_Register_Register, DOMAIN_DISCS);
+	    for (v = thevolumes; v; v = v->next)	/* P:7 */
+	    {
+		struct how how = v->how;	/* P:1 */
+		char *mountname = v->name;
+		char descriptor = (how.owner ? 0 : ATTRIBUTE_PROTECTED) |
+		(how.readonly ? ATTRIBUTE_READONLY : 0) |
+		(how.cdrom ? ATTRIBUTE_CDROM : 0) |
+		(how.subdir ? ATTRIBUTE_SUBDIR : 0) |
+		(how.hidden ? ATTRIBUTE_HIDDEN : 0);
+		_swix(Freeway_Write, _INR(0, 5),
+		      how.auth ? Freeway_Write_Add_Auth : Freeway_Write_Add,
+		      DOMAIN_DISCS, mountname, sizeof(descriptor),
+		      &descriptor, v->pin);
+	    }
+	}
+	break;
+#endif
+
+#if 0				/* turns out we get this on any file
+				 * open whatsoever :-( */
+#define Service_CloseFile 0x68	/* r2 filename, r3 closed count */
+      case Service_CloseFile:	/* Close any handles of
+				 * the file */
+	{
+	    HANDLE *h;
+	    char *path = (char *) r->r[2];
+	    int len = strlen(path);
+	    DEBUGf("Service_Closefile %s%s\n", path, killclosefile ? "(ignored)" : "");
+	    if (killclosefile)
+		break;
+	    FORHANDLES(h)
+		if (!strnicmp(h->path, path, len) && (!h->path[len] || h->path[len] == '.'))
+	    {
+		if (h->oshandle)
+		    r->r[3]++;
+		handle_free(h);
+	    }
+	    break;
+	}
+#endif
+    }
+}
+
+static error *canonicalise(char *s, char *t)	/* from,to */
+{
+    error *err;			/* P:12 */
+    int k;
+    DEBUGf("Canon(%s)", s);	/* P:0 */
+    err = _swix(OS_FSControl, _INR(0, 5) | _OUT(5),
+		37, s, t, 0, 0, 256, &k);
+    DEBUGf("err %s k %d,", err ? err->errmess : "NONE", k);	/* P:0 */
+    if (err && err->errnum == 1025)	/* Possible RO2 canonicalise? *//* P
+					 * :0 */
+    {
+	strcpy(t, s);		/* P:0 */
+	return 0;		/* P:0 */
+    }
+    if (err)
+	return err;		/* P:0 */
+    DEBUGf("=%s\n", t);		/* P:0 */
+    return 0;			/* P:12 */
+}
+
+#else
+static error *canonicalise(char *s, char *t)	/* null version */
+{
+     strcpy(t, s);
+    return NULL;
+}
+#endif
+
+error *remoted_addexport(char *mountname, char *path, struct how how, int pin)
+{
+    VOLUME **k, *v;		/* P:6 */
+    _kernel_osfile_block b;
+    char exportpath[256];
+    int n;
+    HANDLE *h;
+    error *err;
+    int ret;
+    if (sharesareoff)
+	return ERR(Export);
+    err = canonicalise(path, exportpath);
+    if (err)
+	return err;		/* P:0 */
+    if (!mountname || !mountname[0] || strpbrk(mountname, ".$:#*&^ \\|%"))	/* P:12 */
+	return ERR(DiscName);	/* P:0 */
+    for (k = &thevolumes; *k; k = &(*k)->next)	/* P:15 */
+	if (!stricmp(mountname, (*k)->name))	/* P:3 */
+	    break;		/* P:0 */
+    if (*k)
+    {
+	v = *k;			/* P:0 */
+	if (stricmp(v->path, exportpath))
+	    return ERR(DupExprt);	/* P:0 */
+	*k = v->next;
+	free(v->name);
+	free(v->path);
+    }
+    else
+    {
+	v = rmalloc(sizeof(VOLUME));	/* P:6 */
+	if (!v)
+	{
+	    return ERR(NoMem);
+	}			/* P:0 */
+    }
+    v->name = strdup(mountname);
+    v->path = strdup(exportpath);
+    killmedia = 1;
+    ret = _kernel_osfile(17, v->path, &b);
+    killmedia = 0;
+    if (!ret)
+    {
+	free(v->name);
+	free(v->path);
+	free(v);		/* P:0 */
+	return ERR(NotFound);	/* P:0 */
+    }
+    if (ret == 3)
+	ret = 1;		/* P:0 */
+    v->how = how;
+    v->how.recurse = !strnicmp(FSNAME ":", v->path, strlen(FSNAME ":"));
+    v->FileDesc.type = ret;
+    v->FileDesc.buffered = 1;
+    v->FileDesc.interactive = 0;
+    v->FileDesc.noosgbpb = 0;
+    v->FileDesc.length = b.start;
+    v->FileDesc.attr = b.end;
+    v->FileDesc.info.load_exec.load_address = (void *) b.load;
+    v->FileDesc.info.load_exec.execute_address = (void *) b.exec;
+    v->pin = pin;
+    v->next = *k;
+    *k = v;
+#ifdef USEFREEWAY
+    /* {{{  Register this export with freeway */
+    {
+	char descriptor = (how.owner ? 0 : ATTRIBUTE_PROTECTED) |
+	(how.readonly ? ATTRIBUTE_READONLY : 0) |
+	(how.cdrom ? ATTRIBUTE_CDROM : 0) |
+	(how.subdir ? ATTRIBUTE_SUBDIR : 0) |
+	(how.hidden ? ATTRIBUTE_HIDDEN : 0);
+	err = _swix(Freeway_Write, _INR(0, 5),
+		    how.auth ? Freeway_Write_Add_Auth : Freeway_Write_Add,
+		    DOMAIN_DISCS, mountname, sizeof(descriptor),
+		    &descriptor, pin);
+
+	if (err && err->errnum != 0x1e6)	/* P:0 */
+	{
+	    *k = v->next;
+	    free(v->name);
+	    free(v->path);
+	    free(v);		/* P:0 */
+	    if (FreewayError_ObjectExists == err->errnum)
+		err = lookuperr(err->errnum, "DupExprt");	/* P:0 */
+	    return err;		/* P:0 */
+	}
+    }
+#endif
+
+    _swix(OS_ServiceCall, _IN(0) | _IN(1), v->name, Service_RemoteFSExport);
+    rootFileDesc.length++;
+    StampInfo(&rootFileDesc.info);
+    modhandle(&thehandles[0]);	/* Update export lists */
+    n = strlen(exportpath);
+    FORHANDLES(h)		/* P:3084 */
+	if (!strnicmp(exportpath, h->path, n) &&
+	    (h->path[n] == '.' || h->path[n] == 0))	/* P:62 */
+	handle_free(h);		/* P:0 */
+    return 0;			/* P:6 */
+}
+
+error *remoted_removeexport(char *mountname)	/**/
+{
+    VOLUME **k, *v;		/* P:3 */
+    int n, pin;
+    HANDLE *h;
+    for (k = &thevolumes; *k; k = &(*k)->next)	/* P:9 */
+	if (!stricmp(mountname, (*k)->name))	/* P:6 */
+	    break;		/* P:3 */
+    if (!*k)
+	return ERR(NotVol);	/* P:0 */
+    v = *k;
+    *k = v->next;
+    pin = v->pin;
+    _swix(OS_ServiceCall, _IN(0) | _IN(1), thevolumes ? thevolumes->name : NULL, Service_RemoteFSExport);
+#ifdef USEFREEWAY
+    _swix(Freeway_Write, _INR(0, 5), v->how.auth ? Freeway_Write_Remove_Auth : Freeway_Write_Remove, DOMAIN_DISCS, v->name, 0, 0, pin);
+#endif
+    killmods = 1;
+    n = strlen(v->path);
+    FORHANDLES(h)		/* P:1542 */
+	if (!strnicmp(v->path, h->path, n) && (h->path[n] == '.' || h->path[n] == 0))	/* P:59 */
+	handle_free(h);		/* P:0 */
+    killmods = 0;
+    free(v->name);
+    free(v->path);
+    free(v);
+    rootFileDesc.length--;
+    StampInfo(&rootFileDesc.info);
+    return 0;			/* P:3 */
+}
+
+error *remoted_command(int cmd, int argc, char *argv[])	/**/
+{
+    VOLUME *v;			/* P:11 */
+    int f, pin = 0;
+    error *err = NULL;
+    switch (cmd)		/* P:11 */
+    {
+      case 0:	/* *Export [mountname] object *//**//* P
+		 * :6 */
+#ifdef DEBUG
+	if (!stricmp(argv[1], "status"))
+	{
+	    HANDLE *h;		/* P:0 */
+	    FORHANDLES(h)	/* P:0 */
+	    {
+		printf("Handle %x is %s os %d client %x %s\n", HVALUE(h), h->path, h->oshandle, h->client, howprint(h->how));	/* P:0 */
+	    }
+#ifdef NOTMODULE
+	    {
+		extern void showqueue(void);
+		showqueue();
+	    }
+#endif
+	    break;
+	}
+#endif
+	{
+	    char mountname[256];
+	    char exportpath[256];
+	    struct how how;
+#ifdef NOTMODULE
+	    if (argc >= 2 && argv[2][0] != '-')	/* P:2 */
+	    {
+		strcpy(mountname, argv[2]);	/* P:2 */
+		err = canonicalise(argv[1], exportpath);
+		if (err)
+		    return err;	/* P:0 */
+		f = 3;
+	    }
+#else
+	    if (argc >= 2)
+	    {
+		strcpy(mountname, argv[1]);
+		err = canonicalise(argv[2], exportpath);
+		if (err)
+		    return err;
+		f = 3;
+	    }
+#endif
+	    else
+	    {
+		char *p;	/* P:6 */
+		err = canonicalise(argv[1], exportpath);
+		f = 2;
+		if (err)
+		    return err;	/* P:0 */
+		p = strrchr(exportpath, '.');
+		if (!p || p[1] == '$')	/* P:4 */
+		    p = strrchr(exportpath, ':');	/* P:4 */
+		if (!p)
+		    return ERR(dexport);	/* P:0 */
+		if (p[1] == '$')
+		{
+		    strcpy(mountname, exportpath);	/* P:0 */
+		    p = strchr(mountname, ':');
+		}
+		else
+		{
+		    strcpy(mountname, p + 1);	/* P:4 */
+		    p = strchr(mountname, '.');
+		}
+		if (p)
+		    *p = 0;	/* P:4 */
+	    }
+	    how = defaulthow;
+#ifndef NOTMODULE
+	    {
+		char *p = getenv("Export$Options");
+		if (p)
+		{
+		    p = strtok(p, " ");
+		    while (p)
+		    {
+			if (howread(&how, p))
+			    return ERR(Export);
+			p = strtok(NULL, " ");
+		    }
+		}
+	    }
+#endif
+	    for (; f <= argc; f++)	/* P:12 */
+	    {
+		if (howread(&how, argv[f]))
+		{
+		    if (stricmp(argv[f - 1], "-auth") == 0)
+		    {
+			pin = password_to_pin(argv[f]);
+			if (pin < 10)
+			    return ERR(Export);
+		    }
+		    else
+			return ERR(Export);
+		}
+	    }
+	    if (how.subdir && !how.auth)
+		return ERR(Export);
+	    return remoted_addexport(mountname, exportpath, how, pin);	/* P:6 */
+	}
+
+      case 1:	/* UnExport mountname *//**//* P:3 */
+	{
+	    char path[256];
+	    err = remoted_removeexport(argv[1]);
+	    if (err && err->errnum == ERRNotVol &&
+		!canonicalise(argv[1], path))	/* P:0 */
+	    {
+		DEBUGf("Canonicalises to %s\n", path);	/* P:0 */
+		for (v = thevolumes; v; v = v->next)	/* P:0 */
+		{
+		    if (!stricmp(path, v->path))	/* P:0 */
+		    {
+			err = remoted_removeexport(v->name);	/* P:0 */
+			break;
+		    }
+		}
+	    }
+	    return err;		/* P:3 */
+	}
+
+      case 2:	/* Exports *//**//* P:2 */
+	{
+	    FILE *fp;
+#ifdef NOTMODULE
+	    int spin, ronly;
+	    if (argc > 0 && stricmp(argv[1], "off") == 0)
+	    {
+		sharesareoff = 1;
+		break;
+	    }
+	    spin = (argc > 0 && stricmp(argv[1], "-spin") == 0) ? 1 : 0;
+	    ronly = (argc > 0 && stricmp(argv[1], "-readonly") == 0) ? 1 : 0;
+	    fp = stdout;
+#else
+	    if (!argc)
+		fp = stdout;
+	    else
+	    {
+		char buf[256];
+		fp = fopen(argv[1], "w");
+		if (!fp)
+		    return _kernel_last_oserror();
+		fprintf(fp, "%s\n", lookup("exphead", buf, sizeof(buf)));
+	    }
+#endif
+	    for (v = thevolumes; v; v = v->next)	/* P:7 */
+#ifdef NOTMODULE
+	    {
+		if ((ronly && !v->how.readonly) ||
+		    (spin && !v->how.subdir && !v->how.cdrom))
+		    continue;
+		fprintf(fp, "Share %s %s %s",
+			v->path, v->name, howprint(v->how));	/* P:3 */
+		if (spin)
+		{
+		    char buf[32];
+		    /* 
+		     * This is now changed....
+		     *
+		    encrypt_pin(buf, v->pin);
+		    fprintf(fp, "-auth %s", buf);
+		     */
+		    fprintf(fp, "-auth %d", v->pin);
+		}
+		fprintf(fp, "\n");
+	    }
+#else
+		fprintf(fp, "Export %-10s %s %s\n",
+			v->name, v->path, howprint(v->how));
+#endif
+	    if (fp != stdout)
+		fclose(fp);	/* P:0 */
+	    break;
+	}
+
+      case 11:	/* ShareFSCache */
+	{
+	    if (argc > 0)
+	    {
+		if (!strcmp(argv[1], "on"))
+		    return usecache = 1, useprimarycache = 1,
+			usesecondarycache = 1, (error *) 0;
+		if (!strcmp(argv[1], "off"))
+		    return usecache = 0, useprimarycache = 0,
+			usesecondarycache = 0, (error *) 0;
+	    }
+	    printf("CD cacheing is %s\n", usecache ? "on" : "off");
+	    break;
+	}
+
+      case 12:	/* ShareFSCacheType */
+	{
+	    struct cachetype *c;
+	    char ct[4];
+	    if (argc == 0)
+	    {
+		if (cachetypes==NULL)
+		    printf("Cacheing is not disabled for any filetype\n");
+	        else {
+		    printf("Type     Cache\n");
+		    printf("--------------\n");
+		    for (c = cachetypes; c; c = c->next)
+		    {
+		        _kernel_swi_regs r;
+			_kernel_oserror *err;
+			char *text;
+
+		        ct[0] = 0;
+		        if (c->ct & 1)
+			    strcat(ct, "P");
+		        if (c->ct & 2)
+			    strcat(ct, "S");
+			/*
+			 * Convert filetype to a text string.
+			 */
+			r.r[0]=18;
+			r.r[2]=c->type;
+		        err = _kernel_swi(OS_FSControl, &r, &r);
+
+		        if (err) printf("&%3X     %s\n", c->type, ct);
+			else {
+			 r.r[4]=0;
+			 printf("%s %s\n", (char *)&r.r[2], ct);
+			 }
+		    }
+	        }
+	    }
+	    else
+	    {
+		int ct, t;
+		char type[32];
+		struct cachetype *c;
+		_kernel_swi_regs r;
+
+		if (argc == 1)
+		    ct = 0;
+		else
+		{
+		    ct = 0;
+		    if (strchr(argv[2], 'S') || strchr(argv[2], 's'))
+			ct |= 2;
+		    if (strchr(argv[2], 'P') || strchr(argv[2], 'p'))
+			ct |= 1;
+		}
+
+		/*
+		 * Convert filetype names into filetypes.
+		 */
+		if (sscanf(argv[1], "%s", type) != 1)
+		    return 0;
+
+		r.r[0]=31;
+		r.r[1]=(int)type;
+		r.r[2]=0;
+		err = _kernel_swi(XOS_Bit | OS_FSControl, &r, &r);
+
+		if (err) {
+			printf("Cannot get file type. None disabled.\n");
+			return(0);
+			}
+
+		/*
+		 * t contains the file type
+		 */
+		t=r.r[2];
+
+		if (cachetypes)
+		{
+		    for (c = cachetypes; c; c = c->next)
+			if (c->type == t)
+			    break;
+		}
+		else
+		    c = 0;
+		if (!c && ct == 0)
+		    return 0;
+		if (!c)
+		{
+		    if ((c = (struct cachetype *) rmalloc(sizeof(struct cachetype))) == 0)
+			return 0;
+		    c->type = t;
+		    c->next = cachetypes;
+		    cachetypes = c;
+		}
+		if (ct)
+		    c->ct = ct;
+		else
+		{
+		    if (cachetypes == c)
+			cachetypes = c->next;
+		    else
+		    {
+			struct cachetype *c1;
+			for (c1 = cachetypes; c1->next != c; c1 = c1->next);
+			c1->next = c->next;
+		    }
+		    free(c);
+		}
+	    }
+	    break;
+	}
+    }
+    return err;			/* P:2 */
+}
+
+static error *makefullname(char *fullname, struct how *full,
+			   struct filespec *path)	/* Build a path from a
+							 * dirhandle/path pair */
+{
+    char *p = path->path, *q;	/* P:826 */
+    VOLUME *v;
+    DEBUGf(":%x,%s", path->dirhandle, path->path);	/* P:383 */
+    if (strpbrk(p, "^:$\\&%"))
+    {
+	DEBUGf(" ILLEGAL!\n");	/* P:0 */
+	return ERR(badpath);	/* P:0 */
+    }
+    if (!path->dirhandle)	/* first componant is a volume */
+    {
+	if (!*p)		/* P:826 */
+	{
+	    fullname[0] = 0;	/* P:0 */
+	    full->readonly = 1;
+	    full->owner = 1;
+	    full->buffersize = ROOTBUFFERSIZE;
+	    DEBUGf(" root\n");	/* P:0 */
+	    return NULL;	/* P:0 */
+	}
+	q = strchr(p, '.');
+	if (q)
+	    *q = 0;		/* P:767 */
+	for (v = thevolumes; v; v = v->next)	/* P:1695 */
+	    if (!stricmp(v->name, p))	/* P:869 */
+		goto gotvol;	/* P:826 */
+	return ERR(NotVol);	/* P:0 */
+gotvol:			/* P:826 */
+	strcpy(fullname, v->path);
+	*full = v->how;
+	p = q ? q + 1 : "";
+	goto caton;
+    }
+    else
+	/* {{{  use the path from HANDLEPATH(..) */
+    {
+	HANDLE *h = &thehandles[INDEX(path->dirhandle)];
+	DEBUGf("%x %x %x\n", h->token, path->dirhandle, TOKEN(path->dirhandle));	/* P:0 */
+	if (h->token != TOKEN(path->dirhandle))
+	{
+	    DEBUGf("Directory token mismatch, %s - %x!=%x\n", h->path ? h->path : "DEAD", h->token, TOKEN(path->dirhandle));	/* P:0 */
+	    return ERR(Stale);	/* P:0 */
+	}
+	strcpy(fullname, h->path);
+	*full = h->how;
+caton:				/* P:826 */
+	if (p[0])
+	{
+	    strcat(fullname, ".");	/* P:767 */
+	    strcat(fullname, p);
+	}
+	DEBUGf("=%s\n", fullname);	/* P:383 */
+	return NULL;		/* P:826 */
+    }
+}
+
+static error *fulldirstat(char *fullname, int *fulldirattr)	/**/
+{
+    char *p, *q;		/* P:23 */
+    _kernel_osfile_block b;
+    int ret;
+    p = strrchr(fullname, '.');
+    q = strrchr(fullname, ':');
+    if (p && q && p < q || !p)	/* avoid dots from special field *//* P
+				 * :69 */
+    {
+	*fulldirattr = Attr_r | Attr_w;	/* P:0 */
+	return NULL;		/* P:0 */
+    }
+    *p = 0;
+    CHECKERR(_kernel_osfile(17, fullname, &b));	/* P:2 */
+    *p = '.';
+    *fulldirattr = b.end;
+    if (ret != 2)
+	return ERR(NotFound);
+    return NULL;		/* P:22 */
+}
+
+static error *grabbuf(int buffersize)	/**/
+{
+    int i;			/* P:190 */
+    if (!buffersize)
+	return NULL;		/* P:0 */
+    for (i = 0; i < BUFFERS; i++)	/* P:570 */
+    {
+	if (buffer[i])
+	    free(buffer[i]);	/* P:380 */
+	buffer[i] = rmalloc(buffersize);
+	if (!buffer[i])
+	    return ERR(NoMem);	/* P:0 */
+    }
+    return NULL;		/* P:190 */
+}
+
+error *d_msg(int client, union Message *m, int msize, char *p, int n,
+	     struct moreproc *mp, int *outsize)	/**/
+{
+    int i;			/* P:3265 */
+    error *err;
+    if (duse)
+	return ERR(Recurse);	/* P:0 */
+    duse = 1;
+    killmedia = 1;
+    err = d_msg1(client, m, msize, p, n, mp, outsize);
+#ifdef DEBUG
+    if (err && debug)		/* P:41 */
+	printf("Error %x %s\n", err->errnum, err->errmess);	/* P:2 */
+#endif
+    for (i = 0; i < BUFFERS; i++)	/* P:9795 */
+    {
+	if (buffer[i])		/* P:6530 */
+	{
+	    free(buffer[i]);	/* P:380 */
+	    buffer[i] = NULL;
+	}
+    }
+    killmedia = 0;
+    duse = 0;
+    return err;			/* P:3265 */
+}
+
+error *d_msg1(int client, union Message *m, int msize, char *p, int n,
+	      struct moreproc *mp, int *outsize)	/**/
+{
+    error *err = NULL;		/* P:3265 */
+    static char fullname[256];
+    struct how full;
+    int fulldirattr;
+    _kernel_osfile_block b;
+    _kernel_osgbpb_block gb;
+    int ret, len = 0, op;
+    int c, type;
+    HANDLE *h = 0;
+    msize = msize;
+#if 0
+    for (c = theclients; c; c = c->next)
+	if (c->key == client)
+	    goto gotclient;
+    c = rmalloc(sizeof(CLIENT));
+    if (!c)
+	return ERR(NoMem);
+    c->key = client;
+    c->next = theclients;
+    theclients = c;
+
+  gotclient:
+    c->when = MONOTIME;
+#endif
+    c = client;
+    if (!m)
+    {
+	FORHANDLES(h)		/* P:8755 */
+	    if (h->client == c && h->oshandle)	/* P:577 */
+	    h->invalid = 1;	/* P:0 */
+	return NULL;		/* P:17 */
+    }
+    op = m->base.op;
+    if (op >= RCLOSE && op <= RZERO)
+    {
+	h = &thehandles[INDEX(m->filedetails.handle)];	/* P:2424 */
+	if (h->token != TOKEN(m->filedetails.handle))
+	{
+	    DEBUGf("Op %d Token mismatch, %s - %x!=%x\n", op, h->path ? h->path : "DEAD", h->token, TOKEN(m->filedetails.handle));	/* P:10 */
+	    return ERR(Stale);	/* P:10 */
+	}
+	if (h->how.recurse && clientkey)	/* P:15 */
+	    return ERR(Recurse);/* P:0 */
+    }
+
+    switch (op)			/* P:3238 */
+    {
+      default:	/**//* P:0 */
+	DEBUGf("RBad Code %d\n", m->base.op);	/* P:0 */
+	return ERR(dcode);	/* P:0 */
+
+      case RVERSION:	/**//* P:2 */
+	m->ptr.seqptr = SERVER_VERSION;
+	len = sizeof(struct ptr);
+	break;
+
+      case RFIND:	/**//* P:2 */
+	DEBUGf("RFIND");	/* P:0 */
+	err = makefullname(fullname, &full, &m->path.spec);
+	if (err)
+	    return err;		/* P:0 */
+	if (!fullname[0])
+	{
+	    m->desc.FileDesc = rootFileDesc;
+	    len = sizeof(struct desc);
+	    break;
+	}			/* P:0 */
+
+      osfilefull:		/* P:6 */
+	CHECKERR(_kernel_osfile(17, fullname, &b));	/* P:0 */
+
+      osfilefix:		/* P:18 */
+	if (debug > 2)
+	    printf("OSfile %s ret = %d\n", fullname, ret);	/* P:0 */
+	if (!ret || !full.owner && !(b.end & Attr_r))	/* P:16 */
+	    return ERR(NotFound);	/* P:4 */
+	if (ret == 3)
+	    ret = 1;		/* P:0 */
+	len = sizeof(struct desc);
+	m->desc.FileDesc.buffered = 1;
+	m->desc.FileDesc.interactive = 0;
+	m->desc.FileDesc.noosgbpb = 0;
+
+      retosfile:		/* P:801 */
+	m->desc.FileDesc.type = ret;
+	m->desc.FileDesc.length = b.start;
+	m->desc.FileDesc.attr = b.end;
+	m->desc.FileDesc.info.load_exec.load_address = (void *) b.load;
+	m->desc.FileDesc.info.load_exec.execute_address = (void *) b.exec;
+	if (op == ROPENDIR)
+	    goto doopendirread;	/* P:143 */
+	break;
+
+      case ROPENDIR:	/**//* P:148 */
+	DEBUGf("ROPENDIR ");	/* P:68 */
+	err = NULL;
+	h = &thehandles[INDEX(m->pathint.val)];
+	if (m->pathint.val == -1 || !m->pathint.val || h->token != TOKEN(m->pathint.val) || (h->client != c && m->pathint.val))	/* P:0 */
+	{
+	    DEBUGf("(%x dead)", m->pathint.val);	/* P:216 */
+	    err = makefullname(fullname, &full, &m->pathint.spec);
+	    if (err)
+		return err;	/* P:0 */
+	    goto doopen;
+	}
+	DEBUGf("%s ok\n", h->path);	/* P:0 */
+	return ERR(dirok);	/* P:0 */
+
+      case ROPENIN:
+      case ROPENUP:		/**//* P:1304 */
+	DEBUGf("ROPEN");	/* P:314 */
+	err = makefullname(fullname, &full, &m->path.spec);
+	if (err)
+	    return err;		/* P:0 */
+
+      doopen:		/* P:810 */
+	if (!fullname[0])
+	{
+	    m->status.handle = 0;
+	    len = sizeof(struct status);
+	    m->desc.FileDesc = rootFileDesc;	/* P:0 */
+	    if (op == ROPENDIR)
+	    {
+		h = &thehandles[0];	/* P:0 */
+		goto doopendirread;
+	    }
+	    break;
+	}
+	CHECKERR(_kernel_osfile(17, fullname, &b));	/* P:16 */
+	if (!ret)
+	    return ERR(NotFound);	/* P:34 */
+	DEBUGf("(type %d)", ret);	/* P:382 */
+	if (op == ROPENDIR && !(ret & 2))	/* P:143 */
+	    return ERR(NotDir);	/* P:0 */
+	if ((ret & 2) && fullname[strlen(fullname) - 1] == '$')	/* P:169 */
+	    b.end = Attr_R | Attr_W | Attr_r;	/* P:25 */
+	if (!full.owner && !(b.end & Attr_r))	/* P:0 */
+	    return ERR(NotFound);	/* Was Access *//* P:0 */
+	if (ret == 3)
+	    ret = 1;		/* P:0 */
+	type = ret;
+	if (op == ROPENDIR || 2 == type)	/* P:642 */
+	{
+	    ret = 0;		/* P:169 */
+	    FORHANDLES(h)	/* P:78770 */
+	    {
+		if (!strcmp(fullname, h->path))	/* P:4946 */
+		{
+		    DEBUGf("Old handle matches..");	/* P:24 */
+		    goto goth;
+		}
+	    }
+	}
+	else
+	{
+	    int k = op == ROPENIN || ret == 2 || full.readonly || !(b.end & (full.owner ? Attr_W : Attr_w)) ? 0x4B : 0xCB;	/* P:769 */
+	    if (usecache && !strncmp(fullname, "CDFS:", 5) && (k >= 0x40))
+	    {
+		int t;
+		struct cachetype *c;
+		k &= 0xff;
+		k |= 0x400;
+		_swix(OS_File, _INR(0, 1) | _OUT(6), 23, (int) fullname, &t);
+		for (c = cachetypes; c; c = c->next)
+		{
+		    if (c->type == t)
+		    {
+			k |= (c->ct << 8);
+			break;
+		    }
+		}
+		if (!useprimarycache)
+		    k |= 0x200;
+		if (!usesecondarycache)
+		    k |= 0x100;
+	    }
+	    DEBUGf("osfind %x..", k);	/* P:307 */
+	    killclosefile = 1;
+	    ret = _kernel_osfind(k, fullname);
+	    killclosefile = 0;
+	    CHECKERR(ret);	/* P:0 */
+	}
+	DEBUGf("oshandle=%d,", ret);	/* P:374 */
+	for (h = &thehandles[nexthandle]; h < &thehandles[MAXHANDLE]; h++)	/* P:27653 */
+	    if (!h->path)	/* P:26884 */
+		goto gothand;	/* P:769 */
+	for (h = &thehandles[1]; h < &thehandles[nexthandle]; h++)	/* P:27653 */
+	    if (!h->path)	/* P:26884 */
+		goto gothand;	/* P:769 */
+	for (h = &thehandles[killhandle]; h < &thehandles[MAXHANDLE]; h++)	/* P:27653 */
+	    if (!h->oshandle)	/* P:26884 */
+		goto killhand;	/* P:769 */
+	for (h = &thehandles[1]; h < &thehandles[killhandle]; h++)	/* P:27653 */
+	    if (!h->oshandle)	/* P:26884 */
+		goto killhand;	/* P:769 */
+	h = &thehandles[killhandle];
+killhand:
+	killhandle = h - thehandles;
+	if (++killhandle >= MAXHANDLE)
+	    killhandle = 1;	/* P:0 */
+	handle_free(h);
+
+      gothand:			/* P:769 */
+	if (++nexthandle >= MAXHANDLE)
+	    nexthandle = 1;
+	h->oshandle = ret;
+	h->token = time(0) + rand();;
+	h->path = strdup(fullname);
+	h->how = full;
+	h->client = c;
+	h->useinfo = 0;
+	h->invalid = 0;
+
+      goth:			/* P:785 */
+	m->status.handle = HVALUE(h);
+	DEBUGf("=handle %x,", m->status.handle);	/* P:382 */
+	if (ret)
+	    ret = _kernel_osargs(254, ret, 0);	/* P:616 */
+#ifdef NOTMODULE
+	m->desc.FileDesc.buffered = 1;
+	m->desc.FileDesc.interactive = 0;
+#else
+	m->desc.FileDesc.buffered = !(ret & (1 << 10));
+	m->desc.FileDesc.interactive = 0 != (ret & (1 << 3));
+#endif
+	m->desc.FileDesc.noosgbpb = 0;
+	len = sizeof(struct status);
+	ret = type;
+	goto retosfile;
+
+      case RCREATE:/**//* P:8 */
+	DEBUGf("RCREATE");	/* P:1 */
+	err = makefullname(fullname, &full, &m->path.spec);
+	if (err)
+	    return err;		/* P:0 */
+	if (full.readonly)
+	    return ERR(readonly);	/* P:0 */
+	err = fulldirstat(fullname, &fulldirattr);
+	if (err)
+	    return err;		/* P:2 */
+	if (!full.owner && !(fulldirattr & Attr_w))	/* P:0 */
+	    return ERR(accessRO);	/* P:0 */
+	if (!full.owner)
+	{
+	    CHECKERR(_kernel_osfile(17, fullname, &b));	/* P:0 */
+	    if (ret && !(b.end & Attr_r))	/* P:16 */
+		return ERR(accessC);	/* P:4 */
+	}
+	b.load = 0xDEADDEAD;
+	b.exec = 0xDEADDEAD;
+	b.start = 0;
+	b.end = 0;
+	CHECKERR(_kernel_osfile(7, fullname, &b));	/* P:2 */
+	b.end = Attr_R | Attr_W;
+	if (!full.owner)
+	    b.end |= Attr_r | Attr_w;	/* P:0 */
+	CHECKERR(_kernel_osfile(4, fullname, &b));	/* P:0 */
+	goto doopen;
+	/* }}}  */
+       /* {{{  */ case RCREATEDIR:	/**//* P:3 */
+	DEBUGf("RCREATEDIR");	/* P:0 */
+	err = makefullname(fullname, &full, &m->path.spec);
+	if (err)
+	    return err;		/* P:0 */
+	if (full.readonly)
+	    return ERR(readonly);	/* P:0 */
+	err = fulldirstat(fullname, &fulldirattr);
+	if (err)
+	    return err;		/* P:0 */
+	if (!full.owner && !(fulldirattr & Attr_w))	/* P:0 */
+	    return ERR(accessRO);	/* P:0 */
+	if (!full.owner)
+	{
+	    CHECKERR(_kernel_osfile(17, fullname, &b));	/* P:0 */
+	    if (ret && !(b.end & Attr_r))	/* P:16 */
+		return ERR(accessC);	/* P:4 */
+	}
+	b.start = 0;
+	CHECKERR(_kernel_osfile(8, fullname, &b));	/* P:0 */
+	b.end = Attr_R | Attr_W;
+	if (!full.owner)
+	    b.end |= Attr_r | Attr_w;	/* P:0 */
+	CHECKERR(_kernel_osfile(4, fullname, &b));	/* P:0 */
+	goto doopen;
+
+      case RDELETE:/**//* P:4 */
+	DEBUGf("RDELETE");	/* P:0 */
+	err = makefullname(fullname, &full, &m->path.spec);
+	if (err)
+	    return err;		/* P:0 */
+	if (full.readonly)
+	    return ERR(readonly);	/* P:0 */
+	err = fulldirstat(fullname, &fulldirattr);
+	if (err)
+	    return err;		/* P:0 */
+	if (!full.owner && !(fulldirattr & Attr_w))	/* P:0 */
+	    return ERR(accessRO);	/* P:0 */
+	b.start = 0;
+	CHECKERR(_kernel_osfile(6, fullname, &b));	/* P:0 */
+	goto osfilefix;
+
+      case RACCESS:/**//* P:4 */
+	DEBUGf("RACCESS %x", m->pathint.val);	/* P:0 */
+	err = makefullname(fullname, &full, &m->pathint.spec);
+	if (err)
+	    return err;		/* P:0 */
+	if (full.readonly)
+	    return ERR(readonly);	/* P:0 */
+	err = fulldirstat(fullname, &fulldirattr);
+	if (err)
+	    return err;		/* P:0 */
+	if (!full.owner)
+	{
+	    if (!(fulldirattr & Attr_w))	/* P:0 */
+		return ERR(accessRO);	/* P:0 */
+	    CHECKERR(_kernel_osfile(17, fullname, &b));	/* P:0 */
+	    if (!(b.end & Attr_w))
+		return ERR(accessL);	/* P:0 */
+	    b.end = (b.end & ~Attr_L) | (m->pathint.val & Attr_L);
+	}
+	else
+	{
+	    b.end = m->pathint.val;	/* P:4 */
+	}
+	CHECKERR(_kernel_osfile(4, fullname, &b));	/* P:0 */
+	goto osfilefull;
+
+      case RRENAME:/**//* P:2 */
+	{
+	    char buf[256];
+	    struct filespec *newspec;
+	    DEBUGf("RRENAME");	/* P:0 */
+	    if (!p)
+	    {
+		if (!mp)	/* P:2 */
+		    return ERR(ddata);	/* P:0 */
+		err = grabbuf(m->pathint.val);
+		if (err)
+		    return err;	/* P:0 */
+		err = domoreproc(mp, client, buffer[1], 0, buffer[0], m->pathint.val, &p, &n);
+		if (err)
+		{
+		    DEBUGf("moreproc err..");
+		    return err;
+		}		/* P:0 */
+	    }
+	    newspec = (struct filespec *) p;
+	    err = makefullname(fullname, &full, &m->pathint.spec);
+	    if (err)
+		return err;	/* P:0 */
+	    if (full.readonly)
+		return ERR(readonly);	/* P:0 */
+	    strcpy(buf, fullname);
+	    err = fulldirstat(fullname, &fulldirattr);
+	    if (err)
+		return err;	/* P:0 */
+	    if (!full.owner && !(fulldirattr & Attr_w)	/* ||
+		    (fulldirattr&Attr_L) */ )	/* P:0 */
+		return ERR(accessRO);	/* P:0 */
+	    err = makefullname(fullname, &full, newspec);
+	    if (err)
+		return err;	/* P:0 */
+	    if (full.readonly)
+		return ERR(readonly);	/* P:0 */
+	    err = fulldirstat(fullname, &fulldirattr);
+	    if (err)
+		return err;	/* P:0 */
+	    if (!full.owner && !(fulldirattr & Attr_w)	/* ||
+		    (fulldirattr&Attr_L) */ )	/* P:0 */
+		return ERR(accessRO);	/* P:0 */
+	    err = _swix(OS_FSControl, _INR(0, 2), 25, &buf[0], &fullname[0]);
+	    if (err)
+		return err;	/* P:0 */
+	    len = sizeof(int);
+	    break;
+	}
+
+      case RREAD:	/**//* P:1746 */
+	{
+	    int l;
+	    int o = m->filedetails.offset;
+	    int z = m->filedetails.length;
+	    int w;
+	    DEBUGf("RREAD %s %d %d\n", h->path, o, z);	/* P:886 */
+	    for (l = 0, w = 0;; w = 1 - w)	/* P:1838 */
+	    {
+		int m = z - l;	/* P:1838 */
+		int k;
+		if (!p)
+		{
+		    if (!mp)	/* P:274 */
+			return ERR(ddata);	/* P:0 */
+		    n = h->how.buffersize;
+		    if (!buffer[0])
+		    {
+			err = grabbuf(n);	/* P:182 */
+			if (err)
+			    return err;	/* P:0 */
+		    }
+		    p = buffer[w];
+		}
+		if (m > n)
+		    m = n;	/* P:92 */
+		gb.dataptr = p;
+		gb.nbytes = m;
+		gb.fileptr = o;
+		CHECKERR(_kernel_osgbpb(gb.fileptr == -1 ? 4 : 3, h->oshandle, &gb));	/* P:0 */
+		k = (char *) gb.dataptr - p;	/* amount read */
+		if (o != -1)
+		    o += k;	/* P:1838 */
+		l += k;
+		if (!mp)
+		    break;	/* P:0 */
+		err = domoreproc(mp, client, 0, z - 1, p, k, &p, &n);
+		if (err)
+		{
+		    DEBUGf("moreproc err..");
+		    return err;
+		}		/* P:0 */
+		if (k < m || l >= z)	/* P:646 */
+		    break;	/* P:1746 */
+	    }
+	    m->res.newpos = o;
+	    m->res.length = l;
+	    len = sizeof(struct res);
+	    if (!mp)
+		goto retlen;	/* return read data range *//* P:0 */
+	    break;
+	}
+	/* }}}  */
+       /* {{{  */ case RREADDIR:	/**//* P:26 */
+	{
+	    int l;
+	    int o = m->filedetails.offset;
+	    int z = m->filedetails.length;
+	    int w;
+	    DEBUGf("RREADDIR %s %d %d\n", h->path, o, z);	/* P:7 */
+	    goto doreaddir;
+
+	  doopendirread:		/* P:143 */
+	    o = 0;
+	    z = ROPENDIRSIZE;
+	    DEBUGf("OPENDIRREAD\n");	/* P:68 */
+
+	  doreaddir:			/* P:169 */
+	    for (l = 0, w = 0;; w = 1 - w)	/* P:174 */
+	    {
+		int m = z - l;	/* P:174 */
+		if (!p)
+		{
+		    if (!mp)	/* P:0 */
+			return ERR(ddata);	/* P:0 */
+		    n = h->how.buffersize;
+		    if (!buffer[0])
+		    {
+			err = grabbuf(n);	/* P:0 */
+			if (err)
+			    return err;	/* P:0 */
+		    }
+		    p = buffer[w];
+		}
+		if (m > n)
+		    m = n;	/* P:0 */
+		gb.dataptr = p;
+		gb.nbytes = m / 20;
+		gb.fileptr = o;
+		gb.buf_len = m;
+		DEBUGf("seg %d %d:", o, m);	/* P:76 */
+		gb.wild_fld = NULL;
+		if (!h->path[0])
+		{
+		    VOLUME *v;	/* P:0 */
+		    int a, b;
+		    for (v = thevolumes, a = gb.fileptr; a > 0 && v; a--)	/* P:0 */
+			v = v->next;	/* P:0 */
+		    DEBUGf("Skip to vol %d:%s\n", gb.fileptr, v ? v->name : "NULL");	/* P:0 */
+		    for (a = 0; v && gb.nbytes > 0; v = v->next)	/* P:0 */
+		    {
+			b = strlen(v->name);	/* P:0 */
+			DEBUGf("vol %s len %d\n", v->name, (b | 3) + 1 + 20);	/* P:0 */
+			if (gb.buf_len < 24 + b)
+			    break;	/* P:0 */
+			*(FileDesc *) gb.dataptr = v->FileDesc;
+			strcpy((char *) gb.dataptr + 20, v->name);
+			gb.dataptr = (void *) ((int) gb.dataptr + (b | 3) + 1 + 20);
+			gb.buf_len -= (b | 3) + 1 + 20;
+			gb.nbytes--;
+			gb.fileptr++;
+			a++;
+		    }
+		    if (!v)
+			gb.fileptr = -1;	/* P:0 */
+		    gb.nbytes = a;
+		}
+		else
+		    CHECKERR(_kernel_osgbpb(10, (int) h->path, &gb));	/* P:174 */
+		o = gb.fileptr;
+		{
+		    int i, l;
+		    char *x = p;
+		    for (l = 0, i = 0; i < gb.nbytes; i++)	/* P:2130 */
+		    {
+			int k = 20 + (strlen(&p[l + 20]) + 4) & ~3;	/* P:1782 */
+			FileDesc *q = (FileDesc *) (p + l);
+			if (!h->how.owner && !(q->attr & Attr_r))	/* invisible object *//* P
+									 * :0 */
+			{
+			    if (debug > 2)	/* P:0 */
+				printf("invisible %s - %d %x\n", &p[l + 20], q->type, q->attr);	/* P:0 */
+			    l += k;
+			    continue;
+			}
+			if (q->type == 3)
+			    q->type = 1;	/* P:25 */
+			if (debug > 2)
+			    printf("%s - %d %x\n", &p[l + 20], q->type, q->attr);	/* P:0 */
+			if (x != (char *) q)
+			    memcpy(x, q, k);	/* P:0 */
+			l += k;
+			x += k;
+		    }
+		    n = x - p;
+		}
+		DEBUGf("%d bytes:", n);	/* P:76 */
+		l += n;
+		if (!mp)
+		    break;	/* P:0 */
+		err = domoreproc(mp, client, 0, z - 1, p, n, &p, &n);
+		if (err)
+		{
+		    DEBUGf("moreproc err..");
+		    return err;
+		}		/* P:0 */
+		if (n == 0 || o == -1 || z < l + 100)	/* P:179 */
+		    break;	/* P:169 */
+	    }
+	    if (op == ROPENDIR)
+	    {
+		m->statusres.newpos = o;	/* P:143 */
+		m->statusres.length = l;
+		len = sizeof(struct statusres);
+	    }
+	    else
+	    {
+		m->res.newpos = o;	/* P:169 */
+		m->res.length = l;
+		len = sizeof(struct res);
+	    }
+	    if (!mp)
+		goto retlen;	/* return data range *//* P:0 */
+	    break;
+	}
+      
+      case RWRITE:	/**//* P:6 */
+	{
+	    int l;
+	    int o = m->filedetails.offset;
+	    int z = m->filedetails.length;
+	    int w;
+	    DEBUGf("RWRITE %s %d %d\n", h->path, o, z);	/* P:0 */
+	    if (h->how.readonly)
+		return ERR(readonly);	/* P:0 */
+	    for (l = 0, w = 0; l < z; w = 1 - w)	/* P:18 */
+	    {
+		int m = z - l;	/* P:6 */
+		char *q;
+		if (!p)
+		{
+		    int k;	/* P:6 */
+		    if (!mp)
+			return ERR(ddata);	/* P:0 */
+		    k = h->how.buffersize;
+		    if (m < k)
+			k = m;	/* P:6 */
+		    if (!buffer[0])
+		    {
+			err = grabbuf(k);	/* P:6 */
+			if (err)
+			    return err;	/* P:0 */
+		    }
+		    err = domoreproc(mp, client, buffer[1 - w], m - k > h->how.buffersize ? h->how.buffersize : m - k, buffer[w], k, &p, &n);
+		    if (err)
+		    {
+			DEBUGf("moreproc err..");
+			return err;
+		    }		/* P:0 */
+		}
+		q = p;
+		p = 0;
+		if (m > n)
+		    m = n;	/* P:0 */
+		gb.dataptr = q;
+		gb.nbytes = m;
+		gb.fileptr = o;
+		CHECKERR(_kernel_osgbpb(gb.fileptr == -1 ? 2 : 1, h->oshandle, &gb));	/* P:0 */
+		n = (char *) gb.dataptr - q;	/* amount written *//* P:
+						 * 0 */
+		o = gb.fileptr;
+		l += n;		/* P:6 */
+	    }
+	    m->res.newpos = o;	/* P:0 */
+	    m->res.length = l;
+	    len = sizeof(struct res);
+	    break;
+	}			/* P:0 */
+
+      case RENSURE:/**/
+	DEBUGf("RENSURE %s %d\n", h->path, m->filedetails.offset);
+	if (h->how.readonly)
+	    return ERR(readonly);	/* P:2 */
+	CHECKERR(_kernel_osargs(4, h->oshandle, 0));	/* P:0 */
+	while (ret + (100 << 10) < m->filedetails.offset)
+	{
+	    CHECKERR(_kernel_osargs(6, h->oshandle, ret + (100 << 10)));	/* P:0 */
+	    dropper();		/* P:0 */
+	}			/* P:4 */
+	CHECKERR(_kernel_osargs(6, h->oshandle, m->filedetails.offset));	/* P:0 */
+	CHECKERR(_kernel_osargs(4, h->oshandle, 0));
+	m->ptr.seqptr = ret;
+	len = sizeof(struct ptr);
+	break;			/* P:0 */
+
+      case RSETLENGTH:	/**/
+	DEBUGf("RSETLENGTH %s %d\n", h->path, m->filedetails.offset);
+	if (h->how.readonly)
+	    return ERR(readonly);	/* P:4 */
+	CHECKERR(_kernel_osargs(2, h->oshandle, 0));	/* P:1 */
+	while (ret + (100 << 10) < m->filedetails.offset)
+	{
+	    CHECKERR(_kernel_osargs(3, h->oshandle, ret + (100 << 10)));	/* P:0 */
+	    dropper();		/* P:0 */
+	}			/* P:8 */
+	CHECKERR(_kernel_osargs(3, h->oshandle, m->filedetails.offset));	/* P:0 */
+	m->ptr.seqptr = ret;
+	len = sizeof(struct ptr);
+	break;			/* P:0 */
+
+      case RZERO:	/**/
+	{
+	    int o = m->filedetails.offset;
+	    int n = m->filedetails.length;
+	    char *buf;		/* P:4 */
+	    int s = 100000;
+	    DEBUGf("RZERO %s %x+%x\n", h->path, o, n);
+	    if (h->how.readonly)
+		return ERR(readonly);
+	    while (0 == (buf = calloc(1, s)) && s > 1000)	/* P:0 */
+		s /= 2;
+	    if (!buf)
+		return ERR(NoMem);	/* P:0 */
+	    err = 0;		/* P:8 */
+	    while (n > 0 && !err)	/* P:0 */
+	    {
+		int m = n > s ? s : n;	/* P:0 */
+		err = _swix(OS_GBPB, _INR(0, 4) | _OUT(4), o == -1 ? 2 : 1, h->oshandle, buf, m, o, &o);
+		n -= m;		/* P:16 */
+		dropper();	/* P:4 */
+	    }
+	    free(buf);
+	    if (err)
+		return err;
+	    m->res.newpos = o;
+	    len = sizeof(struct res);
+	    break;		/* P:0 */
+	}
+
+      case RCLOSE:	/**/
+	DEBUGf("RCLOSE %s\n", h->path);
+	len = sizeof(int);
+	if (!h->oshandle)	/* its a directory *//* P:616 */
+	    break;		/* P:307 */
+	if (h == &thehandles[0])
+	    return ERR(readonly);
+	handle_free(h);		/* P:0 */
+	break;
+
+      case RSETINFO:	/**/
+	DEBUGf("RSETINFO %s %x/%x\n", h->path, m->filedetails.offset, m->filedetails.length);
+	if (h->how.readonly)
+	    return ERR(readonly);	/* P:10 */
+	h->useinfo = 1;		/* P:1 */
+	h->info.load_exec.load_address = (void *) m->filedetails.offset;
+	h->info.load_exec.execute_address = (void *) m->filedetails.length;	/* P:0 */
+	b.load = m->filedetails.offset;
+	b.exec = m->filedetails.length;
+	CHECKERR(_kernel_osfile(2, h->path, &b));
+	CHECKERR(_kernel_osfile(3, h->path, &b));
+	CHECKERR(_kernel_osfile(17, h->path, &b));
+	goto osfilefix;		/* P:4 */
+
+      case RGETSEQPTR:	/**//* P:0 */
+	DEBUGf("RGETSEQPTR %s", h->path);
+	CHECKERR(_kernel_osargs(0, h->oshandle, 0));
+	m->ptr.seqptr = ret;	/* P:0 */
+	len = sizeof(struct ptr);	/* P:0 */
+	break;			/* P:0 */
+
+      case RSETSEQPTR:	/**/
+	DEBUGf("RSETSEQPTR %s %d\n", h->path, m->filedetails.offset);
+	CHECKERR(_kernel_osargs(1, h->oshandle, m->filedetails.offset));
+	len = 4;		/* P:0 */
+	break;			/* P:0 */
+
+      case RFREESPACE:	/**/
+	{
+	    regs lr;
+	    DEBUGf("RFREESPACE");
+	    err = makefullname(fullname, &full, &m->path.spec);	/* P:0 */
+	    if (err)
+		return err;
+	    if (!fullname[0])	/* P:0 */
+		return ERR(readonly);
+	    lr.r[0] = 49;	/* P:0 */
+	    lr.r[1] = (int) fullname;
+	    err = _kernel_swi(OS_FSControl, &lr, &lr);	/* P:0 */
+	    if (err)
+	    {
+		static struct fsswi
+		{
+		    char *name;
+		    int swi;
+		} fsswis[] =
+		{
+		    {
+			 "adfs:", ADFS_FreeSpace
+		    }
+		    ,
+		    {
+			 "ram:", RamFS_FreeSpace
+		    }
+#ifndef SCSIFS_FreeSpace	/* P:0 */
+#define SCSIFS_FreeSpace 0x40983
+#endif
+		    ,
+		    {
+			 "scsi:", SCSIFS_FreeSpace
+		    }
+#ifndef NFS_FreeSpace
+#define NFS_FreeSpace 0x410C5
+#endif
+		    ,
+		    {
+			 "NFS:", NFS_FreeSpace
+		    }
+		};
+		int i, n;
+		int shape[16];
+		char *p;
+		for (i = 0
+		     ; i < sizeof(fsswis) / sizeof(struct fsswi)
+		     ; i++
+		    )		/* P:0 */
+		{
+		    n = strlen(fsswis[i].name);
+		    if (!strnicmp(fsswis[i].name, fullname, n))
+			goto knowit;
+		}		/* P:0 */
+		return ERR(free);
+
+	      knowit:		/* P:0 */
+		DEBUGf("Recognised as %s\n", fsswis[i].name);
+		p = strchr(fullname + n, '.');	/* P:0 */
+		if (p)
+		    *p = 0;	/* P:0 */
+		if (fsswis[i].swi == NFS_FreeSpace)	/* P:0 */
+		{
+		    err = _swix(fsswis[i].swi, _IN(1) | _OUT(0) | _OUT(2), fullname + n + 1, &lr.r[0], &lr.r[2]);
+		    if (err)
+			return err;	/* P:0 */
+		    lr.r[1] = lr.r[0];
+		}		/* P:0 */
+		else		/* P:0 */
+		{
+		    lr.r[0] = (int) (fullname + n);
+		    lr.r[1] = (int) &shape[0];
+		    err = _kernel_swi(fsswis[i].swi + 2, &lr, &lr);
+		    if (err)
+			return err;	/* P:0 */
+		    lr.r[0] = (int) (fullname + n);
+		    err = _kernel_swi(fsswis[i].swi, &lr, &lr);
+		    if (err)
+			return err;	/* P:0 */
+		    lr.r[2] = shape[4];
+		}
+	    }
+	    len = sizeof(struct free);	/* P:0 */
+	    m->free.freespace.free = lr.r[0];
+	    m->free.freespace.biggest = lr.r[1];
+	    m->free.freespace.size = lr.r[2];
+	    break;
+	}
+
+    }
+
+  retlen:
+    *outsize = len;
+    return err;
+}
+
+error *remoted_enumerateexports(regs *r)	/* P:3207 */
+{
+    VOLUME *v;
+    int n;
+
+#ifdef NOTMODULE
+# define RDISCNAME 1		/* P:0 */
+# define RPATHNAME 2
+# define RNUMBER 4
+#else
+# define RNUMBER 0
+# define RDISCNAME 0
+# define RPATHNAME 1
+#endif
+
+    n = r->r[RNUMBER] + 1;
+    for (v = thevolumes; v; v = v->next)
+    {
+#ifdef NOTMODULE
+	if ((r->r[0] == 0 ||
+	     (r->r[0] & 01 && v->how.owner) ||
+	     (r->r[0] & 02 && v->how.readonly) ||
+	     (r->r[0] & 04 && v->how.hidden) ||
+	     (r->r[0] & 010 && v->how.subdir) ||
+	     (r->r[0] & 020 && v->how.cdrom))
+	    && ((r->r[0] & ((unsigned int) 1 << 31)) ? (v->pin == r->r[5]) : 1))
+#endif
+	    n--;
+	if (!n)
+	    break;
+    }
+
+    if (!v)
+#ifdef NOTMODULE		/* P:0 */
+	r->r[RNUMBER] = -1;
+#else
+	r->r[RDISCNAME] = 0;
+#endif				/* P:0 */
+    else
+    {
+	r->r[RDISCNAME] = (int) v->name;
+	r->r[RPATHNAME] = (int) v->path;
+#ifdef NOTMODULE
+	r->r[RNUMBER]++;	/* P:0 */
+	r->r[3] = (v->how.owner ? 0 : ATTRIBUTE_PROTECTED) |
+	    (v->how.readonly ? ATTRIBUTE_READONLY : 0) |
+	    (v->how.cdrom ? ATTRIBUTE_CDROM : 0) |
+	    (v->how.subdir ? ATTRIBUTE_SUBDIR : 0) |
+	    (v->how.hidden ? ATTRIBUTE_HIDDEN : 0);
+#else
+	r->r[2] = (int) &v->how;
+#endif
+    }
+    return NULL;
+}
+
+#ifndef NOTMODULE
+int clientkey = 0;		/* P:0 */
+char ModuleName[] = FSNAME "Daemon";
+
+void module_finalise(void)	/**/
+{
+    remoted_clear();
+    lookup_clear();
+#ifdef DEBUG
+    rfreeall();
+#endif
+}
+
+error *module_initialise(char *cmd_tail, int podule_base, void *privw)	/**/
+{
+    error *err;
+    cmd_tail = cmd_tail;
+    private_word = privw;
+    podule_base = podule_base;
+    duse = 0;
+    lookup_init(FSNAME "FS:Messages");
+    err = remoted_init();
+    if (!err)
+	atexit(module_finalise);
+    return err;
+}
+
+void module_service(int service_number, regs *r, void *private_word)	/**/
+{
+    service_number = service_number;
+    private_word = private_word;
+    remoted_service(r);
+}
+
+error *module_command(char *s, int argc, int cmd_no, void *privw)	/**/
+{
+    char buf[256];
+    char *t;
+    char *argv[20];
+    int c, f, b;
+    argc = argc;
+    privw = privw;
+    for (c = 1, f = 0, t = buf; t < buf + sizeof(buf) && (b = *s++) >= ' ';)
+    {
+	if (f)
+	    *t++ = (b == ' ') ? f = 0 : b;
+	else
+	if (b != ' ')
+	    argv[c++] = t, *t++ = b, f = 1;
+    }
+    *t = 0;
+#ifdef DEBUG
+    if (argc > 0 && !stricmp(argv[1], "DEBUG"))
+    {
+	if (argc >= 2)
+	    debug = atoi(argv[2]);
+	else
+	    printf("Debug level = %d\n", debug);
+	return 0;
+    }
+    else
+    if (argc >= 2 && !stricmp(argv[1], "rallocDEBUG"))
+    {
+	rallocdebug = atoi(argv[2]);
+	return 0;
+    }
+    else
+    if (argc >= 1 && !stricmp(argv[1], "rcheckall"))
+    {
+	rcheckall();
+	return NULL;
+    }
+#endif
+#ifdef PROFILING
+    else
+    if (argc >= 2 && !stricmp(argv[1], "mapstore"))
+    {
+	_fmapstore(argv[2]);
+	return 0;
+    }
+#endif
+    return remoted_command(cmd_no, argc, argv);
+}
+
+error *inet_send(int client, char *p, int n)	/**/
+{
+     return _swix(OS_ServiceCall, _INR(0, 3), client, Service_RemoteFSSend, p, n);
+}
+
+error *module_swi(int swinum, regs * r, void *privw)	/**/
+{
+     privw = privw;
+    switch (swinum)
+    {
+      default:
+	return lookuperr(ERRBadSWI, "BadSWI", ModuleName);
+
+      case RemoteDaemon_Version & 63:
+	r->r[0] = SERVER_VERSION;
+	return NULL;
+
+      case RemoteDaemon_Exports & 63:
+	return remoted_enumerateexports(r);
+
+      case RemoteDaemon_Msg & 63:
+	return d_msg(r->r[0], (union Message *)r->r[1], r->r[2],
+		     (void *)r->r[3], r->r[4],
+		     r->r[7] ? (struct moreproc *) & r->r[5] : 0, &r->r[2]);
+
+#ifdef BEFREEWAY
+      case RemoteDaemon_Receive & 63:
+	return remoted_receive(r);
+#endif
+    }
+}
+
+struct moreproc	/**/
+{
+    int param;
+    int r12;
+    int addr;
+};
+
+#if 0
+struct moreproc *makemp(moreproc *mp)	/**/
+{
+    static struct moreproc mp;
+    mp.param = (int) mp;
+    mp.r12 = (int) private_word;
+    mp.addr = (int) &xmoreproc;
+    return &mp;
+}
+
+int xmoreproc_handler(regs *r, void *private_word)	/**/
+{
+    error *err;
+    private_word = private_word;
+    err == (*(moreproc *) r->r[5]) (r->r[0], (char *) r->r[1], r->r[2], (char *) r->r[3], r->r[4], (char **) &r->r[3], &r->r[4]);
+    if (err)
+    {
+	r->r[0] = (int) err;
+	r->r[12] |= (1u << 28);
+    }
+    return VIAR14;
+}
+#endif
+
+error *domoreproc(struct moreproc * mp, int client, char *next, int nextsize,
+		  char *buf, int bufsize, char **outbuf, int *outbufsize)
+{
+    regs r;
+    error *err;
+    extern error *callmoreproc(regs * r);
+    r.r[0] = client;
+    r.r[1] = (int) next;
+    r.r[2] = nextsize;
+    r.r[3] = (int) buf;
+    r.r[4] = bufsize;
+    r.r[5] = mp->param;
+    r.r[6] = mp->r12;
+    r.r[7] = mp->addr;
+    err = callmoreproc(&r);
+    *outbuf = (char *) r.r[3];
+    *outbufsize = r.r[4];
+    return err;
+}
+#endif
+
+/* EOF daemon.c */

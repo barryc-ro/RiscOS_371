@@ -1,0 +1,963 @@
+; >Sources.Format
+;
+; Handle interactive verify.
+;
+;
+ [ Version >= 25
+
+        MACRO
+$lab    bit     $bitnum
+$lab    *       1 :SHL: ($bitnum)
+        MEND
+
+
+        MACRO
+$lab    aw      $size           ;allocate word aligned
+        ASSERT  {VAR} :MOD: 4=0
+$lab    #       $size
+        MEND
+
+bit6    bit 6
+bit7    bit 7
+
+                ^       0
+SectorSize      # 1
+SecsPerTrk      # 1
+Heads           # 1     ;1 for old adfs floppy format
+Density         # 1     ;1/2/4 single double quad
+
+;only those above needed for low level drivers
+
+LinkBits        # 1
+BitSize         # 1     ;log2 bytes for each bit in map, 0 for old format
+RAskew          # 1     ;track to track sector skew for random access
+BootOpt         # 1     ;boot option for this disc
+LowSector       # 1     ;b0-5= lowest sector ID, b6= sequence sides, b7= double step
+Zones           # 1     ;# zones in map
+ZoneSpare       # 2     ;# bits in zones after 0 which are not map bits
+        ASSERT  (ZoneSpare :MOD: 4)=2
+RootDir         aw 4
+DiscSize        aw 4
+
+DiscStruc       # 0     ;above entries (except BootOpt) define disc structure
+
+DiscId          aw 2
+DiscName        # 10
+DiscRecSig      # 0     ;above entries form signature of disc
+
+DiscFlags       # 1
+FloppyFlag      bit 0
+NeedNewIdFlag   bit 1
+AltMapFlag      bit 5
+OldMapFlag      bit 6
+OldDirFlag      bit 7   ;set <=> old small dirs
+
+
+;entries below must be valid even when disc rec is not in use
+Priority        # 1     ;0 DISC REC UNUSED
+                        ;1 to # floppies -> floppy priority level
+                        ;&FF good winnie
+DiscsDrv        # 1     ;0-7 => drive in, 8 => not in drive, OR DISC REC UNUSED
+DiscUsage       # 1     ;tasks using this disc, if >0 disc cant be forgotten
+SzDiscRec       # 0
+
+;default last word of disc record
+;DiscFlags      0  FLOPPIES NEED NeedNewIdFlag SET INITIALLY
+;Priority       0
+;DiscsDrv       8
+;DiscUsage      0
+DefDiscRecEnd   * &00080000
+
+
+
+FormatState_Ready       *       0
+FormatState_Format      *       1
+FormatState_Formatting  *       2
+FormatState_VerifyReady *       3
+FormatState_Verify      *       4
+FormatState_Verifying   *       5
+FormatState_Paused      *       6
+FormatState_Resume      *       7
+FormatState_OK          *       8 
+FormatState_SetPause    *       9 
+
+NextStateTable
+        DCD     1       ; Ready       -> Format
+        DCD     6       ; Format      -> Paused
+        DCD     6       ; Formatting  -> Paused
+        DCD     4       ; VerifyReady -> Verify
+        DCD     6       ; Verify      -> Paused
+        DCD     6       ; Verifying   -> Paused
+        DCD     7       ; Paused      -> Resume
+        DCD     0       ; This case cannot happen as state is restored to the saved state.
+        DCD     0       ; This should never happen as the window gets closed.
+
+
+StateButtonTextTable
+        DCD     BFToken - StateButtonTextTable  ; Ready       ==  "Format"
+        DCD     BPToken - StateButtonTextTable  ; Format      ==  "Pause"
+        DCD     BPToken - StateButtonTextTable  ; Formatting  ==  "Pause"
+        DCD     BVToken - StateButtonTextTable  ; VerifyReady ==  "Verify"
+        DCD     BPToken - StateButtonTextTable  ; Verify      ==  "Pause"
+        DCD     BPToken - StateButtonTextTable  ; Verifying   ==  "Pause"
+        DCD     BRToken - StateButtonTextTable  ; Paused      ==  "Resume"
+        DCD     0       ; This case cannot happen as state is restored to the saved state.
+
+
+FormatDriveToken        DCB     "Drive %",0
+FormatNameMessage       DCB     "DefName",0
+ReadyMessage            DCB     0,"FirstMess",0
+InsertDisc              DCB     1,"InsertDisc",0
+DLNoRoomMessage         DCB     1,"DLNoRoom",0
+FormattingMessage       DCB     0,"Formatting",0
+VerifyMessage           DCB     0,"Verifying",0
+DefectToken             DCB     1,"Defect found at %",0
+VerifyReadyMessage      DCB     0,"Ready to verify",0
+VerifyCompleteMessage   DCB     0,"Disc Verified",0
+FormatCompleteMessage   DCB     0,"FOK",0
+VerifyCompleteDefectsMessage   DCB     1,"Verified with defects",0
+FormatCompleteDefectsMessage   DCB     1,"FENDD",0
+BPToken                 DCB     "Pause",0
+BFToken                 DCB     "BF",0
+BRToken                 DCB     "Resume",0
+TFToken                 DCB     "TF",0
+TVToken                 DCB     "Verify",0
+BVToken                 DCB     "Verify",0
+BOKToken                DCB     "OK",0
+                        ALIGN
+ADFSPrefix              DCB     "SCSI::0",0             ; Picked up as 2 words
+DismountCommand         DCB     "SCSI:DISMOUNT :n",0    ; Picked up as  5 words.
+                        ALIGN
+
+        ^       0                       ; Block format for format /verify windows
+fw_next         #       4               ; Next block in list
+fw_prev         #       4               ; Previous block in list
+fw_handle       #       4               ; Window handle
+fw_format       #       4               ; Number of format in format list
+                                        ; If Version >= 40 
+                                        ; This is a pointer to the format description block.
+fw_drive        #       4               ; Drive number
+fw_state        #       4               ; Current state of format / verify
+fw_savedstate   #       4               ; Saved state when paused.
+fw_firststate   #       4               ; First state of this window, used to tell verify windows
+                                        ; apart from format windows.
+fw_discname     #       4               ; Pointer to disc name in fw_indirectdata
+fw_defects      #       4               ; Number of defects found during verify.
+fw_currenttrack #       4               ; Next track to be formatted
+fw_numberoftracks #     4               ; Last track to be formatted + 1
+fw_bytespersector #     4
+fw_bytespertrack  #     4
+fw_currentdefect  #     4
+fw_currentaddress #     4
+fw_bytestoverify  #     4
+fw_formatspec   #       64              ; Format specification block
+fw_discrecord   #       64              ; Disc record.
+fw_formatrecord #       256             ; Format specification block
+fw_defectlist   #       512             ; Defect list for this window
+fw_indirectdata #       256             ; Indirected data for window
+        ASSERT  fw_next=0
+fw_block_size   *       @-fw_next
+
+;---------------------------------------------------------------------
+; SetBar
+; Entry:
+;       r0 = Window handle
+;       r1 = New length of bar
+;       r2 = New colour of bar
+SetBar ROUT
+        Push    "r0-r4,LR"
+      
+      [ debugfo
+        dreg    r1,"set bar"
+      ]
+
+        ADR     r1,userdata
+        STR     r0,[r1]
+        MOV     r0,#4
+        STR     r0,[r1,#4]
+        SWI     XWimp_GetIconState
+        SWIVC   XWimp_DeleteIcon        ; Delete bar icon.
+        STRVS   r0,[sp]
+        Pull    "r0-r4,PC",VS
+
+        LDR     r14,[sp,#2*4]           ; Get colour on entry
+        MOV     r14,r14,ASL #4
+        STRB    r14,[r1,#19+8]          ; Icon's background colour
+
+        LDR     r14,[sp,#1*4]           ; R14=length
+        LDR     r3,[r1,#8]              ; Get x0 of icon
+        ADD     r3,r3,r14               ; r3 = new x1 of icon 
+        LDR     r4,[r1,#16]             ; r4 = old x1 of icon
+        STR     r3,[r1,#16]             ; Store new icon X1
+        LDR     r2,[r1,#16+8]           ; Get icon flags.
+        BIC     r2,r2,#is_deleted       ; make sure it isn't deleted.
+        STR     r2,[r1,#16+8]           ; store flags back.
+        LDR     r2,[r1]
+        STR     r2,[r1,#4]!             ; Store window handle, and increment r1
+        SWI     XWimp_CreateIcon        ; Create the new icon
+        STRVS   r0,[sp]
+        Pull    "r0-r4,PC",VS
+                           
+        CMP     r3,r4                   ; Is new length longer? 
+        Pull    "r0-r4,PC",EQ           ; They are equal !
+        SUBLT   r1,r3,#2                ; No  x0 = new x1
+        SUBGE   r1,r4,#2                ; Yes x0 = old x1
+        ADDLT   r3,r4,#2                ; No  x1 = old x1
+        ADDGE   r3,r3,#2                ; Yes x1 = new x1
+        LDR     r0,[sp,#0*4]            ; r0 = Window handle.
+        ADRL    r14,userdata+4
+        LDR     r2,[r14,#4+4]            ; r2 = y0
+        LDR     r4,[r14,#12+4]           ; r4 = y1
+        SWI     XWimp_ForceRedraw
+        STRVS   r0,[sp]
+        Pull    "r0-r4,PC"
+
+;-------------------------------------------------------------------
+;Report
+;Entry: r0 -> Message token for message to be reported.
+;             First byte of message is a flag:      0 = Normal text.
+;                                               Non 0 = Inverted text
+;       r1 -> argument (if any)
+;       r2 =  Window handle
+; Exit:
+;       Message reported in icon.
+;       [userdata] corrupted.
+;
+Report  ROUT
+        Push    "r0-r3,LR"
+
+      [ debug
+        DREG    r14,"REPORT r14="
+      ]
+
+        ADR     r1,userdata
+        STR     r2,[r1]                 ; Store window handle
+        MOV     r0,#5                   ; Get state of message icon
+        STR     r0,[r1,#4]
+        SWI     XWimp_GetIconState
+        BVS     %FT01
+        
+        ADR     r1,userdata
+        LDR     r2,[r1,#36]             ; Buffer length of icon
+        LDR     r1,[r1,#28]             ; Buffer pointer
+       [ debug
+        dreg    r2,"Buffer length "
+        dreg    r1,"Buffer address "
+       ]
+        LDR     r0,[SP]                 ; Get message token.
+        ADD     r0,r0,#1                ; Skip flag byte
+        LDR     r3,[SP,#1*4]            ; Pointer to argument
+        BL      lookuptoken             ; Look the token up.
+        BVS     %FT01
+
+        ADR     r1,userdata
+        LDR     r0,[sp]                 ; Get pointer to token
+        LDRB    r0,[r0]                 ; Get flag
+        CMP     r0,#0                   ; Is it 0 ?
+        MOV     r2,#is_inverted
+        STRNE   r2,[r1,#8]              ; Yes, invert icon
+        STREQ   r0,[r1,#8]
+        STR     r2,[r1,#12]
+        SWI     XWimp_SetIconState      ; Reflect changes on screen. 
+
+01
+        STRVS   r0,[sp]
+        Pull    "r0-r3,PC"
+
+;-------------------------------------------------------------------
+;SetButton
+;Entry:
+;      r0 -> Message token for message to be put in icon.
+;      r1 -> Argument (if any)
+;      r2 =  Window handle.
+;      r3 =  Icon number to set (must be indirected !)
+; Exit:
+;       Message put in icon.
+;       [userdata] corrupted.
+;
+SetButton  ROUT
+        Push    "r0-r3,LR"
+
+        ADR     r1,userdata
+        STR     r2,[r1]                 ; Store window handle
+        STR     r3,[r1,#4]              ; and icon number
+        SWI     XWimp_GetIconState      ; Get current state.
+        BVS     %FT01
+        
+        ADR     r1,userdata
+        LDR     r2,[r1,#36]             ; r2 = Buffer length
+        LDR     r1,[r1,#28]             ; r1 = Buffer pointer
+        LDR     r0,[SP]                 ; r0 -> token
+        LDR     r3,[SP,#1*4]            ; Get argument.
+        BLVC    lookuptoken             ; Go lookup token.
+        BVS     %FT01
+
+        ADR     r1,userdata
+        MOV     r0,#0
+        STR     r0,[r1,#8]
+        STR     r0,[r1,#12]
+        SWI     XWimp_SetIconState      ; Reflect changes on  screen.
+
+01
+        STRVS   r0,[sp]
+        Pull    "r0-r3,PC"
+                                    
+        LTORG
+
+;-------------------------------------------------------------------
+;SetTitle
+;Entry:
+;   r0 -> Message token for message to be put in window title.
+;   r1 -> Argument
+;   r2 -> Window handle
+;Exit:
+;      Message put in title.
+;      [userdata] corrupted.
+;
+;*NOTE*
+;       THIS MUST BE CALLED BEFORE THE WINDOW IS OPENED.
+;
+SetTitle  ROUT
+        Push    "r0-r3,LR"
+
+
+        ADR     r1,userdata
+        STR     r2,[r1]                 ; Window handle
+        ORR     r1,r1,#1                ; Get window block only.
+        SWI     XWimp_GetWindowInfo
+        BIC     r1,r1,#1
+        
+        ADR     r1,userdata
+        LDRVC   r2,[r1,#84]             ; Buffer length of title
+        LDRVC   r1,[r1,#76]             ; Buffer pointer of title
+        LDRVC   r0,[SP]                 ; r0 = Pointer to token
+        LDRVC   r3,[SP,#1*4]            ; r3 = Pointer to argument
+        BLVC    lookuptoken             ; Go look the token up.
+
+        STRVS   r0,[sp]
+        Pull    "r0-r3,PC"
+
+        LTORG
+
+DiscNameValidation DCB "a~@#$%^&*\\|:"". ", 0
+        ALIGN
+
+;-----------------------------------------------------------------
+;
+;FindWindow
+;Entry:
+;      r0 = Window handle
+;Exit
+;      r0 preserved
+;      r2 -> Window Block
+;      Z set if found.
+;
+FindWindow ROUT
+        Push    "LR"
+
+        ADRL    r2,FormatWindows-fw_next
+01
+        LDR     r2,[r2,#fw_next]
+        CMP     r2,#1
+        Pull    "PC",LT
+        LDR     r14,[r2,#fw_handle]
+        TEQ     r0,r14
+        BNE     %BT01
+
+        Pull    "PC"    
+
+int_close_window
+        ADR     r1,userdata
+        LDR     r0,[r2,#fw_handle]
+        STR     r0,[r1]
+        SWI     XWimp_CloseWindow
+        B       %FT01
+
+
+Format_CloseWindow 
+        Push    "LR"
+
+        LDR     r0,[r1]                 ; Find window block
+        BL      FindWindow
+        Pull    "PC",NE                 ; Not our window
+01
+        LDR     r0, [r2,#fw_prev]
+        LDR     r14,[r2,#fw_next]
+
+        CMP     r0,#0                   ; Unlik block from list
+        STRNE   r14,[r0,#fw_next]
+        STREQ   r14,FormatWindows
+        CMP     r14,#0
+        STRNE   r0,[r14,#fw_prev]
+
+
+        LDR     r0,FormatState          ; Reset FormatState
+        MOV     r14,#1
+        LDR     r1,[r2,#fw_drive]       ; Clear this drive's bit
+        MOV     r14,r14,ASL r1
+        BIC     r0,r0,r14
+        STR     r0,FormatState
+
+        MOV     r0,#ModHandReason_Free  ; Free this RMA block
+        SWI     XOS_Module
+
+        Pull    "PC"
+
+NameTooShort
+        DCD     42
+        DCB     "DNShort", 0
+        ALIGN
+
+Format_MouseClick
+        CMP     r4,#6                   ; Is it the action button ?
+        Pull    "PC",NE
+
+        MOV     r0,r3
+        BL      FindWindow
+        Pull    "PC",NE                 ; Not our window
+
+        ; Check the disc name's OK
+        LDR     r14, [r2, #fw_state]
+
+        TEQ     r14,#FormatState_OK
+        BEQ     int_close_window
+        LDR     r5, [r2,#fw_savedstate] ; In case we need it later
+        TEQ     r14,#FormatState_Paused ; Unless it is paused
+        STRNE   r14,[r2,#fw_savedstate] ; Save old state.
+        MOV     r14,r14,ASL #2
+        ADRL    r1,NextStateTable
+        LDR     r14,[r1,r14]            ; Get new state
+        
+        TEQ     r14,#FormatState_Resume ; Is the new state Resume?
+        MOVEQ   r14,r5
+        STR     r14,[r2,#fw_state]
+        
+        LDR     r6,[r2,#fw_state]
+        LDR     r6,[r2,#fw_savedstate]
+
+                      
+        MOV     r8,r2
+        MOV     r14,r14,ASL #2
+        ADRL    r1,StateButtonTextTable ; Get button text for this state
+        LDR     r14,[r1,r14]
+        LDR     r2,[r8,#fw_handle]      ; r2 = Window handle
+        ADD     r0,r1,r14               ; r0 -> Token for button
+        MOV     r3,#6                   ; Action is icon 6
+        BL      SetButton               ; Set button text.
+              
+        LDR     r14,[r8,#fw_state]
+        TEQ     r14,#FormatState_Verifying
+        TEQNE   r14,#FormatState_Verify
+        Pull    "PC",NE
+
+        ADRL    r0,VerifyMessage
+        LDR     r2,[r8,#fw_handle]
+        BL      Report
+
+        Pull    "PC"
+
+Format_GoVerify
+      [ debugfo
+        dline   "Verify "
+      ]
+
+        LDRB    r4,driveno+1
+        SUB     r4,r4,#"0"
+      [ debugfo
+        dreg    r4,"Drive: "
+      ]                           
+        MOV     r0,#ModHandReason_Claim         ; Aloocate a block for the new window
+        LDR     r3,=fw_block_size
+        SWI     XOS_Module
+        Pull    "PC",VS
+
+        LDR     r0,FormatWindows                ; Link new block to list of windows.
+        STR     r2,FormatWindows
+        STR     r0,[r2,#fw_next]
+        MOV     r1,#0
+        STR     r1,[r2,#fw_prev]
+        STR     r1,[r2,#fw_defectlist]
+        CMP     r0,#0
+        STRNE   r2,[r0,#fw_prev]
+
+        MOV     r0,#FormatState_VerifyReady
+        STR     r0,[r2,#fw_state]     
+        STR     r4,[r2,#fw_drive]
+        STR     r0,[r2,#fw_firststate]
+        MOV     r0,#0
+        STR     r0,[r2,#fw_defects]
+
+        ADRL    r1,formattemplate
+        ADD     r3,r2,#fw_indirectdata
+        STR     r3,[r1,#72]
+        LDR     r14,[r1,#80]
+        ADD     r3,r3,r14               ; Amount of space for title buffer
+        STR     r3, [r1,#88+32*0+20]
+        LDR     r14,[r1,#88+32*0+28]    ; Amount of space for drive icon
+        ADD     r3,r3,r14
+        STR     r3, [r1,#88+32*2+20]
+        LDR     r14,[r1,#88+32*2+28]    ; Amount of space for name icon
+        ADD     r3,r3,r14
+        STR     r3, [r1,#88+32*6+20]
+        LDR     r14,[r1,#88+32*6+28]    ; Amount of space for Message icon
+        ADD     r3,r3,r14
+        STR     r3, [r1,#88+32*5+20]    ; Message icon last, just in case !
+        SWI     XWimp_CreateWindow
+        Pull    "PC",VS
+        STR     r0,[r2,#fw_handle]
+
+        MOV     r8,r2
+        Push    "r2"
+               
+
+        LDR     r1,[r3,#4]              ; r1 -> Menu text for this format
+        MOV     r2,r0                   ; r2 = window handle
+        ADRL    r0,TVToken              ; r0 = title token.
+        BL      SetTitle
+        BVS     %FT01
+     
+        ADD     r3,r4,#"0"              ; Set drive number
+        ADR     r1,userdata+&100        ; SetButton corrupts [userdata]
+        STR     r3,[r1]
+        ADRL    r0,FormatDriveToken
+        MOV     r3,#0                   ; Icon 0 is drive number
+        BL      SetButton
+        BVS     %FT01
+
+        ADRL    r0,VerifyMessage        ; Display welcome message
+        BL      Report
+        BVS     %FT01
+
+        ADRL    r0,BPToken              ; Set action button to "Pause"
+        MOV     r3,#6
+        BL      SetButton
+        BVS     %FT01
+
+        ADR     r1,userdata
+        MOV     r0,r2
+        STR     r0,[r1]
+        MOV     r0,#2
+        STR     r0,[r1,#4]
+        MOV     r0,#0
+        STR     r0,[r1,#8]
+        MOV     r0,#&f :SHL: 12         ; Set button type to never
+        STR     r0,[r1,#12]
+        SWI     XWimp_SetIconState
+        BVS     %FT01
+                   
+        ADR     r1,userdata
+        ADRL    r0,ADFSPrefix
+        LDR     r14,[r0]
+        STR     r14,[r1]
+        LDR     r14,[r0,#4]
+        STR     r14,[r1,#4]
+        LDR     r0,[r8,#fw_drive]
+        ADD     r0,r0,#"0"
+        STRB    r0,[r1,#6]
+        MOV     r0,#0
+        STRB    r0,[r1,#7]
+
+        ADD     r1,r1,#5
+        BL      GetMediaName_nochecks   ; r1 -> "adfs::discname"
+        BVS     %FT01
+        Push    "r1"
+        ADR     r1,userdata+&100
+        LDR     r0,[r8,#fw_handle]
+        STR     r0,[r1]
+        MOV     r0,#2
+        STR     r0,[r1,#4]
+        SWI     XWimp_GetIconState
+        ADDVS   sp,sp,#4
+        BVS     %FT01
+
+        ADR     r1,userdata+&100
+        LDR     r14,[r1,#28]
+        Pull    "r1"
+        ADD     r1,r1,#6
+11
+        LDRB    r3,[r1],#1
+        STRB    r3,[r14],#1
+        CMP     r3,#32
+        BGE     %BT11
+
+        ADR     r1,userdata+&100
+        MOV     r0,#0
+        STR     r0,[r1,#8]
+        STR     r0,[r1,#12]
+        SWI     XWimp_SetIconState
+        
+01
+        MOVVC   r0,r2
+        MOVVC   r1,#0 
+        MOVVC   r2,#7
+        BLVC    SetBar                  ; Set bar to 0 length
+        Pull    "r2"
+        Pull    "PC",VS    
+
+        ADR     r1,userdata
+        STR     r0,[r1]
+        SWI     XWimp_GetWindowState
+        MOVVC   r0,#-1
+        STRVC   r0,[r1,#28]
+        SWIVC   XWimp_OpenWindow
+        Pull    "PC",VS  
+
+        LDR     r0,FormatState
+        LDR     r4,[r2,#fw_drive]
+        MOV     r1,#1
+        MOV     r4,r1,ASL r4
+        ORR     r0,r0,r4
+        STR     r0,FormatState
+
+        Pull    "LR"                    ; FALL THROUGH
+        MOV     r1,r2
+        MOV     r8,r2
+                     
+
+
+StartVerify 
+
+        Push    "r1,LR"
+                       
+        MOV     r8,r1
+
+        ADRL    r0,ADFSPrefix
+        ADR     r1,userdata
+        LDMIA   r0,{r2,r3}
+        STMIA   r1,{r2,r3}
+        LDR     r0,[r8,#fw_drive]
+        ADD     r0,r0,#"0"
+        STRB    r0,[r1,#6]
+
+        ADD     r2,r8,#fw_defectlist
+        MOV     r5,#512
+        MOV     r0,#41
+        SWI     XOS_FSControl                   ; Read defect list - this is all lies
+        Pull    "r1,PC",VS
+           
+      [ debugfo
+        dline   "read defect list"
+      ]
+                                                            
+        ADD     r0,r1,#5
+        ADD     r1,r8,#fw_discrecord
+        SWI     XSCSIFS_DescribeDisc            ; Get disc record
+        Pull    "r1,PC",VS
+
+        MOV     r0,#0
+        STR     r0,[r8,#fw_currenttrack]
+        LDR     r0,[r8,#fw_discrecord+16]       ; Disc size in bytes
+        LDRB    r1,[r8,#fw_discrecord+0]        ; Log2SectorSize
+        LDRB    r2,[r8,#fw_discrecord+1]        ; Sectors in track
+        MOV     r3,#1
+        MOV     r3,r3,ASL r1                    ; Bytes per sector
+        STR     r3,[r8,#fw_bytespersector]
+        MUL     r3,r2,r3                        ; Bytes in track
+        STR     r3,[r8,#fw_bytespertrack]
+        STR     r3,[r8,#fw_bytestoverify]
+        DivRem  r1,r0,r3,r14                    ; Tracks in disc
+        STR     r1,[r8,#fw_numberoftracks]
+
+        MOV     r0,#FormatState_Verifying
+        STR     r0,[r8,#fw_state]               ; parp into thinking that we are doofering
+
+        ADD     r0,r8,#fw_defectlist
+        STR     r0,[r8,#fw_currentdefect]
+
+        MOV     r0,#0
+        STR     r0,[r8,#fw_currentaddress]
+
+        Pull    "r1,PC"       
+
+Format_NullEvent        ROUT
+        Push    "LR"
+
+        ADRL    r1,FormatWindows-fw_next        ; Search for an active window
+01
+        BVC     %FT02
+        Push    "r0"
+        LDR     r2,[r1,#fw_state]
+        STR     r2,[r1,#fw_savedstate]
+        MOV     r2,#FormatState_Paused
+        STR     r2,[r1,#fw_state]               ; Honk! honk! look at me I am paused!
+        ADRL    r0,BRToken
+        LDR     r2,[r1,#fw_handle]
+        MOV     r3,#6
+        BL      SetButton                       ; ohh misses don't
+        Pull    "r0"
+        SETV
+        Pull    "PC"
+02
+        LDR     r1,[r1,#fw_next]
+        CMP     r1,#0
+        Pull    "PC",EQ                         ; No more active windows.
+
+        ADR     lr,%BT01
+        LDR     r2,[r1,#fw_state]
+        ADD     PC,PC,r2,ASL #2                 ; who cares about range checking, child abuse only occurs in cleveland anyway
+        MOV     r0,r0
+        
+        B       %BT01                           ; Ready         Do nothing  
+        B       %BT01                           ; Format
+        B       %BT01                           ; Formatting
+        B       %BT01                           ; Verify ready
+        B       StartVerify                     ; Verify
+        B       VerifyTrack                     ; Verifying
+        B       %BT01                           ; Paused
+        B       %BT01                           ; Resume
+        B       %BT01                           ; Press OK or is it paused
+        B       SetPause                        ; Set Pause or maybe even resume
+                        
+SetPause        ROUT
+        Push    "r1,LR"
+
+        MOV     r2,#FormatState_Paused
+        STR     r2,[r1,#fw_state]
+        ADRL    r0,BRToken
+        LDR     r2,[r1,#fw_handle]
+        MOV     r3,#6
+        BL      SetButton                       ; bish bosh that button type thingi they call an icon
+
+        Pull    "r1,PC"
+
+VerifyTrack
+        Push    "r1,LR"  
+
+        MOV     r8,r1
+
+        LDR     r2,[r8,#fw_currentaddress]   
+        LDR     r14,[r8,#fw_drive]
+        MOV     r14,r14,ASL #29
+        ORR     r2,r2,r14
+        MOV     r1,#0
+        MOV     r3,#0
+        LDR     r4,[r8,#fw_bytestoverify]
+        SWI     XSCSIFS_DiscOp                  ; this parps the creamy doofer with all sorts of sundary sill person values
+        BIC     r2,r2,#7 :SHL: 29               ; oh no one of those magic numbers that bites yer bum!
+        BVS     %FT01
+
+        LDR     r4,[r8,#fw_bytespertrack]
+        STR     r4,[r8,#fw_bytestoverify]       ; if only life was this easy all the time
+
+KnownDefect
+
+        STR     r2,[r8,#fw_currentaddress]
+        LDR     r0,[r8,#fw_currenttrack]
+        LDR     r1,[r8,#fw_numberoftracks]
+        ADD     r0,r0,#1
+        CMP     r0,r1
+        BNE     %FT11
+
+; End of verify
+
+        LDR     r2,[r8,#fw_defects]
+        TEQ     r2,#0                           ; did we have to bosh bosh around with the defects
+        LDR     r2,[r8,#fw_firststate]
+        BNE     %FT10
+        TEQ     r2,#FormatState_Ready   
+        ADREQL  r0,FormatCompleteMessage
+        ADRNEL  r0,VerifyCompleteMessage
+        B       %FT20
+10
+        TEQ     r2,#FormatState_Ready   
+        ADREQL  r0,FormatCompleteDefectsMessage
+        ADRNEL  r0,VerifyCompleteDefectsMessage
+        Push    "r0,r2"
+        LDR     r0,[r8,#fw_defects]
+        ADR     r1,userdata+&100
+        MOV     r2,#20
+        SWI     XOS_ConvertCardinal4            ; yeehaa that was good!
+        STRVS   r0,[sp]
+        Pull    "r0,r2"
+        Pull    "r1,PC",VS
+        ADR     r1,userdata+&100
+20        
+        TEQ     r2,#FormatState_Ready
+        BNE     %FT30
+        Push    "r0-r3"
+        ADRL    r1,ADFSPrefix
+        LDMIA   r1,{r0,r2}
+        ADR     r1,userdata
+        STMIA   r1,{r0,r2}
+        LDR     r0,[r8,#fw_drive]
+        ADD     r0,r0,#"0"
+        STRB    r0,[r1,#6]
+        ADD     r3,r8,#fw_defectlist
+21
+        LDR     r2,[r3],#4
+        TEQ     r2,#&20000000
+        Pull    "r0-r3",EQ
+        BEQ     %FT30    
+        MOV     r0,#FSControl_AddDefect         ; looks a bit dodgey this bit, kinda relies on FileCore
+        SWI     XOS_FSControl
+        BVC     %BT21
+        Pull    "r0-r3"                         ; If add defect fails, simulate desktop verify
+        ADRL    r0,VerifyCompleteDefectsMessage
+30
+        LDR     r2,[r8,#fw_handle]
+        BL      Report    
+        Pull    "r1,PC",VS
+        ADRL    r0,BOKToken
+        MOV     r3,#6
+        BL      SetButton
+        Pull    "r1,PC",VS
+
+        MOV     r0,#FormatState_OK              ; F is for frottage (eh?!)
+        STR     r0,[r8,#fw_state]
+        Pull    "r1,PC"
+
+11
+        STR     r0,[r8,#fw_currenttrack]        ; who wants to update bar lengths,
+        MOV     r4,r0                           ; I want to be a lumberjack and hang around in bars
+        LDR     r5,[r8,#fw_numberoftracks]
+        LDR     r14,MaxFormatBarLength
+        MUL     r14,r4,r14
+        DivRem  r1,r14,r5,r7
+        LDR     r0,[r8,#fw_handle]
+        MOV     r2,#10
+        BL      SetBar
+        Pull    "r1,PC"
+
+01    
+        ; It is only a defect if it is a disc error
+        LDR     r14,[r0]     
+       [ debugfo
+        DREG    r14,"error is "
+        DLINE   "Compare with &201c3 or &201c4"
+       ] 
+        LDR     r1,= &FFFFF
+        AND     r14,r14,r1              ; small error
+        LDR     R1,=&201c3              ; medium error
+        CMP     r14,r1                  ; big error
+        SETV    NE
+        Pull    "r1,PC",VS              ; huge stonking bodge error
+                    
+      [ debugfo
+        dreg    r2,"defect found at "
+      ]
+
+        LDR     r0,[r8,#fw_currentdefect]               ; pointer to previous defect fount
+02
+
+; R2 = disc address of defect
+
+        LDR     r1,[r0]                                 ; scan through defect list looking for next
+        CMP     r1,r2                                   ; defect ready to skip it.
+        ADDLT   r0,r0,#4
+        BLT     %BT02                            
+                                                 
+        STR     r0,[r8,#fw_currentdefect]               
+        
+;        LDR     r0,[r8,#fw_bytespersector]              ; get size of a sector
+;        ADD     r2,r2,r0                                ; advance disc address to next sector
+;                        
+;        LDR     r0,[r8,#fw_currentaddress]              ; get the current address
+;        SUB     r0,r2,r0                                ; get the size of block that failed
+;        LDR     r1,[r8,#fw_bytestoverify]               ; get the number of bytes that failed
+;        SUB     r1,r1,r0
+;        STR     r1,[r8,#fw_bytestoverify]
+                
+;------------------------------------------------------------------------------
+; Start of that fine new code
+                                        
+; R0 -> entry for R1
+; R1 our next known defect (always >=R2)
+; R2 contains address of non-mapped out physical defect
+
+; As the SCSI driver will automatically skip any mapped out defects we have
+; a dilema, this is that the defect address may be *wildly* different to the
+; address we think we are dealing with.
+
+; If defect address >= current address + bytes to verify then align defect 
+; address back to start of track and store in current address.
+
+        LDR     R0,[R8,#fw_bytestoverify]
+        LDR     R1,[R8,#fw_currentaddress]
+        ADD     R3,R0,R1                        ; end of block being verifyed
+        CMP     R2,R3                           ; is the defect within this block?
+        BLT     defect_in_track
+
+        Push    "R2"
+        LDR     R3,[R8,#fw_bytespertrack]
+        DivRem  R4,R2,R3,LR            
+        MUL     R3,R4,R3                        ; gives start of track with defect in
+        STR     R3,[R8,#fw_currentaddress]      ; fool into thinking we start on this track
+        STR     R4,[R8,#fw_currenttrack]        ; and dilly dally with the current track so all in sync
+        Pull    "R2"                            ; preserve defect address (DivRem corrupts it)
+          
+defect_in_track        
+        LDR     R0,[R8,#fw_bytespersector]      
+        ADD     R2,R2,R0                        ; set disc address after defect
+
+        LDR     R0,[R8,#fw_bytestoverify]
+        LDR     R1,[R8,#fw_currentaddress]
+        ADD     R0,R0,R1                        ; get track address after one with failed sector
+        SUB     R1,R0,R2                        ; get amount still left to verify
+        STR     R1,[R8,#fw_bytestoverify]
+                
+; End of new bit
+;------------------------------------------------------------------------------
+
+
+      [ debugfo
+        dreg    r1,"bytes to verify "
+      ]
+        BEQ     KnownDefect 
+           
+      [ debugfo
+        dline   "not a known defect"
+      ] 
+
+        LDR     r14,[r8,#fw_defects]
+        ADD     r14,r14,#1                      ; decrease the defect count (tee hee)
+        STR     r14,[r8,#fw_defects]
+
+        STR     r2,[r8,#fw_currentaddress]
+
+        LDR     r0,[r8,#fw_bytespersector]
+        SUB     r0,r2,r0   
+        LDR     r14,[r8,#fw_firststate]
+        TEQ     r14,#FormatState_Ready
+        BNE     %FT50
+        LDR     r14,[r8,#fw_currentdefect]
+        STR     r0,[r14],#4                     ; turn defect into a newt, but it gets better
+        MOV     r1,#&20000000
+        STR     r1,[r14]
+        STR     r14,[r8,#fw_currentdefect]
+50
+
+        ADR     r1,userdata+&100
+
+        MOV     r2,#20
+        SWI     XOS_ConvertHex8                 ; tish tosh the hamster into a number
+        Pull    "r1,PC",VS
+
+        ADR     r1,userdata+&100
+        ADRL    r0,DefectToken
+        LDR     r2,[r8,#fw_handle]
+        BL      Report
+        Pull    "r1,PC",VS
+
+        LDR     r0,[r8,#fw_state]
+        STR     r0,[r8,#fw_savedstate]
+        MOV     r0,#FormatState_Paused
+        STR     r0,[r8,#fw_state]
+
+        ADRL    r0,BRToken
+        LDR     r2,[r8,#fw_handle]
+        MOV     r3,#6
+        BL      SetButton
+
+        Pull    "r1,PC"
+
+
+ [ debug
+        InsertDebugRoutines
+        InsertHostDebugRoutines
+ ]
+
+
+ ]
+ 
+ END
+ 

@@ -1,0 +1,700 @@
+; > Sources.PDriverPS.Draw
+
+; Draw call handling routines for the PostScript printer driver
+
+draw_boundaryonly
+        Push    "LR"
+        PrError draw_boundaryonly_return
+
+        BL      draw_outputtransformandflatness
+        BLVC    draw_outputpathforclosedstroke
+        PrPassError
+
+        PrStrIm "0 LW St ",FallThroughOnError
+        BLVC    output_grestore
+
+        PrError
+draw_boundaryonly_return
+        Pull    "PC"
+
+draw_interiornobdry                     ;Effectively impossible to exclude
+draw_interior                           ;  boundary in PostScript
+        Push    "LR"
+        PrError draw_interior_return
+
+        BL      draw_outputtransformandflatness
+        BLVC    draw_outputpathforfill
+        PrPassError
+
+        TST     R1,#2
+        BEQ     draw_interior_nonzerorule
+        PrStrIm "eo"
+draw_interior_nonzerorule
+        PrStrIm "fill ",FallThroughOnError
+        BLVC    output_grestore
+
+        PrError
+draw_interior_return
+        Pull    "PC"
+
+draw_interiorwithbdry
+        Push    "LR"
+        BL      draw_interior
+        BLVC    draw_boundaryonly
+        Pull    "PC"
+
+draw_strokenobdry                       ;Effectively impossible to do
+draw_stroke                             ;  boundary variants in PostScript
+draw_strokewithbdry
+        Push    "R0-R3,R7,LR"
+        PrError draw_stroke_return
+
+; Check the join and cap style. If both caps are of the same type and neither
+; is triangular, we can produce the relevant piece of PostScript reasonably
+; easily. Otherwise, we will have to invoke the Draw module to produce the
+; relevant outline, then fill it.
+
+        LDRB    R1,[R5,#1]
+        CMP     R1,#2
+        LDRLSB  LR,[R5,#2]
+        EORLS   R1,R1,LR
+        CMPLS   R1,#0
+        BLS     draw_stroke_easy
+
+        [       PSFreeFlatness
+
+; Modify the user-specified flatness by dividing it by 4 (on the assumption
+; that it is a screen flatness), then making certain it isn't too small.
+
+        TEQ     R3,#0
+        MOVEQ   R3,#&200
+        MOV     R3,R3,ASR #2
+        CMP     R3,#2
+        MOVLT   R3,#2
+
+        ]
+
+; Use Draw_ProcessPath to find out how big a buffer is required for the
+; outline. Then get that size of chunk from the RMA. Then do a real
+; Draw_ProcessPath into it. (We use Draw_ProcessPath rather than
+; Draw_StrokePath to avoid the re-flattening operation after thickening,
+; as this operation simply loses accuracy and uses extra workspace...)
+
+        MOV     R1,#ProcessPath_Flatten + ProcessPath_Thicken
+        MOV     R2,#0                   ;Don't transform path
+        Push    "R1-R3"
+        MOV     R7,#DrawSpec_Count
+        SWI     XDraw_ProcessPath
+        MOVVC   R3,R0                   ;Claim suitable size RMA block
+        MOVVC   R0,#ModHandReason_Claim
+        SWIVC   XOS_Module
+        STRVC   R2,temprmablock         ;Register it
+        MOVVC   R0,#0                   ;Put header into RMA block to make
+        SUBVC   R3,R3,#8                ;  it a Draw output buffer
+        STMVCIA R2,{R0,R3}
+        MOVVC   R7,R2                   ;Now output to this buffer
+        Pull    "R1-R3"                 ;Recover Draw_ProcessPath parameters
+        LDRVC   R0,[R13]                ;Recover path pointer
+        SWIVC   XDraw_ProcessPath       ;And process as before
+
+; Now we want to output the path to PostScript component by component,
+; telling it to fill each component appropriately. This is effectively a
+; variant of the code used for 'draw_interior'
+
+        MOVVC   R0,R7                   ;Point to path just obtained
+        LDRVC   R2,[R13,#8]             ;Recover entry value of R2
+        BLVC    draw_outputtransformandflatness
+        BLVC    draw_outputbysubpaths
+        BLVC    output_grestore
+        MOV     R1,R0                   ;Release the RMA block we obtained
+        MOV     R2,PC                   ;  above, preserving error status
+        BL      releasetemprmablock     ;  if this call doesn't return an
+        MOVVC   R0,R1                   ;  error
+        TEQVCP  R2,#0
+        B       draw_stroke_return
+
+; This is a (comparatively) easy case - we simply need to output the path
+; correctly and tell PostScript to stroke it.
+
+draw_stroke_easy
+        BL      draw_outputtransformandflatness
+        BLVC    draw_outputpathforopenstroke
+        BLVC    draw_outputdashpattern
+        BLVC    draw_outputcapandjoin
+        PrPassError
+
+        PrNumSp R4
+        PrStrIm "LW St ",FallThroughOnError
+        BLVC    output_grestore
+
+        PrError
+draw_stroke_return
+        STRVS   R0,[R13]
+        Pull    "R0-R3,R7,PC"
+
+; Zero width stroke handling routine
+
+draw_thinstroke
+        Push    "LR"
+        PrError draw_thinstroke_return
+
+        BL      draw_outputtransformandflatness
+        BLVC    draw_outputpathforopenstroke
+        BLVC    draw_outputdashpattern
+        PrPassError
+
+        PrStrIm "0 LW St ",FallThroughOnError
+        BLVC    output_grestore
+
+        PrError
+draw_thinstroke_return
+        Pull    "PC"
+
+; Subroutine to output the full Draw transformation - i.e. the matrix pointed
+; to by R2 followed by translation by (origin-usersoffset) - and the Draw
+; flatness held in R3 to the file handle in R10. Does a "gsave" first!
+
+draw_outputtransformandflatness
+        Push    "R1-R4,LR"
+        PrError draw_outputtransformandflatness_return
+
+        [       PSCoordSpeedUps
+        BL      ensure_OScoords
+        BLVC    colour_ensure
+        BLVC    output_gsave
+        |
+        BL      output_gsave
+        ]
+        PrPassError
+
+        TEQ     R2,#0
+        ADREQ   R2,draw_defaultmatrix
+        MOV     R1,#6
+draw_outputtransformloop
+        LDMIA   R2!,{R4}
+        PrNumSp R4
+        SUBS    R1,R1,#1
+        BNE     draw_outputtransformloop
+
+        ADR     R1,origin
+        LDMIA   R1,{R1,R2}
+        ADR     R4,usersoffset
+        LDMIA   R4,{R4,LR}
+        SUB     R1,R1,R4
+        SUB     R2,R2,LR
+        PrPair  R1,R2
+
+        PrLnIm  "T DM"
+
+        [       :LNOT:PSFreeFlatness
+        TEQ     R3,#0
+        MOVEQ   R3,#&200
+        PrNumSp R3
+        PrLnIm  "DF",FallThroughOnError
+        ]
+
+        PrError
+draw_outputtransformandflatness_return
+        Pull    "R1-R4,PC"
+
+draw_defaultmatrix
+        DCD     &10000,0,0,&10000,0,0
+
+; 'draw_outputpathforfill' ignores "special" segments (those started with
+; path element type 3), closes open subpaths and treats gaps as lines. This
+; is fairly easy - we just have to move along the path, outputting its
+; elements as appropriate.
+
+draw_outputpathforfill
+        Push    "R1-R3,R8,R9,LR"
+
+        MOV     R1,R0                   ;Path pointer
+        MOV     R3,#0                   ;No open subpath at present
+
+draw_outputpathforfill_nextelement
+        LDRB    R2,[R1],#4
+        CMP     R2,#8
+        ADDLS   PC,PC,R2,LSL #2
+        B       draw_outputpathforfill_badelement
+        B       draw_outputpathforfill_endpath
+        B       draw_outputpathforfill_continuepath
+        B       draw_outputpathforfill_moveto
+        B       draw_outputpathforfill_moveto
+        B       draw_outputpathforfill_closepath
+        B       draw_outputpathforfill_closepath
+        B       draw_outputpathforfill_bezierto
+        NOP
+draw_outputpathforfill_lineto
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLO     draw_outputpathforfill_badsequence
+        LDMIA   R1!,{R8,R9}
+        BLEQ    draw_lineto
+        BVC     draw_outputpathforfill_nextelement
+        B       draw_outputpathforfill_return
+
+draw_outputpathforfill_bezierto
+        CMP     R3,#2
+        BLO     draw_outputpathforfill_badsequence
+        ADDHI   R1,R1,#24
+        BHI     draw_outputpathforfill_nextelement
+        LDMIA   R1!,{R8,R9}
+        BL      draw_outputcoords
+        LDMVCIA R1!,{R8,R9}
+        BLVC    draw_outputcoords
+        LDMVCIA R1!,{R8,R9}
+        BLVC    draw_curveto
+        BVC     draw_outputpathforfill_nextelement
+        B       draw_outputpathforfill_return
+
+draw_outputpathforfill_moveto
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLEQ    draw_closepath
+        BVS     draw_outputpathforfill_return
+        LDMIA   R1!,{R8,R9}
+        MOV     R3,R2
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLEQ    draw_moveto
+        BVC     draw_outputpathforfill_nextelement
+        B       draw_outputpathforfill_return
+
+draw_outputpathforfill_closepath
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        MOV     R3,#0
+        BLEQ    draw_closepath
+        BVC     draw_outputpathforfill_nextelement
+        B       draw_outputpathforfill_return
+
+draw_outputpathforfill_continuepath
+        LDMIA   R1,{R1}
+        B       draw_outputpathforfill_nextelement
+
+draw_outputpathforfill_badelement
+        ADR     R0,ErrorBlock_BadPathElement
+        B       draw_outputpathforfill_errorreturn      ; 3 lines down!
+
+draw_outputpathforfill_badsequence
+        ADR     R0,ErrorBlock_BadPathSequence
+draw_outputpathforfill_errorreturn
+        BL      LookupSingle                    ; Always sets V flag
+        B       draw_outputpathforfill_return
+
+draw_outputpathforfill_endpath
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLEQ    draw_closepath
+
+draw_outputpathforfill_return
+        Pull    "R1-R3,R8,R9,PC"
+
+; 'draw_outputbysubpaths' ignores "special" segments (those started with path
+; element type 3), closes open subpaths and treats gaps as lines. It differs
+; from 'draw_outputpathforfill' in that it fills each subpath as it completes
+; it. This is fairly easy - we just have to move along the path, outputting
+; its elements as appropriate.
+
+draw_outputbysubpaths
+        Push    "R1-R3,R8,R9,LR"
+
+        MOV     R1,R0                   ;Path pointer
+        MOV     R3,#0                   ;No open subpath at present
+
+draw_outputbysubpaths_nextelement
+        LDRB    R2,[R1],#4
+        CMP     R2,#8
+        ADDLS   PC,PC,R2,LSL #2
+        B       draw_outputbysubpaths_badelement
+        B       draw_outputbysubpaths_endpath
+        B       draw_outputbysubpaths_continuepath
+        B       draw_outputbysubpaths_moveto
+        B       draw_outputbysubpaths_moveto
+        B       draw_outputbysubpaths_closepath
+        B       draw_outputbysubpaths_closepath
+        B       draw_outputbysubpaths_bezierto
+        NOP
+draw_outputbysubpaths_lineto
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLO     draw_outputbysubpaths_badsequence
+        LDMIA   R1!,{R8,R9}
+        BLEQ    draw_lineto
+        BVC     draw_outputbysubpaths_nextelement
+        B       draw_outputbysubpaths_return
+
+draw_outputbysubpaths_bezierto
+        CMP     R3,#2
+        BLO     draw_outputbysubpaths_badsequence
+        ADDHI   R1,R1,#24
+        BHI     draw_outputbysubpaths_nextelement
+        LDMIA   R1!,{R8,R9}
+        BL      draw_outputcoords
+        LDMVCIA R1!,{R8,R9}
+        BLVC    draw_outputcoords
+        LDMVCIA R1!,{R8,R9}
+        BLVC    draw_curveto
+        BVC     draw_outputbysubpaths_nextelement
+        B       draw_outputbysubpaths_return
+
+draw_outputbysubpaths_moveto
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLEQ    draw_closeandfillpath
+        BVS     draw_outputbysubpaths_return
+        LDMIA   R1!,{R8,R9}
+        MOV     R3,R2
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLEQ    draw_moveto
+        BVC     draw_outputbysubpaths_nextelement
+        B       draw_outputbysubpaths_return
+
+draw_outputbysubpaths_closepath
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        MOV     R3,#0
+        BLEQ    draw_closeandfillpath
+        BVC     draw_outputbysubpaths_nextelement
+        B       draw_outputbysubpaths_return
+
+draw_outputbysubpaths_continuepath
+        LDMIA   R1,{R1}
+        B       draw_outputbysubpaths_nextelement
+
+draw_outputbysubpaths_badelement
+        ADR     R0,ErrorBlock_BadPathElement
+        B       draw_outputbysubpaths_errorreturn       ; 3 lines down
+
+draw_outputbysubpaths_badsequence
+        ADR     R0,ErrorBlock_BadPathSequence
+draw_outputbysubpaths_errorreturn
+        BL      LookupSingle                    ; Always sets V flag
+        B       draw_outputbysubpaths_return
+
+draw_outputbysubpaths_endpath
+        CMP     R3,#2                           ;NB clears V, as R3 a byte
+        BLEQ    draw_closeandfillpath
+
+draw_outputbysubpaths_return
+        Pull    "R1-R3,R8,R9,PC"
+
+        MakeInternatErrorBlock  BadPathElement,,PathEl
+
+        MakeInternatErrorBlock  BadPathSequence,,PathSeq
+
+; 'draw_outputpathforclosedstroke' pays attention to "special" segments,
+; closes open subpaths and treats gaps as moves.
+;
+; 'draw_outputpathforopenstroke' pays attention to "special" segments,
+; does not close open subpaths and treats gaps as moves.
+;
+; These last two are quite a bit more difficult. The trouble arises because
+; PostScript has no concept of a "gap" (i.e. effectively a move that doesn't
+; start a new path component). To deal with this, we may in general have to
+; split a Draw path component up into several PostScript path components, one
+; of which may have to extend from the end of the Draw path component to its
+; beginning.
+
+draw_outputpathforstroke_badelement
+        ADR     R0,ErrorBlock_BadPathElement
+        B       draw_outputpathforstroke_errorreturn    ; 3 lines down
+
+draw_outputpathforstroke_badsequence
+        ADR     R0,ErrorBlock_BadPathSequence
+draw_outputpathforstroke_errorreturn
+        BL      LookupSingle            ; Always sets the V flag
+
+draw_outputpathforstroke_return
+        Pull    "R1-R9,PC"
+
+draw_outputpathforopenstroke
+        Push    "R1-R9,LR"
+        MOV     R4,#0                   ;Do not close open components
+        B       draw_outputpathforstroke
+
+draw_outputpathforclosedstroke
+        Push    "R1-R9,LR"
+        MOV     R4,#-1                  ;Do close open components
+
+draw_outputpathforstroke
+        MOV     R1,R0                   ;Path pointer
+
+draw_outputpathforstroke_componentloop
+
+; We start by finding the next component of the path pointed to by R1. We
+; will put a pointer to its start in R2, a pointer to a gap in it (or
+; &80000000 if it contains no gap) in R3 and update R1 to point to the first
+; path component after its end. Set R5 to say whether the component is
+; closed.
+
+        MOV     R2,#0                   ;Start not found yet
+draw_outputpathforstroke_scan
+        LDRB    R7,[R1],#4
+        CMP     R7,#8
+        ADDLS   PC,PC,R7,LSL #2
+        B       draw_outputpathforstroke_badelement
+        B       draw_outputpathforstroke_scan_endpath
+        B       draw_outputpathforstroke_scan_continuepath
+        B       draw_outputpathforstroke_scan_moveto
+        B       draw_outputpathforstroke_scan_moveto
+        B       draw_outputpathforstroke_scan_closewithgap
+        B       draw_outputpathforstroke_scan_closewithline
+        B       draw_outputpathforstroke_scan_bezierto
+        B       draw_outputpathforstroke_scan_gapto
+draw_outputpathforstroke_scan_lineto
+        TEQ     R2,#0
+        ADDNE   R1,R1,#8
+        BNE     draw_outputpathforstroke_scan
+        B       draw_outputpathforstroke_badsequence
+        
+draw_outputpathforstroke_scan_gapto
+        TEQ     R2,#0
+        SUBNE   R3,R1,#4
+        ADDNE   R1,R1,#8
+        BNE     draw_outputpathforstroke_scan
+        B       draw_outputpathforstroke_badsequence
+        
+draw_outputpathforstroke_scan_bezierto
+        TEQ     R2,#0
+        ADDNE   R1,R1,#24
+        BNE     draw_outputpathforstroke_scan
+        B       draw_outputpathforstroke_badsequence
+
+draw_outputpathforstroke_scan_continuepath
+        LDMIA   R1,{R1}
+        B       draw_outputpathforstroke_scan
+
+draw_outputpathforstroke_scan_endpath
+        CMP     R2,#0                   ;Clears V
+        Pull    "R1-R9,PC",EQ           ;If no component found, return;
+                                        ;  else treat just like moveto
+
+draw_outputpathforstroke_scan_moveto
+        TEQ     R2,#0
+        SUBNE   R1,R1,#4
+        MOVNE   R5,R4
+        BNE     draw_outputpathforstroke_scandone
+        SUB     R2,R1,#4
+        ADD     R1,R1,#8
+        MOV     R3,#&80000000
+        B       draw_outputpathforstroke_scan
+        
+draw_outputpathforstroke_scan_closewithgap
+        TEQ     R2,#0
+        SUBNE   R3,R1,#4
+        MOVNE   R5,#0
+        BNE     draw_outputpathforstroke_scandone
+        B       draw_outputpathforstroke_badsequence
+        
+draw_outputpathforstroke_scan_closewithline
+        TEQ     R2,#0
+        BEQ     draw_outputpathforstroke_badsequence
+        MOV     R5,#-1
+
+draw_outputpathforstroke_scandone
+
+; Now we have a path component.
+;   R1 points to the first path element after its end.
+;   R2 points to the moveto or specialmoveto at its start.
+;   R3 points to a gap in the path, or contains &80000000 if there isn't one.
+;   R5 = -1 if the path component should be closed with a line, 0 otherwise.
+;   R0 and R4 contain values that should be preserved.
+; There are no endpath, moveto or specialmoveto path elements strictly
+; between R2 and R1.
+;   First choose where we will start work. This is at the gap pointed to
+; by R3 if it exists; otherwise it is at the start of the component.
+
+        MOVS    R6,R3
+        MOVMI   R6,R2
+
+draw_outputpathforstroke_doelement
+        LDRB    R7,[R6],#4
+        SUB     R7,R7,#2
+        ADD     PC,PC,R7,LSL #2
+        B       draw_outputpathforstroke_continuepath
+        B       draw_outputpathforstroke_moveto
+        B       draw_outputpathforstroke_moveto
+        B       draw_outputpathforstroke_nextelement
+        B       draw_outputpathforstroke_nextelement
+        B       draw_outputpathforstroke_bezierto
+        B       draw_outputpathforstroke_gapto
+draw_outputpathforstroke_lineto
+        LDMIA   R6!,{R8,R9}
+        BL      draw_lineto
+        BVS     draw_outputpathforstroke_return
+
+draw_outputpathforstroke_nextelement
+        TEQ     R6,R1
+        BNE     draw_outputpathforstroke_notatend
+        TEQ     R3,#&80000000
+        MOVNE   R6,R2
+        BNE     draw_outputpathforstroke_notatend
+        CMP     R5,#0                           ;NB clears V, as R5 = 0 or -1
+        BLNE    draw_closepath
+        BVC     draw_outputpathforstroke_componentloop
+        B       draw_outputpathforstroke_return
+
+draw_outputpathforstroke_notatend
+        TEQ     R6,R3
+        BNE     draw_outputpathforstroke_doelement
+        B       draw_outputpathforstroke_componentloop
+
+draw_outputpathforstroke_moveto
+        TST     R5,R3,LSL #1            ;Treat as lineto if this component
+                                        ;  contains a gap and path is closed;
+                                        ;  otherwise treat as gapto
+        BNE     draw_outputpathforstroke_lineto
+
+draw_outputpathforstroke_gapto
+        LDMIA   R6!,{R8,R9}
+        BL      draw_moveto
+        BVC     draw_outputpathforstroke_nextelement
+        B       draw_outputpathforstroke_return
+
+draw_outputpathforstroke_bezierto
+        LDMIA   R6!,{R8,R9}
+        BL      draw_outputcoords
+        LDMVCIA R6!,{R8,R9}
+        BLVC    draw_outputcoords
+        LDMVCIA R6!,{R8,R9}
+        BLVC    draw_curveto
+        BVC     draw_outputpathforstroke_nextelement
+        B       draw_outputpathforstroke_return
+
+draw_outputpathforstroke_continuepath
+        LDMIA   R6,{R6}
+        B       draw_outputpathforstroke_nextelement
+
+
+; Subroutine to output the dash pattern pointed to by R6 to the file handle
+; in R10.
+
+draw_outputdashpattern
+        TEQ     R6,#0                   ;If a solid line, don't output
+        Return  EQ                      ;  anything.
+
+        Push    "R1,R2,R3,LR"
+        PrError draw_outputdashpattern_return
+
+        PrStrIm "[ "
+
+        LDR     R1,[R6,#4]              ;Get number of dash elements
+        TEQ     R1,#0
+        BEQ     draw_outputdashpattern_endloop
+        ADD     R2,R6,#8                ;Address first dash element
+draw_outputdashpattern_loop
+        LDR     R3,[R2],#4              ;Get a dash element
+        PrNumSp R3                      ;Print it
+        SUBS    R1,R1,#1                ;Loop till all elements done
+        BNE     draw_outputdashpattern_loop
+draw_outputdashpattern_endloop
+        PrStrIm "] "
+
+        LDR     R1,[R6]                 ;Get distance into dash pattern
+        PrNumSp R1                      ;  and print it
+
+        PrLnIm  "setdash",FallThroughOnError
+
+        PrError
+draw_outputdashpattern_return
+        Pull    "R1,R2,R3,PC"
+
+; Subroutine to output the cap and join specification pointed to by R5 to the
+; file handle in R10.
+
+draw_outputcapandjoin
+        Push    "R1,R2,R3,LR"
+        PrError draw_outputcapandjoin_return
+
+        LDMIA   R5,{R1,R3}
+        MOV     R2,R1,LSR #8
+        AND     R1,R1,#&FF
+        AND     R2,R2,#&FF
+        PrPair  R1,R2
+        PrNumSp R3
+        PrLnIm  "CJ",FallThroughOnError
+
+        PrError
+draw_outputcapandjoin_return
+        Pull    "R1,R2,R3,PC"
+
+; Subroutine to output a "closepath" equivalent and check for ESCAPE.
+
+draw_closepath
+        Push    "LR"
+        PrLnIm  "Cl",FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+        Pull    "PC"                            ;  will set R0 for us if so
+
+; Subroutine to output a "closepath fill" equivalent and check for ESCAPE.
+
+draw_closeandfillpath
+        Push    "LR"
+        PrLnIm  "Cl fill",FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+        Pull    "PC"                            ;  will set R0 for us if so
+
+; Subroutine to output the co-ordinate pair held in R8,R9, then a "moveto"
+; equivalent, then check for ESCAPE.
+
+draw_moveto
+        Push    "LR"
+        BL      draw_outputcoords
+        BVS     draw_moveto_return
+        PrLnIm  "M",FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+draw_moveto_return                              ;  will set R0 for us if so
+        Pull    "PC"
+
+; Subroutine to output the co-ordinate pair held in R8,R9, then a "lineto"
+; equivalent, then check for ESCAPE.
+
+draw_lineto
+        Push    "LR"
+        BL      draw_outputcoords
+        BVS     draw_lineto_return
+        PrLnIm  "L",FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+draw_lineto_return                              ;  will set R0 for us if so
+        Pull    "PC"
+
+; Subroutine to output the co-ordinate pair held in R8,R9, then a "curveto"
+; equivalent, then check for ESCAPE.
+
+draw_curveto
+        Push    "LR"
+        BL      draw_outputcoords
+        BVS     draw_curveto_return
+        PrLnIm  "B",FallThroughOnError
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+draw_curveto_return                             ;  will set R0 for us if so
+        Pull    "PC"
+
+; Subroutine to output the co-ordinate pair held in R8,R9.
+
+draw_outputcoords
+        Push    "R0,R1,LR"
+        PrPair  R8,R9,CorruptR0andR1,FallThroughOnError
+draw_outputcoords_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,PC"
+
+        END

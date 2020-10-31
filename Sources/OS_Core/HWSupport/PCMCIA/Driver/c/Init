@@ -1,0 +1,155 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Init.c                                                                           ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA_Drv Module                                                 ***/
+/***  Version:       0.02                                                              ***/
+/***                                                                                   ***/
+/***  By:            N.Critchell, W.Turner, Acorn Computers Ltd.                       ***/
+/***  Date:          7th July 1994                                                     ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains the code to initialise the module and also kill the      ***/
+/***                 module when requested to do so.                                   ***/
+/***                                                                                   ***/
+/***  History:       0.01 28th June 1993 - Original version                            ***/
+/***                 0.02 7th July 1994 - modified due to FS review (WT)               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Routines:-                                                                       ***/
+/***    PCMCIADriver_Initialisation()                                                  ***/
+/***    PCMCIADriver_Termination()                                                     ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Variables.h"
+#include "Init.h"
+#include "Resources.h"
+#include "HWOps.h"
+#include "Error.h"
+#include "Misc.h"
+
+#include "Debug.h"
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  PCMCIADriver_Initialisation(cmd_tail, podule_base, pw)                           ***/
+/***                                                                                   ***/
+/***  This function will install and initialise the PCMCIA Driver module. It is called ***/
+/***  by the OS when the module is startted.                                           ***/
+/***  The cmd_tail, podule_base and private_word will all be ignored. The code will    ***/
+/***  perform the following:-                                                          ***/
+/***    1) Register an exit routine, which is called when the module quits.            ***/
+/***    2) Initialise all fixed variables.                                             ***/
+/***    3) Attempt to initialise the resource messages.                                ***/
+/***    4) Initialise the hardware.                                                    ***/
+/***    5) Set up a CCB block.                                                         ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    NULL pointer, if installed succesfully.                                        ***/
+/***    ErrorBlock, if an error occured.                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+_kernel_oserror *PCMCIADriver_Initialisation(char *cmd_tail, int podule_base, void *pw)
+    {
+    _kernel_oserror            *error = NULL;
+    _kernel_swi_regs            callregs;
+
+    #if Debug == TRUE
+        Set_DebugVar_Name("hwdrvdebug");
+        DebugMessage("yK", "*****    Initalising PCMCIA Driver    ****\n\n");
+    #endif
+
+    /*************************************************************************************/
+    /**   The following code will always be executed.                                   **/
+    /*************************************************************************************/
+    atexit(&PCMCIADriver_Termination);                  /* register exit routine        */
+
+    PrivateWord = pw;
+
+    error = InitialiseResources();
+    if(!error) {
+        error = InitialiseHardware();    /* Sets up 'NumberOfSlots' */
+        if(!error) {
+            callregs.r[0] = CLAIM_RMA_SPACE;
+            callregs.r[3] = sizeof(CCB) * NumberOfSlots;
+            if (_kernel_swi(OS_Module, &callregs, &callregs) == NULL) {
+                CCB_Block=(CCB *)(callregs.r[2]);
+                #if Debug == TRUE
+                    DebugMessage("yK","CCB block allocated %d bytes",sizeof(CCB) * NumberOfSlots);
+                    DebugMessage("yK"," at address &%8X\n",(int)CCB_Block);
+                #endif
+                callregs.r[0] = CLAIM_RMA_SPACE;
+                callregs.r[3] = sizeof(SLOT_STATE) * STATESTACK_ENTRIES;
+                if (_kernel_swi(OS_Module, &callregs, &callregs) == NULL) {
+                    State_Stack=(SLOT_STATE *)(callregs.r[2]);
+                    #if Debug == TRUE
+                        DebugMessage("yK","State stack allocated %d bytes",sizeof(SLOT_STATE) * STATESTACK_ENTRIES);
+                        DebugMessage("yK"," at address &%8X\n",(int)State_Stack);
+                    #endif
+                }
+                else error = SetError(ERROR__NO_RMA);
+            }
+            else error = SetError(ERROR__NO_RMA);
+        }
+    }
+    if(error == NULL) error = InitialiseSlots(); /** Sets up the CCBs etc **/
+    if ((error == NULL) && Resources_Loaded) RegisterWithManager();
+
+    if(error) PCMCIADriver_Termination();
+    return(error);
+}
+
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  PCMCIADriver_Termination()                                                       ***/
+/***                                                                                   ***/
+/***  This function will be called whenever the driver is about to be terminated. It   ***/
+/***  wil ensure that the driver exits cleanly. It performs the following:-            ***/
+/***                                                                                   ***/
+/***    1) Release any claimed RMA Space & shut the message file                       ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+void PCMCIADriver_Termination(void)
+    {
+    _kernel_swi_regs    callregs;
+
+    FinaliseHardware();
+
+    DeregisterWithManager();
+    #if Debug == TRUE
+        DebugMessage("yK","De-registered Driver from PCMCIA Support Code\n");
+    #endif
+
+    if (CCB_Block != NULL) {
+        callregs.r[0] = FREE_RMA_SPACE;
+        callregs.r[2] = (int)CCB_Block;
+        _kernel_swi(OS_Module, &callregs, &callregs);
+        #if Debug == TRUE
+            DebugMessage("yK","Released claimed CCB block memory\n");
+        #endif
+    }
+
+    callregs.r[0] = (int)Message_FileDescriptor;
+    _kernel_swi(MessageTrans_CloseFile, &callregs, &callregs);
+
+    #if Debug == TRUE
+        DebugMessage("yK","*****    Terminating PCMCIA Driver    ****\n\n");
+    #endif
+}

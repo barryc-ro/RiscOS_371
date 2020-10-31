@@ -1,0 +1,401 @@
+/*From CLib*/
+#include <stdio.h>
+#include <string.h>
+#include <swis.h>
+
+/*From Support*/
+#include "trace.h"
+#include "x.h"
+
+/*From OSLib*/
+#include "econet.h"
+#include "netfs.h"
+#include "macros.h"
+#include "os.h"
+#include "osbyte.h"
+#include "osfscontrol.h"
+#include "osmodule.h"
+#include "socket.h"
+#include "wimpreadsysinfo.h"
+
+static void Get_Ether_DCI2 (byte id [6])
+
+{  int i;
+   bool unclaimed;
+   struct dib
+      {  char *name;
+         int  units;
+         int  swi_base;
+         byte *address [4];
+         char *module;
+      }
+      *dib;
+
+   tracef ("Get_Ether_DCI2\n");
+
+   for (i = 0; i < 4; i++)
+   {  _swi (OS_ServiceCall, _IN (1) | _IN (2) | _IN (3) | _IN (4) |
+            _OUT (1) | _OUT (3), 0x84, -1, 0, i, &unclaimed, &dib);
+
+      if (!unclaimed)
+      {  memcpy (id, dib->address [0], 6);
+         break;
+      }
+   }
+}
+
+static void Get_Ether_DCI4 (byte id [6])
+
+{  struct dib
+         /*Fix fault: use the released structure definition. J R C 9th Mar
+            1995*/
+      {  bits       swi_base;
+         char       *name;
+         bits       unit;
+         byte       *address;
+         char       *module;
+         char       *location;
+         bits       slot;
+      };
+
+   struct dibchain
+      {  struct dibchain *next;
+         struct dib      *dib;
+      }
+      *chain, *c, *next;
+
+   tracef ("Get_Ether_DCI4\n");
+
+   chain = (struct dibchain *) _swi (OS_ServiceCall,
+         _IN (0) | _IN (1) | _RETURN (0), NULL, 0x9B);
+
+   for (c = chain; c != NULL; c = c->next)
+   {  /*Ignore Econet and Loopback.*/
+      tracef ("found interface %s\n" _ c->dib->name);
+      if (!(strcmp (c->dib->name, "ec") == 0 ||
+            strcmp (c->dib->name, "lo") == 0))
+      {  memcpy (id, c->dib->address, 6);
+         break;
+   }  }
+
+   /*Free the chain.*/
+   for (c = chain; c != NULL; c = next)
+   {  next = c->next;
+      osmodule_free (c);
+   }
+}
+
+static int Module_Version (char *module_name)
+
+   /*Return the version number of a ROM module.*/
+
+#if 1
+{  char *cc;
+   int col, version, place;
+   enum {BEFORE, AFTER} state;
+   byte *module;
+
+   osmodule_lookup (module_name, NULL, &module, NULL, NULL);
+   cc = (char *) &module [*(int *) &module [osmodule_ENTRY_HELP]];
+
+   /*True code. JRC 17th Feb 1995*/
+   for (col = 0; *cc != '\0' && col < 16;
+         *cc++ == '\t'? col += 8, col &= ~7: col++)
+      ;
+   if (*cc == '\0') return 0;
+   /*assert (col == 16);*/
+
+   for (; *cc != '\0' && !ISXDIGIT (*cc); cc++)
+      ;
+   if (*cc == '\0') return 0;
+   /*assert (ISXDIGIT (*cc));*/
+
+   version = 0;
+   state = BEFORE;
+   for (;; cc++)
+      if (ISXDIGIT (*cc))
+         if (state == BEFORE)
+            version = version << 4 | XDIGIT (*cc) << 8;
+         else
+            version += XDIGIT (*cc) << (place -= 4);
+      else
+         switch (*cc)
+         {  case '.':
+               state = AFTER;
+               place = 8;
+            break;
+
+            default:
+               /*No more xdigits, end of string, etc.*/
+               return version;
+            break;
+         }
+}
+#else
+   /*Can't use osmodule_enumerate_rom_with_info() on RO200.*/
+{  int v = 0, m, s;
+   char *name;
+   x_exception x;
+
+   m = 0, s = -1;
+   x_TRY (&x)
+      /*Bizarrely, this call only stops when it gets an error ...*/
+      while (TRUE)
+      {  m = osmodule_enumerate_rom_with_info (m, s, &s, &name, NULL,
+            NULL, &v);
+
+         if (strcmp (name, module) == 0)
+            break;
+      }
+   x_CATCH (&x)
+      ;
+
+   return v >> 8;
+}
+#endif
+
+static bits Get_Inter (char *interface)
+
+{  socket_ifconf conf;
+   socket_ifreq reqs [8], *r, *end;
+   socket_s s;
+   x_exception x;
+   bits addr = NONE;
+
+   s = socket_creat (socket_AF_INET, socket_SOCK_DGRAM, 0);
+
+   x_TRY (&x)
+   {  conf.u AS req = reqs;
+      socket_ioctl (s, socket_SIOCGIFCONF, (byte *) &conf);
+
+      end = (socket_ifreq *) (conf.u AS buf + conf.len);
+      for (r = reqs; r < end; r++)
+      {  socket_ioctl (s, socket_SIOCGIFFLAGS, (byte *) r);
+
+         if ((r->u AS flags & (socket_IF_LOOPBACK | socket_IF_BROADCAST |
+               socket_IF_UP)) == (socket_IF_BROADCAST | socket_IF_UP) &&
+               strcmp (r->name, interface) == 0)
+         {  socket_ioctl (s, socket_SIOCGIFADDR, (byte *) r);
+            addr = r->u AS sockaddr.sockaddr_in.addr;
+            break;
+   }  }  }
+   x_CATCH (&x)
+      ;
+
+   socket_close (s);
+
+   return addr;
+}
+
+int main (void)
+
+{  int fs, used;
+   char version [80 + 1], *state, unique [80 + 1],
+         boot_dir [os_FILE_NAME_LIMIT + 1], canon [os_FILE_NAME_LIMIT + 1];
+
+   trace_initialise ("BootVars$Trace");
+
+   /*Set Boot$OSVersion to the version number.*/
+   sprintf (version, "%X0", Module_Version ("UtilityModule")/16);
+   tracef ("utility module version 0x%X\n" _
+         Module_Version ("UtilityModule"));
+   os_set_var_val ("Boot$OSVersion", (byte *) version, strlen (version), 0,
+         os_VARTYPE_STRING, NULL);
+
+   state = wimpreadsysinfo_task_count () == 0? "commands": "desktop";
+   os_set_var_val ("Boot$State", (byte *) state, strlen (state), 0,
+         os_VARTYPE_STRING, NULL);
+
+   /*Set Boot$Unique to the unique machine id.*/
+   os_byte (osbyte_READ_CMOS, osbyte_CONFIGURE_FILE_SYSTEM, SKIP,
+         NULL, &fs);
+
+   switch (fs)
+   {  case fileswitch_FS_NUMBER_NETFS:
+      {  byte station, net;
+         x_exception x;
+
+         tracef ("NetFS\n");
+         econet_read_local_station_and_net (&station, &net);
+
+         /*Fix infelicity: if there is a native Econet, and also an Internet
+            connection, the net number just returned is 0, which is wrong.
+            Let's try asking Internet if it has a better idea of the net
+            number, but still using 0 if there's an error. J R C 21st Feb
+            1995*/
+         if (net == 0)
+            x_TRY (&x)
+               net = (Get_Inter ("ea0") & 0xFF0000) >> 16;
+            x_CATCH (&x)
+               ;
+
+         sprintf (unique, "Stn%.3d!%.3d", net, station);
+      }
+      break;
+
+      case fileswitch_FS_NUMBER_SHAREFS:
+      {  byte id [6] = {0 /*, ...*/};
+         char addr [13], *a;
+
+         tracef ("ShareFS\n");
+         /*To get the ethernet number, we need the Internet version
+            number.*/
+         tracef ("internet version 0x%X\n" _ Module_Version ("Internet"));
+         if (Module_Version ("Internet") < 0x350)
+               /*was 0x400 J R C 8th Mar 1995*/
+            Get_Ether_DCI2 (id);
+         else
+            Get_Ether_DCI4 (id);
+
+         sprintf (addr, "%.2X%.2X%.2X%.2X%.2X%.2X",
+               id [0], id [1], id [2], id [3], id [4], id [5]);
+         tracef ("addr %s\n" _ addr);
+
+         /*Skip leading noughts.*/
+         a = addr;
+         while (*a == '0') a++;
+         if (*a == '\0') a--;
+
+         /*And make sure the file name is still only 10 letters long.*/
+         sprintf (unique, "%.10s", a);
+      }
+      break;
+
+      case 45 /*osfscontrol_FS_NUMBER_NEXUS*/:
+      {  union {struct {int lo, hi;} words; char bytes [6];} id;
+         char addr [13], *a;
+
+         _swi (0x45A09 /*NexusVC_ReadLocalAddress*/, _OUT(0) | _OUT(1),
+               &id AS words.lo, &id AS words.hi);
+
+         sprintf (addr, "%.2X%.2X%.2X%.2X%.2X%.2X",
+               id AS bytes [5], id AS bytes [4], id AS bytes [3],
+               id AS bytes [2], id AS bytes [1], id AS bytes [0]);
+
+         /*Skip leading noughts.*/
+         a = addr;
+         while (*a == '0') a++;
+         if (*a == '\0') a--;
+
+         /*And make sure the file name is still only 10 letters long.*/
+         sprintf (unique, "%.10s", a);
+      }
+      break;
+
+      default:
+         strcpy (unique, "Local");
+      break;
+   }
+
+   os_set_var_val ("Boot$Unique", (byte *) unique, strlen (unique),
+         0, os_VARTYPE_STRING, NULL);
+
+   /*"Canonicalise" Boot$Dir, making sure it contains the filing system and
+      disc name.*/
+   os_read_var_val ("Boot$Dir", boot_dir, sizeof boot_dir - 1, 0,
+         os_VARTYPE_STRING, &used, NULL);
+   boot_dir [used] = '\0';
+
+   /*Don't do this more than once.*/
+   if (strchr (boot_dir, '$') == NULL)
+   {  switch (fs)
+      {  case fileswitch_FS_NUMBER_NETFS:
+         {  char csd [os_FILE_NAME_LIMIT + 1],
+                  disc [netfs_DISC_NAME_LIMIT + 1];
+            netfs_read_env read_env;
+
+            /*Get the CSD name.*/
+            netfs_do_fs_op (netfs_FS_OP_READ_ENV, (netfs_op *) &read_env, 0,
+                  sizeof read_env, NULL);
+
+            csd [0] = '$';
+            if (read_env AS reply.csd_name [0] == '$')
+               csd [1] = '\0';
+            else
+            {  read_env AS reply.csd_name [sizeof read_env AS reply.csd_name]
+                     = ' '; /*ensure it's terminated - this overwrites the
+                     first character of the library name, which we don't
+                     need.*/
+               sprintf (csd + 1, ".%.*s",
+                     strcspn (read_env AS reply.csd_name, " "),
+                     read_env AS reply.csd_name);
+            }
+
+            /*Get the disc name.*/
+            read_env AS reply.disc_name [sizeof read_env AS reply.disc_name]
+                  = ' '; /*ensure it's terminated - this overwrites the
+                  first character of the CSD name, which we've already
+                  saved.*/
+            sprintf (disc, "%.*s", strcspn (read_env AS reply.disc_name,
+                  " "), read_env AS reply.disc_name);
+
+         #if 1 /*don't use the configured file server - all the info we need
+               has now been read from the real thing. JRC 17th Feb 1995
+               after talk with Rhodri James, S J Research*/
+            sprintf (canon, "Net::%s.%s.!ArmBoot", disc, csd);
+         #else
+            /*Get the configured file server.*/
+            os_byte (osbyte_READ_CMOS, osbyte_CONFIGURE_FS_STATION, SKIP,
+                  NULL, &station);
+            if (station == 0)
+            {  /*Name configured.*/
+               int i, b;
+               char *cc;
+
+               cc = name;
+
+               os_byte (osbyte_READ_CMOS, osbyte_CONFIGURE_FS_NAME0, SKIP,
+                     NULL, &b);
+               *cc++ = b;
+
+               for (i = osbyte_CONFIGURE_FS_NAME1;
+                     i < osbyte_CONFIGURE_FS_NAME1 +
+                     osbyte_CONFIGURE_FS_NAME_LIMIT - 1; i++)
+               {  os_byte (osbyte_READ_CMOS, i, SKIP, NULL, &b);
+                  *cc++ = b;
+               }
+               *cc = '\0';
+
+               sprintf (canon, "Net::%s.%s.!ArmBoot", name, csd);
+            }
+            else
+            {  /*Number configured.*/
+               os_byte (osbyte_READ_CMOS, osbyte_CONFIGURE_FS_NET, SKIP,
+                     NULL, &net);
+               sprintf (canon, "Net#%d.%d:%s.!ArmBoot", net, station, csd);
+            }
+         #endif
+         }
+         break;
+
+         case fileswitch_FS_NUMBER_ADFS:
+         {  int drive;
+
+            os_byte (osbyte_READ_CMOS, osbyte_CONFIGURE_DRIVE, SKIP, NULL,
+                  &drive);
+            sprintf (canon, "ADFS::%d.$.!Boot",
+                  (drive & osbyte_CONFIGURE_DRIVE_MASK) >>
+                  osbyte_CONFIGURE_DRIVE_SHIFT);
+         }
+         break;
+
+         case fileswitch_FS_NUMBER_SCSIFS:
+         {  int drive;
+
+            os_byte (osbyte_READ_CMOS, osbyte_CONFIGURE_SCSIFS_DRIVE,
+                  SKIP, NULL, &drive);
+            sprintf (canon, "SCSI::%d.$.!Boot",
+                  ((drive & osbyte_CONFIGURE_SCSIFS_DRIVE_MASK) >>
+                  osbyte_CONFIGURE_SCSIFS_DRIVE_SHIFT) + 4);
+         }
+         break;
+      }
+
+      os_set_var_val ("Boot$Dir", (byte *) canon, strlen (canon),
+            0, os_VARTYPE_STRING, NULL);
+   }
+
+   trace_terminate ();
+
+   return 0;
+}

@@ -1,0 +1,205 @@
+#include <stdio.h>
+#include <string.h>
+
+#include "osfile.h"
+#include "osfscontrol.h"
+#include "wimp.h"
+#include "taskmanager.h"
+#include "toolbox.h"
+#include "draggable.h"
+
+#include "event.h"
+
+#include "FileUtils.h"
+#include "Main.h"
+
+extern toolbox_o AUNObject, RoutingObject, NamesObject;
+
+static bool file_bounce(wimp_event_no, wimp_block *, toolbox_block *, void *);
+static bool file_loader(wimp_message *, void *);
+static bool file_copier(wimp_message *, void *);
+static bool file_acker(wimp_message *, void *);
+static char filer_name[64];
+static const char *copying_filename;
+
+void FileInit(void)
+{
+    messagetrans_control_block cb;
+    os_error *e;
+    int used;
+
+    event_register_wimp_handler(event_ANY, wimp_USER_MESSAGE_ACKNOWLEDGE, file_bounce, 0);
+    event_register_message_handler(message_DATA_SAVE, file_loader, 0);
+    event_register_message_handler(message_DATA_SAVE_ACK, file_copier, 0);
+    event_register_message_handler(message_DATA_LOAD, file_acker, 0);
+
+    e=xmessagetrans_open_file(&cb, "Filer:Messages", 0);
+    if (e)
+        return;
+    e=xmessagetrans_lookup(&cb, "TskName", filer_name, sizeof filer_name, 0, 0, 0, 0, 0,
+                           &used);
+    if (!e)
+        filer_name[used]='\0';
+    else
+        filer_name[0]='\0';
+
+    messagetrans_close_file(&cb);
+}
+
+void DoubleClickFile(const char *filename, wimp_w w, int x, int y)
+{
+    wimp_message message;
+
+    message.your_ref = 0;
+    message.action = message_DATA_OPEN;
+    message.data.data_xfer.w = w;
+    message.data.data_xfer.pos.x = x;
+    message.data.data_xfer.pos.y = y;
+    message.data.data_xfer.est_size = 0;
+    message.data.data_xfer.file_type = osfile_TYPE_TEXT;
+    osfscontrol_canonicalise_path(filename, message.data.data_xfer.file_name, 0, 0,
+                                  sizeof message.data.data_xfer.file_name);
+    message.size = 44 + ((strlen(message.data.data_xfer.file_name) + 4) &~ 3);
+
+    wimp_send_message(wimp_USER_MESSAGE_RECORDED, &message, wimp_BROADCAST);
+}
+
+static bool file_bounce(wimp_event_no event_code, wimp_block *event,
+    	    	    	toolbox_block *id, void *handle)
+{
+    char buffer[256];
+
+    NOT_USED(event_code); NOT_USED(id); NOT_USED(handle);
+
+    if (event->message.action != message_DATA_OPEN)
+    	return FALSE;
+
+    sprintf(buffer, "@RunType_FFF %s", event->message.data.data_xfer.file_name);
+    wimp_start_task(buffer);
+
+    return TRUE;
+}
+
+void DragFile(const char *filename, draggable_action_drag_ended *drag)
+{
+    wimp_message message = { 0 };
+    int /**pi, */len;
+    wimp_t dest_task;
+    char *dest_name;
+
+    /* Determine whether we dragged to the filer (yuck) */
+    message.size = 16;
+    message.your_ref = 0;
+    dest_task = wimp_send_message_to_window(wimp_USER_MESSAGE_ACKNOWLEDGE, &message,
+                                            drag->ids.wimp.w, drag->ids.wimp.i);
+    dest_name = taskmanager_task_name_from_handle(dest_task);
+    if (strcmp(dest_name, filer_name) == 0)
+    {
+        char buffer[256];
+        osfscontrol_canonicalise_path(filename, buffer, 0, 0, sizeof buffer);
+        strcpy(message.data.data_xfer.file_name, strrchr(buffer, '.') + 1);
+        message.action = message_DATA_SAVE;
+        copying_filename = filename;
+    }
+    else
+    {
+        osfscontrol_canonicalise_path(filename, message.data.data_xfer.file_name,
+                                      0, 0, sizeof message.data.data_xfer.file_name);
+        message.action = message_DATA_LOAD;
+    }
+    message.data.data_xfer.w = drag->ids.wimp.w;
+    message.data.data_xfer.i = drag->ids.wimp.i;
+    message.data.data_xfer.pos = drag->pos;
+    osfile_read_stamped(filename, 0, 0, &message.data.data_xfer.est_size, 0, 0);
+    message.data.data_xfer.file_type = osfile_TYPE_TEXT;
+    message.your_ref = 0;
+    len = (strlen(message.data.data_xfer.file_name) + 4) & ~3;
+    message.size = 20 + 24 + len/* + 8*/;
+    /* Row and column numbers, like the Filer (3-254) */
+    /*pi = (int *) &message.data.reserved[24 + len];
+    pi[0] = pi[1] = 1;*/
+    /* Use recorded message, like the Filer. Some yucky apps (eg pinboard) will
+       ignore it otherwise */
+    wimp_send_message_to_window(wimp_USER_MESSAGE/*_RECORDED*/, &message,
+                                drag->ids.wimp.w, drag->ids.wimp.i);
+
+}
+
+static bool file_loader(wimp_message *message, void *handle)
+{
+    toolbox_o o;
+    char *filename;
+
+    NOT_USED(handle);
+
+    window_wimp_to_toolbox(0, message->data.data_xfer.w, message->data.data_xfer.i,
+                           &o, 0);
+
+    if (o==AUNObject)
+    	filename = "InetDBase:AUNMap";
+    else if (o==RoutingObject)
+    	filename = CONFIGDIR_WRITE "Routing";
+    else if (o==NamesObject)
+    	filename = "InetDBase:Hosts";
+    else
+    	return FALSE;
+
+    osfscontrol_canonicalise_path(filename, message->data.data_xfer.file_name, 0, 0,
+    	    	    	    	  sizeof message->data.data_xfer.file_name);
+
+    message->your_ref = message->my_ref;
+    message->size = 44 + ((strlen(message->data.data_xfer.file_name) + 4) & ~3);
+    message->action = message_DATA_SAVE_ACK;
+
+    wimp_send_message(wimp_USER_MESSAGE, message, message->sender);
+
+    return TRUE;
+}
+
+static bool file_acker(wimp_message *message, void *handle)
+{
+    NOT_USED(handle);
+
+    if (message->your_ref == 0)
+    {
+        /* The Filer has just chucked onto us */
+        char *filename;
+        toolbox_o o;
+        os_error *e;
+
+    	window_wimp_to_toolbox(0, message->data.data_xfer.w, message->data.data_xfer.i,
+                            &o, 0);
+
+        if (o==AUNObject)
+            filename = "InetDBase:AUNMap";
+        else if (o==RoutingObject)
+            filename = CONFIGDIR_WRITE "Routes";
+        else if (o==NamesObject)
+            filename = "InetDBase:Hosts";
+        else
+            return FALSE;
+
+    	e=xosfscontrol_copy(message->data.data_xfer.file_name, filename,
+    	                    osfscontrol_COPY_FORCE, 0, 0, 0, 0, 0);
+    }
+
+    message->action = message_DATA_LOAD_ACK;
+    message->your_ref = message->my_ref;
+
+    wimp_send_message(wimp_USER_MESSAGE, message, message->sender);
+
+    return TRUE;
+}
+
+static bool file_copier(wimp_message *message, void *handle)
+{
+    if (!copying_filename)
+        return FALSE;
+
+    osfscontrol_copy(copying_filename, message->data.data_xfer.file_name,
+                     0, 0, 0, 0, 0, 0);
+
+    copying_filename = 0;
+
+    return TRUE;
+}

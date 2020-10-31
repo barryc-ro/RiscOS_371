@@ -1,0 +1,496 @@
+/*
+ * $Header: /ab/bsd:etc/scsidm/probe.c:bsd.riscix1_2  1.3  $
+ * $Source: /ab/bsd:etc/scsidm/probe.c: $
+ *
+ * Copyright (c) 1990 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	probe.c,v $
+ * Revision 1.3  90/09/11  15:42:51  kwelton
+ * Removed the redundant "_sys" from struct nlist nl[].
+ * Tidied up behaviour if GetRawBase() cannot find scsi_ropen in cdevsw.
+ * 
+ * Revision 1.2  90/08/13  15:26:22  jroach
+ * Bring Risc OS and RISCiX versions in line with each other.
+ * The Risc OS version just issues a *Devices command.
+ * 
+ * Revision 1.1  90/08/02  15:53:43  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /ab/bsd:etc/scsidm/probe.c:bsd.riscix1_2  1.3  $";
+#endif
+
+#if defined(SCSIDM_FOR_RISCOS)
+#include <stdlib.h>
+
+void probe(argc, argv)
+int argc;
+char *argv[];
+{
+        /*
+                Keep the compiler quiet
+        */
+        argc = argc;
+        argv = argv;
+
+        /*
+                Just use the *-command
+        */
+        system( "*Devices" );
+}
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <stdio.h>
+#include <errno.h>
+#include <netdb.h>
+#include <a.out.h>
+
+#include <dev/ps_scsi.h>
+#include <dev/ps_structs.h>
+
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/version.h>
+#include <sys/conf.h>
+
+#include "scsidm.h"
+#include "dmcmds.h"
+
+#define UNIT_ATTENTION	(0x06)
+
+extern char *mktemp(), *typename();
+
+struct nlist nl[] =
+{
+    { "_cdevsw" },
+    { "_nchrdev" },
+    { "_scsi_card_count" },
+    { "_scsi_ropen" },
+    { "" }
+};
+#define NL_CDEV		0
+#define NL_CDEVSIZE	1
+#define NL_COUNT	2
+#define NL_RAW		3
+
+#define N_SCSI_SYMBOLS	2			/* no. of nlist entries that
+						 * should be missing if SCSI
+						 * driver is not in the
+						 * kernel */
+
+char *kernel = "/vmunix";
+char *memory = "/dev/kmem";
+char *tempname = "/tmp/devicesXXXXXX";
+int memfile;
+
+/**********************************************************************/
+
+/*
+ *
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, probe.c:
+ *
+ */
+
+/**********************************************************************/
+
+int ReadKmem(addr, buffer, nbytes)
+u_long addr;
+u_char *buffer;
+unsigned nbytes;
+{
+    /*
+     * subroutine ReadKmem() -
+     *
+     * routine reads nbytes kernel memory from addr into buffer.
+     * returns TRUE if all OK, else FALSE.
+     */
+
+    /* no autos */
+
+    if( lseek(memfile, addr, L_SET) < 0 )
+    {
+	printf("lseek failed on %s", memory);
+	return(FALSE);
+    }
+
+    if( read(memfile, buffer, nbytes) < 0 )
+    {
+	printf("read failed on %s\n", memory);
+	return(FALSE);
+    }
+
+    /* all OK */
+    return(TRUE);
+}
+
+/**********************************************************************/
+
+static int ValidateKernel()
+{
+    /*
+     * subroutine ValidateKernel() -
+     *
+     * routine checks against mismatch between version of kernel
+     * executable, and that in kernel memory. Returns TRUE if
+     * versions match, else FALSE.
+     */
+
+    /* declare autos */
+    int fd, retc = FALSE;
+    struct version v;
+    struct exec_header e;
+
+    if( getversion(&v, sizeof(v)) < 0 )
+	printf("Failed to read kernel version");
+    else if( (fd = open(kernel, O_RDONLY)) < 0 )
+	printf("Failed to open %s\n", kernel);
+    else
+    {
+	if( read(fd, &e, sizeof(e)) < 0 )
+	    printf("Cannot read %s\n", kernel);
+	else if( bcmp(&v, &(e.a_version), sizeof(v)) )
+	    printf("%s is different version to currently executing kernel\n",
+		    kernel);
+	else
+	    /* all was OK */
+	    retc = TRUE;
+
+	close(fd);
+    }
+
+    return(retc);
+}
+
+/**********************************************************************/
+
+static int GetRawBase()
+{
+    /*
+     * subroutine GetRawBase() -
+     *
+     * routine gets index into cdevsw of first entry for the SCSI
+     * driver. returned value is the index, -1 if something went
+     * wrong.
+     */
+
+    /* declare autos */
+    int i, cdevsize;
+    struct cdevsw cdeventry, *cdevptr;
+
+    /*
+     * loop over cdevsw, looking for first
+     * occurence of SCSI open routine.
+     */
+    cdevptr = (struct cdevsw *)nl[NL_CDEV].n_value;
+    if( !ReadKmem(nl[NL_CDEVSIZE].n_value, (u_char *)&cdevsize,
+		  sizeof(cdevsize)) )
+	return(-1);
+
+    for( i = 0; i < cdevsize; ++i, ++cdevptr )
+    {
+	if( !ReadKmem((u_long)cdevptr, (u_char *)&cdeventry,
+		      sizeof(cdeventry)) )
+	    return(-1);
+
+	if( cdeventry.d_open == (int (*)())nl[NL_RAW].n_value )
+	    break;
+    }
+
+    if( i == cdevsize )
+    {
+	printf("probe: SCSI driver not present\n");
+	return(-1);
+    }
+
+    return(i);
+}
+
+/**********************************************************************/
+
+static void RequestSense(fd, failed_cmd)
+int fd;
+struct scsiop *failed_cmd;
+{
+    /*
+     * subroutine RequestSense() -
+     *
+     * routine performs a request sense for the failed command.
+     * no value is returned, but the failed_cmd->flags are set
+     * to indicate valid/invalid sense data
+     */
+
+    /* declare autos */
+    struct scsiop o;
+
+    bzero(o.cdb, 6);
+    o.cdb[0] = REQSEN;
+    o.cdb[4] = SCSI_SENSE;
+    o.xfer = SCSI_SENSE;
+    o.addr = failed_cmd->sense;
+    o.timeout = REQSENTIMEO;
+    o.flags = SC_READ | SC_NO_SENSE;
+
+    if( RunCommand(fd, &o) )
+	failed_cmd->flags |= SC_SENSE_VALID;
+    else
+	failed_cmd->flags &= ~SC_SENSE_VALID;
+}
+
+/**********************************************************************/
+
+static int RunCommand(fd, cmd)
+int fd;
+struct scsiop *cmd;
+{
+    /*
+     * subroutine RunCommand() -
+     *
+     * routine runs given command using SCSIDO ioctl. the SCSI
+     * driver does not do automatic Request Sense for devices
+     * with the DIY bit set (as this device has) so do it here.
+     * retry the command if target returns Unit Attention.
+     * returns TRUE if command succeeded, else FALSE.
+     */
+
+    /* declare autos */
+    struct scsiop o;
+    u_char repeat;
+
+    do
+    {
+	repeat = 0;
+
+	/*
+	 * load the command & make sure driver does
+	 * not do the Request Sense.
+	 */
+	bcopy(cmd, &o, sizeof(o));
+	o.flags |= SC_NO_SENSE;
+
+	if( ioctl(fd, SCSIDO, &o) < 0 )
+	{
+	    printf("Cannot run SCSI command");
+	    return(FALSE);
+	}
+
+	/*
+	 * do Request Sense if necessary and wanted
+	 */
+	if( o.status == SCSI_CHECK_CONDITION &&
+	   !(cmd->flags & SC_NO_SENSE) )
+	{
+	    RequestSense(fd, &o);
+
+	    if( (o.flags & SC_SENSE_VALID) &&
+	       (o.sense[2] & SKEYMASK) == UNIT_ATTENTION )
+		++repeat;
+	}
+    } while(repeat);
+
+    bcopy(&o, cmd, sizeof(o));
+    return( (o.status == SCSI_GOOD_STATUS) ? TRUE : FALSE );
+}
+
+/**********************************************************************/
+
+static u_char *CheckDevice(fd)
+int fd;
+{
+    /*
+     * subroutine CheckDevice() -
+     *
+     * routine sends an INQUIRY command to a potential device. returned
+     * value is pointer to INQUIRY data if command succeeded, else NULL
+     */
+
+    /* declare autos */
+    struct scsiop o;
+    static u_char data[MAXINQ];
+    u_char *retc = data;
+
+    /*
+     * build the INQUIRY command and send it out.
+     * NOTE:  use a private routine to send the
+     * command, as the standard routines
+     * (runcmd() / runicmd()) expect a current
+     * device to have already been selected.
+     */
+    bzero(o.cdb, 6);
+    o.cdb[0] = INQUIRE;
+    o.cdb[4] = MAXINQ;
+    o.xfer = MAXINQ;
+    o.addr = (char *)data;
+    o.timeout = INQTIMEO;
+    o.flags = SC_READ;
+    (void)RunCommand(fd, &o);
+
+    switch(o.status)
+    {
+      case SCSI_TIMEOUT:
+	/* Selection Timeout - no device present */
+	retc = NULL;
+	break;
+
+      case SCSI_GOOD_STATUS:
+	/* Command OK */
+	break;
+
+      default:
+	/*
+	 * Device present, but returning error
+	 */
+	sprintf((char *)data, "\t<faulty device>");
+	break;
+    }
+
+    return(retc);
+}
+
+/**********************************************************************/
+
+static void ShowDevice(fd, devno, inqdata)
+int fd, devno;
+u_char *inqdata;
+{
+    /*
+     * subroutine ShowDevice() -
+     *
+     * routine prints out the INQUIRY data (if any given)
+     * for the device. no value is returned.
+     */
+
+    /* declare autos */
+    int target = (devno % DEVICES);
+
+    if( target == 0 )
+    {
+	printf("Devices for logical slot %d:\n", (devno / DEVICES));
+	printf("Target   Type              "
+	       "        Vendor   Product        Rev\n");
+    }
+
+    if( inqdata )
+	printf("%4d   %-27.27s %-28.28s\n",
+	       target, typename(*inqdata), inqdata + 8);
+    else
+	printf("%4d\n", target);
+
+    if( target == (DEVICES - 1) )
+	printf("\n");
+}
+
+/**********************************************************************/
+
+static int ListDevices(devno, devbase)
+int devno, devbase;
+{
+    /*
+     * subroutine ListDevices() -
+     *
+     * routine creates a special device with the DIY bit
+     * set for each of the posible targets on the current
+     * system. returns TRUE if all OK, else FALSE.
+     */
+
+    /* declare autos */
+    int devfile, i;
+    const u_int ftype = S_IFCHR | S_IREAD | S_IWRITE;
+
+    for( i = devno; i < (devno + DEVICES); ++i )
+    {
+	if( mknod(tempname, ftype, makedev(i + devbase, SCSI_ESCAPE)) < 0 )
+	{
+	    printf("cannot make character special device %s\n",
+		   tempname);
+	    return(FALSE);
+	}
+
+	if( (devfile = open(tempname, O_RDWR)) < 0 )
+	{
+	    printf("cannot open character special device %s\n",
+		   tempname);
+	    return(FALSE);
+	}
+
+	ShowDevice(devfile, i, CheckDevice(devfile));
+
+	close(devfile);
+
+	if( unlink(tempname) < 0 )
+	{
+	    printf("cannot unlink character special device %s\n",
+		   tempname);
+	    return(FALSE);
+	}
+    }
+
+    /* all done */
+    return(TRUE);
+}
+
+/**********************************************************************/
+
+void probe(argc, argv)
+int argc;
+char *argv[];
+{
+    int i, ncards;
+    int raw_base;
+
+    /*
+     * keep the compiler happy
+     */
+    argc = argc;
+    argv = argv;
+
+    if( !ValidateKernel() )
+	return;
+
+    if( (memfile = open(memory, O_RDONLY)) < 0 )
+    {
+	printf("Cannot open %s\n", memory);
+	return;
+    }
+
+    /*
+     * try to get name list from kernel
+     */
+    if( (i = nlist(kernel, nl)) )
+    {
+	if( i == N_SCSI_SYMBOLS )
+	{
+	    printf("No SCSI drivers in current kernel\n");
+	    return;
+	}
+	else
+	{
+	    printf("Failed to read kernel name list\n");
+	    return;
+	}
+    }
+
+    if( (raw_base = GetRawBase()) == -1 )
+	return;
+
+    if( !ReadKmem(nl[NL_COUNT].n_value, (u_char *)&ncards, sizeof(ncards)) )
+	return;
+
+    tempname = mktemp(tempname);
+    for( i = 0; i < ncards; ++i )
+	if( !ListDevices(i * DEVICES, raw_base) )
+	    break;
+
+    close(memfile);
+    return;
+}
+
+/**********************************************************************/
+
+#endif
+/* EOF probe.c */

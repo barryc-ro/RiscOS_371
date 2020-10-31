@@ -1,0 +1,372 @@
+/*trace.c - simple trace to tube*/
+
+#undef  TRACE
+#define TRACE 1
+
+/*From CLib*/
+#include <assert.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/*From OSLib*/
+#include "econet.h"
+#include "macros.h"
+#include "os.h"
+#include "osargs.h"
+#include "osfile.h"
+#include "osfind.h"
+#include "osgbpb.h"
+
+/*From Support*/
+#include "hostfs.h"
+#include "socket.h"
+#include "trace.h"
+
+#define TRACE_BUFFER_SIZE 1024
+
+static enum {STDOUT, DISC, TUBE, NOWHERE, ECONET, VDU, INTERNET} Trace =
+      VDU;
+
+static os_error *Error = NULL;
+
+static int Station, Net; /*for ECONET*/
+
+static socket_s S; /*for INTERNET*/
+
+static os_f F; /*for DISC*/
+
+char *trace_file;
+int  trace_line;
+/*------------------------------------------------------------------------*/
+static os_error *Send (char *s, int n)
+
+{  int status;
+   os_error *error;
+
+   do
+      if ((error = xeconet_do_transmit (0x81, 0xF0, Station, Net, (byte *) s,
+            n, 1, 0, &status, NULL)) != NULL)
+         goto finish;
+   while (status != econet_STATUS_TRANSMITTED);
+
+finish:
+   return error;
+}
+/*------------------------------------------------------------------------*/
+os_error *trace_initialise (char *var)
+
+{  os_error *error = NULL;
+   char to [80 + 1], *val;
+
+   if ((val = getenv (var)) == NULL)
+      strcpy (to, "v");
+   else
+      strcpy (to, val);
+
+   switch (to [0])
+   {  case 'e': case 'E':
+         if ((error = xeconet_read_station_number (to + 1, NULL, &Station,
+               &Net)) != NULL)
+            goto finish;
+
+         Trace = ECONET;
+      break;
+
+      case 'f': case 'F':
+         if ((error = xosfind_openout (osfind_NO_PATH |
+               osfind_ERROR_IF_ABSENT | osfind_ERROR_IF_DIR, to + 1, NULL,
+               &F)) != NULL)
+            goto finish;
+
+         if ((error = xosfile_set_type (to + 1, osfile_TYPE_TEXT)) != NULL)
+            goto finish;
+
+         Trace = DISC;
+      break;
+
+      case 'i': case 'I':
+      {  socket_sockaddr addr;
+         bits i0, i1, i2, i3;
+         int n;
+
+         if (sscanf (to + 1, "%u.%u.%u.%u%n", &i0, &i1, &i2, &i3, &n) < 4 ||
+               n < strlen (to + 1) || i0 > 255 || i1 > 255 || i2 > 255 ||
+               i3 > 255)
+         {  error = (os_error *) "\0\0\0\1Trace variable should be <byte>."
+                  "<byte>.<byte>.<byte>";
+            goto finish;
+         }
+
+         if ((error = xsocket_creat (socket_AF_INET, socket_SOCK_STREAM,
+               0, &S)) != NULL)
+            goto finish;
+
+         addr AS sockaddr_in.af = socket_AF_INET;
+         addr AS sockaddr_in.port = *(short *) "JC";
+         ((byte *) (&addr AS sockaddr_in.addr)) [0] = i0;
+         ((byte *) (&addr AS sockaddr_in.addr)) [1] = i1;
+         ((byte *) (&addr AS sockaddr_in.addr)) [2] = i2;
+         ((byte *) (&addr AS sockaddr_in.addr)) [3] = i3;
+
+         if ((error = xsocket_connect (S, &addr, sizeof addr AS sockaddr_in))
+               != NULL)
+            goto finish;
+
+         Trace = INTERNET;
+      }
+      break;
+
+      case 'n': case 'N':
+         Trace = NOWHERE;
+      break;
+
+      case 's': case 'S':
+         Trace = STDOUT;
+      break;
+
+      case 't': case 'T':
+         Trace = TUBE;
+      break;
+
+      case 'v': case 'V':
+         Trace = VDU;
+      break;
+   }
+
+finish:
+   return Error = error;
+}
+/*------------------------------------------------------------------------*/
+os_error *trace_terminate (void)
+
+{  os_error *error = NULL;
+
+   switch (Trace)
+   {  case DISC:
+         if ((error = xosfind_close (F)) != NULL)
+            goto finish;
+      break;
+
+      case INTERNET:
+         if ((error = xsocket_close (S)) != NULL)
+            goto finish;
+      break;
+   }
+
+finish:
+   return Error;
+}
+/*------------------------------------------------------------------------*/
+void trace_f (char *file, int line, char *format, ...)
+
+{  va_list list;
+   char s [TRACE_BUFFER_SIZE + 1], *cc;
+   bool has_format = format != NULL && strlen (format) > 0;
+   os_error *error = NULL;
+
+   /*Do not do anything once Error is set.*/
+   if (Error == NULL)
+   {  s [TRACE_BUFFER_SIZE] = '\0';
+      if (file != NULL)
+      {  sprintf (s, has_format? "%s,%d: ": "%s,%d\n\r", file, line);
+         assert (s [TRACE_BUFFER_SIZE] == '\0');
+
+         switch (Trace)
+         {  case ECONET:
+               if ((error = Send (s, strlen (s))) != NULL)
+                  goto finish;
+            break;
+
+            case DISC:
+               if ((error = xosgbpb_write (F, (byte *) s, strlen (s), NULL))
+                     != NULL)
+                  goto finish;
+
+               if ((error = xosargs_ensure (F)) != NULL)
+                  goto finish;
+            break;
+
+            case INTERNET:
+               if ((error = xsocket_write (S, (byte *) s, strlen (s), NULL))
+                     != NULL)
+                  goto finish;
+            break;
+
+            case STDOUT:
+               printf ("%s", s);
+            break;
+
+            case TUBE:
+               for (cc = s; *cc != '\0'; cc++)
+                  if ((error = xhostfs_writec (*cc)) != NULL)
+                     goto finish;
+            break;
+
+            case VDU:
+               if ((error = xos_write0 (s)) != NULL)
+                  goto finish;
+            break;
+      }  }
+
+      if (has_format)
+      {  s [TRACE_BUFFER_SIZE] = '\0';
+         va_start (list, format);
+         vsprintf (s, format, list);
+         va_end (list);
+         assert (s [TRACE_BUFFER_SIZE] == '\0');
+
+         switch (Trace)
+         {  case ECONET:
+               if ((error = Send (s, strlen (s))) != NULL)
+                  goto finish;
+            break;
+
+            case DISC:
+               if ((error = xosgbpb_write (F, (byte *) s, strlen (s), NULL))
+                     != NULL)
+                  goto finish;
+
+               if ((error = xosargs_ensure (F)) != NULL)
+                  goto finish;
+            break;
+
+            case INTERNET:
+               if ((error = xsocket_write (S, (byte *) s, strlen (s), NULL))
+                     != NULL)
+                  goto finish;
+            break;
+
+            case STDOUT:
+               printf ("%s", s);
+            break;
+
+            case TUBE:
+               for (cc = s; *cc != '\0'; cc++)
+                  if (*cc >= 32)
+                  {  if ((error = xhostfs_writec (*cc)) != NULL)
+                        goto finish;
+                     if (*cc == '\\')
+                        if ((error = xhostfs_writec (*cc)) != NULL)
+                           goto finish;
+                  }
+                  else if (*cc == '\n')
+                  {  if ((error = xhostfs_writec ('\n')) != NULL)
+                        goto finish;
+                     if ((error = xhostfs_writec ('\r')) != NULL)
+                        goto finish;
+                  }
+                  else
+                  {  if ((error = xhostfs_writec ('\\')) != NULL)
+                        goto finish;
+                     if ((error = xhostfs_writec ('x')) != NULL)
+                        goto finish;
+                     if ((error = xhostfs_writec (UCHAR (*cc/16))) != NULL)
+                        goto finish;
+                     if ((error = xhostfs_writec (UCHAR (*cc%16))) != NULL)
+                        goto finish;
+                  }
+            break;
+
+            case VDU:
+               for (cc = s; *cc != '\0'; cc++)
+               {  char c = *cc;
+
+                  if (c >= 128)
+                  {  if ((error = xos_writen ("|!", 2)) != NULL)
+                        goto finish;
+                     c -= 128;
+                  }
+
+                  if (c < 32)
+                  {  if (c == '\n')
+                     {  if ((error = xos_new_line ()) != NULL)
+                           goto finish;
+                        continue;
+                     }
+                     else
+                     {  if ((error = xos_writec ('|')) != NULL)
+                           goto finish;
+                        c += 64;
+                     }
+                  }
+
+                  if ((error = xos_writec (c)) != NULL)
+                     goto finish;
+                  if (c == '|')
+                     if ((error = xos_writec (c)) != NULL)
+                        goto finish;
+               }
+            break;
+   }  }  }
+
+finish:
+   if (error != NULL)
+      Error = error;
+}
+/*------------------------------------------------------------------------*/
+void trace_vdu (char *s, int n)
+
+{  os_error *error = NULL;
+   int i;
+
+   /*Do not do anything once Error is set.*/
+   if (Error == NULL)
+      switch (Trace)
+      {  case ECONET:
+            if ((error = Send (s, n)) != NULL)
+               goto finish;
+         break;
+
+         case DISC:
+            if ((error = xosgbpb_write (F, (byte *) s, n, NULL)) != NULL)
+               goto finish;
+
+            if ((error = xosargs_ensure (F)) != NULL)
+               goto finish;
+         break;
+
+         case INTERNET:
+            if ((error = xsocket_write (S, (byte *) s, n, NULL)) != NULL)
+               goto finish;
+         break;
+
+         case TUBE:
+            for (i = 0; i < n; i++)
+               if ((error = xhostfs_writec (s [i])) != NULL)
+                  goto finish;
+         break;
+
+         case VDU:
+            if ((error = xos_writen (s, n)) != NULL)
+               goto finish;
+         break;
+      }
+
+finish:
+   if (error != NULL)
+      Error = error;
+}
+/*------------------------------------------------------------------------*/
+void trace_wait (char *file, int line, int t)
+
+{  clock_t end;
+   int left;
+   os_error *error;
+
+   end = clock () + t*CLOCKS_PER_SEC;
+
+   while ((left = (int) end - (int) clock ()) > 0)
+      switch (Trace)
+      {  case TUBE: case ECONET: case INTERNET:
+            trace_f (file, line, "%-*d", DEC_WIDTH, left/CLOCKS_PER_SEC);
+            if ((error = xhostfs_writec ('\r')) != NULL)
+               goto finish;
+         break;
+      }
+
+finish:;
+}

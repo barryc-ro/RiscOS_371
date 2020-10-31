@@ -1,0 +1,399 @@
+/* > compress.c
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "dboxes.h"
+#include "event.h"
+#include "msgs.h"
+#include "template.h"
+#include "werr.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "dboxinc.h"
+#include "iconmenu.h"
+#include "macros.h"
+#include "popup.h"
+#include "wmisc.h"
+
+#include "arinfo.h"
+#include "compress.h"
+
+#define DEFAULT_FIELD   0
+#define CANCEL_FIELD    1
+#define OK_FIELD        2
+
+#define FIX_QUALITY_FIELD   7
+#define FIX_SIZE_FIELD      8
+#define FIX_BANDWIDTH_FIELD 9
+
+#define LATENCY_FIELD       11
+#define DATA_RATE_FIELD     16
+#define DOUBLE_BUFFER_FIELD 20
+
+#define FAST_MATCH_FIELD    21
+#define ARM2_LIMIT_FIELD    22
+
+#define QUALITY_FIELD       24
+
+#define FRAME_SIZE_FIELD    28
+
+#define KEY_FRAMES_FIELD    32
+#define FORMAT_FIELD        33
+#define FORMAT_MENU_FIELD   34
+
+#define BANDWIDTH_START     10
+#define BANDWIDTH_END       20
+
+#define QUALITY_START       23
+#define QUALITY_END         26
+
+#define SIZE_START          27
+#define SIZE_END            31
+
+#define COMPRESS_IDENT      "compress"
+
+#define BAD_COLOURSPACE msgs_lookup("Mcomp0")
+#define BAD_SIZE        msgs_lookup("Mcomp1")
+#define NO_COMPRESSORS  msgs_lookup("Mcomp2")
+#define TOO_SMALL   msgs_lookup("Mcomp3")
+#define TOO_LARGE   msgs_lookup("Mcomp4")
+#define WRONG_ALIGN msgs_lookup("Mcomp5")
+#define X_MSG       msgs_lookup("Mcomp6")
+#define Y_MSG       msgs_lookup("Mcomp7")
+
+
+/* ------------------------------------------------------------------------------------------ */
+
+static icon_menu_str compress_menus[] =
+{
+#define FORMAT_MENU 0
+    { "dfmt", FORMAT_FIELD, FORMAT_MENU_FIELD },
+    { NULL }
+};
+
+static void init_field(dbox d, icon_menu_str *ip, int selection)
+{
+    char buffer[64];
+    ip->selection = selection;
+    iconmenu_extractentry(buffer, ip, selection);
+    dbox_setfield(d, ip->display_field, buffer);
+}
+
+static void menuhit(void *handle, char *hit)
+{
+    dbox    d = handle;
+    char    buffer[64];
+    int     imenu = iconmenu_extracthit(compress_menus, buffer, hit);
+    dbox_setfield(d, compress_menus[imenu].display_field, buffer);
+}
+
+static menu menumake(void *handle)
+{
+    return iconmenu_make(compress_menus);
+    UNUSED(handle);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+static void write_double(char *buffer, int val)
+{
+    sprintf(buffer, "%g", (double)val/LATENCY_UNIT);
+}
+
+static int read_double(const char *buffer)
+{
+    return (int) (strtod(buffer, NULL)*LATENCY_UNIT + 0.5);
+}
+
+
+static dbox_incstr  datarate_inc =
+{
+    1, 10, 0, 99999,
+    0, 0, 0,
+    dboxinc_NoFullIcons
+},                  latency_inc =
+{
+    1, 10, 0, 99999,
+    read_double, write_double, 0,
+    dboxinc_NoFullIcons
+},                  quality_inc =
+{
+    1, 10, 0, 99,
+    0, 0, 0,
+    dboxinc_NoFullIcons
+},                  framesize_inc =
+{
+    100, 1000, 0, 99999,
+    0, 0, 0,
+    dboxinc_NoFullIcons | dboxinc_NoValidateOnReturn
+};
+
+/* ------------------------------------------------------------------------------------------ */
+
+static differ_options copy_of_differ_options;
+static int copy_of_compressor;
+
+static void set_type(dbox d, int type)
+{
+    dbox_deleteblock(d, BANDWIDTH_START, BANDWIDTH_END, type != fixby_Bandwidth);
+    dbox_deleteblock(d, QUALITY_START, QUALITY_END, type != fixby_Quality);
+    dbox_deleteblock(d, SIZE_START, SIZE_END, type != fixby_Size);
+
+    dbox_setnumeric(d, FIX_BANDWIDTH_FIELD, type == fixby_Bandwidth);
+    dbox_setnumeric(d, FIX_QUALITY_FIELD, type == fixby_Quality);
+    dbox_setnumeric(d, FIX_SIZE_FIELD, type == fixby_Size);
+
+    dbox_deleteblock(d, FAST_MATCH_FIELD, ARM2_LIMIT_FIELD, type == fixby_Quality);
+}
+
+static void set_fields(dbox d, const compress_str *cp)
+{
+    differ_flag f = cp->o.differ.opts;
+
+    dbox_setnumeric(d, QUALITY_FIELD, cp->o.differ.quality);
+
+    dbox_setnumeric(d, FRAME_SIZE_FIELD, cp->o.differ.frame_size);
+    dbox_setnumeric(d, ARM2_LIMIT_FIELD, f & differ_LimitARM2);
+    dbox_setnumeric(d, FAST_MATCH_FIELD, f & differ_FastMatch);
+
+    dbox_setnumeric(d, DATA_RATE_FIELD, cp->o.differ.data_rate);
+    dboxinc_setfield(d, LATENCY_FIELD, &latency_inc, cp->o.differ.latency);
+    dbox_setnumeric(d, DOUBLE_BUFFER_FIELD, f & differ_DoubleBuffers);
+
+    dbox_setnumeric(d, KEY_FRAMES_FIELD, f & differ_KeyFrames);
+
+    init_field(d, &compress_menus[FORMAT_MENU],
+        arinfo_findsubindex(arinfo_BatchComp, arinfo_BatchComp, arinfo_formattoindex(cp->o.compressor)));
+}
+
+static void get_fields(dbox d, compress_str *cp)
+{
+    cp->o.differ.quality = dbox_getnumeric(d, QUALITY_FIELD);
+
+    cp->o.differ.frame_size = dbox_getnumeric(d, FRAME_SIZE_FIELD);
+
+    cp->o.differ.data_rate = dbox_getnumeric(d, DATA_RATE_FIELD);
+    cp->o.differ.latency = dboxinc_getfield(d, LATENCY_FIELD, &latency_inc);
+
+    cp->o.differ.opts &= ~(differ_FixBy | differ_LimitARM2 | differ_FastMatch | differ_DoubleBuffers | differ_KeyFrames);
+    cp->o.differ.opts |= (dbox_getnumeric(d, ARM2_LIMIT_FIELD) ? differ_LimitARM2 : 0)  |
+                (dbox_getnumeric(d, FAST_MATCH_FIELD) ? differ_FastMatch : 0)   |
+                (dbox_getnumeric(d, DOUBLE_BUFFER_FIELD) ? differ_DoubleBuffers : 0) |
+                (dbox_getnumeric(d, KEY_FRAMES_FIELD) ? differ_KeyFrames : 0);
+
+    if (dbox_getnumeric(d, FIX_QUALITY_FIELD))
+        cp->o.differ.opts |= fixby_Quality;
+    else if (dbox_getnumeric(d, FIX_SIZE_FIELD))
+        cp->o.differ.opts |= fixby_Size;
+    else if (dbox_getnumeric(d, FIX_BANDWIDTH_FIELD))
+        cp->o.differ.opts |= fixby_Bandwidth;
+
+    {
+        int selection = compress_menus[FORMAT_MENU].selection;
+        if (selection != -1)
+        {
+            arinfo_str *ip = arinfo_info(arinfo_findindex(arinfo_BatchComp, arinfo_BatchComp, selection));
+            if (ip)
+                cp->o.compressor = ip->format;
+        }
+    }
+}
+
+static void set_defaults(dbox d)
+{
+    dbox_setnumeric(d, ARM2_LIMIT_FIELD, TRUE);
+    dbox_setnumeric(d, FAST_MATCH_FIELD, FALSE);
+
+    dbox_setnumeric(d, DATA_RATE_FIELD, 150);
+    dboxinc_setfield(d, LATENCY_FIELD, &latency_inc, 40);
+    dbox_setnumeric(d, DOUBLE_BUFFER_FIELD, FALSE);
+
+    dbox_setnumeric(d, KEY_FRAMES_FIELD, TRUE);
+
+    set_type(d, fixby_Bandwidth);
+    dbox_setnumeric(d, QUALITY_FIELD, 7);
+
+    init_field(d, &compress_menus[FORMAT_MENU], 0);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+static void compress_events(dbox d, void *handle)
+{
+    compress_str    *cp = handle;
+    dbox_field      action = dbox_get(d);
+
+    switch (action)
+    {
+        case dbox_CLOSE:
+        case CANCEL_FIELD:
+            cp->o.differ = copy_of_differ_options;
+            cp->o.compressor = copy_of_compressor;
+            if (dbox_persist())
+            {
+                set_type(d, cp->o.differ.opts & differ_FixBy);
+                set_fields(d, cp);
+            }
+            else
+                compress_dispose();
+            break;
+
+        case OK_FIELD:
+            get_fields(d, cp);
+            if (!dbox_persist())
+                compress_dispose();
+            break;
+
+        case DEFAULT_FIELD:
+            set_defaults(d);
+            break;
+
+        case FIX_QUALITY_FIELD:
+            set_type(d, fixby_Quality);
+            break;
+        case FIX_SIZE_FIELD:
+            set_type(d, fixby_Size);
+            break;
+        case FIX_BANDWIDTH_FIELD:
+            set_type(d, fixby_Bandwidth);
+            break;
+
+        case FORMAT_MENU_FIELD:
+            popup_menu(dbox_syshandle(d));
+            break;
+
+        default:
+            (void) (dboxinc_processinc(d, DATA_RATE_FIELD, action, &datarate_inc, NULL) ||
+                    dboxinc_processinc(d, LATENCY_FIELD, action, &latency_inc, NULL) ||
+                    dboxinc_processinc(d, QUALITY_FIELD, action, &quality_inc, NULL) ||
+                    dboxinc_processinc(d, FRAME_SIZE_FIELD, action, &framesize_inc, NULL));
+            break;
+    }
+}
+
+/* ------------------------------------------------------------------------------------------ */
+
+static dbox compress_d = NULL;
+
+void compress_open(compress_str *cp)
+{
+    dbox d = compress_d;
+    if (d)
+        bring_to_front(dbox_syshandle(d));
+    else
+    {
+        template *tmpl = template_copy(template_find(COMPRESS_IDENT));
+
+        template_fixupblock(&tmpl->window, QUALITY_START, QUALITY_END, QUALITY_START, BANDWIDTH_START);
+        template_fixupblock(&tmpl->window, SIZE_START, SIZE_END, SIZE_START, BANDWIDTH_START);
+
+        if ((d = dbox_new_fromtemplate(tmpl)) != NULL)
+        {
+            compress_d = d;
+
+            dbox_showstatic(d);
+            dbox_eventhandler(d, compress_events, cp);
+
+            iconmenu_setup(compress_menus);
+            event_attachmenumaker(dbox_syshandle(d), menumake, menuhit, d);
+
+            copy_of_differ_options = cp->o.differ;
+            copy_of_compressor = cp->o.compressor;
+
+            set_type(d, cp->o.differ.opts & differ_FixBy);
+            set_fields(d, cp);
+        }
+
+        template_dispose(&tmpl);
+    }
+}
+
+void compress_dispose(void)
+{
+    if (compress_d)
+    {
+        iconmenu_dispose(compress_menus);
+
+        dbox_savepos(compress_d);
+        dbox_dispose(&compress_d);
+        compress_d = NULL;
+    }
+}
+
+void compress_readoptions(compress_str *cp)
+{
+    if (compress_d)
+        get_fields(compress_d, cp);
+}
+
+BOOL is_compress_open(void)
+{
+    return compress_d != NULL;
+}
+
+/*
+ * If cp != NULL then check that the compressor is suitable
+ * (check colour space and size).
+ * oherwise just return whether there are any compressors at all.
+ */
+
+static char *arinfo_checkdim(const arinfo_dimstr *dims, int size)
+{
+    if (size < dims->min)
+        return TOO_SMALL;
+    if (size > dims->max)
+        return TOO_LARGE;
+    if ((size % dims->inc) != 0)
+        return WRONG_ALIGN;
+    return NULL;
+}
+
+BOOL is_compress_available(const compress_str *cp)
+{
+    if (compress_menus[FORMAT_MENU].text == NULL)
+    {
+        if (cp)
+            werr(0, NO_COMPRESSORS);
+        return FALSE;
+    }
+
+    if (cp)
+    {
+        arinfo_str *ip = arinfo_info(arinfo_formattoindex(cp->o.compressor));
+        int src_space = cp->hdr->flags & armovie_ColourSpace;
+        char *msg;
+
+        if ((ip->colourspaces & (1 << src_space)) == 0)
+        {
+            werr(0, BAD_COLOURSPACE, ip->description);
+            return FALSE;
+        }
+
+        if ((msg = arinfo_checkdim(&ip->x, cp->hdr->xsize)) != NULL)
+        {
+            werr(0, BAD_SIZE, ip->description, X_MSG, msg);
+            return FALSE;
+        }
+
+        if ((msg = arinfo_checkdim(&ip->x, cp->hdr->ysize)) != NULL)
+        {
+            werr(0, BAD_SIZE, ip->description, Y_MSG, msg);
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+void compress_init(void)
+{
+    arinfo_init();
+
+    compress_menus[FORMAT_MENU].text = arinfo_makemenu(arinfo_BatchComp, arinfo_BatchComp);
+}
+
+/* eof compress.c */

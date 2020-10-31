@@ -1,0 +1,964 @@
+/*
+ * $Header: /smsa/bsd:etc/scsidm/scsidm.c:bsd  1.4  $
+ * $Source: /smsa/bsd:etc/scsidm/scsidm.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:        scsidm.c,v $
+ * Revision 1.4  90/08/15  16:18:51  jroach
+ * Update Risc OS textual version number to 1.03
+ * 
+ * Revision 1.3  90/08/13  15:27:00  jroach
+ * Bring Risc OS and RISCiX versions in line with each other.
+ * 
+ * Revision 1.2  90/05/25  11:23:44  kwelton
+ * Added support for optical devices.
+ * Now uses a minimal command table until first device is selected.
+ * 
+ * Revision 1.1  89/04/06  11:22:45  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /smsa/bsd:etc/scsidm/scsidm.c:bsd  1.4  $";
+#endif
+
+/*
+ * Copyright (c) 1983 Regents of the University of California.
+ * All rights reserved.  The Berkeley software License Agreement
+ * specifies the terms and conditions for redistribution.
+ */
+
+#ifndef lint
+char copyright[] =
+"@(#) Copyright (c) 1983 Regents of the University of California.\n\
+ All rights reserved.\n";
+#endif
+
+#include <stdio.h>
+#include <signal.h>
+#include <ctype.h>
+#include <setjmp.h>
+#if defined(SCSIDM_FOR_RISCiX)
+#include <syslog.h>
+#include <fcntl.h>
+#include <dev/ps_scsi.h>
+#elif defined(SCSIDM_FOR_RISCOS)
+#include "syslog.h"        /*RCM>>> was <syslog.h>      */
+#include "fcntl.h"         /*RCM>>> was <fcntl.h>       */
+#include "ps_scsi.h"       /*RCM>>> was <dev/ps_scsi.h> */
+#else
+#error Neither SCSIDM_FOR_RISCOS nor SCSIDM_FOR_RISCiX is defined
+#endif
+#include "scsidm.h"
+
+        /* declare globals */
+global char *name;              /* program name */
+global bool fromatty;           /* is stdin a terminal? */
+global int iperror;             /* has an error occured on input? */
+global char **iphelp;           /* help for input data */
+
+global struct cmd *cmdtab;      /* current list of available commands */
+global int ncmds;               /* no. of entries in current command table */
+global bool optical = FALSE;    /* flag explicitly supported optical drives */
+
+global struct d_parms *cdev = NULL;     /* parameters for current
+                                         * SCSI device */
+
+global struct scsiop devcmd;            /* next command block for
+                                         * the device */
+
+        /* import externals */
+import struct cmd initcmds[];   /* command table */
+import int ninitcmds;           /* no. of entries in cmdtab */
+
+        /* declare external routines */
+import long atol();
+import void *malloc(), device(), clrdef();
+
+        /* declare statics */
+static char cmdline[CANBSIZ];
+static int margc;
+static char *margv[20];
+
+static int rpt;
+static bool onceonly;
+static jmp_buf toplevel;
+
+        /* declare static routines */
+static void intr(), cmdscanner(), makeargv();
+static struct cmd *getcmd();
+
+        /* declare globa routines defined this segment */
+global unsigned long ipdata(), ipul();
+
+/************************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, scsidm.c:
+ *
+ * 1) int main() - program entry point
+ *
+ * 2) static void intr() - handler for ^C(RISCiX) or ESC(RISCOS) from keyboard
+ *
+ * 3) static void cmdscanner() - read & execute commands
+ *
+ * 4) static struct cmd *getcmd() - read next command
+ *
+ * 5) static void makeargv() - split cmd line into argc, argv format
+ *
+ * 6) void help() - print useful little help messages
+ *
+ * 7) unsigned long ipdata() - input data from stdin
+ *
+ * 8) unsigned long iplims() - input data & check against limits
+ *
+ * 9) int vdbool() - validate received data as boolean yes/no
+ *
+ * 10) int vdint() - validate received data as integer
+ *
+ * 11) unsigned long vdul() - validate received data as unsigned long
+ *
+ * 12) int vdstr() - validate received data as an ASCII string
+ *
+ */
+
+/************************************************************************/
+
+int main(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine main() -
+         *
+         * routine is the program entry point. if a command
+         * is given in argv, it tries to execute it & then
+         * finishes, otherwise it traps ^C(RISCiX) or ESC
+         * (RISCOS) signals and calls a routine to prompt
+         * for and execute all commands. this routine
+         * does not return.
+         *
+         */
+
+        /* declare autos */
+        register struct cmd *c;
+        char *rindex();
+
+        /* work out the program name */
+        if( (name = rindex(*argv,DIRECTORY_SEPARATOR)) == NULL )
+         name = *argv;
+        else
+         ++name;
+
+#if defined(SCSIDM_FOR_RISCOS)
+        /* initialise command table */
+        cmdtab = initcmds;
+        ncmds = ninitcmds;
+
+        if ((argv[1] != NULL) && (argv[1][0] == '-') &&
+            ((argv[1][1] == 'h') || (argv[1][1] == 'H'))
+           )
+        { argv[1]++;     /*>>>RCM kludge to allow 'scsidm -help' */
+        }
+        else
+        /* is there a device name given? */
+        if( --argc > 0 )
+        {
+         /* yes - use device to open it */
+         device(2,argv);
+
+         /* finished with device name in argv[1] */
+         ++argv;
+
+         /* cdev will be NULL if open failed */
+         if( cdev == NULL )
+          exit(1);
+        }
+#elif defined(SCSIDM_FOR_RISCiX)
+        /* is there a device name given? */
+        if( --argc > 0 )
+        {
+         /* yes - use device to open it */
+         device(2,argv);
+
+         /* finished with device name in argv[1] */
+         ++argv;
+
+         /* cdev will be NULL if open failed */
+         if( cdev == NULL )
+          exit(1);
+        }
+        else
+        {
+            /* initialise command table */
+            cmdtab = initcmds;
+            ncmds = ninitcmds;
+        }
+#endif
+
+        /* check whether input is from a tty */
+        fromatty = (bool)isatty(fileno(stdin));
+
+        /* trap signals */
+        signal(SIGINT, (int (*)())intr);
+
+        /* is there any command in argv? */
+        if( --argc > 0 )
+        {
+         /* read command & execute it */
+         onceonly = TRUE;
+         if( (c = getcmd(*++argv)) == (struct cmd *)-1)
+         {
+          fprintf(stderr,"Ambiguous command: %s\n",*argv);
+          exit(1);
+         }
+
+         else if( c == 0 )
+         {
+          fprintf(stderr,"Invalid command: %s\n",*argv);
+          exit(1);
+         }
+
+         else if( c->c_priv &&
+                 (cdev->d_type != DAPTYPE && cdev->d_type != OMPTYPE) )
+         {
+          fprintf(stderr,"Bad command for device type: %s\n",
+                   c->c_name);
+          exit(1);
+         }
+
+         else
+         {
+          /* print full command name if necessary */
+          if( strcmp(*argv,c->c_name) )
+           printf("command is `%s'\n",c->c_name);
+
+          *argv = c->c_name;
+          (*c->c_handler)(argc,argv);
+          exit(0);
+         }
+        }
+
+        /* nothing in argv - save context */
+        onceonly = FALSE;
+        rpt = setjmp(toplevel);
+
+        /* loop forever, reading & executing commands */
+        for(;;)
+        {
+         cmdscanner(rpt);
+         rpt = 1;
+        }
+
+        /*
+         * should never reach here, but don't
+         * treat it as an error if we do.
+         */
+        exit(0);
+}
+
+/************************************************************************/
+
+#if defined(SCSIDM_FOR_RISCOS)
+/*>>>RCM don't use C's gets, cos its crap */
+/*   ie now input length limiting and it  */
+/*      gets upset when ESCape is pressed */
+/*   So use good old reliable OS_ReadLine */
+
+#define swiOS_ReadLine 0xE
+
+char *mygets(buff)
+char *buff;
+{
+  int r[10];
+
+  r[0] = (int) buff;
+  r[1] = CANBSIZ-1;   /* leave room for the terminator */
+  r[2] = 32;
+  r[3] = 255;
+  SWIcall(swiOS_ReadLine, r);
+  buff[r[1]] = 0;  /* replace CR terminator with zero */
+  return("ok");
+}
+#elif defined(SCSIDM_FOR_RISCiX)
+char *gets();
+#define mygets(str) gets(str)
+#endif
+
+/************************************************************************/
+
+static void intr()
+
+{
+#if defined(SCSIDM_FOR_RISCOS)
+        /* re-install trap handler, cos C library has removed it */
+        signal(SIGINT,intr);         /*>>>RCM */
+#endif
+
+        /*
+         * subroutine intr() -
+         *
+         * routine is the ISR for a ^C(RISCiX) or ESC(RISCOS) signal.
+         * If stdin is not a terminal, then the routine calls exit(),
+         * else it restores the context held in toplevel. this routine
+         * does not return.
+         *
+         */
+
+        /* no autos */
+
+        if( !fromatty || onceonly )
+        {
+         if( onceonly )
+         {
+          putchar('\n');
+          fflush(stdout);
+         }
+         exit(0);
+        }
+
+        /* clear the defect list if necessary */
+        clrdef();
+
+        /* restore saved context */
+        longjmp(toplevel,1);
+}
+
+/************************************************************************/
+
+static void cmdscanner(rpt)
+
+int rpt;
+
+{
+        /*
+         * subroutine cmdscanner() -
+         *
+         * routine is the command parser: it reads a line from stdin
+         * then calls the requested command. no value is returned.
+         *
+         */
+
+        /* declare autos */
+        register struct cmd *c;
+        /*char *gets(); JSR>>> use mygets so that the RISCOS version can replace it */
+
+        if( rpt )
+         putchar('\n');
+
+        for(;;)
+        {
+         if( fromatty )
+         {
+          printf("%s> ",name);
+          fflush(stdout);
+         }
+
+         if( mygets(cmdline) == NULL )
+         {
+          putchar('\n');
+          quit();
+         }
+
+         if( cmdline[0] == '\0' )
+          break;
+
+         /* split the command line up & search for the given command */
+         makeargv();
+
+         if( margc <= 0 )
+             break;        /*>>>RCM stops a line of spaces being */
+                       /*       treated as a crap command    */
+
+         c = getcmd(*margv);
+
+         if( c == (struct cmd *)-1 )
+         {
+          printf("Ambiguous command: %s\n",*margv);
+          continue;
+         }
+
+         else if( c == 0 )
+         {
+          printf("Invalid command: %s\n",*margv);
+          continue;
+         }
+
+         else if( c->c_priv &&
+                 (cdev->d_type != DAPTYPE && cdev->d_type != OMPTYPE) )
+         {
+          printf("Bad command for device type: %s\n",
+                  c->c_name);
+          continue;
+         }
+
+         else
+         {
+          /* print the full command if necessary */
+          if( strcmp(*margv,c->c_name) )
+           printf("%s\n",c->c_name);
+
+          *margv = c->c_name;
+          (*c->c_handler)(margc, margv);
+         }
+        }
+
+        /* loop has broken, restore saved context */
+        longjmp(toplevel, 0);
+}
+
+/************************************************************************/
+
+static struct cmd *getcmd(name)
+
+char *name;
+
+{
+        /*
+         * subroutine getcmd() -
+         *
+         * routine searches the list of commands in cmdtab for
+         * a unique match to name. returned value is 0 if no
+         * match found, -1 if more than one match found, else
+         * a pointer to the appropriate member of cmdtab
+         *
+         */
+
+        /* declare autos */
+        register char *p, *q;
+        register struct cmd *c, *found;
+        register int nmatches, longest;
+
+        longest = 0;
+        nmatches = 0;
+        found = (struct cmd *)0;
+
+        for( c = cmdtab; *(p = c->c_name) != '\0'; c++ )
+        {
+#if defined(SCSIDM_FOR_RISCOS)
+         for( q = name; tolower(*q) == tolower(*p++); q++ )
+#elif defined(SCSIDM_FOR_RISCiX)
+         for( q = name; *q == *p++; q++ )
+#endif
+          /* exact match? */
+          if( *q == 0 )
+           return(c);
+
+         if( !*q )
+         {
+          /* the name was a prefix */
+          if( (q - name) > longest )
+          {
+           longest = q - name;
+           nmatches = 1;
+           found = c;
+          }
+
+          else if( q - name == longest )
+           nmatches++;
+         }
+        }
+
+        if (nmatches > 1)
+         return((struct cmd *) -1);
+        else
+         return(found);
+}
+
+/************************************************************************/
+
+static void makeargv()
+
+{
+        /*
+         * subroutine makeargv() -
+         *
+         * routine slices the string in cmdline into whitespace
+         * delimited lumps, and puts a pointer to each lump into
+         * margv, with margc the number of lumps. no value is
+         * returned.
+         *
+         */
+
+        /* declare autos */
+        register char *cp;
+        register char **argp = margv;
+
+        margc = 0;
+        for( cp = cmdline; *cp; )
+        {
+         while( isspace(*cp) )
+          cp++;
+
+         if (*cp == '\0')
+          break;
+
+        *argp++ = cp;
+        margc += 1;
+        while( *cp != '\0' && !isspace(*cp) )
+         cp++;
+
+        if( *cp == '\0' )
+         break;
+
+        *cp++ = '\0';
+        }
+
+        /* set a NULL string to mark end of list */
+        *argp++ = 0;
+        return;
+}
+
+/************************************************************************/
+
+#define HELPINDENT (sizeof("stickitupyerbum"))
+
+void help(argc,argv)
+
+int argc;
+char **argv;
+
+{
+        /*
+         * subroutine help() -
+         *
+         * routine prints useful help messages, either a list of
+         * commands if no arguments are given, otherwise specific
+         * information on each command named in argv. no value is
+         * returned.
+         *
+         */
+
+        /* declare autos */
+        register int ncprint = 0;
+        register struct cmd *c;
+
+        if( argc == 1 )
+        {
+         register int i, j, w;
+         int columns, width = 0, lines;
+         register struct cmd *wktab;
+
+         /*
+          * some commands may be restricted: use a working copy
+          * of cmdtab that only contains unrestricted commands.
+          * this allows us to maintain the natty style of
+          * printout we have adopted.
+          */
+         if( (wktab = malloc(ncmds * sizeof(*wktab))) == NULL )
+         {
+          fputs("help(): cannot allocate any core\n",stdout);
+          return;
+         }
+
+#if defined(SCSIDM_FOR_RISCOS)
+         printf("SCSIDM (RISC OS) version 1.11\n\n");
+#endif
+
+         printf("Commands may be abbreviated.  Commands are:\n\n");
+
+         /* calculate max. length of any command name */
+         for( c = cmdtab; c < (cmdtab + ncmds); c++ )
+         {
+          int len;
+
+          /* ignore unwanted commands */
+          if( c->c_priv && cdev && 
+             (cdev->d_type != DAPTYPE && cdev->d_type != OMPTYPE) )
+           /* ignore this command */
+           continue;
+
+          /* this command is OK - copy it across & increment counter */
+          wktab[ncprint++] = *c;
+
+          if( (len = strlen(c->c_name)) > width )
+           width = len;
+         }
+
+         /* calculate the no. of columns that can be supported */
+         width = (width + 8) & ~7;
+         columns = 80 / width;
+         if( columns == 0 )
+          columns = 1;
+
+         /* how many lines are needed? */
+         lines = (ncprint + columns - 1) / columns;
+         for( i = 0; i < lines; i++)
+         {
+          for( j = 0; j < columns; ++j )
+          {
+           c = wktab + j * lines + i;
+
+           printf("%s", c->c_name);
+
+           if( (c + lines) >= &wktab[ncprint] )
+           {
+            printf("\n");
+            break;
+           }
+
+           w = strlen(c->c_name);
+           while( w < width )
+           {
+#if defined(SCSIDM_FOR_RISCOS)
+            putchar(' ');  /*>>>RCM print spaces */
+            w = w + 1;
+#elif defined(SCSIDM_FOR_RISCiX)
+            w = (w + 8) &~ 7;
+            putchar('\t');
+#endif
+           }
+          }
+         }
+         return;
+        }
+
+        /* arguments given to help command */
+        while( --argc > 0 )
+        {
+         register char *arg;
+         arg = *++argv;
+
+         c = getcmd(arg);
+         if( c == (struct cmd *) -1 )
+          printf("Ambiguous help command: %s\n",arg);
+
+         else if( c == (struct cmd *) 0 ||
+                 (c != (struct cmd *) -1 && c->c_priv &&
+                  cdev &&
+                   (cdev->d_type != DAPTYPE && cdev->d_type != OMPTYPE)) )
+          printf("Invalid help command: %s\n",arg);
+
+         else
+          printf("%-*s\t%s\n",HELPINDENT,c->c_name,c->c_help);
+        }
+}
+
+/************************************************************************/
+
+unsigned long ipdata(ipbuf,prompt,checkfun,retdef)
+
+char *ipbuf, *prompt;
+int (*checkfun)();
+bool retdef;
+
+{
+        /*
+         * subroutine ipdata() -
+         *
+         * routine uses checkfun() to validate the data in ipbuf.
+         * if prompt is not NULL, it prompts for the data first
+         * and keeps reading until checkfun() is satisfied.
+         * returned value is the final return code from checkfun().
+         *
+         */
+
+        /* declare autos */
+        register unsigned long retc;
+
+        /*
+         * if no prompt is given, just check
+         * what is already in ipbuf.
+         */
+        if( prompt == NULL )
+         retc = (unsigned long)(*checkfun)(ipbuf,TRUE);
+
+        else if( fromatty )
+        {
+         do
+         {
+          /* put the prompt out */
+          fputs(prompt,stdout);
+
+          if( mygets(ipbuf) == NULL )
+          {
+           if( feof(stdin) )
+           {
+            /* clear the prompt line & input stream */
+            fputs("\nPlease do not do that again\n",stdout);
+            clearerr(stdin);
+
+            /* ask again */
+            *ipbuf = '\0';
+            continue;
+           }
+
+           else
+           {
+            /* something is BADLY wrong */
+#if defined(SCSIDM_FOR_RISCOS)
+            fprintf(stderr,"\nFatal error on reading standard input\n");
+#elif defined(SCSIDM_FOR_RISCiX)
+            fprintf(stderr,"\n** bad news **  Error on reading standard input\n");
+#endif
+            exit(1);
+           }
+          }
+
+          /* was anything given at all */
+          else if( *ipbuf == '\0' )
+          {
+           if( retdef )
+            return(USEDEFAULT);
+
+           else
+           {
+#if defined(SCSIDM_FOR_RISCOS)
+            fputs("You must give an answer, use Esc to abort the command\n",
+                  stdout);  /*>>>RCM */
+#elif defined(SCSIDM_FOR_RISCiX)
+            fputs("You must give an answer, use ^C to abort the command\n",
+                  stdout);
+#endif
+            continue;
+           }
+          }
+
+          /* did the user ask for help? */
+          if( !strncmp(ipbuf,"help",strlen(ipbuf)) ||
+             (*ipbuf == '?' && *(ipbuf + 1) == '\0') )
+          {
+           /* print it out */
+           register char **cptr;
+
+           putchar('\n');
+           for( cptr = iphelp; **cptr != '\0'; ++cptr )
+            fprintf(stdout,"\t%s\n",*cptr);
+           putchar('\n');
+
+           /* repeat the question */
+           *ipbuf = '\0';
+           continue;
+          }
+
+          /* validate the reply */
+          retc = (unsigned long)(*checkfun)(ipbuf,FALSE);
+         } while( (retc == BADARG && iperror) || *ipbuf == '\0' );
+        }
+
+        else
+        {
+         /* reading from something other than a tty - be more rigorous */
+         if( mygets(ipbuf) == NULL )
+         {
+          fputs("unexpected EOF on stdin - abort\n",stderr);
+          exit(1);
+         }
+
+         if( (retc = (unsigned long)(*checkfun)(ipbuf,FALSE)) == BADARG &&
+              iperror )
+         {
+          fputs("cannot recover from error - goodbye\n",stderr);
+          exit(1);
+         }
+        }
+
+        /* return the final state */
+        return(retc);
+}
+
+/************************************************************************/
+
+unsigned long iplims(ipbuf,prompt,checkfun,limlo,limhi,retdef)
+
+char *ipbuf, *prompt;
+int (*checkfun)(), limlo, limhi;
+bool retdef;
+
+{
+        /*
+         * subroutine iplims() -
+         *
+         * routine uses ipdata() to input data as normal, then checks
+         * the result against the passed limits. If prompt is not NULL,
+         * it repeatedly inputs data until the result is within the
+         * limits. returned value is the final code received from
+         * ipdata().
+         *
+         */
+
+        /* declare autos */
+        register long retc;
+
+        for(;;)
+        {
+         retc = (long)ipdata(ipbuf,prompt,checkfun,retdef);
+
+         /* was default signalled */
+         if( retc == USEDEFAULT && *ipbuf == '\0' )
+          /* yes */
+          return(USEDEFAULT);
+
+         if( iperror == FALSE && (retc < limlo || retc > limhi) )
+         {
+          if( prompt == NULL )
+           /* this is the only chance for an error message */
+           printf("Bad number `%ld': must be in the range %d to %d\n",
+                  retc,limlo,limhi);
+
+          retc = BADARG;
+          iperror = TRUE;
+         }
+
+         /* return when satisfied */
+         if( iperror == FALSE || prompt == NULL )
+          return((unsigned long)retc);
+
+         /* not satisfied - try again */
+         printf("Answer must be in the range %d to %d, try again\n",
+                limlo,limhi);
+        }
+
+        /*NOTREACHED*/
+}
+
+/************************************************************************/
+
+int vdbool(ipbuf,isanarg)
+
+char *ipbuf;
+bool isanarg;
+
+{
+        /*
+         * subroutine vdbool() -
+         *
+         * routine validates the data in ipbuf as a proper boolean,
+         * i.e. `yes' or `no'. isanarg is used to condition error
+         * messages.
+         *
+         */
+
+        /* declare autos */
+        register int arglen;
+
+#if defined(SCSIDM_FOR_RISCOS)
+        int i;
+#endif
+
+        /* clear the error flag */
+        iperror = FALSE;
+
+        arglen = strlen(ipbuf);
+
+#if defined(SCSIDM_FOR_RISCOS)
+        for (i=0; i<arglen; i++) ipbuf[i] = tolower(ipbuf[i]); /*RCM>>> lowercase the reply */
+#endif
+
+        /* is this an affirmative */
+        if( !strncmp(ipbuf,"yes",arglen) )
+         return(TRUE);
+
+        else if( !strncmp(ipbuf,"no",arglen) )
+         return(FALSE);
+
+        else
+        {
+         fprintf(stderr,"invalid %s `%s' - should be `yes' or `no'\n",
+                isanarg ? "argument" : "reply",ipbuf);
+         iperror = TRUE;
+         return(BADARG);
+        }
+
+        /*NOTREACHED*/
+}
+
+/************************************************************************/
+
+int vdint(ipbuf,isanarg)
+
+char *ipbuf;
+bool isanarg;
+
+{
+        /*
+         * subroutine vdint() -
+         *
+         * routine validates the data in ipbuf an a valid integer
+         * string. returned value is TRUE if so, else BADARG.
+         *
+         */
+
+        /* declare autos */
+        register int retc;
+
+        /* clear input error flag */
+        iperror = FALSE;
+
+        /* convert & check the result */
+        if( (retc = atoi(ipbuf)) == 0 && *ipbuf != '0' )
+        {
+         retc = BADARG;
+         iperror = TRUE;
+         printf("bad integer %s: %s\n",
+                isanarg ? "argument" : "input",ipbuf);
+        }
+
+        /* return the decision */
+        return(retc);
+}
+
+/************************************************************************/
+
+unsigned long vdul(ipbuf,isanarg)
+
+char *ipbuf;
+bool isanarg;
+
+{
+        /*
+         * subroutine vdul() -
+         *
+         * routine validates the data in ipbuf as a valid unsigned long
+         * string. returned value is TRUE if so, else (unsigned long)BADARG.
+         *
+         */
+
+        /* declare autos */
+        register long retc;
+
+        /* clear input error flag */
+        iperror = FALSE;
+
+        /* convert & check the result */
+        if( (retc = (unsigned long)atol(ipbuf)) == 0 && *ipbuf != '0')
+        {
+         retc = BADARG;
+         iperror = TRUE;
+         printf("bad unsigned integer %s: %s\n",
+                isanarg ? "argument" : "input",ipbuf);
+        }
+
+        /* return the decision */
+        return(retc);
+}
+
+/**********************************************************************/
+
+int vdstr()
+
+{
+        /*
+         * subroutine vdstr() -
+         *
+         * routine validates input data as a valid ASCII string. since this
+         * covers anything that can be entered, all it has to do is clear
+         * error flags & return an OK status.
+         *
+         */
+
+        /* do it */
+        iperror = FALSE;
+
+        /* done it */
+        return(TRUE);
+}
+
+/************************************************************************/

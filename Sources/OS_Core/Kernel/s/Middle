@@ -1,0 +1,1293 @@
+        TTL     => Middle
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; VecRdLine - Read line from input stream (OSWORD 0 equivalent)
+
+; In    r0 -> buffer for characters
+;       r1 = max length of line (excluding carriage return)
+;       r2 = lowest character put into buffer
+;       r3 = highest character put into buffer
+;       wp -> OsbyteVars
+
+; Out   r1 = length of line (excluding carriage return)
+;       C=0 => line terminated by return (CR or LF)
+;       C=1 => line terminated by ESCAPE
+
+; ReadLine: suggested extensions (available RSN)
+;
+; are 1) stopping it reflecting control characters/characters not put in the
+;        buffer
+;     2) making any reflection print a given character (for hiding passwords
+;        etc
+;
+; So, definition is :
+;
+; Top byte R0 contains flags :
+;   Bit 31 set means don't reflect characters that don't go in the buffer
+;   Bit 30 set means reflect with the character in R4
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+VecRdLine ROUT
+
+        Push    "R4-R7"
+        AND     R7, R0, #&C0000000      ; extract flags
+        AND     R4, R4, #&FF
+        ORR     R7, R7, R4              ; got flags, potential echo byte in R7
+
+        BIC     R4, R0, #ARM_CC_Mask-3  ; R4 -> buffer
+
+        MOV     R6, #0                  ; R6 = index into buffer
+        STRB    R6, PageModeLineCount   ; reset page lines
+
+        B       %FT10
+        LTORG
+
+05
+        SWI     XOS_WriteC
+        BVS     ReadLine_Vset
+10
+        SWI     XOS_ReadC
+        BVS     ReadLine_Vset
+        BCS     %FT70                   ; ESCAPE
+
+        LDRB    R5, WrchDest            ; does output include VDU ?
+        TST     R5, #2
+        BNE     %FT30                   ; no, then still buffer
+
+        LDRB    R5, VDUqueueItems       ; is VDU queueing ?
+        TEQ     R5, #0
+        BNE     %BT05                   ; yes, then just print
+
+30
+        TEQ     R0, #127                ; is it DELETE ?
+        TEQNE   R0, #8                  ; or backspace?
+        BNE     %FT40                   ; no, then skip
+
+        TEQ     R6, #0                  ; yes, then have we any chars ?
+        BEQ     %BT10                   ; no, then loop
+        SUB     R6, R6, #1              ; go back 1 char
+        MOV     R0, #127
+        B       %BT05                   ; print DEL and loop
+
+40
+        TEQ     R0, #21                 ; is it CTRL-U ?
+        BNE     %FT50                   ; no, then skip
+
+        TEQ     R6, #0                  ; yes, then have we any chars ?
+        BEQ     %BT10                   ; no, then loop
+
+45
+        SWI     XOS_WriteI+127          ; print DELs to start of line
+        BVS     ReadLine_Vset
+        SUBS    R6, R6, #1
+        BNE     %BT45
+        B       %BT10                   ; then loop
+
+50
+        TEQ     R0, #13                 ; is it CR ?
+        TEQNE   R0, #10                 ; or LF ?
+        MOVEQ   r0, #13                 ; always store CR if so
+        STRB    R0, [R4, R6]            ; store byte in buffer
+        BEQ     %FT60                   ; Exit if either
+
+        CMP     R6, R1                  ; is buffer full ?
+        MOVCS   R0, #7                  ; if so, beep and loop
+        BCS     %BT05
+
+        CMP     R0, R2                  ; is char >= min ?
+        CMPCS   R3, R0                  ; and char <= max ?
+        ADDCS   R6, R6, #1              ; if so, then inc pointer
+        BCS     %FT80
+        CMP     R7, #0                  ; no reflection
+        BMI     %BT10                   ; of non-entered chars
+
+80      TST     R7, #1:SHL:30
+        ANDNE   R0, R7, #&FF            ; echo char -> R0
+
+        B       %BT05                   ; echo character
+
+60      SWI     XOS_NewLine
+        BVS     ReadLine_Vset
+
+; insert code here to call NetVec with R0 = &0D
+
+70
+        CLRV
+EndReadLine
+        MOVVC   R0, R4                  ; restore R0
+        MOV     R5, #0
+        LDRB    R5, [R5, #ESC_Status]
+        MOVS    R5, R5, LSL #(32-6)     ; shift esc bit into carry
+
+        MOV     R1, R6                  ; R1 := length
+        Pull    "R4-R7, lr"             ; Always claiming vector
+        BIC     lr, lr, #V_bit :OR: C_bit
+        MOV     r12, pc
+        AND     r12, r12, #V_bit :OR: C_bit
+        ORRS    pc, lr, r12             ; back with C, V affected.
+
+ReadLine_Vset
+        SETV
+        B       EndReadLine
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_Control (deprecated): set handlers
+
+SCTRL   Push    "R0-R3, lr"
+
+        TEQP    PC, #SVC_mode+I_bit ; need IRQs off to get consistent state
+        MOV     R0, #EventHandler
+        MOV     R1, R3
+        BL      CallCESWI
+        STR     R1, [stack, #3*4]
+
+        MOV     R0, #EscapeHandler
+        LDR     R1, [stack, #2*4]
+        BL      CallCESWI
+        STR     R1, [stack, #2*4]
+
+        MOV     R0, #ErrorHandler
+        Pull    "R1, R3"
+        BL      CallCESWI
+        MOV     R0, R1
+        MOV     R1, R3
+
+        Pull    "R2, R3, lr"
+        ExitSWIHandler
+
+
+CallCESWI
+        Push    lr
+        MOV     r2, #0                  ; readonly
+        SWI     XOS_ChangeEnvironment
+        Pull    pc
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_SetEnv (deprecated): Environment setting
+
+SSTENV  Push    "R0, R1, lr"
+        TEQP    PC, #SVC_mode+I_bit     ; no irqs - want consistent set.
+        MOV     R0, #AddressExceptionHandler
+        MOV     R1, R7
+        SWI     XOS_ChangeEnvironment
+        MOV     R7, R1
+
+        MOV     R0, #DataAbortHandler
+        MOV     R1, R6
+        SWI     XOS_ChangeEnvironment
+        MOV     R6, R1
+
+        MOV     R0, #PrefetchAbortHandler
+        MOV     R1, R5
+        SWI     XOS_ChangeEnvironment
+        MOV     R5, R1
+
+        MOV     R0, #UndefinedHandler
+        MOV     R1, R4
+        SWI     XOS_ChangeEnvironment
+        MOV     R4, R1
+
+        MOV     R0, #MemoryLimit
+        LDR     R1, [stack, #4]
+        SWI     XOS_ChangeEnvironment
+        STR     R1, [stack, #4]
+
+        MOV     R0, #ExitHandler
+        Pull    "R1"
+        BL      CallCESWI
+        Push    "R1"
+
+        MOV     R12, #0
+        LDR     R2, [R12, #RAMLIMIT]    ; this is read-only
+        MOV     R3, #0                  ; never any Brazil-type buffering
+                                        ; m2 tools will complain if there is!
+        Pull    "R0, R1, lr"
+        ExitSWIHandler
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Change user state SWIs
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+SINTON  BIC     lr, lr, #I_bit
+        ExitSWIHandler
+
+SINTOFF ORR     lr, lr, #I_bit
+        ExitSWIHandler
+
+SENTERSWI ORR   lr, lr, #SVC_mode
+        ExitSWIHandler
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_BreakPt: user breakpoint - unsuitable for debugging SVC mode code!
+
+SBRKPT ROUT
+
+        ADD     sp, sp, #4              ; discard stacked R11
+        MOV     r12, #0
+        LDR     r12, [r12, #BrkBf]
+        SUB     r14, R14, #4
+        STR     r14, [r12, #15*4]       ; PC of the SWI put in.
+        TST     r14, #SVC_mode
+        BNE     %FT01
+        STMIA   r12!, {r0}
+        MOV     r0, r12
+        LDMFD   sp, {r10-r12}
+
+  [ SASTMhatbroken
+        STMIA   r0!,{r1-r12}
+        STMIA   r0, {r13_usr,r14_usr}^ ; user mode case done.
+        SUB     r0, r0, #12*4
+  |
+        STMIA   r0, {r1-r12, r13_usr, r14_usr}^ ; user mode case done.
+        NOP
+  ]
+
+10      LDR     stack, =SVCSTK
+        MOV     r12, #BrkAd_ws
+        LDMIA   r12, {r12, pc}          ; call breakpoint handler
+
+
+01      TST     r14, #1                 ; SWI mode?
+        TSTNE   r14, #2
+        BNE     %FT02                   ; [yes]
+
+        STMIA   r12!, {r0}
+        MOV     r0, r12
+        LDMFD   sp, {r10-r12}           ; Not banked if IRQ mode
+        TEQP    pc, R14                 ; get at registers
+        NOP
+        STMIA   r0, {r1-r14}
+        TEQP    pc, #SVC_mode
+        B       %BT10
+
+
+02      MOV     r14, r12                ; supervisor mode. R14 in buffer dead
+        LDMFD   sp!, {r10-r12}
+        STMIA   r14, {r0-r14}
+        B       %BT10
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_UnusedSWI (deprecated): Set the unused SWI handler
+
+SUNUSED Push    "R1, lr"
+        MOV     R1, R0
+        MOV     R0, #UnusedSWIHandler
+        SWI     XOS_ChangeEnvironment
+        MOV     R0, R1
+        Pull    "R1, lr"
+        ExitSWIHandler
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_SetCallBack: Set callback flag
+
+SSETCALL ROUT
+
+        TEQP    pc, #SVC_mode+I_bit
+        MOV     r10, #0
+        LDRB    r11, [r10, #CallBack_Flag]
+        ORR     r11, r11, #CBack_OldStyle
+        STRB    r11, [r10, #CallBack_Flag]
+        Pull    "r11"
+        Pull    "r10-r12"
+        MOVS    pc, lr                  ; Do NOT exit via normal mechanism
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI read mouse information
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+VecMouse
+     MOV   R10, #MouseV
+     TEQP  PC, #SVC_mode+I_bit ; no irqs
+     Push "lr"
+     BL    CallVector
+     Pull "lr"
+     ExitSWIHandler
+
+ [ :LNOT: DriversInKernel
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_SerialOp when not in kernel
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+SerialOp ROUT
+        MOV     r10, #SerialV
+        Push    lr
+        BL      CallVector
+        Pull    lr
+        BICCC   lr, lr, #C_bit
+        ORRCS   lr, lr, #C_bit
+        B       SLVK_TestV
+ ]
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Supervisor routines to set default handlers
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+; Reset Error and Escape handlers
+
+DEFHAN LDR  R1, =GeneralMOSBuffer         ; decent length error buffer
+       ADR  R0, ERRORH
+       ADR  R2, ESCAPH
+       MOV  R3, #0
+       MOV  R4, R14
+       SWI  XOS_Control
+
+       MOV  r0, #UpCallHandler
+       ADR  r1, DefUpcallHandler
+       MOV  r2, #0
+       SWI  XOS_ChangeEnvironment
+
+       MOV  PC, R4
+
+; Reset Exception, Event, BreakPoint, UnusedSWI, Exit and CallBack handlers
+
+DEFHN2 MOV  R12, R14
+       MOV  R0, #0
+       MOV  R1, #0
+       MOV  R2, #0
+       ADR  R3, EVENTH
+       SWI  XOS_Control
+       LDR  R0, =DUMPER
+       ADR  R1, NOCALL
+       SWI  XOS_CallBack
+       ADRL R0, CLIEXIT
+       MOV  R1, #0
+       MOV  R2, #0
+       ADR  R4, UNDEF
+       ADR  R5, ABORTP
+       ADRL R6, ABORTD
+       ADRL R7, ADDREX
+       SWI  XOS_SetEnv
+       LDR  R0, =DUMPER
+       ADR  R1, DEFBRK
+       SWI  XOS_BreakCtrl
+       ADRL R0, NoHighSWIHandler
+       SWI  XOS_UnusedSWI
+       MOV  PC, R12
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; system handlers
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+DefUpcallHandler
+ESCAPH
+EVENTH  MOV     pc, lr
+
+
+NOCALL  MOV     r0, #0                  ; default callback routine
+        LDR     r14, [r0, #CallBf]
+        LDMIA   r14, {r0-r12, r13_usr, r14_usr}^ ; load user's regs
+        NOP
+        LDR     r14, [r14, #4*15]
+        MOVS    pc, r14
+
+
+ERRORH ROUT
+
+      [ International
+        ADR     R0,KernelMessagesBlock+4
+        ADR     R1,ErrorToken
+        MOV     R2,#0
+        SWI     XMessageTrans_Lookup
+        MOVVC   R12,R2
+        ADRVS   R12,ErrorText
+
+01
+        LDRB    R0,[R12],#1
+        CMP     R0,#32
+        BLT     %FT99
+        CMP     R0,#"%"
+        SWINE   XOS_WriteC
+        BVS     %FT99 
+        BNE     %BT01 
+
+        LDRB    R0,[R12],#1              ; Found a %
+        CMP     R0,#32
+        BLT     %FT99
+
+        CMP     R0,#"0"
+        LDREQ   R0,=GeneralMOSBuffer+8
+        BEQ     %FT10
+        CMP     R0,#"1"
+        BNE     %BT01
+
+        LDR     R3,=GeneralMOSBuffer+4
+        LDR     R0,[R3]       
+        LDR     R1,=MOSConvertBuffer
+        MOV     R2,#12
+        SWI     XOS_ConvertHex8
+
+02
+        LDRB    R1, [R0], #1
+        CMP     R1, #"0"
+        BEQ     %BT02
+        CMP     R1, #0
+        SUBEQ   R0, R0, #1
+        SUB     R0, R0, #1 
+
+10
+        SWI     XOS_Write0
+        BVC     %BT01
+
+99
+        SWI     XOS_NewLine
+
+        MOV     R0, #0
+        STRB    R0, [R0, #ErrorSemaphore]                 ; Enable error translation, in case we got here in the 
+                                                        ; middle of looking up an error
+
+        B       GOSUPV
+
+ErrorToken      =       "Error:"
+ErrorText       =       "Error: %0 (Error Number &%1)",0
+        ALIGN
+      |
+
+        SWI     OS_WriteS
+        =       10,13,"Error:",10,13, 0
+        ALIGN
+        LDR     r0, =GeneralMOSBuffer+4
+        BL      PrintError
+        B       GOSUPV
+      ]
+
+
+DEFBRK  
+      [ International 
+        TEQP    pc, #0
+        MOV     r0, r0
+        MOV     r13, #0
+        LDR     r13, [r13, #BrkBf]
+        LDR     r0, [r13, #15*4]
+        LDR     r1, =GeneralMOSBuffer
+        MOV     r2, #?GeneralMOSBuffer
+        SWI     OS_ConvertHex8
+
+; r0 -> address
+
+        MOV     R4,R0
+        ADR     R0,KernelMessagesBlock+4
+        ADR     R1,BreakToken
+        LDR     R2,=GeneralMOSBuffer+16
+        MOV     R3,#256-16
+        SWI     XMessageTrans_Lookup
+        MOVVC   R0,R2
+        ADRVS   R0,BreakText
+        SWI     OS_Write0
+        SWI     OS_NewLine
+
+      |
+        SWI     OS_WriteS
+        = "Stopped at break point at &", 0
+        ALIGN
+        TEQP    pc, #0
+        MOV     r0, r0
+        MOV     r13, #0
+        LDR     r13, [r13, #BrkBf]
+        LDR     r0, [r13, #15*4]
+        LDR     r1, =GeneralMOSBuffer
+        MOV     r2, #?GeneralMOSBuffer
+        SWI     OS_ConvertHex8
+        SWI     OS_Write0
+        SWI     OS_NewLine
+      ]
+
+Quit_Code
+        SWI     OS_Exit
+
+      [ International
+
+BreakToken      =       "BreakPt:"
+BreakText       =       "Stopped at break point at &%0",0
+        ALIGN
+
+      ]
+
+PrintError
+        MOV    R12, R14
+        LDR    R10, [R0], #4
+        SWI    XOS_Write0
+        BVS    %FT02  
+      [ :LNOT: International
+        SWI    XOS_WriteS
+        =     " (Error number &", 0
+        BVS    %FT02
+      ]
+        LDR    R1,=GeneralMOSBuffer
+        MOV    R2, #&E0
+        MOV    R0, R10
+        SWI    XOS_ConvertHex8       ; can't fail!
+01      LDRB   R1, [R0], #1
+        CMP    R1, #"0"
+        BEQ    %BT01
+        CMP    R1, #0
+        SUBEQ  R0, R0, #1
+      [ International                   ; We might not have any stack so ..
+        SUB    R11,R0, #1               ; R11 -> Error number
+        ADR    R0, KernelMessagesBlock+4
+        ADR    R1, PrintErrorString
+        MOV    R2,#0                    ; Don't copy message
+        SWI    XMessageTrans_Lookup
+        ADRVS  R2,PrintErrorString+4    ; If no MessageTrans point at english text.
+11
+        LDRB   R0,[R2],#1
+        CMP    R0,#32
+        BLT    %FT13
+        CMP    R0,#"%"
+        SWINE  XOS_WriteC
+        BVS    %FT13
+        BNE    %BT11
+
+        LDRB    R0,[R2],#1
+        CMP     R0,#32
+        BLT     %FT13                   ; Just in case the % is the last character !
+
+        CMP     R0,#"0"                 ; We only know about %0
+        BNE     %BT11
+
+12                       
+        LDRB    R0,[R11],#1              ; Print error number.
+        CMP     R0,#32
+        BLT     %BT11
+        SWI     XOS_WriteC
+        BVC     %BT12
+
+13
+      |
+        SUB    R0, R0, #1
+        SWI    XOS_Write0
+        SWIVC  XOS_WriteI+")"
+      ]
+        SWIVC  XOS_NewLine
+02      MOVS   PC, R12
+
+      [ International
+PrintErrorString
+        =     "Err: (Error number &%0)", 0
+        ALIGN
+      ]
+
+        LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Exception handling
+
+DumpyTheRegisters  ROUT
+        LDR     R1, [R0, -R0]         ; PC when exception happened
+        STR     R1, [R0, #(15-8)*4]   ; In the right slot now ...
+        TST     R1, #SVC_mode
+  [ SASTMhatbroken
+        STMEQIA R0!,{R8-R12}
+        STMEQIA R0, {R13,R14}^        ; user mode case done.
+        SUBEQ   R0, R0, #5*4
+  |
+        STMEQIA R0, {R8-R14}^         ; user mode case done.
+  ]
+        BEQ     UNDEF1
+
+        TST     R1, #1                ; SWI mode?
+        TSTNE   R1, #2
+        BNE     %FT02
+        ORR     R1, R1, #I_bit :OR: F_bit
+                                 ; keep interrupts off until handlers restored
+        TEQP    R1, #0                  ; get at registers
+        NOP
+        STMIA   R0, {R8-R14}
+        TEQP    PC, #SVC_mode :OR: I_bit :OR: F_bit
+        AND     R1, R1, #SVC_mode
+        EORS    R2, R1, #FIQ_mode       ; Was we in FIQ ? Zero if so
+        MOVEQ   R3, #IOC
+        STREQB  R2, [R3, #IOCFIQMSK]    ; Blow away all FIQ sources
+        B       UNDEF1
+
+02      STMIA   R0, {R8-R14}
+
+; ... and fall into
+
+UNDEF1  LDR     sp, =SVCSTK             ; Flatten superstack
+
+ [ ExceptionsAreErrors
+        MOV     R0, #0
+        LDR     R0, [R0, #ExceptionDump]
+        ADD     R1, R0, #10*4           ; point at dumped R10
+        LDMIA   R1, {R10-R12}           ; try and put back user registers
+        Push    "R10-R12"               ; for error handler to find on stack
+        LDR     R1, [R0, #15*4]
+        Push    R1
+
+        LDR     R0, BranchThroughZeroInstruction ; load the B RESET1 instr.
+        STR     R0, [R1, -R1]           ; and store it at zero again
+
+        BIC     R14, R14, #ARM_CC_Mask
+        LDR     R0, =GeneralMOSBuffer+128 ; so can do deviant sharing !
+
+       [ International
+        MOV     r10, #0
+        LDRB    r10, [r10, #ErrorSemaphore]
+        TEQ     r10, #0                 ; if ok to translate error
+        MOVEQ   r10, r14
+        BEQ     %FT10
+       ]
+
+        LDR     r11, [r14], #4          ; Copy error number
+        STR     r11, [r0], #4
+
+01      LDRB    r11, [r14], #1          ; Copy error string
+        STRB    r11, [r0], #1
+        CMP     r11, #"%"               ; Test for "%" near end of string
+        BNE     %BT01
+10
+        SUB     r1, r0, #1              ; point, ready for conversion
+
+        LDR     R2, =GeneralMOSBuffer+?GeneralMOSBuffer
+        SUB     r2, r2, r1              ; amount left in buffer
+
+        MOV     R0, #0
+        LDR     R0, [R0, #ExceptionDump]
+        LDR     R0, [R0, #15*4]         ; saved PC
+        BIC     R0, R0, #ARM_CC_Mask
+        SWI     XOS_ConvertHex8  
+       
+      [ International
+        MOV     r4, #0
+        LDRB    r4, [r4, #ErrorSemaphore]
+        TEQ     r4, #0
+        LDRNE   R0, =GeneralMOSBuffer+128
+        MOVEQ   R4, R0
+        MOVEQ   R0, R10
+        BLEQ    TranslateError_UseR4
+      |
+        LDR     R0, =GeneralMOSBuffer+128
+      ]
+
+        TEQP    PC, #IRQ_mode+I_bit
+        MOV     R1, #0
+        STR     R1, [R1, #IRQsema]
+        LDR     SPIRQ, =IRQSTK
+        SWI     OS_GenerateError
+   |
+        Push    R14
+        BL      DEFHAN
+        BL      DEFHN2
+        Pull    R0
+        TEQP    PC, #IRQ_mode
+        NOP
+        LDR     SPIRQ, =IRQSTK
+        BIC     R0, R0, #ARM_CC_Mask
+        SWI     OS_Write0
+        B       UNDEF3
+    ]
+
+        LTORG
+
+UNDEF ROUT
+        TEQP    pc, #F_bit :OR: I_bit :OR: SVC_mode ; FIQ off too
+        STR     R14, [R0, -R0]
+        MOV     R14, #0
+        LDR     R14, [R14, #ExceptionDump]
+        STMIA   R14!, {R0-R7}
+        MOV     R0, R14
+        BL      DumpyTheRegisters
+ [ ExceptionsAreErrors
+        MakeErrorBlock UndefinedInstruction
+ |
+        =       "Undefined instruction at ", 0
+        ALIGN
+ ]
+
+ABORTP ROUT
+        TEQP    pc, #F_bit :OR: I_bit :OR: SVC_mode ; FIQ off too
+        STR     R14, [R0, -R0]
+        MOV     R14, #0
+        LDR     R14, [R14, #ExceptionDump]
+        STMIA   R14!, {R0-R7}
+        MOV     R0, R14
+        BL      DumpyTheRegisters
+
+ [ ExceptionsAreErrors
+        MakeErrorBlock InstructionAbort
+ |
+        =       "Abort on instruction fetch at ", 0
+        ALIGN
+ ]
+
+ABORTD ROUT
+        TEQP    pc, #F_bit :OR: I_bit :OR: SVC_mode ; FIQ off too
+        STR     R14, [R0, -R0]
+        MOV     R14, #0
+        LDR     R14, [R14, #ExceptionDump]
+        STMIA   R14!, {R0-R7}
+        MOV     R0, R14
+        BL      DumpyTheRegisters
+ [ ExceptionsAreErrors
+        MakeErrorBlock DataAbort
+ |
+        =       "Abort on data transfer at ", 0
+        ALIGN
+ ]
+
+
+ADDREX ROUT
+        TEQP    pc, #F_bit :OR: I_bit :OR: SVC_mode ; FIQ off too
+        STR     R14, [R0, -R0]
+        MOV     R14, #0
+        LDR     R14, [R14, #ExceptionDump]
+        STMIA   R14!, {R0-R7}
+        MOV     R0, R14
+        BL      DumpyTheRegisters
+
+ [ ExceptionsAreErrors
+        MakeErrorBlock AddressException
+ |
+        =       "Address exception at ", 0
+        ALIGN
+ ]
+
+
+; Can branch through zero in any mode
+
+RESET1 ROUT
+
+        STR     R1, [R0, -R0]
+        MOV     R1, #0
+        LDR     R1, [R1, #ExceptionDump]
+        STMIA   R1, {R0-R15}
+        LDR     R0, [R0, -R0]
+        STR     R0, [R1, #1*4]
+        SWI     XOS_EnterOS
+
+ [ ExceptionsAreErrors
+        BL      UNDEF1
+        MakeErrorBlock BranchThrough0
+ |
+        LDR     sp, =SVCSTK
+        TEQP    PC, #IRQ_mode
+        LDR     SPIRQ, =IRQSTK
+        TEQP    PC, #0
+        BL      DEFHAN
+        BL      DEFHN2
+        SWI     OS_WriteS
+        =      "Entering Supervisor because of branch through 0", 0
+        B       UNDEF2
+ ]
+
+BranchThroughZeroInstruction
+ [ ProcessorVectors
+        LDR     PC, .+ProcVec_Branch0
+ |
+        B       .+(RESET1-0)
+ ]
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI to call the UpCall vector
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+DoAnUpCall ROUT
+
+        Push    lr                  ; better have one of these to pull later !
+        AND     r10, lr, #&F0000000 ; copy user flags (I_bit clear)
+        TEQP    r10, #SVC_mode      ; ints on, stay in SVC mode, flags in psr
+        MOV     r10, #UpCallV
+        BL      CallVector
+        Pull    lr
+        BIC     lr, lr, #&F0000000
+        MOV     R10, PC, LSR #(32-4)
+        ORR     lr, lr, R10, LSL #(32-4)
+        ExitSWIHandler
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_ChangeEnvironment: Call the environment change vector
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+ChangeEnvironment ROUT
+
+        Push    lr
+        MOV     R10, #ChangeEnvironmentV
+        BL      CallVector
+        Pull    lr
+        B       SLVK_TestV
+
+
+; ..... and the default handler .....
+
+AdjustOurSet
+        TEQP    PC, #SVC_mode+I_bit
+        CMP     R0, #MaxEnvNumber
+        BHI     AOS_Silly
+
+  [ False
+        CMP     r0, #CallBackHandler
+        BLEQ    testcallbackpending
+  ]
+
+        ADR     R10, AOS_Table
+        ADD     R11, R0, R0, LSL #1   ; number * 3
+        ADD     R10, R10, R11, LSL #2 ; point at entry
+
+        MOV     R12, R1
+        LDR     R11, [R10]
+        CMP     R11, #0
+        LDRNE   R1,  [R11]
+        CMPNE   R12, #0
+        STRNE   R12, [R11]
+
+        MOV     R12, R2
+        LDR     R11, [R10, #4]
+        CMP     R11, #0
+        LDRNE   R2,  [R11]
+        CMPNE   R12, #0
+        STRNE   R12, [R11]
+
+        MOV     R12, R3
+        LDR     R11, [R10, #8]
+        CMP     R11, #0
+        LDRNE   R3,  [R11]
+        CMPNE   R12, #0
+        STRNE   R12, [R11]
+
+        Pull    pc,,^
+
+AOS_Silly
+        ADR     r0, ErrorBlock_BadEnvNumber
+      [ International
+        BL      TranslateError
+      ]
+exit_AOS
+        Pull    "lr"
+        ORRS    pc, lr, #V_bit
+        MakeErrorBlock BadEnvNumber
+
+   [ False
+
+testcallbackpending
+        CMP     r1, #0                ; OK if only reading
+        CMPEQ   r2, #0
+        CMPEQ   r3, #0
+        LDRNEB  r10, [r0, #CallBack_Flag-CallBackHandler]
+        TSTNE   r10, #CBack_OldStyle
+        MOVEQ   pc, r14
+  SetBorder r0, r14, 15, 0, 0
+        ADR     r0, ErrorBlock_CallbackPending
+        B       exit_AOS
+        MakeErrorBlock CallbackPending
+   ]
+
+AOS_Table
+        &  MemLimit     ;  MemoryLimit
+        &  0
+        &  0
+
+        &  UndHan       ; UndefinedHandler
+        &  0
+        &  0
+    
+        &  PAbHan       ; PrefetchAbortHandler
+        &  0
+        &  0
+
+        &  DAbHan       ; DatabortHandler
+        &  0
+        &  0
+
+        &  AdXHan       ; AddressExceptionHandler
+        &  0
+        &  0
+
+        &  0            ; OtherExceptionHandler
+        &  0
+        &  0
+
+        &  ErrHan       ; ErrorHandler
+        &  ErrHan_ws
+        &  ErrBuf
+
+        &  CallAd       ; CallBackHandler
+        &  CallAd_ws
+        &  CallBf
+
+        &  BrkAd        ; BreakPointHandler
+        &  BrkAd_ws
+        &  BrkBf
+
+        &  EscHan       ; EscapeHandler
+        &  EscHan_ws
+        &  0
+
+        &  EvtHan       ; EventHandler
+        &  EvtHan_ws
+        &  0
+
+        &  SExitA       ; ExitHandler
+        &  SExitA_ws
+        &  0
+
+        &  HiServ       ; UnusedSWIHandler
+        &  HiServ_ws
+        &  0
+
+        &  ExceptionDump ; ExceptionDumpArea
+        &  0
+        &  0
+
+        &  AplWorkSize  ; application space size
+        &  0
+        &  0
+
+        &  Curr_Active_Object
+        &  0
+        &  0
+
+        &  UpCallHan
+        &  UpCallHan_ws
+        &  0
+
+        assert (.-AOS_Table)/12 = MaxEnvNumber
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_ReadDefaultHandler
+
+; In    r0 = environment number
+
+ReadDefaultHandler ROUT
+
+        CMP     r0, #(dhte-defhantab)/12
+        MOVHS   r0, #0                  ; return wally value
+        ADD     r10, r0, r0, LSL #1     ; *3
+        ADD     r10, pc, r10, LSL #2    ; *4 (pc = defhantab-4)
+        LDMIB   r10, {r1-r3}            ; gives additional +4
+        ExitSWIHandler
+
+defhantab
+     & 0                ; wally entry
+     & 0
+     & 0
+
+     & UNDEF            ; UndefinedHandler
+     & 0
+     & 0
+
+     & ABORTP           ; PrefetchAbortHandler
+     & 0
+     & 0
+
+     & ABORTD           ; DataAbortHandler
+     & 0
+     & 0
+
+     & ADDREX           ; AddressExceptionHandler
+     & 0
+     & 0
+
+     & 0                ; OtherExceptionHandler
+     & 0
+     & 0
+
+     & ERRORH           ; ErrorHandler
+     & 0
+     & GeneralMOSBuffer
+
+     & NOCALL           ; CallBackHandler
+     & 0
+     & DUMPER
+
+     & DEFBRK           ; BreakPointHandler
+     & 0
+     & DUMPER
+
+     & ESCAPH           ; EscapeHandler
+     & 0
+     & GeneralMOSBuffer
+
+     & EVENTH           ; EventHandler
+     & 0
+     & 0
+
+     & CLIEXIT          ; ExitHandler
+     & 0
+     & 0
+
+     & NoHighSWIHandler ; UnusedSWIHandler
+     & 0
+     & 0
+
+     & 0                ; exception dump
+     & 0
+     & 0
+
+     & 0                ; app space size
+     & 0
+     & 0
+
+     & 0                ; cao pointer
+     & 0
+     & 0
+
+     & DefUpcallHandler ; upcall handler
+     & 0
+     & 0
+
+dhte
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r0 = sysinfo handle
+
+; Out   r0 = sysinfo for r0in
+
+ReadSysInfo_Code ROUT
+        CMP     r0, #1
+        BCC     %FT00                   ; r0 = 0
+        BEQ     %FT10                   ; r0 = 1
+        CMP     r0, #3
+        BCC     %FT20                   ; r0 = 2
+        BEQ     %FT30                   ; R0 = 3
+        CMP     r0, #5
+        BCC     %FT40                   ; R0 = 4
+        BEQ     %FT50                   ; R0 = 5
+
+        ;       R0 > 5, so illegal value
+
+        ADR     r0, ErrorBlock_BadReadSysInfo
+      [ International
+        Push    "lr"
+        BL      TranslateError
+        Pull    "lr"
+      ]
+        ORR     lr, lr, #V_bit
+        ExitSWIHandler
+
+        MakeErrorBlock BadReadSysInfo
+
+; ReadSysInfo(0) - return configured screensize in r0
+
+00
+        Push    "r1, r2, lr"
+        MOV     r0, #ReadCMOS
+        MOV     r1, #ScreenSizeCMOS
+        SWI     XOS_Byte
+        AND     r0, r2, #&7F            ; top bit is reserved 
+        MOV     r10, #0
+        LDR     r10, [r10, #Page_Size]
+        MUL     r0, r10, r0
+        BL      MassageScreenSize       ; adjust for min and max or default values
+        Pull    "r1, r2, lr"
+        ExitSWIHandler
+
+; ReadSysInfo(1) - returns configured mode/wimpmode in r0
+;                          configured monitortype in r1
+;                          configured sync in r2
+;                          (all de-autofied)
+
+10
+        Push    "r3-r5, lr"
+        BL      Read_Configd_Sync
+        MOV     r2, r0
+ [ ModeSelectors
+        LDR     r1, =VduDriverWorkSpace+CurrentMonitorType      ; read current monitortype
+        LDR     r1, [r1]
+ |
+        BL      Read_Configd_MonitorType
+        MOV     r1, r0
+ ]
+        BL      Read_Configd_Mode
+        CMP     r0, #-1                         ; if none of the three are auto, don't bother with translation
+        CMPNE   r1, #-1
+        CMPNE   r2, #-1
+        BNE     %FT15
+        BL      TranslateMonitorLeadType        ; issue service or work it out ourselves
+        CMP     r0, #-1                         ; if mode auto
+        MOVEQ   r0, r3                          ; then replace with default
+        CMP     r1, #-1                         ; if monitortype auto
+        MOVEQ   r1, r4                          ; then replace with default
+        CMP     r2, #-1                         ; if sync auto
+        MOVEQ   r2, r5                          ; then replace with default
+15
+        Pull    "r3-r5, lr"
+        ExitSWIHandler
+
+; ReadSysInfo(2)
+;
+; in:   r0 = 2
+;
+; out:  r0 = hardware configuration word 0
+;               bits 0-7 = special functions chip type
+;                               0 => none
+;                               1 => IOEB
+;               bits 8-15 = I/O control chip type
+;                               0 => IOC
+;                               1 => IOMD
+;               bits 16-23 = memory control chip type
+;                               0 => MEMC1/MEMC1a
+;                               1 => IOMD
+;               bits 24-31 = video control chip type
+;                               0 => VIDC1a
+;                               1 => VIDC20
+;       r1 = hardware configuration word 1
+;               bits 0-7 = I/O chip type
+;                               0 => absent
+;                               1 => 82C710/711 or SMC'665 or similar
+;               bits 8-31 reserved (set to 0)
+;       r2 = hardware configuration word 2
+;               bits 0-7 = LCD controller type
+;                               0 => absent
+;                               1 => present (type 1) eg A4 portable
+;                               2 => present (type 2) eg Stork portable
+ [ MorrisSupport
+;               bits 8-15 = IOMD variant
+;                               0 => IOMD
+;                               1 => IOMDL ie ARM7500 (Morris)
+;               bits 16-23 = VIDC20 variant
+;                               0 => VIDC20
+;                               1 => VIDC2L ie ARM7500 (Morris)
+;               bits 24-31 reserved (set to 0)
+ |
+;               bits 8-31 reserved (set to 0)
+ ]
+;       r3 = word 0 of unique machine ID, or 0 if unavailable
+;       r4 = word 1 of unique machine ID, or 0 if unavailable
+
+; Bits in IOSystemType
+
+IOST_IOEB       * 1     ; On IOMD systems this really means IOMD.
+IOST_82C710     * 2
+IOST_LC         * 4
+IOST_82C711     * 8
+IOST_37C665     * 16
+ [ MorrisSupport
+IOST_7500       * 32    ;Running on ARM7500 (Morris) so actually IOMDL and VIDC2L
+IOST_BATMAN     * 64    ;Stork keyboard/battery controller seems to be present
+ ]
+20
+        MOV     r0, #0
+        LDR     r3, [r0, #RawMachineID+0]
+        LDR     r4, [r0, #RawMachineID+4]
+        MOV     r3, r3, LSR #8                  ; lose first 8 bits
+        ORR     r3, r3, r4, LSL #24             ; and put bits 0..7 of r3 into bits 24..31 of r2
+        MOV     r4, r4, LSL #8                  ; lose CRC bits
+        MOV     r4, r4, LSR #16                 ; and move the rest down to the bottom
+        LDRB    r0, [r0, #IOSystemType]
+
+        ANDS    r2, r0, #IOST_LC
+        MOVNE   r2, #1                          ; make r2 0 or 1
+ [ MorrisSupport
+        TST     r0, #IOST_BATMAN
+        MOVNE   r2, #2                          ;NE, its a Stork portable
+        TST     r0, #IOST_7500
+        ORRNE   r2, r2, #&00000100              ;NE, Morris based machine with IOMDL
+        ORRNE   r2, r2, #&00010000              ;NE, and VIDC2L
+ ]
+        ANDS    r1, r0, #IOST_82C710 :OR: IOST_82C711 :OR: IOST_37C665
+        MOVNE   r1, #1                          ; make r1 0 or 1
+
+ [ IO_Type = "IOMD"
+   [ VIDC_Type = "VIDC20"
+        LDR     r0, =&01010100
+   |
+        LDR     r0, =&00010100
+   ]
+ |
+        ASSERT  IOST_IOEB = 1
+        AND     r0, r0, #IOST_IOEB              ; and r0 0 or 1
+   [ VIDC_Type = "VIDC20"
+        ORR     r0, r0, #&01000000
+   ]
+ ]
+        ExitSWIHandler
+
+; ReadSysInfo(3)
+;
+; in:   r0 = 3
+;
+; out:  r0 = I/O chip base features mask                710     711     665
+;               Bits 0..3   Base IDE type               1       1       1
+;               Bits 4..7   Base FDC type               1       1       1
+;               Bits 8..11  Base parallel type          1       1       1
+;               Bits 12..15 Base 1st serial type        1       1       1
+;               Bits 16..19 Base 2nd serial type        0       1       1
+;               Bits 20..23 Base Config type            1       2       3
+;               Bits 24..31 Reserved                    0       0       0
+;
+;       r1 = I/O chip extra features mask               710     711     665
+;               Bits 0..3   IDE extra features          0       0       0
+;               Bits 4..7   FDC extra features          0       0       0
+;               Bits 8..11  parallel extra features     0       0       1
+;               Bits 12..15 1st serial extra features   0       0       1
+;               Bits 16..19 2nd serial extra features   0       0       1
+;               Bits 20..23 config extra features       0       0       0
+;               Bits 24..31 Reserved                    0       0       0
+;
+;       r2-r4 undefined (reserved for future expansion)
+;
+
+30
+        MOV     r0, #0                          ; used as index and as default value
+        LDRB    r1, [r0, #IOSystemType]
+        TST     r1, #IOST_82C710
+        LDRNE   r0, =&00101111
+        MOVNE   r1, #0
+        TST     r1, #IOST_82C711
+        LDRNE   r0, =&00211111
+        MOVNE   r1, #0
+        TST     r1, #IOST_37C665
+        LDRNE   r0, =&00311111
+        LDRNE   r1, =&00011100
+        MOV     r2, #0
+        MOV     r3, #0
+        MOV     r4, #0
+        ExitSWIHandler
+
+; OS_ReadSysInfo 4 (SWI &58)
+;
+; On entry:       r0 = 4 (reason code)
+;
+; On exit:        r0 = LSW of Ethernet Network Address (or 0)
+;                 r1 = MSW of Ethernet Network Address (or 0)
+;
+; Use:            Code loaded from the dedicated Network Expansion Card or
+;                 from a normal Expansion Card should use the value returned
+;                 by this call in preference to a locally provided value.
+
+40
+        MOV     r0, #0
+        LDRB    r1, [ r0, #RawMachineID ]               ; The family byte
+        TEQ     r1, #&81                                ; Is this a custom part?
+        BNE     ExitNoEthernetAddress
+        LDR     r1, [ r0, #RawMachineID+4 ]             ; Acorn's ID and part#
+  [  True
+        BIC     r1, r1, #&FF000000                      ; Remove the CRC
+        LDR     r0, =&0050A4                            ; Acorn's ID is &005
+  | ; Version for no checking of Manufacture's ID
+        MOV     r1, r1, LSL #20
+        MOV     r1, r1, LSR #20                         ; Remove CRC and ID
+        LDR     r0, =&0A4
+  ]
+        TEQ     r1, r0                                  ; Is this one of our chips?
+        BNE     ExitNoEthernetAddress
+        MOV     r0, #0
+        LDR     r0, [ r0, #RawMachineID ]
+        MOV     r0, r0, LSR #8                          ; Lose family byte
+        LDR     r1, =&0000A4100000                      ; Base Ethernet address
+        ADD     r0, r1, r0                              ; Add Dallas part to base
+        MOV     r1, #0                                  ; Top 16 bits are zero
+        ExitSWIHandler
+
+ExitNoEthernetAddress
+        MOV     r0, #0
+        MOV     r1, #0
+        ExitSWIHandler
+
+; OS_ReadSysInfo 5
+;
+; On entry:       r0 = 5 (reason code)
+;
+; On exit:        r0 = LSW of Raw data from Dallas Chip
+;                 r1 = MSW of Raw data from Dallas Chip
+
+50
+        MOV     r0, #0
+        LDR     r1, [r0, #RawMachineID+4]
+        LDR     r0, [r0, #RawMachineID+0]
+        ExitSWIHandler
+
+        LTORG
+
+        END

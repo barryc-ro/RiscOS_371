@@ -1,0 +1,1115 @@
+#include "Patch.h"
+
+
+/* Convenient zero length string to point things at. */
+
+static char                     null_string[] = "";
+
+
+/* Global data - root of the memory tree of all the patch files. */
+
+APPLICATION *                   apps_root = NULL;
+
+
+/* Structure for each command in the command table.
+
+   split_parms is set if the rest of the command line after the keyword
+   is to be split into two space seperated parameters. */
+
+typedef enum
+{
+    CMD_PATCHESDIR = 0,
+    CMD_TRANSFORMSFILE,
+    CMD_APPLICATION,
+    CMD_DESCRIPTION,
+    CMD_PATCH,
+    CMD_FILE,
+    CMD_TRANSFORM,
+    CMD_LOCATION,
+    CMD_CHANGEWORD,
+    CMD_VERIFYWORD,
+    CMD_CHANGEBYTE,
+    CMD_VERIFYBYTE,
+    CMD_CHANGESTRING,
+    CMD_VERIFYSTRING,
+    CMD_REPLACEFILE,
+    CMD_CREATEFILE,
+    CMD_DELETEFILE,
+    CMD_OLDCONTENTS,
+    CMD_NEWCONTENTS,
+
+    CMD_END
+} PATCH_CMD;
+
+typedef struct
+{
+    char const * const          cmd;
+    char const                  cmd_len;
+    char const                  cmd_number;
+    char const                  split_parms;
+} const CMD_STRUCT;
+
+
+/* Static table of the command strings in the patch file. This is scanned
+   linearly, so the infrequently used commands are put at the end. */
+
+static CMD_STRUCT cmds[] =
+{
+
+    {
+        "Application:",
+        12,
+        CMD_APPLICATION,
+        TRUE
+    },
+    {
+        "Description:",
+        12,
+        CMD_DESCRIPTION,
+        FALSE
+    },
+    {
+        "Patch:",
+        6,
+        CMD_PATCH,
+        FALSE
+    },
+    {
+        "File:",
+        5,
+        CMD_FILE,
+        TRUE
+    },
+    {
+        "Transform:",
+        10,
+        CMD_TRANSFORM,
+        TRUE
+    },
+    {
+        "Location:",
+        9,
+        CMD_LOCATION,
+        TRUE
+    },
+    {
+        "ChangeWord:",
+        11,
+        CMD_CHANGEWORD,
+        TRUE
+    },
+    {
+        "VerifyWord:",
+        11,
+        CMD_VERIFYWORD,
+        TRUE
+    },
+    {
+        "ChangeByte:",
+        11,
+        CMD_CHANGEBYTE,
+        TRUE
+    },
+    {
+        "VerifyByte:",
+        11,
+        CMD_VERIFYBYTE,
+        TRUE
+    },
+    {
+        "ChangeString:",
+        13,
+        CMD_CHANGESTRING,
+        TRUE
+    },
+    {
+        "VerifyString:",
+        13,
+        CMD_VERIFYSTRING,
+        TRUE
+    },
+    {
+        "ReplaceFile:",
+        12,
+        CMD_REPLACEFILE,
+        TRUE
+    },
+    {
+        "CreateFile:",
+        11,
+        CMD_CREATEFILE,
+        TRUE
+    },
+    {
+        "DeleteFile:",
+        11,
+        CMD_DELETEFILE,
+        TRUE
+    },
+    {
+        "OldContents:",
+        12,
+        CMD_OLDCONTENTS,
+        TRUE
+    },
+    {
+        "NewContents:",
+        12,
+        CMD_NEWCONTENTS,
+        TRUE
+    },
+
+    /* Very uncommon (once only usually!) commands from here on. OK so
+       some of the commands above may not occurr at all, but on the other
+       hand they all might occurr a lot. There is a very high chance that
+       the commands from here on will occurr a very low numbers of times,
+       usually once only. */
+
+    {
+        "PatchesDir:",
+        11,
+        CMD_PATCHESDIR,
+        TRUE
+    },
+    {
+        "TransformsFile:",
+        15,
+        CMD_TRANSFORMSFILE,
+        TRUE
+    },
+    {
+        /* Command of null marks the end of the table. */
+
+        NULL,
+        0,
+        CMD_END,
+        FALSE
+    }
+};
+
+
+
+
+/* This function finds an application in the chain. */
+
+static APPLICATION * find_application
+(
+    char const * const                  name,
+    int const                           name_len,
+    int const                           file_type
+)
+{
+    APPLICATION *                       this_app;
+
+    for (this_app = apps_root;
+         this_app != NULL;
+         this_app = this_app->next)
+    {
+        if (this_app->name_len == name_len &&
+            this_app->file_type == file_type &&
+            strcmp(this_app->name, name) == 0)
+        {
+            break;
+        }
+    }
+
+    return this_app;
+}
+
+
+
+/* This function finds an application in the chain or adds it to the
+   chain if it can't be found. */
+
+static APPLICATION * find_application_or_create
+(
+    char const * const                  name,
+    int const                           name_len,
+    int const                           file_type
+)
+{
+    APPLICATION *                       this_app;
+
+    this_app = find_application(name, name_len, file_type);
+
+    if (this_app == NULL)
+    {
+        this_app = calloc_noerr(sizeof(*this_app), 1);
+
+        this_app->name_len = name_len;
+        this_app->name = malloc_noerr(name_len + 1);
+        strcpy(this_app->name, name);
+        this_app->file_type = file_type;
+
+        this_app->next = apps_root;
+        apps_root = this_app;
+    }
+
+    return this_app;
+}
+
+
+
+/* This function finds a patch in the chain. */
+
+static PATCH_DATA * find_patch
+(
+    APPLICATION const * const           app,
+    char const * const                  desc,
+    int const                           desc_len
+)
+{
+    PATCH_DATA *                        this_patch;
+
+    for (this_patch = app->patches;
+         this_patch != NULL;
+         this_patch = this_patch->next)
+    {
+        if (this_patch->desc_len == desc_len &&
+            strcmp(this_patch->desc, desc) == 0)
+        {
+            break;
+        }
+    }
+
+    return this_patch;
+}
+
+
+
+/* This function finds a patch in the chain, or adds it to the chain it
+   it can't be found. */
+
+static PATCH_DATA * find_patch_or_create
+(
+    APPLICATION * const                 app,
+    char const * const                  desc,
+    int const                           desc_len
+)
+{
+    PATCH_DATA *                        this_patch;
+
+    this_patch = find_patch(app, desc, desc_len);
+
+    if (this_patch == NULL)
+    {
+        this_patch = calloc_noerr(sizeof(*this_patch), 1);
+
+        this_patch->desc_len = desc_len;
+        this_patch->desc = malloc_noerr(desc_len + 1);
+        strcpy(this_patch->desc, desc);
+
+        this_patch->next = app->patches;
+        app->patches = this_patch;
+        app->num_patches++;
+    }
+
+    return this_patch;
+}
+
+
+
+/* Allocates a new chunk of verify data of the size specified. */
+
+static VERIFY_CHUNK * new_ver
+(
+    FILE_DATA *                         curr_file,
+    int const                           data_size,
+    int const                           location
+)
+{
+    VERIFY_CHUNK *                      new_ver;
+
+    new_ver = calloc_noerr(sizeof(*new_ver) + data_size, 1);
+    new_ver->location = location;
+    new_ver->data = (char *) (new_ver + 1);
+
+    /* Link it into the chain of verifies. */
+
+    new_ver->next = curr_file->u_verifies;
+    curr_file->u_verifies = new_ver;
+
+    DEBUG_PRINTF(("New verify chunk, data size %d\n", data_size));
+
+    return new_ver;
+}
+
+
+
+/* Allocates a new chunk of change data of the size specified. */
+
+static MODIFY_CHUNK * new_chg
+(
+    FILE_DATA *                         curr_file,
+    int const                           data_size,
+    int const                           location
+)
+{
+    MODIFY_CHUNK *                       new_chg;
+
+    new_chg = calloc_noerr(sizeof(*new_chg) + data_size * 2, 1);
+    new_chg->location = location;
+    new_chg->old = (char *) (new_chg + 1);
+    new_chg->new = new_chg->old + data_size;
+
+    /* Link it into the chain of changes. */
+
+    new_chg->next = curr_file->u_changes;
+    curr_file->u_changes = new_chg;
+
+    DEBUG_PRINTF(("New modify chunk, data size %d\n", data_size));
+
+    return new_chg;
+}
+
+
+
+#ifdef UNDEFINED
+
+/* This function checks whether a patch file is OK. A return value of
+   0 means it is, 1 means it isn't.
+
+   **** This function needs some serious work improving the error
+   reporting. */
+
+static int check_patch_file
+(
+    char const * const                  the_file
+)
+{
+    FILE *                              infile;
+    char                                buffer[1000];
+    int                                 i;
+    int                                 line;
+    int                                 dsize;
+    int                                 current_changes = 0;
+    int                                 current_location = 0;
+    int                                 current_patch = 0;
+    int                                 current_file = 0;
+    int                                 current_application = 0;
+    char *                              tail_2;
+    char *                              tail;
+
+    infile = fopen(the_file, "r");
+
+    if (infile == 0)
+    {
+        /* **** Needs decent error handling adding here. */
+
+        DEBUG_PRINTF(("Patch file '%s' failed to open\n", the_file));
+        return 1;
+    }
+
+    line = 1;
+    while (fgets(buffer, sizeof(buffer), infile) != NULL)
+    {
+        if (buffer[0] == '\n' || buffer[0] == '#')
+        {
+            /* Blank line or comment line - skip it. */
+
+            continue;
+        }
+
+        for (i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++)
+        {
+            dsize = strlen(cmds[i]);
+            if (strncmp(buffer, cmds[i], dsize) == 0 &&
+                buffer[dsize] == ':')
+            {
+                /* We have found the command for this line. */
+
+                break;
+            }
+        }
+
+        if (i >= sizeof(cmds) / sizeof (cmds[0]))
+        {
+            /* **** Needs decent error handling adding. */
+
+            buffer[strlen(buffer) - 1] = '\0';
+
+            DEBUG_PRINTF(("Bad directive '%s' at line %d of patch file '%s'\n", buffer, line, the_file));
+            fclose(infile);
+            return 1;
+        }
+
+        tail = &buffer[dsize+1];
+        tail[strlen(tail) - 1] = '\0';
+
+        switch (i)
+        {
+        case CMD_APPLICATION:
+            if (current_application && !current_patch)
+            {
+                DEBUG_PRINTF(("No patches specified for application ending at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            if (current_patch && !current_file)
+            {
+                DEBUG_PRINTF(("No files in patch ending at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            if (current_file && !current_changes)
+            {
+                DEBUG_PRINTF(("No changes in patch ending at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            current_application = 1;
+            current_file = 0;
+            current_patch = 0;
+            current_changes = 0;
+            break;
+
+        case CMD_PATCH:
+            if (!current_application)
+            {
+                DEBUG_PRINTF(("Patch started without application at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            if (current_patch && !current_file)
+            {
+                DEBUG_PRINTF(("No changes specified for file ending at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            if (current_file && !current_changes)
+            {
+                DEBUG_PRINTF(("No changes in patch ending at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            current_file = 0;
+            current_patch = 1;
+            current_changes = 0;
+            break;
+
+        case CMD_TRANSFORM:
+            if (!current_file)
+            {
+                DEBUG_PRINTF(("Transform specified without a file at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+            break;
+
+        case CMD_FILE:
+            if (!current_patch)
+            {
+                DEBUG_PRINTF(("File specified without a patch at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            if (current_file && !current_changes)
+            {
+                DEBUG_PRINTF(("Previous patch empty at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            current_file = 1;
+            current_changes = 0;
+            break;
+
+        case CMD_LOCATION:
+            if (!current_file)
+            {
+                DEBUG_PRINTF(("Location specified without a patch at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            current_location = (int) strtoul(tail, &tail_2, 0);
+            if (*tail_2 != '\0')
+            {
+                DEBUG_PRINTF(("Bad location at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+            break;
+
+        case CMD_CHANGEWORD:
+            if (!current_file)
+            {
+                DEBUG_PRINTF(("Change specified without a patch at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            current_changes = 1;
+
+            (void) strtoul(tail, &tail_2, 0);
+            if (*tail_2 != ' ')
+            {
+                DEBUG_PRINTF(("Badly formed change at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+
+            (void) strtoul(tail_2 + 1, &tail_2, 0);
+            if (*tail_2 != '\0')
+            {
+                DEBUG_PRINTF(("Badly formed change at line %d of patch file %s\n", line, the_file));
+                fclose(infile);
+                return 1;
+            }
+            break;
+        }
+
+        line++;
+
+    } /* End while all lines in the file */
+
+    fclose(infile);
+    return 0;
+}
+
+#endif /* UNDEFINED */
+
+
+
+/* This function reads a patch file, and adds it to the memory structure. */
+
+void read_patch_file
+(
+    char const * const                  directory,
+    char const * const                  the_file,
+    int                                 file_type
+)
+{
+    char *                              filename;
+    FILE *                              infile;
+    CMD_STRUCT *                        cmd;
+    char                                buffer[1000];
+    int                                 line;
+
+    char *                              parm1;
+    int                                 parm1_len;
+    char *                              parm2;
+    int                                 parm2_len;
+
+    char *                              trans1;
+    int                                 trans1_len;
+    char *                              trans2;
+    int                                 trans2_len;
+
+    APPLICATION *                       curr_app = NULL;
+    PATCH_DATA *                        curr_patch = NULL;
+    FILE_DATA *                         curr_file = NULL;
+    MODIFY_CHUNK *                      curr_chg = NULL;
+    VERIFY_CHUNK *                      curr_ver = NULL;
+    int                                 curr_location;
+
+
+    /* Only read files of type Patch. */
+
+    if (file_type != FileType_Patch)
+    {
+        return;
+    }
+
+
+    /* Put the filename together if we have a seperate directory. */
+
+    if (directory == NULL)
+    {
+        filename = (char * ) the_file;
+    }
+    else
+    {
+        filename = malloc_noerr(strlen(directory) + strlen(the_file) + 2);
+        strcpy(filename, directory);
+        strcat(filename, ".");
+        strcat(filename, the_file);
+    }
+
+/*
+    if (check_patch_file(filename))
+    {
+        DEBUG_PRINTF(("File '%s' buggered - not reading\n", the_file));
+
+        goto free_memory;
+    }
+*/
+
+    infile = fopen(filename, "r");
+    line = 1;
+
+    while (fgets(buffer, sizeof(buffer), infile) != NULL)
+    {
+        /* If we have a blank line or comment, skip it. */
+
+        if (buffer[0] == '\n' || buffer[0] == '#')
+        {
+            continue;
+        }
+
+
+        /* Chop the trailing '\n' off the string. */
+
+        buffer[strlen(buffer) - 1] = '\0';
+
+
+        /* Scan the commands, looking for this one. */
+
+        for (cmd = &cmds[0]; cmd->cmd != NULL; cmd++)
+        {
+            if (strncmp(buffer, cmd->cmd, cmd->cmd_len) == 0)
+            {
+                /* We have found the command for this line. */
+
+                break;
+            }
+        }
+
+
+        /* Get a pointer to the first parameter. */
+
+        parm1 = buffer + cmd->cmd_len;
+
+
+        /* See if we should split into two space seperated parms or not. */
+
+        if (cmd->split_parms)
+        {
+            /* Find the second parameter if present. Also the first
+               parameter is deemed absent if we have a leading space. */
+
+            parm2 = parm1;
+
+            if (isspace(*parm1))
+            {
+                /* Parameter 1 is absent. */
+
+                parm1 = null_string;
+            }
+            else
+            {
+                /* Find the end of parameter 1. */
+
+                while (*parm2++ > 32)
+                {
+                    /* Do nothing */
+                }
+                parm2--;
+
+
+                /* Null terminate parameter 1, and set up to look for
+                   parameter 2. */
+
+                *parm2++ = '\0';
+            }
+
+
+            /* Skip the whitespace at the start of parm2. */
+
+            while (isspace(*parm2++))
+            {
+                /* Do nothing */
+            }
+            parm2--;
+
+
+            /* If there is no parm2, then it points to the '\0' at the end
+               of parm1 which is fine. */
+
+            parm2_len = strlen(parm2);
+
+        }
+        else /* if (cmd->split_parms) */
+        {
+            /* The whole command line is one parameter. Strip leading
+               and trailing spaces from it, to avoid serious problems
+               with filenames and make things line up nicely in the
+               window on screen. */
+
+            parm2 = parm1 + strlen(parm1);      /* Points at '\0' */
+
+            while (isspace(*--parm2))
+            {
+                /* Do nothing. */
+            }
+
+
+            /* Null terminate parm1 after the last non space character.
+               At the same time this points parm2 at a null string. */
+
+            *++parm2 = '\0';
+            parm2_len = 0;
+
+
+            /* Now skip past leading spaces. */
+
+            while (isspace(*parm1++))
+            {
+                /* Do nothing. */
+            }
+            parm1--;
+
+        } /* End if (cmd->split_parms) */
+
+
+        /* Get the length of parm1. */
+
+        parm1_len = strlen(parm1);
+
+
+        /* Now we have the parameters sussed out, perform the command. */
+
+        switch (cmd->cmd_number)
+        {
+        case CMD_APPLICATION:
+            /* May be a new app, or may be more data for a previous one. */
+
+            curr_app = find_application_or_create(parm1, parm1_len,
+                                                  read_number(parm2));
+            curr_patch = NULL;
+            curr_file = NULL;
+
+            DEBUG_PRINTF(("Application '%s', file_type &%03X\n",
+                         curr_app->name,
+                         curr_app->file_type));
+            break;
+
+
+        case CMD_DESCRIPTION:
+            /* Only copy the application description if it hasn't
+               already got one. */
+
+            if (curr_app->desc == NULL)
+            {
+                curr_app->desc_len = parm1_len;
+                curr_app->desc = malloc_noerr(parm1_len + 1);
+                strcpy(curr_app->desc, parm1);
+
+                DEBUG_PRINTF(("Description '%s'\n",
+                              curr_app->desc));
+            }
+#ifdef DEBUG
+            else
+            {
+                DEBUG_PRINTF(("Ignored description '%s'\n", parm1));
+            }
+#endif
+            break;
+
+
+        case CMD_PATCH:
+            /* May be a new patch or may re-introduce an old patch. */
+
+            curr_patch = find_patch_or_create(curr_app, parm1, parm1_len);
+            curr_file = NULL;
+
+            DEBUG_PRINTF(("Patch '%s'\n", curr_patch->desc));
+            break;
+
+
+        case CMD_FILE:
+            /* Allocate the memory, do the stuff specific to this
+               keyword, and jump to the common code. */
+
+            curr_file = calloc_noerr(sizeof(*curr_file), 1);
+
+            curr_file->flavour = FLAVOUR_MODIFY;
+            curr_file->u_file_type = read_number(parm2);
+
+            DEBUG_PRINTF(("Modify type &%03X, ", curr_file->u_file_type));
+
+            goto file_common;
+
+
+        case CMD_REPLACEFILE:
+            /* Allocate the memory, do the stuff specific to this
+               keywords, and jump to the common code. */
+
+            curr_file = calloc_noerr(sizeof(*curr_file), 1);
+            curr_file->flavour = FLAVOUR_REPLACE;
+
+            DEBUG_PRINTF(("Replace "));
+
+            goto file_common;
+
+
+        case CMD_CREATEFILE:
+            /* Allocate the memory, do the stuff specific to this
+               keywords, and jump to the common code. */
+
+            curr_file = calloc_noerr(sizeof(*curr_file), 1);
+            curr_file->flavour = FLAVOUR_CREATE;
+
+            DEBUG_PRINTF(("Create "));
+
+            goto file_common;
+
+
+        case CMD_DELETEFILE:
+            /* Allocate the memory, do the stuff specific to this
+               keywords, and drop through to the common code. */
+
+            curr_file = calloc_noerr(sizeof(*curr_file), 1);
+            curr_file->flavour = FLAVOUR_DELETE;
+
+            DEBUG_PRINTF(("Delete "));
+
+file_common:
+            /* File keywords assumed unique within a patch. (!Patch
+               will work even if they aren't, it will just be
+               less efficient.) */
+
+            curr_chg = NULL;
+            curr_ver = NULL;
+            curr_location = 0;
+
+            curr_file->name_len = parm1_len;
+            curr_file->name = malloc_noerr(parm1_len + 1);
+            strcpy(curr_file->name, parm1);
+
+            /* Put onto the head of the chain of files for this patch. */
+
+            curr_file->next = curr_patch->files;
+            curr_patch->files = curr_file;
+
+            DEBUG_PRINTF(("file '%s'\n", curr_file->name));
+            break;
+
+
+        case CMD_TRANSFORM:
+            /* Store the name of the transform for the current file. */
+
+            curr_file->u_transform = malloc_noerr(parm1_len + 1);
+            strcpy(curr_file->u_transform, parm1);
+
+            DEBUG_PRINTF(("Transform '%s'\n", curr_file->u_transform));
+            break;
+
+
+        case CMD_LOCATION:
+            /* Location applies to both changes and verifies. */
+
+            curr_location = read_number(parm1);
+
+            DEBUG_PRINTF(("Location &%08X\n", curr_location));
+            break;
+
+
+        case CMD_CHANGEWORD:
+            /* Put the words into the current chunk if they will fit. */ 
+
+            if (curr_chg == NULL ||
+                curr_chg->length + 4 > CHUNK_SIZE ||
+                curr_chg->location + curr_chg->length != curr_location)
+            {
+                /* Need to allocate a new chunk of changes. */
+
+                curr_chg = new_chg(curr_file, CHUNK_SIZE, curr_location);
+            }
+
+            *(int *)(curr_chg->old + curr_chg->length) = read_number(parm1);
+            *(int *)(curr_chg->new + curr_chg->length) = read_number(parm2);
+            curr_chg->length += 4;
+            curr_location += 4;
+
+            DEBUG_PRINTF(("ChangeWord at &%08X from &%08X to &%08X\n",
+                          curr_chg->location + curr_chg->length - 4,
+                          *(int *)(curr_chg->old + curr_chg->length - 4),
+                          *(int *)(curr_chg->new + curr_chg->length - 4)));
+            break;
+
+
+        case CMD_VERIFYWORD:
+            /* Put the word into the current verify chunk if it will fit. */ 
+
+            if (curr_ver == NULL ||
+                curr_ver->length + 4 > CHUNK_SIZE ||
+                curr_ver->location + curr_ver->length != curr_location)
+            {
+                /* Need to allocate a new chunk of verifies. */
+
+                curr_ver = new_ver(curr_file, CHUNK_SIZE, curr_location);
+            }
+
+            *(int *)(curr_ver->data + curr_ver->length) = read_number(parm1);
+            curr_ver->length += 4;
+            curr_location += 4;
+
+            DEBUG_PRINTF(("VerifyWord at &%08X as &%08X\n",
+                          curr_ver->location + curr_ver->length - 4,
+                          *(int *)(curr_ver->data + curr_ver->length - 4)));
+            break;
+
+
+        case CMD_CHANGEBYTE:
+            /* Put the bytes into the current chunk if they will fit. */ 
+
+            if (curr_chg == NULL ||
+                curr_chg->length + 1 > CHUNK_SIZE ||
+                curr_chg->location + curr_chg->length != curr_location)
+            {
+                /* Need to allocate a new chunk of changes. */
+
+                curr_chg = new_chg(curr_file, CHUNK_SIZE, curr_location);
+            }
+
+            *(curr_chg->old + curr_chg->length) = read_number(parm1);
+            *(curr_chg->new + curr_chg->length) = read_number(parm2);
+            curr_chg->length++;
+            curr_location++;
+
+            DEBUG_PRINTF(("ChangeByte at &%08X from &%02X to &%02X\n",
+                          curr_chg->location + curr_chg->length - 1,
+                          *(curr_chg->old + curr_chg->length - 1),
+                          *(curr_chg->new + curr_chg->length - 1)));
+            break;
+
+
+        case CMD_VERIFYBYTE:
+            /* Put the byte into the current verify chunk if it will fit. */ 
+
+            if (curr_ver == NULL ||
+                curr_ver->length + 1 > CHUNK_SIZE ||
+                curr_ver->location + curr_ver->length != curr_location)
+            {
+                /* Need to allocate a new chunk of verifies. */
+
+                curr_ver = new_ver(curr_file, CHUNK_SIZE, curr_location);
+            }
+
+            *(curr_ver->data + curr_ver->length) = read_number(parm1);
+            curr_ver->length++;
+            curr_location++;
+
+            DEBUG_PRINTF(("VerifyByte at &%08X as &%02X\n",
+                          curr_ver->location + curr_ver->length - 1,
+                          *(int *)(curr_ver->data + curr_ver->length - 1)));
+            break;
+
+
+        case CMD_CHANGESTRING:
+            /* GSTrans the two strings. */
+
+            trans1 = gstrans(parm1, parm1_len, &trans1_len);
+            trans2 = gstrans(parm2, parm2_len, &trans2_len);
+
+            /* Put into current chunk if strings will fit. */ 
+
+            if (curr_chg == NULL ||
+                curr_chg->length + trans1_len > CHUNK_SIZE ||
+                curr_chg->location + curr_chg->length != curr_location)
+            {
+                /* Need to allocate a new chunk of changes. Use standard
+                   size chunk if the strings will fit, otherwise use a
+                   bigger one. No other special handling is needed for
+                   big chunks - since the length field is always greater
+                   than CHUNK_SIZE, all the other keywords automatically
+                   allocate a new chunk after a non standard one has
+                   been used. */
+
+                curr_chg = new_chg(curr_file, trans1_len > CHUNK_SIZE ?
+                                              trans1_len : CHUNK_SIZE,
+                                   curr_location);
+            }
+
+            memcpy(curr_chg->old + curr_chg->length, trans1, trans1_len);
+            memcpy(curr_chg->new + curr_chg->length, trans2, trans2_len);
+            free(trans1);
+            free(trans2); 
+
+            curr_chg->length += trans1_len;
+            curr_location += trans1_len;
+
+            DEBUG_PRINTF(("ChangeString at &%08X from '%s' to '%s'\n",
+                          curr_chg->location + curr_chg->length - trans1_len,
+                          parm1, parm2));
+            break;
+
+
+        case CMD_VERIFYSTRING:
+            /* GSTrans the string. */
+
+            trans1 = gstrans(parm1, parm1_len, &trans1_len);
+
+            /* Put into current chunk if string will fit. */ 
+
+            if (curr_ver == NULL ||
+                curr_ver->length + trans1_len > CHUNK_SIZE ||
+                curr_ver->location + curr_ver->length != curr_location)
+            {
+                /* Need to allocate a new chunk of verifies. Use standard
+                   size chunk if the string will fit, otherwise use a
+                   bigger one. No other special handling is needed for
+                   big chunks - since the length field is always greater
+                   than CHUNK_SIZE, all the other keywords automatically
+                   allocate a new chunk after a non standard one has
+                   been used. */
+
+                curr_ver = new_ver(curr_file, trans1_len > CHUNK_SIZE ?
+                                              trans1_len : CHUNK_SIZE,
+                                   curr_location);
+            }
+
+            memcpy(curr_ver->data + curr_ver->length, trans1, trans1_len);
+            free(trans1);
+
+            curr_ver->length += trans1_len;
+            curr_location += trans1_len;
+
+            DEBUG_PRINTF(("VerifyString at &%08X as '%s'\n",
+                          curr_ver->location + curr_ver->length - trans1_len,
+                          parm1));
+            break;
+
+
+        case CMD_OLDCONTENTS:
+            curr_file->u_old_contents = malloc_noerr(parm1_len + 1);
+            strcpy(curr_file->u_old_contents, parm1);
+            curr_file->u_old_file_type = read_number(parm2);
+            break;
+
+
+        case CMD_NEWCONTENTS:
+            curr_file->u_new_contents = malloc_noerr(parm1_len + 1);
+            strcpy(curr_file->u_new_contents, parm1);
+            curr_file->u_new_file_type = read_number(parm2);
+            break;
+
+
+        case CMD_PATCHESDIR:
+            /* Path name to recursively scan for more patch files. */
+
+            enumerate_files_in_object(parm1, object_file, read_patch_file);
+            break;
+
+
+        case CMD_TRANSFORMSFILE:
+            /* MessageTrans format file describing transforms. Add it to
+               our list of open MessageTrans files. */
+
+            open_msgtrans_file(parm1);
+            break;
+        }
+
+        line++;
+    }
+
+    fclose(infile);
+
+    /* Jump here to free() up the filename if we had to get it off
+       the heap. */
+/*
+free_memory:
+*/
+    if (filename != the_file)
+    {
+        free(filename);
+    }
+}

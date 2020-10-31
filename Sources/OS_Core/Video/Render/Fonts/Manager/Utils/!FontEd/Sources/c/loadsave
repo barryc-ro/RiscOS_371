@@ -1,0 +1,2542 @@
+/*  Title: > c.loadsave
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.drag"
+#include "h.loadsave"
+#include "h.menu"
+#include "h.redraw"
+#include "h.sprites"
+#include "h.suspend"
+
+
+BOOL heaptrace = FALSE;
+
+static os_error * readmetrics(Font_Block *font, const char *filename, int firstchar, int lastchar);
+static int signed16bit(unsigned char *ch);
+static os_error * addcomposite(Char_Block *charptr, int charno, int x, int y);
+
+static os_error *linkfont(Font_Block *font);
+static void putcoord(int x, int y);
+
+static os_error *validatefont(FFile_FontHdr **filedatap, int fsize, BOOL fillindependencies);
+static os_error *validatescaffold(FFile_FontHdr *filedata);
+static os_error *verr(const char *format, ...);
+os_error * warning(char *mess);
+
+static void read_xywh(char_flags flags,char **pp,int *xp,int *yp,int *wp,int *hp);
+static void read_xy(char_flags flags,char **pp,int *xp,int *yp);
+
+static int Get1(Font_Block *font, int *p);
+static void GetCoord(Font_Block *font, int *p, int *x, int *y);
+
+static BOOL coordsize;    /* true ==> use 12-bit coords, else 8-bit */
+
+typedef enum
+{
+  FF_TERMINATOR = 0,
+  FF_MOVETO     = 1,
+  FF_LINETO     = 2,
+  FF_CURVETO    = 3,
+  FF_TYPE       = 0x3,                 /* bits 0..1 */
+  FF_SCAFFOLDX  = 0x1C,                /* bits 2..4 */
+  FF_SCAFFOLDY  = 0xE0                 /* bits 5..7 */
+} linetype;
+
+#define FB_SCAFFOLDX 2
+#define FB_SCAFFOLDY 5
+
+
+#define IN_BASE_FILE (~0x7FFFFFFF)
+
+
+static char *outptr;
+
+
+/* ignore errors (font manager may not be loaded) */
+
+static void font_uncachefile(const char *filename, int recache)
+{
+  os_swi3(os_X + 0x4009A, 0, (int)filename, recache);
+}
+
+
+/* Scan fonts in the window list, generating sprites from any chars not yet processed
+ * Called twice from the main polling loop, so that 1-bpp fonts can take precedence
+ */
+
+os_error * scanloading(BOOL *foundany, int bpp)
+{
+  Wind_Link *wlink = Wind_Head.next;
+
+  *foundany = 0;
+
+  while (wlink != NULL)
+  {
+    if (wlink->type == W_FONTINDEX)
+    {
+      Font_Block * font = wlink->info;
+      Char_Block * charp;
+      int charnumber;
+
+      if (font->filedata->bpp == bpp)
+      if (font->currchar >= 0)
+      {
+        *foundany = 1;
+        while ((charnumber = font->currchar) < font->nchars)
+        {
+          font->currchar += 1;
+          if ((charp = font->chars[charnumber]) != NULL)
+          if (charp->sprname[0] == '\0')
+          {
+            os_error *err;
+            checklinear = 1;               /* only check these when first bringing up char */
+            err = loadchar(charp);         /* that allows them to be altered later */
+            checklinear = 0;
+            er(suspendpathdata(charp));    /* save memory */
+            if (err) return(err);
+            break;
+          }
+        }
+        if (font->currchar >= font->nchars) {
+          font->currchar = -1;
+          font->filedata->fontid = FONT_READY;
+          bbc_vdu(7);
+        }
+      }
+    }
+    wlink = wlink->next;
+  }
+  return(NULL);
+}
+
+
+/* ---- Load file ---------------------------------------------------------- */
+
+
+#define abf(x) { os_error *e = x; if (e!=NULL) { abortf(font); return(e); } }
+
+/* File formats:
+ * Version 2:  16-bit scaffold coords
+ * Version 3:  12-bit scaffold coords
+ *                    next 3 bits are the 'scaffold link' index (default = 0)
+ *                    next bit is reserved
+ * Version 4:  bit 3 in charflags => outline char, else bitmap
+ * Version 5:  table[nchars] = skeleton threshold
+ * Version 6:  byte after index in chunk = dependency flags
+ *                    if bit 3 of outline terminator set, composite bits follow
+ * Version 7:  first word in each chunk contains a copy of the file flags
+ */
+
+#define ErrorNumber_BadFontFile 0x20C
+
+os_error * loadfile(Font_Block *font, const char *filename, int estsize)
+{
+  wimp_w handle;
+  int i;
+  os_error *err;
+  Wind_Link *wlink = findwindinfo(W_FONTINDEX,font);     /* for setextent() */
+
+  handle = wlink->wind_handle;          /* for redrawing the window */
+
+  /* ---- read in file data (if invalid font file, see if it's a metrics file) ---- */
+
+  err = loadfiledata(filename, font, &font->filedata);     /* allocates a flex block and reads file into it */
+
+  if (err && err->errnum==ErrorNumber_BadFontFile) {
+    err = loadfile2(font, filename, estsize);              /* if invalid, see if it's a metrics file */
+    if (err) deletefont(font);
+    return(err);
+  }
+
+  if (err) { deletefont(font); return(err); }
+
+  /* ---- initialise font header from file data ---- */
+
+  if (font->filedata->bpp == 1) {
+    fontsizestr *fsiz = (fontsizestr *)&font->filedata->table[1];
+    font->xpoints = fsiz->xpoints / 16;
+    font->ypoints = fsiz->ypoints / 16;
+    font->xres    = fsiz->xres;
+    font->yres    = fsiz->yres;
+  }
+
+  font->currchar = 0;                                                   /* start scanning characters */
+  strcpy(font->filename, (estsize >= 0) ? filename
+                                        : (const char *)"Outlines");    /* remember filename for later */
+  font->parent = NULL;
+
+  /* ---- if any chunks come from the base file, try to find it ---- */
+
+  er(losebasefile(font));
+  er(findbasefile(font));      /* only loads it if at least one chunk comes from the basefile */
+
+  /* ---- set up appropriate char data ---- */
+
+  er(deleteallchars(font));                     /* this deletes bitmap links if nec. */
+  er(linkfont(font));                           /* see if there are any new links to be made */
+
+  font->grid.skip = 32;                         /* skip chunk 0 if there are no chars in it */
+  for (i=0;i<font->nchars;i++)
+  {
+    int chaddr = charaddr(font,i);
+    if (chaddr) {
+      if (i<32) font->grid.skip = 0;            /* we need chunk 0 if there are any chars in it */
+      er(newchar(font,i));                      /* this sets up bitmap links if possible */
+      getcharheader(font->chars[i]);            /* set up bounding box immediately from file data */
+      if ((font->filedata->bpp)==0) {
+        font->chars[i]->nextpath = PATH_SUSPENDED;
+      } else {
+        font->chars[i]->nextpath = PATH_BITMAP;
+      }
+    }
+  }
+  er(setextent(wlink));                         /* in case the grid skip has changed */
+
+  if (font->filedata->bpp == 0) er(loadscaffold(font));
+
+  /* Unless there is already a metrics file,
+   * look in the same directory for one
+   * and if that fails, scan <Font$Path> to find it
+   */
+
+  if (strcmp(font->filename2, "IntMetrics") == 0) {     /* try to find a suitable metrics file */
+    char buffer[256];
+    er(findmetrics(font, buffer, sizeof(buffer)));
+    if (*buffer) loadfile2(font, buffer, 0);            /* updates the name if successful */
+  }
+
+  if (handle) invalidate(handle,-big,-big,big,big);     /* invalidate font window */
+
+  return(NULL);
+}
+
+
+/* Load a font file into a flex block, verifying the identification word */
+
+os_error *loadfiledata(const char *filename, Font_Block *font, FFile_FontHdr **filepp)
+{
+  FILE *infile;
+  int fsize;
+
+  if ((infile = fopen(filename,"r")) == NULL)
+    returnerr("Couldn't open file");
+
+  /* ---- first see if its a legal font file - if not, try reading it as a metrics file */
+
+  {
+    char mybuffer[5];
+    fread(mybuffer, 4, 1, infile);               /* if first 4 bytes != "FONT", see if it's a metrics file */
+    mybuffer[4] = 0;
+    if (strcmp(mybuffer, "FONT") != 0) {           /* not a font file */
+      static os_error err = { ErrorNumber_BadFontFile, "Illegal font file" };
+      fclose(infile);
+      return(&err);
+    }
+  }
+
+  fseek(infile,0,SEEK_END);
+  fsize = (int) ftell(infile);
+
+  if (*filepp)
+  {
+    flex_free((flex_ptr)filepp);
+    *filepp = NULL;
+  }
+
+  e( { fclose(infile); return(e); }, myflex_alloc((flex_ptr)filepp,fsize));
+
+  fseek(infile, 0, SEEK_SET);
+  fread((char *)*filepp,fsize,1,infile);
+  fclose(infile);
+
+  er(validatefont(filepp, fsize, FALSE));      /* check font data, but don't fill in dependencies */
+
+  if (font->nchars < 32*nchunks(*filepp)) er(changenchars(font,32*nchunks(*filepp)));
+
+  return(grungefiledata(filepp));       /* adjust pointers for old versions */
+}
+
+
+/* Delete font block and associated data */
+
+os_error *deletefont(Font_Block * font)
+{
+  Wind_Link *wlink;
+
+  er(deleteallchars(font));                    /* delete chars in font */
+  if (font->filedata) {
+    flex_free((flex_ptr)&font->filedata);      /* delete file block  */
+    font->filedata = NULL;
+  }
+  er(losebasefile(font));
+  heap_free(font->chars);
+  heap_free(font);                             /* delete font block  */
+
+  if ((wlink = findwindinfo(W_FONTINDEX, font)) != NULL) {    /* close font index window */
+    deletewindlink(backlink, wlink);
+  }
+
+  if ((wlink = findwindinfo(W_TREE, font)) != NULL) {    /* close scaffold tree window if open */
+    deletewindlink(backlink, wlink);
+  }
+
+  return(NULL);
+}
+
+
+/* Find default metrics filename to load with this font */
+
+os_error *findmetrics(Font_Block *font, char *outbuffer, int size)
+{
+  char *ch;
+  int len = strlen(font->filename);
+  int alphabet;
+  char leafname[64], numbuff[64];
+
+  for (ch = font->filename + len-1; *ch != '.' && ch >= font->filename; ch--) {};
+  if (*ch++ == '.') {
+    if (sscanf(ch, "%s%d", leafname, &alphabet)==2) {
+      sprintf(numbuff, "%d", alphabet);
+      len = strlen("IntMetrics") + strlen(numbuff) - 10; if (len < 0) len=0;
+      strcpy(leafname, "IntMetrics");
+      strcpy(leafname + strlen("IntMetrics") - len, numbuff);
+      if (findleaf(font,outbuffer,size,leafname)==NULL) return(NULL);
+    }
+  }
+
+  return(findleaf(font,outbuffer,size,"IntMetrics"));
+}
+
+/* Find default outlines filename to load with this font (used as a base font) */
+
+os_error *findoutlines(Font_Block *font, char *outbuffer, int size)
+{
+  return(findleaf(font,outbuffer,size,"Outlines"));
+}
+
+
+/* Given a font block, look for a directory containing <leafname>
+ * First look in the same directory as the outline file,
+ * then see if there is a directory of the font's name referenced via Font$Path
+ * Returns full name of <leafname> file, or null string if not found
+ */
+
+os_error *findleaf(Font_Block *font, char *outbuffer, int size, const char *leafname)
+{
+  char *ch;
+  int len = strlen(font->filename);
+  int leaflen = strlen(leafname);
+
+  if (len >= size) returnerr("Buffer overflow");
+
+  strcpy(outbuffer, font->filename);
+  for (ch = outbuffer + len-1; *ch != '.' && ch >= outbuffer; ch--) {};
+  if (*ch == '.') {
+    os_filestr filestr;
+    len = ch+1-outbuffer;
+    if (len + leaflen >= size) returnerr("Buffer overflow");
+    strcpy(ch+1, leafname);
+    filestr.action = 17;    /* read info without using File$Path */
+    filestr.name = outbuffer;
+    if (os_file(&filestr) == NULL) {                    /* if error, just treat it as 'not found' */
+      if (filestr.action == 1) return(NULL);
+    }
+  }
+
+  er(findfontdir(font, outbuffer, size));
+
+  if (*outbuffer != 0) {
+    if (strlen(outbuffer) + leaflen >= size) returnerr("Buffer overflow");
+    strcpy(outbuffer + strlen(outbuffer), leafname);
+  }
+  return(NULL);
+}
+
+
+/* Given a font block, find the relevant font prefix
+ * ie. see if there is a directory of the font's name referenced via Font$Path
+ * Returns:  <Font$Path element><FontName>.
+ */
+
+os_error *findfontdir(Font_Block *font, char *outbuffer, int size)
+{
+  FFile_FontHdr *f = font->filedata;
+  char *fontname = ((char *)f->table) + f->table[0];
+  char mybuffer[256];
+  char *ch, *ch2, *ch3;
+
+  er(os_swi3(0x27, (int)"<Font$Path>,", (int)mybuffer, sizeof(mybuffer)));
+  mybuffer[255] = 0;   /* just in case ! */
+  ch2 = outbuffer;
+  ch3 = outbuffer+size;
+  for(ch=mybuffer; *ch; ch++) {
+    if (*ch != ',') { if (ch2 < ch3) *ch2++ = *ch; else returnerr("Buffer overflow"); }
+    else {
+      os_filestr filestr;
+      if (ch2 + strlen(fontname) + 2 > ch3) returnerr("Buffer overflow");
+      strcpy(ch2, fontname);
+      filestr.action = 17;    /* read info without using File$Path */
+      filestr.name = outbuffer;
+      if (os_file(&filestr) == NULL) {                    /* if error, just treat it as 'not found' */
+        if (filestr.action == 2) {
+          strcpy(outbuffer+strlen(outbuffer), ".");
+          return(NULL);          /* the directory exists - assume it's OK */
+        }
+      }
+    }
+  }
+  *outbuffer = 0;    /* null name => not found (last element is a dummy) */
+  return(NULL);
+}
+
+
+/* Load metrics file information into the font data,
+ * updating the stored metrics filename if the estimated size is >= 0.
+ */
+
+os_error * loadfile2(Font_Block *font, const char *filename, int estsize)
+{
+  er(readmetrics(font, filename, 0, font->nchars-1));    /* read metrics for all characters */
+
+  if (estsize >= 0) strcpy(font->filename2, filename);   /* update filename if succeeded */
+
+  return(NULL);
+}
+
+
+/* Read data from the metrics file to update the specified character blocks.
+ * Creates null glyphs for non-existant characters if they have non-zero width.
+ * Called from loadfile2() and alter_inheritance().
+ */
+
+typedef enum
+{
+  FLG_NOBBOXES   = 1 << 0,
+  FLG_NOXOFFSETS = 1 << 1,
+  FLG_NOYOFFSETS = 1 << 2,
+  FLG_KERNS      = 1 << 3,
+  FLG_MOREKERNS  = 1 << 4,
+  FLG_CHARMAPSIZED = 1 << 5
+} file_flags;
+
+typedef struct metricshdr {
+  char fontname[40];
+  int xsize, ysize;           /* normally 16,16 */
+  unsigned char ncharlo, fileversion, fileflags, ncharhi;
+} metricshdr;
+/* optional char map, bbox, xwidth, ywidth arrays follow */
+
+
+os_error *readmetrics(Font_Block *font, const char *filename, int firstchar, int lastchar)
+{
+  os_filestr f;
+  int bpp = font->filedata->bpp;
+  int designsize = font->filedata->designsize;
+  int multiplier = (bpp==0) ? 1 : font->xpoints;
+  int i, ch, nchars;
+  unsigned char *chmap;
+  int chmapsize, gapatend;
+  metricshdr *metrics;                                 /* held in a temporary flex block */
+  unsigned char *bbox, *xwidths, *ywidths, *table;     /* can't use shorts as not 2-byte aligned */
+  int table0, table1, table2, table3;
+  int xwidth, ywidth;
+  Char_Block **charray = font->chars;
+  Char_Block *charptr;
+  int newchars = 0;                   /* set if reading metrics creates any new characters */
+
+  f.action = 17;                    /* read info without using File$Path */
+  f.name = (char *)filename;
+  er(os_file(&f));     /* returns error if not found */
+
+  if (f.action != 1) {
+    static os_error error = { 1, "" };
+    sprintf(error.errmess, "File '%s' not found", filename);
+    return(&error);
+  }
+
+  if (f.start < sizeof(metricshdr)) returnerr("Illegal metrics file - too short");
+
+  metrics = heap_alloc(f.start);
+  if (!metrics) returnerr("Out of memory");
+
+  f.action = 16;                   /* load without using File$Path */
+  f.loadaddr = (int)metrics;
+  f.execaddr = 0;                  /* load at address given in f.loadaddr */
+  { os_error *err = os_file(&f);
+    if (err) { heap_free(metrics); return(err); }
+  }
+
+  nchars = metrics->ncharlo + (metrics->ncharhi << 8);     /* number of entries in arrays */
+
+  chmap = (unsigned char *)metrics + sizeof(metricshdr);
+  if (metrics->fileflags & FLG_CHARMAPSIZED) {
+    chmapsize = *chmap++;
+    chmapsize += *chmap++ << 8;
+  } else {
+    chmapsize = 256;
+  }
+
+  if (chmapsize) {
+    if (nchars > 256) {
+      returnerr("Illegal metrics file - charmap cannot be used for more than 256 entries");
+    }
+    for (i=0; i<chmapsize; i++) if (chmap[i] >= nchars) {
+      static os_error err = { 1, "" };
+      sprintf(err.errmess,"Illegal metrics file - char map entry[%d] = %d (max allowed %d)",i,chmap[i],nchars-1);
+      heap_free(metrics);
+      return(&err);
+    }
+  }
+
+  /* Read in metrics info: origbox, x-widths, y-widths */
+
+  bbox = chmap + chmapsize;
+  if (metrics->fileflags & FLG_NOBBOXES) { xwidths = bbox; bbox = NULL; } else xwidths = bbox + 8*nchars;
+  if (metrics->fileflags & FLG_NOXOFFSETS) { ywidths=xwidths; xwidths=NULL; } else ywidths=xwidths+2*nchars;
+  if (metrics->fileflags & FLG_NOYOFFSETS) { table=ywidths; ywidths=NULL; } else table=ywidths+2*nchars;
+
+  mytracef("charmap at offset &%X [%d]\n",chmapsize ? chmap-(unsigned char *)metrics : 0, chmapsize);
+  mytracef("   bbox at offset &%X\n",bbox    ? bbox   -(unsigned char *)metrics : 0);
+  mytracef("xwidths at offset &%X\n",xwidths ? xwidths-(unsigned char *)metrics : 0);
+  mytracef("ywidths at offset &%X\n",ywidths ? ywidths-(unsigned char *)metrics : 0);
+  mytracef("  table at offset &%X\n",table   ? table  -(unsigned char *)metrics : 0);
+
+  gapatend = f.start - (table - (unsigned char *)metrics);
+
+  if (gapatend) {
+    table0 = table[0] + (table[1] << 8); table0=table0; /* shut up C! */
+    table1 = table[2] + (table[3] << 8); table1=table1; /* shut up C! */
+    table2 = table[4] + (table[5] << 8); table2=table2; /* shut up C! */
+    table3 = table[6] + (table[7] << 8); table3=table3; /* shut up C! */
+  } else {
+    table0 = table1 = table2 = table3 = 0;
+  }
+
+  mytracef("gapatend = &%X, table[3] = &%X\n",gapatend,table3);
+
+  if (gapatend < 0) {
+    heap_free(metrics);
+    returnerr("Illegal metrics file - too short for number of chars");
+  }
+
+  if (metrics->fileflags & FLG_KERNS) {
+    if (gapatend < 8 || gapatend != table3) {
+      warning("Invalid kern data at end of metrics");
+    } else {
+      warning("Kerning data at end of metrics will be ignored");
+    }
+  } else {
+    if (gapatend > 0) warning("Unexpected extra data at end of metrics will be ignored");
+  }
+
+  for (i=firstchar; i<=lastchar; i++) {
+    if (chmapsize) {
+      if (i<chmapsize) ch=chmap[i]; else ch=0;
+    } else {
+      if (i<nchars) ch=i; else ch=0;
+    }
+
+    mytracef("Char %d entry %d bbox %d %d %d %d xwidth %d ywidth %d\n", i, ch,
+         bbox?signed16bit(bbox+2*ch+0*nchars):0,
+         bbox?signed16bit(bbox+2*ch+2*nchars):0,
+         bbox?signed16bit(bbox+2*ch+4*nchars):0,
+         bbox?signed16bit(bbox+2*ch+6*nchars):0,
+         xwidths?signed16bit(xwidths+2*ch):0,
+         ywidths?signed16bit(ywidths+2*ch):0);
+
+    if (xwidths) xwidth = signed16bit(xwidths+2*ch); else xwidth = 0;
+    if (ywidths) ywidth = signed16bit(ywidths+2*ch); else ywidth = 0;
+    if (bpp==0 && i && charray[i] == NULL && (xwidth || ywidth)) { er(newchar(font, i)); newchars = 1; }
+    if ((charptr=charray[i]) != NULL) {
+      charptr->xwidth = xwidth * multiplier;
+      charptr->ywidth = ywidth * multiplier;
+      if (bbox && bpp==0) {
+        register unsigned char * c = bbox + ch*2;
+        charptr->origbox.x0 = signed16bit(c+0*nchars) * designsize / 1000;
+        charptr->origbox.y0 = signed16bit(c+2*nchars) * designsize / 1000;
+        charptr->origbox.x1 = signed16bit(c+4*nchars) * designsize / 1000;
+        charptr->origbox.y1 = signed16bit(c+6*nchars) * designsize / 1000;
+      } else {
+        static wimp_box nullbox = { 0, 0, 0, 0 };
+        charptr->origbox = nullbox;
+      }
+    }
+  }
+
+  /* ignore kerning information for now */
+
+  heap_free(metrics);
+
+  /* Redraw font index if new chars created, and skeleton/bitmap windows if width displayed */
+
+  {
+    Wind_Link *wlink = Wind_Head.next;
+    while(wlink) {
+      switch(wlink->type) {
+        case W_FONTINDEX: if (newchars && wlink->info==font) invalidate(wlink->wind_handle, -big,-big,big,big);
+                          break;
+        case W_SKELETON:
+        case W_BITMAP:    if (showwidth && ((Char_Block *)wlink->info)->parent==font)
+                            invalidate(wlink->wind_handle, -big,-big,big,big);
+      }
+      wlink = wlink->next;
+    }
+  }
+
+  return(NULL);
+}
+
+
+int signed16bit(unsigned char *ch)
+{
+  int c = *ch++; c += *ch++ << 8;
+
+  return((c << 16) >> 16);
+}
+
+
+/* Work out if this bitmap font has an Outline parent loaded.
+ */
+
+static os_error *linkfont(Font_Block *font)
+{
+  if (font->filedata->bpp == 0) {                  /* find 1-bpp children for the font */
+    FFile_FontHdr *f = font->filedata;
+    char * f1 = ((char *)f->table) + f->table[0];
+    Wind_Link *wlink = Wind_Head.next;
+    while (wlink) {
+      if (wlink->type == W_FONTINDEX) {
+        Font_Block *font2 = wlink->info;
+        if (font2->filedata->bpp == 1)
+        if (font2->parent == NULL) {
+          FFile_FontHdr *f = font2->filedata;
+          char * f2 = ((char *)f->table) + f->table[0];
+          if (strcmp(f1,f2) == 0) font2->parent = font;
+        }
+      }
+      wlink = wlink->next;
+    }
+  } else {                                                    /* find outline parent for the font */
+
+    FFile_FontHdr *f = font->filedata;
+    char * f1 = ((char *)f->table) + f->table[0];
+    Wind_Link *wlink = Wind_Head.next;
+    while (wlink) {
+      if (wlink->type == W_FONTINDEX) {
+        Font_Block *font2 = wlink->info;
+        if (font2->filedata->bpp == 0) {
+          FFile_FontHdr *f = font2->filedata;
+          char * f2 = ((char *)f->table) + f->table[0];
+          if (strcmp(f1,f2) == 0) {
+            font->parent = font2;
+            break;        /* there can only be one parent! */
+          }
+        }
+      }
+      wlink = wlink->next;
+    }
+  }
+  return(NULL);
+}
+
+
+/* Convert file scaffold data into Char_Block data.
+ */
+
+os_error *loadscaffold(Font_Block *font)
+{
+  FFile_FontHdr *f = font->filedata;
+  FFile_FontHdr *f2 = font->basefiledata;
+  unsigned short *table;
+  unsigned short *table1 = f->table;
+  unsigned short *table2 = f2 ? f2->table : NULL;
+  int version = f->version;
+  int c, c2, i, temp;
+  char *inp;
+  int localword, baseword;
+  Char_Block *ch, *ch2, **charray = font->chars;
+  int *xchar, *xlink;
+  int *xcoord;
+  int *xwidth;
+  int nscaffold1 = f && f->version >= 8 && f->chunk.new.nscaffolds ? f->chunk.new.nscaffolds : 256;
+  int nscaffold2 = f2 && f2->version >= 8 && f2->chunk.new.nscaffolds ? f2->chunk.new.nscaffolds : 256;
+  int nscaffolds;
+  scaff_flags scaffoldflags1 = f && f->version >= 8 ? f->chunk.new.scaffoldflags : 0;
+  scaff_flags scaffoldflags2 = f2 && f2->version >= 8 ? f2->chunk.new.scaffoldflags : 0;
+  scaff_flags scaffoldflags;
+  int bit16;
+
+  font->skeleton_threshold = (version >= 5) ? *((char *)&table1[nscaffold1]) : 0;
+
+  /* first read in the local lines */
+
+  for (c=1;c<font->nchars;c++)   /* omit first element (= offset to end) */
+  if ((ch=charray[c])!=NULL) {
+    xchar = ch->scaffold.xchar;
+    xlink = ch->scaffold.xlink;
+    xcoord = ch->scaffold.xcoord;
+    xwidth = ch->scaffold.xwidth;
+    for (i=0;i<16;i++) {
+      xchar[i] = c;
+      xlink[i] = 0;
+      xcoord[i] = NULL_SCAFFOLD;
+      xwidth[i] = 0;
+    }
+
+    if (inbasefile(font,c)) {
+      table = table2;
+      nscaffolds = nscaffold2;
+      scaffoldflags = scaffoldflags2;
+    } else {
+      table = table1;
+      nscaffolds = nscaffold1;
+      scaffoldflags = scaffoldflags1;
+    }
+
+    if (c<nscaffolds && (temp = table[c]) != 0) {
+      if (scaffoldflags & SCF_16BIT) {
+        bit16 = 1;
+      } else if (temp & OFF_16BIT) {
+        bit16 = 1;
+        temp &= ~OFF_16BIT;
+      } else {
+        bit16 = 0;
+      }
+
+      inp = ((char *)table)+temp;
+      ch->scaffold.basechar = *inp++;
+      if (bit16) ch->scaffold.basechar += *inp++ << 8;
+      baseword = *inp++ | (*inp++ << 8);
+      localword = *inp++ | (*inp++ << 8);
+      for (i=0;i<16;i++) {
+        if (localword & (1<<i)) {
+          xcoord[i] = ((*inp++ << 20) | (*inp++ << 28)) >> 20;
+          xlink[i] = (version == 2) ? 0 : (inp[-1] >> 4);   /* scaffold link index / linear bit */
+          xwidth[i] = *inp++;
+        } else if (baseword & (1<<i)) {
+          xchar[i] = 0;    /* mark so it will be scanned later */
+        }
+      }
+    }
+  }
+
+   /* now rescan, to find out where the global lines are */
+
+  for (c=1;c<font->nchars;c++)
+  if ((ch=charray[c])!=NULL) {
+    xchar = ch->scaffold.xchar;
+    xlink = ch->scaffold.xlink;
+    xcoord = ch->scaffold.xcoord;
+    xwidth = ch->scaffold.xwidth;
+    for (i=0;i<16;i++)
+    if (xchar[i] == 0) {                                /* defined in a parent character */
+      c2 = ch->scaffold.basechar;
+      while(c2) {                                       /* loop to find the local definition */
+        if ((ch2=charray[c2]) == NULL) { c2=0; break; }
+        if (ch2->scaffold.xchar[i] == c2) break;
+        c2 = ch2->scaffold.basechar;
+      }
+      if (c2) {
+        xchar[i] = ((temp=ch2->scaffold.xcoord[i]) == NULL_SCAFFOLD) ? c : c2;
+        xlink[i] = ch2->scaffold.xlink[i];
+        xcoord[i] = temp;
+        xwidth[i] = ch2->scaffold.xwidth[i];
+      } else {
+        xchar[i] = c;        /* null line */
+      }
+    }
+  }
+
+  return(NULL);
+}
+
+
+/* Routines to load bytes out of the font file data.
+ * Must cope with the file data moving due to flex block expansion.
+ */
+
+#define get1(p) Get1(font,&p)
+#define getcoord(p,x,y) GetCoord(font,&p,&x,&y)
+
+int Get1(Font_Block *font, int *p)
+{
+  unsigned char *f = (unsigned char *)(*p & IN_BASE_FILE ? font->basefiledata : font->filedata);
+  int res = f[*p & ~IN_BASE_FILE];             /* NB: NOT sign-extended */
+  *p += 1;
+  return(res);
+}
+
+void GetCoord(Font_Block *font, int *p, int *x, int *y)
+{
+  char *f = (char *)(*p & IN_BASE_FILE ? font->basefiledata : font->filedata);
+  int p1 = *p & ~IN_BASE_FILE;
+  if (coordsize) {
+    int b1 = f[p1+1];
+    *x = ((f[p1+0] << 20) | (b1 << 28)) >> 20;
+    *y = ((b1 << 16) | (f[p1+2] << 24)) >> 20;
+    *p += 3;
+  } else {
+    *x = f[p1] << 24 >> 24;
+    *y = f[p1+1] << 24 >> 24;
+    *p += 2;
+  }
+}
+
+
+/* Lose the base file data (if any) */
+
+os_error *losebasefile(Font_Block *font)
+{
+  if (font->basefiledata) {
+    flex_free((flex_ptr)&font->basefiledata);
+    font->basefiledata = NULL;
+  }
+  return(NULL);
+}
+
+
+/* If any chunks require it, make sure we have a base file.
+ * If none do, remove our base file (if any).
+ */
+
+os_error *findbasefile(Font_Block *font)
+{
+  int i;
+  int orr = 0;
+
+  for (i=0; i<nchunks(font->filedata); i++) orr |= chunkoffset(font->filedata,i);
+
+  if (orr & IN_BASE_FILE) {
+    if (!font->basefiledata) {
+      char buffer[256];
+      er(findoutlines(font, buffer, sizeof(buffer)));
+      er(loadfiledata(buffer, font, &font->basefiledata));
+      for (i=0; i<nchunks(font->basefiledata); i++) {
+        if (chunkoffset(font->basefiledata,i) & IN_BASE_FILE) returnerr("Invalid base font file");
+      }
+    }
+    return(NULL);
+  } else {
+    return(losebasefile(font));
+  }
+}
+
+
+
+/* Create a sprite for the given character, if it hasn't got one already.
+ */
+
+os_error * loadchar(Char_Block *charptr)
+{
+  Font_Block *font;
+  int        charnumber;
+  wimp_w     handle;
+
+  /* CharData */
+
+  if (charptr == NULL) return(NULL);                      /* nothing to load */
+
+  mytracef("loadchar %3d from &%p: nextpath = &%p\n",
+                 charptr->charno,charptr,charptr->nextpath);
+
+  font = charptr->parent;
+  charnumber = charptr->charno;
+  handle = findwindinfo(W_FONTINDEX,font)->wind_handle;
+
+  mytracef("loadchar: handle = &%p\n",handle);
+
+  if (charptr->nextpath==PATH_BITMAP)
+  {
+    if (charptr->sprname[0] != '\0') return(NULL);  /* already done */
+    if (font->filedata->fontid == FONT_SCALING) {
+      if (charptr->template != NULL) {
+        abf(makesprite1bpp(charptr,(nonzerowinding(charptr))));     /* calls loadchar(charptr->template) */
+      } else {
+        abf(deletechardata(font,charptr->charno,charptr->charno)); /* outline char has been deleted */
+      }
+    } else {
+      abf(unpack1bpp(charptr));
+    }
+    if (handle) displaychar(handle,font,charnumber);
+  } else {
+    er(unsuspendpathdata(charptr));
+    if (charptr->sprname[0] == '\0') {          /* are we doing this for the first time? */
+      er(updatebbox(charptr, NULL));            /* don't trust the one in the file */
+      abf(makesprite(charptr,(nonzerowinding(charptr))));
+      if (handle) displaychar(handle,font,charnumber);
+    }
+  }
+
+  return(NULL);
+}
+
+
+typedef enum {
+  LOAD_FINISHED = 0,
+  LOAD_FILLPATH = 1,
+  LOAD_STROKEPATH = 2
+} loadflags;
+
+
+/* Convert char data in file into heap format for display.
+ */
+
+os_error *unsuspendpathdata(Char_Block *charptr)
+{
+  Path_Block *pathptr, **headpath;
+  Pt_Block   *firstpt, *headpt;
+  int        firstx, firsty, curx, cury, x, y;
+  Pt_Block   *ptr1, *ptr2;
+  char       cflags;
+  loadflags  chargoing;
+  int        ch, code;
+  Font_Block *font = charptr->parent;
+
+  if (charptr->nextpath != PATH_SUSPENDED) {
+    mytracef("charptr->nextpath = &%p\n",charptr->nextpath); return(NULL);
+  }
+
+  ch = getcharheader(charptr);                  /* load bbox */
+
+  if (bbc_inkey(-2)) {
+    mytracef("Char %d is at offset &%X in font file at &%p\n",charptr->charno,ch,font->filedata);
+    code=ch; for (x=0; x<64; x++) mytracef(" %2X",get1(ch)); ch=code;
+    mytracef("\n");
+  }
+
+  charptr->flags |= CHAR_OUTLINE;               /* mark as outlines */
+  charptr->sline.p[1]  = NULL;                  /* no selected line  */
+
+  charptr->nextpath = NULL;                     /* in case of null character */
+  headpath = &charptr->nextpath;
+  firstpt = NULL;                               /* headpt, curx, cury not relevant yet */
+
+  if (charptr->flags & CHAR_COMPOSITE) {        /* in this case ch->byte after flags */
+    if (charptr->flags & CHAR_COMPOSITE1) {
+      code = get1(ch); if (charptr->flags & CHAR_16BITCODES) code += get1(ch) << 8;
+      abf(addcomposite(charptr,code,0,0));
+    }
+    if (charptr->flags & CHAR_COMPOSITE2) {
+      code = get1(ch); if (charptr->flags & CHAR_16BITCODES) code += get1(ch) << 8;
+      getcoord(ch,x,y);                         /* offset of accent */
+      abf(addcomposite(charptr,code,x,y));
+    }
+  } else {
+    chargoing = LOAD_FILLPATH;
+    do
+    {
+      switch((cflags = get1(ch)) & 0x3)
+      {
+        case FF_MOVETO:
+             getcoord(ch,x,y);
+             firstx = curx = x;
+             firsty = cury = y;
+             abf(getheap(Path_Block,&pathptr));
+             *headpath = pathptr;
+             headpath = &pathptr->nextpath;
+             *headpath = NULL;
+             abf(newpt(PT_HINGED,x,y,pathptr,&headpt));
+             pathptr->firstpoint = firstpt = headpt;
+             headpt->scaffoldx = (cflags & FF_SCAFFOLDX) >> FB_SCAFFOLDX;
+             headpt->scaffoldy = (cflags & FF_SCAFFOLDY) >> FB_SCAFFOLDY;
+             break;
+
+        case FF_LINETO:
+             getcoord(ch,x,y);
+
+             abf(newpt(PT_STRAIGHT,(2*curx+x)/3,(2*cury+y)/3,pathptr,&ptr1));
+             headpt->nextpt[1] = ptr1;
+             ptr1->nextpt[1] = headpt;
+
+             abf(newpt(PT_STRAIGHT,(curx+2*x)/3,(cury+2*y)/3,pathptr,&ptr2));
+             ptr1->nextpt[0] = ptr2;
+             ptr2->nextpt[0] = ptr1;
+
+             if (chargoing == LOAD_FILLPATH && x==firstx && y==firsty)
+             {
+               ptr2->nextpt[1] = firstpt;
+               firstpt->nextpt[0] = ptr2;
+               firstpt = NULL;
+             }
+             else
+             {
+               abf(newpt(PT_HINGED,x,y,pathptr,&headpt));
+               ptr2->nextpt[1] = headpt;
+               headpt->nextpt[0] = ptr2;
+               curx = x;
+               cury = y;
+               headpt->scaffoldx = (cflags & FF_SCAFFOLDX) >> FB_SCAFFOLDX;
+               headpt->scaffoldy = (cflags & FF_SCAFFOLDY) >> FB_SCAFFOLDY;
+             }
+             break;
+
+        case FF_CURVETO:
+             getcoord(ch,x,y);
+             abf(newpt(PT_CONTROL,x,y,pathptr,&ptr1));
+             headpt->nextpt[1] = ptr1;
+             ptr1->nextpt[1] = headpt;
+
+             getcoord(ch,x,y);
+             abf(newpt(PT_CONTROL,x,y,pathptr,&ptr2));
+             ptr1->nextpt[0] = ptr2;
+             ptr2->nextpt[0] = ptr1;
+
+             getcoord(ch,curx,cury);
+
+             if (chargoing == LOAD_FILLPATH && curx==firstx && cury==firsty)
+             {
+               ptr2->nextpt[1] = firstpt;
+               firstpt->nextpt[0] = ptr2;
+               firstpt = NULL;
+             }
+             else
+             {
+               abf(newpt(PT_HINGED,curx,cury,pathptr,&headpt));
+               ptr2->nextpt[1] = headpt;
+               headpt->nextpt[0] = ptr2;
+               headpt->scaffoldx = (cflags & FF_SCAFFOLDX) >> FB_SCAFFOLDX;
+               headpt->scaffoldy = (cflags & FF_SCAFFOLDY) >> FB_SCAFFOLDY;
+             }
+             ptr1->scaffoldx = ptr1->nextpt[1]->scaffoldx;
+             ptr1->scaffoldy = ptr1->nextpt[1]->scaffoldy;
+             ptr2->scaffoldx = ptr2->nextpt[1]->scaffoldx;
+             ptr2->scaffoldy = ptr2->nextpt[1]->scaffoldy;
+             break;
+
+        case FF_TERMINATOR:
+             chargoing = (cflags & 0x04) ? LOAD_STROKEPATH : LOAD_FINISHED;
+             break;
+
+        default:
+             {
+               finish("Unknown segment type");
+             }
+      }
+    } while (chargoing != LOAD_FINISHED);
+
+    /* if bit 3 of terminator set, a list of composite elements follows */
+
+    if (cflags & 0x08) {
+      code = get1(ch); if (charptr->flags & CHAR_16BITCODES) code += get1(ch) << 8;
+      while (code) {
+        getcoord(ch,x,y);                       /* x,y offset of this element */
+        abf(addcomposite(charptr,code,x,y));
+        code = get1(ch); if (charptr->flags & CHAR_16BITCODES) code += get1(ch) << 8;
+      }
+    }
+  }
+
+  return(NULL);
+}
+
+
+/* Add a composite section to the list.
+ */
+
+os_error * addcomposite(Char_Block *charptr, int charno, int x, int y)
+{
+  Comp_Block *comp, **backcomp;
+
+  for (backcomp=&charptr->composites; *backcomp; backcomp = &((*backcomp)->next)) {};
+
+  er(getheap(Comp_Block, &comp));
+  comp->charno = charno;
+  comp->xorigin = x;
+  comp->yorigin = y;
+  comp->next = NULL;
+  *backcomp = comp;
+
+  return(NULL);
+}
+
+
+/* Force a character to have its sprite recomputed
+ */
+
+os_error * reloadchar(Char_Block * charptr)
+{
+  if (charptr->sprname[0]!=0)
+  {
+    sprite_id tempid;
+    tempid.s.name = charptr->sprname;
+    tempid.tag = sprite_id_name;
+    erx(sprite_delete(charptr->parent->spritedata,&tempid));
+    charptr->sprname[0] = 0;
+  }
+  return(loadchar(charptr));
+}
+
+
+/* Return offset within file data of character address.
+ * Returns top bit set if character is part of the base file.
+ */
+
+int getcharheader(Char_Block * charptr)
+{
+  Font_Block * font = charptr->parent;
+  int ch = charaddr(font,charptr->charno);
+  int x, y;
+
+  if (ch==0) finish("Eh? this character is now null, but it wasn't before!");
+
+  /* mytracef("filedata, charaddr = %p %p\n",font->filedata,ch); */
+
+  charptr->flags   = get1(ch);
+  coordsize = (charptr->flags & CHAR_12BIT) != 0;    /* global variable for subsequent reads */
+
+  if ((charptr->flags & CHAR_OUTLINE) && (charptr->flags & CHAR_COMPOSITE)) {
+    /* leave bounding box alone - worked out by updatebbox */
+  } else {
+    getcoord(ch, charptr->xlowc, charptr->ylowc);
+    getcoord(ch, x, y);
+    charptr->xupperc = charptr->xlowc + x;
+    charptr->yupperc = charptr->ylowc + y;
+  }
+
+  /* mytracef("getcharheader(&%x): x0,y0,x1,y1 = %d,%d,%d,%d\n",
+              charptr->charno,
+              charptr->xlowc, charptr->ylowc, charptr->xupperc, charptr->yupperc);
+   */
+
+  return(ch);
+}
+
+
+/* convert heap data back into file format data */
+
+os_error * savechar(Char_Block *charptr)
+{
+  Path_Block *subpath = charptr->nextpath;
+  Comp_Block *comp;
+
+  if (subpath == PATH_BITMAP) {
+    return(pack1bpp(charptr));
+  } else if (subpath == PATH_SUSPENDED) {
+    return(NULL);       /* this has already been done! */
+  } else {
+    char       scratchblock[4096];     /* save char data into here first */
+    Pt_Block   *firstpt, *endp, *ctrl1, *ctrl2;
+    loadflags chargoing, whichpath;
+    BOOL leftout;
+
+    /* first construct the output data in scratchblock */
+
+    outptr = scratchblock;      /* global variable */
+
+    charptr->flags = (charptr->flags & ~(CHAR_COMPOSITE | CHAR_16BITCODES)) | CHAR_12BIT | CHAR_OUTLINE;
+
+    /* scan list of composite elements to see if 16-bit codes are required */
+
+    if (charptr->parent->filedata->version >= 8) {
+      for (comp = charptr->composites; comp; comp = comp->next) {
+        if (comp->charno > 255) charptr->flags |= CHAR_16BITCODES;
+      }
+    }
+
+    if (charptr->parent->filedata->version >= 7 &&            /* only allowed in version 7 onwards */
+        charptr->nextpath==NULL && charptr->composites) {
+      Comp_Block *comp1 = charptr->composites;
+      Comp_Block *comp2 = comp1 ? comp1->next : NULL;
+      Comp_Block *comp3 = comp2 ? comp2->next : NULL;
+
+      if (comp3==NULL) {
+        if (comp1->xorigin || comp1->yorigin) {
+          comp3 = comp1; comp1 = comp2; comp2 = comp3;   /* swap so comp1 is at 0,0 if either is */
+        }
+        if (!comp1 || (comp1->xorigin==0 && comp1->yorigin==0)) {    /* basechar must be at 0,0 if present */
+          char *startptr = outptr++;      /* for later */
+          if (comp1) { charptr->flags |= CHAR_COMPOSITE1;
+                       *outptr++ = comp1->charno;
+                       if (charptr->flags & CHAR_16BITCODES) *outptr++ = comp1->charno >> 8;
+                     }
+          if (comp2) { charptr->flags |= CHAR_COMPOSITE2;
+                       *outptr++ = comp2->charno;
+                       if (charptr->flags & CHAR_16BITCODES) *outptr++ = comp2->charno >> 8;
+                       putcoord(comp2->xorigin, comp2->yorigin);
+                     }
+          *startptr = charptr->flags;
+        }
+      }
+    }
+
+    if ((charptr->flags & CHAR_COMPOSITE) == 0) {
+      *outptr++ = charptr->flags;
+      putcoord(charptr->xlowc, charptr->ylowc);
+      putcoord(charptr->xupperc-charptr->xlowc, charptr->yupperc-charptr->ylowc);
+
+      /* mytracef("putcharheader(&%x): x0,y0,x1,y1 = %d,%d,%d,%d\n",
+                  charptr->charno,
+                  charptr->xlowc, charptr->ylowc, charptr->xupperc, charptr->yupperc);
+       */
+
+      chargoing = LOAD_FILLPATH;
+      do {
+        leftout = false;
+        subpath = charptr->nextpath;
+        while (subpath != NULL)
+        {
+          firstpt = subpath->firstpoint;
+          whichpath = (firstpt->nextpt[0] == NULL || firstpt->nextpt[1] == NULL)
+                          ? LOAD_STROKEPATH
+                          : LOAD_FILLPATH;
+          if (chargoing != whichpath) {
+            leftout = true;
+          } else {
+            firstpt = endp = subpath->firstpoint;
+            ctrl2 = NULL;
+        
+            *outptr++ = FF_MOVETO
+                      | (endp->scaffoldx<<FB_SCAFFOLDX)
+                      | (endp->scaffoldy<<FB_SCAFFOLDY);
+            outpoint(endp);
+
+            do
+            {
+              if ((ctrl1=endp->nextpt[0])==ctrl2) ctrl1 = endp->nextpt[1];
+              if (ctrl1 == NULL) break;
+
+              ctrl2 = ctrl1->nextpt[0];
+              endp  = ctrl2->nextpt[1];
+
+              switch(ctrl1->type)
+              {
+                case PT_STRAIGHT:
+                     *outptr++ = FF_LINETO
+                               | (endp->scaffoldx<<FB_SCAFFOLDX)
+                               | (endp->scaffoldy<<FB_SCAFFOLDY);
+                     outpoint(endp);
+                     break;
+
+                case PT_CONTROL:
+                     *outptr++ = FF_CURVETO
+                               | (endp->scaffoldx<<FB_SCAFFOLDX)
+                               | (endp->scaffoldy<<FB_SCAFFOLDY);
+                     outpoint(ctrl1); outpoint(ctrl2); outpoint(endp);
+                     break;
+
+                default:
+                     returnerr("Unknown control point type");
+              }
+
+            } while (endp!=firstpt);     /* avoid looping */
+          }
+          subpath = subpath->nextpath;
+        }
+
+        if (chargoing == LOAD_FILLPATH) {
+          if (leftout) {
+            *outptr++ = FF_TERMINATOR | 0x04;
+            chargoing = LOAD_STROKEPATH;
+          } else {
+            *outptr++ = FF_TERMINATOR;
+            chargoing = LOAD_FINISHED;
+          }
+        } else {
+          *outptr++ = FF_TERMINATOR;
+          chargoing = LOAD_FINISHED;
+        }
+      } while (chargoing != LOAD_FINISHED);
+
+      /* append list of composite elements afterwards, if there are any */
+
+      if (charptr->composites) {
+        comp = charptr->composites;
+        outptr[-1] |= 0x08;
+        while (comp) {
+          *outptr++ = comp->charno;
+          if (charptr->flags & CHAR_16BITCODES) *outptr++ = comp->charno >> 8;
+          putcoord(comp->xorigin, comp->yorigin);
+          comp = comp->next;
+        }
+        *outptr++ = 0;
+        if (charptr->flags & CHAR_16BITCODES) *outptr++ = 0;
+      }
+    }
+
+    /* word-alignment:  while (((outptr-scratchblock) & 3) != 0) *outptr++ = 0; */
+    /* mytracef("New char data size = %p\n",outptr-scratchblock); */
+
+    /* now insert the character data into the file data */
+
+    return(savechardata(charptr,scratchblock,outptr-scratchblock));
+  }
+}
+
+
+void outpoint(Pt_Block *pt)
+{
+  putcoord(pt->x, pt->y);
+}
+
+
+static void putcoord(int x, int y)
+{
+  *outptr++ = x;
+  *outptr++ = ((x >> 8) & 0x0F) | (y << 4);
+  *outptr++ = y >> 4;
+}
+
+
+/*  Take a chunk of data and store it in the filedata
+ *  File is separated into 8 chunks, each word-aligned
+ *  Each chunk contains 32 character offsets (0 ==> no char)
+ *  Wastage is stored BEFORE the first char, so it can be calculated again
+ */
+
+os_error * savechardata(Char_Block * charptr,char * newdata,int newsize)
+{
+  Font_Block *font    = charptr->parent;
+  FFile_FontHdr *f    = font->filedata;
+  int        chunk    = charptr->charno >> 5;
+  int        ch       = charptr->charno & 0x1F;
+  int        chunkoff, chunkend, chrstart, chrend, i;
+  int        *chunkindex, indexsize;
+  int        pixflags = (f->bpp ? f->designsize : FLG_DEPENDENCIES) | FLG_PRESENT;
+
+/*
+  mytracef("Saving chardata for char %d\n",charptr->charno);
+*/
+
+  chunkoff = chunkoffset(f,chunk);
+  chunkend = chunkoffset(f,chunk+1) & ~IN_BASE_FILE;
+  chunkindex = (int *) ((char *)f + chunkoff);
+
+  if (chunkoff & IN_BASE_FILE) return(NULL);                    /* don't touch base file data */
+
+  indexsize = 32*4;
+  if (f->version >= 7) { chunkindex++; indexsize = 33*4; }      /* first word is flag data */
+  if (pixflags & FLG_DEPENDENCIES) indexsize += 4;              /* word after index is dependencies */
+
+  if (chunkend == chunkoff)        /* create null chunk if nec. */
+  {
+    er(myflex_midextend("Creating null chunk",(flex_ptr)&font->filedata,chunkoff,indexsize));
+    chunkend += indexsize;
+    for (i=chunk+1;i<=nchunks(f);i++) chunkoffset(f,i) += indexsize; /* relocate other chunks */
+    for (i=0;i<=31;i++) chunkindex[i] = 0;                      /* initialise index */
+    if (f->version >= 7) chunkindex[-1] = pixflags;             /* initialise pixflags */
+    if (pixflags & FLG_DEPENDENCIES) chunkindex[32] = 0;        /* initialise dependencies */
+  }
+
+  /* calculate start and end addresses of current char data */
+
+  if (heaptrace) mytracef("version = %d\n",f->version);
+
+  if (f->version >= 7) { chunkoff += 4; indexsize -= 4; }       /* skip pixflags */
+
+  chrend = chunkend-chunkoff;
+  for (i=31;i>ch;i--) if (chunkindex[i]!=0) { chrend = chunkindex[i]; }
+  if ((chrstart=chunkindex[ch])==0) chrstart = chrend;
+
+  if (heaptrace) mytracef("chrstart = %d, chrend = %d\n",chrstart,chrend);
+
+  {
+    int extend = newsize - (chrend-chrstart);
+    int wastage = 0;
+    int wastext;
+
+    if (extend != 0)
+    {
+      wastage = chunkend-chunkoff-indexsize;         /* find offset to first character */
+      for (i=0;i<32;i++) if (chunkindex[i]!=0) { wastage = chunkindex[i]-indexsize; break; }
+
+      if (heaptrace)
+      mytracef("chunkoff = %d, chunkend = %d, indexsize = %d, wastage = %d\n",
+                    chunkoff,chunkend,indexsize,wastage);
+
+      if ((wastext = ((wastage-extend) & 3) - wastage) != 0) {
+        er(myflex_midextend("Correcting wastage",
+                                      (flex_ptr)&font->filedata, chunkoff+indexsize+wastage, wastext));
+
+        for (i=0;i<=31;i++) if (chunkindex[i]!=0) chunkindex[i] += wastext;
+        chrstart += wastext;
+        chrend += wastext;
+      }
+
+      er(myflex_midextend("Altering char size",(flex_ptr)&font->filedata, chunkoff+chrend, extend));
+
+      for (i=ch+1;i<=31;i++) if (chunkindex[i]!=0) chunkindex[i] += extend;
+      extend += wastext;   /* should now be word-aligned */
+      if (extend & 3) finish("Chunks not word-aligned");
+      for (i=chunk+1;i<=nchunks(font->filedata);i++) {
+        chunkoffset(font->filedata,i) += extend;
+      }
+    }
+  }
+
+  if (newdata == NULL)
+  {
+    chunkindex[ch] = 0;
+  }
+  else
+  {
+    char *ptr1, *ptr2;
+
+    chunkindex[ch] = chrstart;
+    ptr2 = (char *)chunkindex + chrstart;
+    for (ptr1=newdata;ptr1<newdata+newsize;) *ptr2++ = *ptr1++;
+  }
+
+  /*
+    mytracef("Contents of chunk %d:\n",chunk);
+    for (i=0;i<=31;i++) mytracef("%p  ",chunkindex[i]);
+    mytracef("\n");
+
+    for (i=0;i<=8;i++)
+      mytracef("Chunk %d offset = &%p\n",i,chunkoffset(font->filedata,i));
+
+    mytracef("Total file size = &%p\n",flex_size((flex_ptr)&font->filedata));
+  */
+
+  return(NULL);
+}
+
+
+/* Returns offset of character data in file
+ * Can't return the address as the file data block may move.
+ * Returns top bit set if character is in the base file.
+ * Returns 0 if character is null.
+ */
+
+int charaddr(Font_Block * font, int charno)
+{
+  FFile_FontHdr * filep = font->filedata;
+  int chunk = chunkoffset(filep,charno>>5);
+  int in_base_file = 0;
+
+  if (chunk & IN_BASE_FILE) {
+    filep = font->basefiledata;
+    if (filep == NULL) finish("Base file data not present");
+    chunk = chunkoffset(filep,charno>>5);
+    in_base_file = IN_BASE_FILE;
+  }
+
+  if (chunk < chunkoffset(filep,(charno>>5)+1) ) {
+    int charp;
+    char *chunkp = ((char *)filep) + chunk;
+    if (filep->version >= 7) chunkp += 4;       /* skip flag word */
+    charp = ((int *)chunkp)[charno & 0x1F];
+    if (charp!=0) return(in_base_file | (chunkp+charp - (char *)filep));
+  }
+
+  return(0);
+}
+
+
+/* Say whether a given character is in this font or the base file */
+
+BOOL inbasefile(Font_Block *font, int ch)
+{
+  return((chunkoffset(font->filedata,ch>>5) & IN_BASE_FILE) != 0);
+}
+
+
+/* Alter the inheritance of the font,
+ * ie. which chunks are local and which inherited from the base file.
+ */
+
+os_error * alter_inheritance(Font_Block *font, int chunk)
+{
+  wimp_w handle = findwindinfo(W_FONTINDEX,font)->wind_handle;
+  wimp_box box1, box2;
+  int firstchar = chunk<<5;
+  int ch;
+  Char_Block *charptr;
+  int chaddr;
+  BOOL in_base_file = inbasefile(font, chunk<<5);
+
+  getcharbox(font, (chunk<<5)   , 0,0, &box1);
+  getcharbox(font, (chunk<<5)+31, 0,0, &box2);
+  invalidate(handle, -big, box2.y0, big, box1.y1);
+
+  chunkoffset(font->filedata,chunk) &= ~IN_BASE_FILE;
+
+  for (ch=firstchar; ch<firstchar+32; ch++) {
+    charptr = font->chars[ch];
+    if (charptr) {
+      er(savechardata(charptr, NULL, 0));       /* delete character data in file */
+    }
+  }
+  er(deletechardata(font, firstchar?firstchar:1, firstchar+31));        /* delete character heap blocks */
+
+  if (in_base_file) {     /* chunk not now inherited - must be null */
+
+    chunkoffset(font->filedata,chunk) &= ~IN_BASE_FILE;
+    er(findbasefile(font));
+
+  } else {                /* chunk is now inherited - set up new char blocks */
+
+    chunkoffset(font->filedata,chunk) |= IN_BASE_FILE;
+    er(findbasefile(font));
+    if (font->basefiledata) {
+      char buffer[256];
+
+      for (ch=firstchar; ch<firstchar+32; ch++) {
+        chaddr = charaddr(font,ch);
+        if (chaddr) {
+          er(newchar(font,ch));                   /* this sets up bitmap links if possible */
+          charptr = font->chars[ch];
+          getcharheader(charptr);                 /* set up bounding box immediately from file data */
+          charptr->nextpath = font->filedata->bpp==0 ? PATH_SUSPENDED : PATH_BITMAP;
+        }
+      }
+      if (findleaf(font, buffer, sizeof(buffer), "IntMetrics")==NULL) { /* find base metrics file */
+        er(readmetrics(font, buffer, firstchar, firstchar+31));         /* set up correct metrics */
+      }
+    }
+  }
+
+  return(NULL);
+}
+
+
+void abortf(font)
+Font_Block *font;
+{
+  font->currchar = -1;                  /* should really mark font invalid */
+  font->filedata->fontid = FONT_READY;  /* so you can salvage something */
+}
+
+
+/* ---- Heap allocation routines ------------------------------------------- */
+
+
+os_error * newpt(pt_type type,int x,int y,Path_Block *subpath,Pt_Block **ptptr)
+{
+  Pt_Block * ptr;
+  er(getheap(Pt_Block,&ptr));
+  ptr->type = type;
+  ptr->x = x;
+  ptr->y = y;
+  ptr->scaffoldx =
+  ptr->scaffoldy = 0;
+  ptr->nextpt[0] = NULL;
+  ptr->nextpt[1] = NULL;
+  ptr->path = subpath;
+  *ptptr = ptr;
+  return(NULL);
+}
+
+
+/* Allocate a block from the heap, extending it if necessary
+ */
+
+os_error * heapalloc(int size, void **ptrptr)
+{
+  void * temp = heap_alloc(size);
+
+  if (heaptrace) mytracef("heapalloc(%d,%p) returns %p\n",size,ptrptr,temp);
+
+  if (temp==NULL) returnerr("Heap full");
+
+  *ptrptr = temp;
+
+  return(NULL);
+}
+
+
+/* ---- Debug font --------------------------------------------------------- */
+
+
+void debugfont(font)
+Font_Block * font;
+{
+  int        charnumber;
+  Char_Block *charptr;
+
+  bbc_vdu(4); bbc_vdu(12); bbc_tab(0,1); bbc_vdu(14);
+
+  printf( "Font block at &%p\n",(void *) font);
+  printf( "Font data at  &%p\n\n",(void *) font->filedata);
+
+  if (font->filedata->bpp) {
+    fontsizestr *fsiz = (fontsizestr *)&font->filedata->table[1];
+    printf("Font is %dx%d points at %dx%d dpi\n",
+              fsiz->xpoints,fsiz->ypoints,fsiz->xres,fsiz->yres);
+  } else {
+    printf("Design size = %d\n",font->filedata->designsize);
+    printf("#### File's scaffold debugging not implemented ####\n");
+  }
+
+  printf("Font bounding box: x0=%d, y0=%d, xs=%d, ys=%d\n",
+           font->filedata->x0, font->filedata->y0, font->filedata->xs, font->filedata->ys);
+
+  for(charnumber = 0; charnumber<font->nchars; charnumber++)
+  {
+    if (bbc_inkey(-2)) break;
+    if ((charptr = font->chars[charnumber]) != NULL)
+      debugchar(charptr,NULL);
+  }
+  restorescreen();
+}
+
+
+void debugchar(charptr,mess)
+Char_Block *charptr;
+char *mess;
+{
+  Path_Block *subpath;
+  Pt_Block   *ptptr,*firstpt;
+  int        linkno;
+  Pt_Block   *prevpt, *pt;
+  int i;
+
+  if (findwindinfo(W_SKELETON, charptr) == NULL) return;
+
+  bbc_vdu(4); if (mess!=NULL) printf("Debug request: %s\n",mess);
+
+  printf("\nCharacter %d at &%x\n\n",charptr->charno,(int) charptr);
+  printf("xlowc = %d\n",       charptr->xlowc       );
+  printf("ylowc = %d\n",       charptr->ylowc       );
+  printf("xupperc = %d\n",     charptr->xupperc     );
+  printf("yupperc = %d\n",     charptr->yupperc     );
+
+  for (i=0;i<16;i++) {
+    if (charptr->scaffold.xcoord[i] == NULL_SCAFFOLD) {
+      if (charptr->scaffold.xchar[i] != charptr->charno)
+        printf("#### Error: deleted line has base char %d\n",charptr->scaffold.xchar[i]);
+    } else {
+      printf("scaffold.%cchar[%d] = %d, coord = %d, width = %d\n",
+                i<8?'x':'y', i & 7,
+                charptr->scaffold.xchar[i],
+                charptr->scaffold.xcoord[i],
+                charptr->scaffold.xwidth[i]);
+    }
+  }
+
+  if ((subpath = charptr->nextpath) == PATH_SUSPENDED)
+  {
+    printf("Suspended\n");
+    return;
+  }
+
+  while (subpath != NULL)
+  {
+    printf("\nSubpath at &%5x\n",(int)subpath);
+    prevpt = NULL;
+    ptptr = subpath->firstpoint;
+    firstpt = ptptr;
+
+    while (ptptr != NULL)
+    {
+      if (bbc_inkey(-2)) return;
+
+      linkno = 0;
+      if ((pt = ptptr->nextpt[0]) == prevpt)
+      {
+        pt = ptptr->nextpt[1]; linkno = 1;
+      }
+      printf("Point: &%5x [&%5x,&%5x]   %1d, (%3d, %3d) subpath = &%5x\n",
+                     (int) ptptr,
+                     (int) ptptr->nextpt[0],
+                     (int) ptptr->nextpt[1],
+                     ptptr->type,
+                     ptptr->x,
+                     ptptr->y,
+                     (int) ptptr->path
+            );
+      prevpt = ptptr;
+      ptptr = pt;
+      if (ptptr == firstpt) break;  /* avoid looping */
+    }
+    subpath = subpath->nextpath;
+  }
+}
+
+
+void restorescreen(void)
+{
+  puts("\nPress SPACE");
+  bbc_get();
+  bbc_vdu(5);
+  invalidate(-1,-big,-big,big,big);
+}
+
+
+/* ---- Save outline/bitmap file ---------------------------------------------------- */
+
+
+os_error *savefilechk(Font_Block *fontptr, const char *filename, int estsize)
+{
+  const char *i;
+
+  for (i = filename; *i != '.'; i++)
+    if (*i < 32)
+      returnerr("To save, drag the file icon to a directory window.");
+
+  return(savefile(fontptr,filename,estsize));
+}
+
+
+os_error * savefile(Font_Block *font, const char *filename, int estsize)
+{
+  os_filestr f;
+  FFile_FontHdr *fhdr = font->filedata;
+/*
+  bbc_vdu(4);
+  printf("Save file: '%s' from font at &%5x\n",filename,(int)font);
+*/
+
+  if (fhdr->bpp == 0) er(savescaffold(font));
+
+  /* recompute font bounding box, and redisplay char windows if it changes */
+
+  {
+    int minx, miny, maxx, maxy, i;
+    Char_Block **charray = font->chars, *charptr;
+    minx = miny = big;
+    maxx = maxy = -big;
+    for (i=0;i<font->nchars;i++)
+    if ((charptr=charray[i])!=NULL) {
+      if (charptr->xlowc < minx) minx = charptr->xlowc;
+      if (charptr->ylowc < miny) miny = charptr->ylowc;
+      if (charptr->xupperc > maxx) maxx = charptr->xupperc;
+      if (charptr->yupperc > maxy) maxy = charptr->yupperc;
+    }
+    if (minx != big) {               /* keep pretending until we get something useful! */
+      if (fhdr->x0 != minx ||
+          fhdr->y0 != miny ||
+          fhdr->xs != maxx-minx ||
+          fhdr->ys != maxy-miny) {
+        Wind_Link *wlink = Wind_Head.next;
+        fhdr->x0 = minx;
+        fhdr->y0 = miny;
+        fhdr->xs = maxx-minx;
+        fhdr->ys = maxy-miny;             /* update to new settings */
+        while(wlink) {
+          switch(wlink->type) {               /* then see if any windows need redrawing / extenting */
+            case W_SKELETON:
+            case W_FULL:
+              if (((Char_Block *)wlink->info)->parent == font) {
+                er(setextent(wlink));               /* extent depends on font bbox, and... */
+                if ((wlink->type == W_SKELETON && showfbox) ||
+                    fhdr->x0 != minx ||
+                    fhdr->y0+fhdr->ys != maxy)           /* origin depends on font x0, y1 */
+                  invalidate(wlink->wind_handle, -big,-big,big,big);
+              }
+          } /* switch */
+          wlink = wlink->next;
+        } /* while */
+      } /* if */
+    }
+  }
+
+  er(validatefont(&font->filedata, flex_size((flex_ptr)&font->filedata), TRUE));  /* constructs dependencies */
+
+  font_uncachefile(filename,0);  /* ensure font manager closes the file */
+
+  f.action = 10;         /* save stamped file */
+  f.name = (char *) filename;
+  f.loadaddr = 0xFF6;    /* filetype - used to be 0xADB */
+  f.execaddr = 0;
+  f.start = (int) fhdr;
+  f.end = f.start + flex_size((flex_ptr)&font->filedata);
+  er(os_file(&f));
+
+  if (estsize >= 0) strcpy(font->filename,filename);      /* update name if succeeded */
+
+  erx(wimp_create_menu(NULL,0,0));
+  return(NULL);
+}
+
+
+#define SCF_16BIT (1 << 0)
+
+os_error *savescaffold(Font_Block *font)
+{
+  Char_Block *ch, **charray = font->chars;
+  char outputarray[4096], *outptr;
+  unsigned short offset[1024];              /* ##### max chars = 1024 */
+  int c, i;
+  int *xchar, *xlink;
+  int *xcoord;
+  int *xwidth;
+  int baseword, localword;
+  int nscaffolds = 1;                  /* must include the size at least */
+  int done, scaffoldflags;
+  int maxscaffoldsize;
+
+  done=0;
+  for (scaffoldflags=font->filedata->chunk.new.scaffoldflags & ~SCF_16BIT; !done; scaffoldflags |= SCF_16BIT) {
+
+    outptr = outputarray;
+
+    *outptr++ = font->skeleton_threshold;           /* version 5 onwards */
+
+    for (c=1; c<font->nchars; c++)    /* character 0 is different */
+    { 
+      offset[c] = 0xFFFF;      /* impossible value */
+      if ((chunkoffset(font->filedata,c>>5) & IN_BASE_FILE)==0 && (ch=charray[c]) != NULL) {
+        baseword = localword = 0;
+        xchar = ch->scaffold.xchar;
+        xlink = ch->scaffold.xlink;
+        xcoord = ch->scaffold.xcoord;
+        xwidth = ch->scaffold.xwidth;
+        for (i=0; i<16; i++) {
+          if (xcoord[i] != NULL_SCAFFOLD) {
+            if (xchar[i] != c) baseword += 1<<i; else localword += 1<<i;
+          }
+        }
+        if (baseword | localword) {
+          nscaffolds = c+1;
+          offset[c] = outptr-outputarray;
+          *outptr++ = ch->scaffold.basechar;
+          if (scaffoldflags & SCF_16BIT) {
+            *outptr++ = ch->scaffold.basechar >> 8;
+          } else if (ch->scaffold.basechar > 255) {
+            *outptr++ = ch->scaffold.basechar >> 8;
+            offset[c] |= OFF_16BIT;
+          }
+          *outptr++ = baseword; *outptr++ = baseword >> 8;
+          *outptr++ = localword; *outptr++ = localword >> 8;
+          for (i=0; i<16; i++) {
+            if (localword & (1<<i)) {
+              *outptr++ = xcoord[i];
+              *outptr++ = ((xcoord[i] >> 8) & 0x0F) | (xlink[i] << 4);   /* 12-bit coord, 4-bit link */
+              *outptr++ = xwidth[i];
+            }
+          }
+        }
+      }
+    }
+
+    if (font->filedata->version >= 8) {
+      font->filedata->chunk.new.nscaffolds = nscaffolds;
+      font->filedata->chunk.new.scaffoldflags = scaffoldflags;
+    } else {
+      for (c=nscaffolds; c<256; c++) offset[c] = 0xFFFF;
+      nscaffolds = 256;
+    }
+
+    done = (scaffoldflags & SCF_16BIT) || (outptr-outputarray+nscaffolds*sizeof(unsigned short)+OFF_16BIT) < 0xFFFF;
+  }
+
+  maxscaffoldsize = font->filedata->version < 8 ? 0x7FFF : 0xFFFF;
+
+  if (outptr-outputarray + nscaffolds * sizeof(unsigned short) >= maxscaffoldsize) {
+    if (font->filedata->version >= 8) { returnerr("Scaffold data too large (max 64k)"); }
+                                 else { returnerr("Scaffold data too large (max 32k)"); }
+  }
+
+  offset[0] = outptr-outputarray;
+
+  er(changetitle(font, offset[0] + nscaffolds * sizeof(unsigned short), NULL, NULL));
+
+  {
+    unsigned short *outoffset = font->filedata->table;
+    char *ptr, *ptr2 = (char *)&outoffset[nscaffolds];
+
+    for (c=0; c<nscaffolds; c++) outoffset[c] = offset[c]==0xFFFF ? 0
+                                                                  : offset[c] + nscaffolds*sizeof(unsigned short);
+    for (ptr=outputarray; ptr<outptr; ) *ptr2++ = *ptr++;
+  }
+
+  return(NULL);
+}
+
+
+os_error * warning(char *mess)
+{
+  os_error err;
+
+  err.errnum = 1;
+  sprintf(err.errmess, "Warning: %s", mess);
+  return(wimp_reporterror(&err,wimp_EOK,"Font Editor"));
+}
+
+
+/* Routine to check that a font file seems OK.
+ * Also writes out the chunk dependency bytes, for outline files with version >= 6.
+ * Checks for entirely null chunks, and deletes them.
+ */
+
+os_error *validatefont(FFile_FontHdr **filedatap, int fsize, BOOL fillindependencies)
+{
+  FFile_FontHdr *filedata = *filedatap;
+  int indexsize, chunkoff, chunkoff2, chunkend;
+  int *chunkindex;
+  int i, j, jj, flags, skip, code;
+  char *ptr, *stopby;
+
+  if (bbc_inkey(-2)) return(NULL);  /* don't check file if CTRL key held down - for salvaging data */
+
+  mytracef("validatefont enters\n");
+
+  if (filedata->fontid != FONT_READY) {
+    returnerr("Invalid font file");
+  } else if (filedata->version < 2) {
+    returnerr("Font file format too old");
+  } else if (filedata->version > 8) {
+    returnerr("This version of !FontEd is too old");
+  }
+
+  /* check that the title strings are within the file, and are zero-terminated */
+
+  if (filedata->table[0] < 2) returnerr("Invalid table size (bytes 52,53 in file)");
+  stopby = ((char *) filedata) + fsize;          /* avoid address exceptions */
+  ptr = ((char *) filedata->table) + filedata->table[0];
+  for (i=1; i<=2; i++) {
+    for (; ptr < stopby && *ptr; ptr++) {
+      if (*ptr < 32) returnerr("Illegal character in title string");
+    }
+    if (ptr >= stopby) returnerr("Font file too short");
+    ptr++;
+  }
+  chunkoff = ((ptr - (char *)filedata) + 3) & ~3;   /* first chunk must start here */
+
+  /* if version 8, check that the chunk offset table is valid */
+
+  if (filedata->version >= 8) {
+    if (filedata->chunk.new.chunkoff < chunkoff) returnerr("Chunk table overlaps header");
+    if (filedata->chunk.new.chunkoff > chunkoff) warning("Gap before chunk table");
+    chunkoff += (filedata->chunk.new.nchunks+1)*sizeof(int);
+    i = filedata->chunk.new.nscaffolds; if (i==0) i=256;
+    if (i > filedata->chunk.new.nchunks*32) returnerr("Invalid number of scaffold entries");
+    for (i=0;i<5;i++) if (filedata->chunk.new.reserved[i]) { warning("Reserved word non-zero in header"); break; }
+  }
+
+  /* check that the chunks are consecutive (ie. they don't overlap, and there are no gaps) */
+
+  if (chunkoff < (chunkoffset(filedata,0) & ~IN_BASE_FILE)) warning("Gap before first chunk");
+  if (chunkoff > (chunkoffset(filedata,0) & ~IN_BASE_FILE)) returnerr("First chunk overlaps header");
+  for (i=1; i<=nchunks(filedata); i++) {
+    int nextchunk = chunkoffset(filedata,i) & ~IN_BASE_FILE;
+    if (nextchunk < chunkoff) returnerr("Chunks not consecutive");
+    chunkoff = nextchunk;
+    if (chunkoff & 3) returnerr("Chunk not word-aligned");
+  }
+  if (chunkoff < fsize) returnerr("Gap after last chunk");
+  if (chunkoff > fsize) returnerr("Part of last chunk is missing");
+
+  if (chunkoffset(filedata,0)==chunkoffset(filedata,nchunks(filedata))) {
+    /* if (filedata->xs > 0 || filedata->ys > 0) returnerr("Invalid font bounding box - should be null"); */
+  } else {
+    if (filedata->xs <= 0 || filedata->ys <= 0) returnerr("Invalid font bounding box");
+  }
+
+  /* check flags in header, and scaffolding (if outlines) or size/resolution (if bitmaps) */
+
+  switch(filedata->bpp) {
+    case 0: if (filedata->designsize <= 0) returnerr("Invalid design size");
+              er(validatescaffold(filedata));
+              indexsize = 32;
+              break;
+    case 1:
+    case 4: if (filedata->table[0] != 10) returnerr("Font table size must be 10 bytes unless outlines");
+              for (i=1; i<=4; i++) if (filedata->table[i] < 1) returnerr("Invalid font size / resolution");
+              switch(filedata->designsize) {
+                case 0: indexsize = 32; break;
+                case 1: indexsize = 128; break;
+                case 2: indexsize = 128; break;
+                case 3: indexsize = 512; break;
+                default: returnerr("Reserved bit(s) in flags non-zero");
+              }
+              if (indexsize != 32 && filedata->bpp != 4) {
+                returnerr("Subpixel scaling flags must be zero unless 4-bpp");
+              }
+              break;
+    default: returnerr("Invalid number of bits per pixel (0,1 or 4 are legal)");
+  }
+
+  /* check char offsets within chunks: indexsize = no of chars in each chunk */
+
+  for (i=0; i<nchunks(filedata); i++) {
+    int chunkdep = 0;     /*  bit n set => chunk n is required when loading this chunk */
+    int pixflags;
+    int prevchar = -1;
+    BOOL anychars = FALSE;
+    int mask = 0;
+    int x0,y0,width,height, charaddr;
+
+    chunkoff = chunkoffset(filedata,i) & ~IN_BASE_FILE;
+    chunkend = chunkoffset(filedata,i+1) & ~IN_BASE_FILE;
+    if (chunkend-chunkoff) {
+      int charoffset = 4*indexsize;
+      chunkindex = (int *) (((char *) filedata) + chunkoff);
+
+      if (filedata->bpp) {
+        pixflags = filedata->designsize;
+        if (filedata->version >= 7 && *chunkindex++ != pixflags) returnerr("Invalid flag word at start of chunk");
+      } else {
+        switch(filedata->version) {
+          case 0:
+          case 1:
+          case 2:
+          case 3:
+          case 4:
+          case 5: pixflags = 0; break;
+          case 6: pixflags = FLG_DEPENDENCIES; break;
+          case 7:
+          case 8: pixflags = *chunkindex++;
+                  if (pixflags & FLG_PRESENT) {
+                    switch (filedata->bpp) {
+                      case 0: mask = FLG_DEPENDENCIES; break;
+                      case 1: mask = 0; break;
+                      case 4: mask = FLG_HSUBPIXEL | FLG_VSUBPIXEL;
+                    }
+                    if (pixflags & ~(FLG_PRESENT | mask)) returnerr("Reserved bits in chunk flags must be 0");
+                  } else {
+                    returnerr("Bit 31 of chunk flags must be set");
+                  }
+        }
+      }
+
+      if (pixflags & FLG_DEPENDENCIES) charoffset+=(nchunks(filedata)+7)/8;   /* extra byte(s) for dependencies */
+      for (j=0; j<indexsize; j++) {
+        if ((chunkoff2 = chunkindex[j]) != 0) {
+          anychars = TRUE;
+          if (chunkoff2 < charoffset) {
+            int chunkoff3 = chunkoffset(filedata,i) & ~IN_BASE_FILE;
+            if (prevchar<0) {
+              return(verr("Character &%X at &%X overlaps the chunk index at &%X",
+                        (i<<5)+j, chunkoff3, chunkoff3+chunkoff2));
+            } else {
+              return(verr("Start of character &%X at &%X comes before end of character &%X at &%X",
+                             (i<<5)+j, chunkoff3+chunkoff2,
+                             (i<<5)+prevchar, chunkoff3+charoffset));  /* gaps are allowed */
+            }
+          }
+          prevchar = j;
+          ptr = ((char *) chunkindex) + chunkoff2;
+          flags = *ptr++;
+          charaddr = ptr - (char *)filedata;
+          stopby = ((char *)filedata) + chunkend;
+          switch(filedata->bpp) {
+            case 0:
+              if (filedata->version >= 4 && flags & CHAR_OUTLINE == 0)
+                returnerr("Bit 3 of char flags must be set for outline fonts");
+              ptr[-1] |= CHAR_OUTLINE;
+              if (flags & (CHAR_1BPP | CHAR_INITSTATE | (CHAR_FVALUE & ~(CHAR_COMPOSITE | CHAR_16BITCODES))))
+                returnerr("Bits 1,2,6..7 of char flags must be 0 for outline chars");
+              skip = (flags & CHAR_12BIT) ? ((filedata->version == 2) ? 4 : 3) : 2; /* 16-bit in version 2 */
+              if (flags & CHAR_COMPOSITE) {
+                if (flags & CHAR_COMPOSITE1) {
+                  code = *ptr++; if (flags & CHAR_16BITCODES) code += *ptr++ << 8;
+                  chunkdep |= (1 << (code >> 5));    /* base char dependency */
+                }
+                if (flags & CHAR_COMPOSITE2) {
+                  code = *ptr++; if (flags & CHAR_16BITCODES) code += *ptr++ << 8;
+                  chunkdep |= (1 << (code >> 5));    /* accent dependency */
+                  ptr += skip;                       /* skip coord offset */
+                }
+                if (ptr > stopby) returnerr("Char outside range");
+              } else {
+                int going = 1;
+                for (ptr += 2*skip; going;) {
+                  switch(*ptr++ & 3) {
+                    case 0: if (ptr[-1] & 0xF0) returnerr("Bits 4..7 of terminator are reserved");
+                              if (ptr[-1] & 0x04) {
+                                if (going != 1) returnerr("Only one skeleton section allowed");
+                                going = 2;
+                              } else going = 0;
+                              break;
+                    case 1:
+                    case 2: ptr += skip; break;
+                    case 3: ptr += 3*skip;
+                  }
+                }
+                if (ptr > stopby) returnerr("Char outside range");
+                if (ptr[-1] & 0x08) {
+                  code = *ptr++; if (flags & CHAR_16BITCODES) code += *ptr++ << 8;
+                  while(ptr <=stopby && code) {
+                    chunkdep |= (1 << (code >> 5));    /* set up dependency flags */
+                    ptr += skip;                       /* composite offset */
+                    code = *ptr++; if (flags & CHAR_16BITCODES) code += *ptr++ << 8;
+                  }
+                  if (ptr > stopby) return(verr("Char at &%X outside range",charaddr));
+                }
+              }
+              charoffset = ptr - (char *) chunkindex;
+              break;
+
+            case 1:
+              if ((flags & (CHAR_1BPP | CHAR_OUTLINE))!=CHAR_1BPP)
+                return(verr("Invalid character flags at offset &%X",charaddr));
+              if ((flags & CHAR_FVALUE) == 0) {
+                if (flags & CHAR_INITSTATE) return(verr("Invalid character flags at offset &%X",charaddr));
+                read_xywh(flags,&ptr,&x0,&y0,&width,&height);
+                charoffset = ptr + (width * height + 7) / 8 - (char *) chunkindex;
+              } else {
+                /* wimp out for now, cos it's quite hard to scan the packed data */
+                charoffset = stopby - (char *) chunkindex;
+                for (jj = j+1; jj<indexsize; jj++) if (chunkindex[jj]) { charoffset = chunkindex[jj]; break; }
+              }
+              break;
+
+            case 4:
+              if ((flags & (CHAR_1BPP | CHAR_INITSTATE | CHAR_OUTLINE | CHAR_FVALUE)) == 0) {
+                read_xywh(flags,&ptr,&x0,&y0,&width,&height);
+                charoffset = ptr + (width * height + 1) / 2 - (char *) chunkindex;
+              } else {
+                return(verr("Invalid character flags at offset &%X",charaddr));
+              }
+          } /* switch */
+        } /* if */
+      } /* for (chars within chunk) */
+
+      /* the dependencies are filled in when saving - we can guarantee there is a spare word after the index */
+
+      if (fillindependencies) {
+        if (pixflags & FLG_PRESENT) {
+          if (chunkdep) pixflags |= FLG_DEPENDENCIES; else pixflags &= ~FLG_DEPENDENCIES;
+          chunkindex[-1] = pixflags;
+        }
+        if (pixflags & FLG_DEPENDENCIES) {
+          register char *dptr = (char *)&chunkindex[32];
+          register int i;
+          for (i=0; i<nchunks(filedata); i+=8) *dptr++ = chunkdep >> i;    /* update dependency byte(s) */
+        }
+      }
+
+      if (!anychars) {
+        er(myflex_midextend("Deleting null chunk",(flex_ptr)filedatap,chunkend,chunkoff-chunkend));
+        filedata = *filedatap;
+        for (j=i+1; j<=nchunks(filedata); j++) chunkoffset(filedata,j) += chunkoff-chunkend;
+      }
+
+    } /* if (non-null chunk) */
+  } /* for (chunks) */
+
+  if (indexsize != 32 || filedata->bpp > 1)
+    returnerr("Anti-aliased bitmap font seems OK, but this version of !FontEd can't load it");
+
+  mytracef("validatefont exits OK\n");
+
+  return(NULL);    /* font file is OK !!! */
+}
+
+
+/* read x0,y0,width,height from char header, taking note of char flags */
+
+void read_xywh(char_flags flags,char **pp,int *xp,int *yp,int *wp,int *hp)
+{
+  read_xy(flags,pp,xp,yp);
+  read_xy(flags,pp,wp,hp);
+}
+
+
+/* Read a coordinate pair from a location */
+
+void read_xy(char_flags flags,char **pp,int *xp,int *yp)
+{
+  char *f = *pp;
+  int b1;
+
+  if (flags & CHAR_12BIT) {
+    b1 = f[1];
+    *xp = ((f[0] << 20) | (b1 << 28)) >> 20;
+    *yp = ((b1 << 16) | (f[2] << 24)) >> 20;
+    *pp += 3;
+  } else {
+    *xp = f[0] << 24 >> 24;
+    *yp = f[1] << 24 >> 24;
+    *pp += 2;
+  }
+}
+
+
+/* check out the scaffolding in the file */
+
+os_error *validatescaffold(FFile_FontHdr *filedata)
+{
+  unsigned short *table = filedata->table;
+  int nscaffolds = filedata->version >= 8  ? filedata->chunk.new.nscaffolds : 256;
+  scaff_flags scaffoldflags = filedata->version >= 8 ? filedata->chunk.new.scaffoldflags : 0;
+  int length = table[0];
+  int i, offset;
+  if (nscaffolds == 0) nscaffolds = 256;  /* default */
+
+  mytracef("validatescaffold enters\n");
+
+  if (length < nscaffolds * sizeof(unsigned short)) returnerr("Scaffold table length must include the index");
+
+  for (i=1; i<nscaffolds; i++) {
+    if ((offset = table[i]) != 0) {                                    /* if null, use 0 offset */
+      if ((scaffoldflags & SCF_16BIT) == 0) offset &= ~OFF_16BIT;
+      if (offset < nscaffolds*sizeof(unsigned short) || offset >= length) {  /* so offset must be < length */
+        static os_error er = { 1, "" };
+        sprintf(er.errmess, "Invalid scaffold table index[%d] = &%X (should be between &%X and &%X)",
+                                 i, offset, nscaffolds*sizeof(unsigned short), length-1);
+        return(&er);
+      }
+    }
+  }
+
+  mytracef("validatescaffold exits\n");
+
+  return(NULL);
+}
+
+
+/* return an os_error block given a format string and some arguments */
+
+os_error *verr(const char *format, ...)
+{
+  static os_error errblk;
+  va_list args;
+
+  va_start(args, format);
+  errblk.errnum = 1;
+  vsprintf(errblk.errmess, format, args);
+  va_end(args);
+
+  return(&errblk);
+}
+
+
+/* ---- Save metrics file ----------------------------------------------------------- */
+
+
+os_error *savefilechk2(Font_Block *fontptr, const char *filename, int estsize)
+{
+  const char *i;
+
+  for (i = filename; *i != '.'; i++)
+    if (*i < 32)
+      returnerr("To save, drag the file icon to a directory window.");
+
+  return(savefile2(fontptr,filename,estsize));
+}
+
+
+os_error *savefile2(Font_Block *fontptr, const char *filename, int estsize)
+{
+  Char_Block **charray = fontptr->chars;
+  metricshdr hdr;
+  FILE *outfile;
+  int i, j;
+  FFile_FontHdr *f = fontptr->filedata;
+  char *ch = ((char *)f->table) + f->table[0];   /* ch -> font name */
+  short *bbox_x0, *bbox_y0, *bbox_x1, *bbox_y1;
+  short *xwidth, *ywidth;
+  unsigned char *chmap = NULL;
+  int nchars, chmapsize;
+  int designsize = fontptr->filedata->designsize;
+  int x0,y0,x1,y1,xw,yw;
+
+  if (fontptr->filedata->bpp) returnerr("Only outline fonts can output their metrics file");
+
+  er(myflex_alloc((flex_ptr)&bbox_x0,fontptr->nchars*sizeof(short)));
+  er(myflex_alloc((flex_ptr)&bbox_y0,fontptr->nchars*sizeof(short)));
+  er(myflex_alloc((flex_ptr)&bbox_x1,fontptr->nchars*sizeof(short)));
+  er(myflex_alloc((flex_ptr)&bbox_y1,fontptr->nchars*sizeof(short)));
+  er(myflex_alloc((flex_ptr)&xwidth,fontptr->nchars*sizeof(short)));
+  er(myflex_alloc((flex_ptr)&ywidth,fontptr->nchars*sizeof(short)));
+
+  /* set up header */
+
+  for (i=0; i<sizeof(hdr.fontname); i++) hdr.fontname[i] = (*ch) ? *ch++ : 13;  /* pad with <cr> */
+  hdr.xsize = hdr.ysize = 16;
+  hdr.fileflags = hdr.fileversion = 0;
+
+  /* work out how many entries will be required */
+
+  nchars = 1;
+  chmapsize = 0;
+  for (i=0; i<fontptr->nchars; i++) if (charray[i]) { nchars++; chmapsize = i+1; }
+
+  if (nchars > 256) chmapsize = 0;           /* can't use charmap if index entries more than 8 bits */
+
+  if (nchars >= 256 || chmapsize > 256) {    /* version 0 can't cope with more than 255 entries */
+    hdr.fileflags |= FLG_CHARMAPSIZED;
+    hdr.fileversion = 2;                     /* only use later version if necessary */
+  } else {
+    chmapsize = 256;
+  }
+
+  if (chmapsize) {
+    er(myflex_alloc((flex_ptr)&chmap,chmapsize*sizeof(unsigned char)));
+  } else {
+    chmap = NULL;
+  }
+
+  /* entry 0 = char 0 - if chmap present, other null chars can share it */
+
+  bbox_x0[0] = bbox_y0[0] = bbox_x1[0] = bbox_y1[0] = xwidth[0] = ywidth[0] = 0;
+  nchars = 1;
+
+  for (i=0; i<fontptr->nchars; i++) {
+    Char_Block *charptr = charray[i];
+    if (charptr == NULL && chmap) {
+      chmap[i] = 0;                                   /* can only map null chars onto this if chmap present */
+    } else {
+      if (charptr) {
+        x0 = charptr->xlowc * 1000 / designsize;
+        y0 = charptr->ylowc * 1000 / designsize;
+        x1 = charptr->xupperc * 1000 / designsize;
+        y1 = charptr->yupperc * 1000 / designsize;
+        xw = charptr->xwidth;
+        yw = charptr->ywidth;
+      } else {
+        x0 = y0 = x1 = y1 = xw = yw = 0;              /* otherwise the actual null entry must be provided */
+      }
+      if (chmap) {
+        for (j=0; j<nchars; j++) if (x0==bbox_x0[j] && y0==bbox_y0[j] &&
+                                     x1==bbox_x1[j] && y1==bbox_y1[j] &&
+                                     xw==xwidth[j] && yw==ywidth[j]) break;
+        if (j==nchars) nchars++;
+        chmap[i] = j;
+      } else {
+        j=i; nchars = i+1;
+      }
+      bbox_x0[j] = x0; bbox_y0[j] = y0; bbox_x1[j] = x1; bbox_y1[j] = y1;
+      xwidth[j] = xw; ywidth[j] = yw;
+    }
+  }
+  hdr.ncharlo = nchars;
+  hdr.ncharhi = nchars >> 8;
+
+  font_uncachefile(filename,0);    /* get font manager to close file */
+
+  if ((outfile = fopen(filename, "w")) == NULL) returnerr("Couldn't write metrics file");
+
+  fwrite(&hdr, sizeof(hdr), 1, outfile);
+  if (hdr.fileflags & FLG_CHARMAPSIZED) { fputc(chmapsize & 0xFF, outfile); fputc(chmapsize >> 8, outfile); }
+  if (chmap) { fwrite(chmap, sizeof(unsigned char), chmapsize, outfile); }
+  for(i=0; i<nchars; i++) { register int x = bbox_x0[i]; fputc(x & 0xFF, outfile); fputc(x >> 8, outfile); }
+  for(i=0; i<nchars; i++) { register int x = bbox_y0[i]; fputc(x & 0xFF, outfile); fputc(x >> 8, outfile); }
+  for(i=0; i<nchars; i++) { register int x = bbox_x1[i]; fputc(x & 0xFF, outfile); fputc(x >> 8, outfile); }
+  for(i=0; i<nchars; i++) { register int x = bbox_y1[i]; fputc(x & 0xFF, outfile); fputc(x >> 8, outfile); }
+  for(i=0; i<nchars; i++) { register int x = xwidth[i]; fputc(x & 0xFF, outfile); fputc(x >> 8, outfile); }
+  for(i=0; i<nchars; i++) { register int x = ywidth[i]; fputc(x & 0xFF, outfile); fputc(x >> 8, outfile); }
+  fclose(outfile);
+  { char buffer[256]; sprintf(buffer, "Settype %s FF6", filename); er(os_cli(buffer)); }
+
+  font_uncachefile(filename,1);    /* get font manager to read it back in */
+
+  if (estsize >= 0) strcpy(fontptr->filename2, filename);   /* update name if succeeded */
+
+  flex_free((flex_ptr)&bbox_x0);
+  flex_free((flex_ptr)&bbox_y0);
+  flex_free((flex_ptr)&bbox_x1);
+  flex_free((flex_ptr)&bbox_y1);
+  flex_free((flex_ptr)&xwidth);
+  flex_free((flex_ptr)&ywidth);
+  if (chmap) flex_free((flex_ptr)&chmap);
+
+  erx(wimp_create_menu(NULL,0,0));
+  return(NULL);
+}
+
+
+/* Routine to ensure that the correct amount of space is reserved after the chunk indexes
+ * This is called by loadfile() after a file has been loaded and validated.
+ * Reserve 4 bytes there for convenience - only 1 byte is currently used (dependencies)
+ * validatefont() then inserts the correct dependency values when the file is saved
+ * NB: if you hold down the CTRL key, validatefont() is not called
+ *
+ * This routine is also called when a file is loaded and after the format
+ * version number is changed:
+ *      Version 6  has the char index at the start of each chunk, followed by dependencies
+ *      Version 7  has a flag word, then the char index, then the dependencies
+ *      Version 8  has the chunk offsets one level of indirection away
+ * NB: (1) Char offsets in index are relative to index start, not chunk start.
+ *     (2) After this call, space is always allocated for the dependency flags, even if marked not present.
+ *         This is so that validatefont() can always fill them in when saving the file.
+ */
+
+os_error * grungefiledata(FFile_FontHdr **filepp)
+{
+  FFile_FontHdr *f = *filepp;
+  int chunk;
+  int chunkoff0 = f->chunk.offsets[0] & ~IN_BASE_FILE;
+  int chunkoff1 = f->chunk.offsets[1] & ~IN_BASE_FILE;
+  int *newchunkarray = (int *) ((char *)f + chunkoff0);
+  int i;
+
+  if (f->version < 6) f->version = 6;
+
+  if (f->version < 8 && chunkoff1 < chunkoff0) {
+    int shrink = (chunkoff1+1)*sizeof(int);
+    int fsize;
+    for (i=0; i<=8; i++) f->chunk.offsets[i] = newchunkarray[i>chunkoff1?chunkoff1+1:i] - shrink;
+    er(myflex_midextend("Removing new chunk section",(flex_ptr)filepp, chunkoff0+shrink, -shrink));
+    fsize = flex_size((flex_ptr)filepp);
+    er(myflex_midextend("Removing crap at end",(flex_ptr)filepp, fsize, chunkoffset(f,8)-fsize));
+  }
+
+  if (f->version >= 8 && chunkoff1 >= chunkoff0) {
+    er(myflex_midextend("New chunk section",(flex_ptr)filepp, chunkoff0, 9*sizeof(int)));
+    for (i=0; i<=8; i++) newchunkarray[i] = f->chunk.offsets[i] + 9*sizeof(int);
+    f->chunk.new.nchunks = 8;
+    f->chunk.new.nscaffolds = 256;
+    f->chunk.new.scaffoldflags = 0;
+    for (i=0; i<5; i++) f->chunk.new.reserved[i] = 0;   /* rest of this area is reserved */
+  }
+
+  for (chunk=0; chunk<nchunks(f); chunk++) {
+    int chunkoff = chunkoffset(f,chunk) & ~IN_BASE_FILE;
+    int chunkend = chunkoffset(f,chunk+1) & ~IN_BASE_FILE;
+    int *chunkindex = (int *) ((char *)f + chunkoff);
+    if (chunkend > chunkoff) {        /* don't bother with null chunk */
+      int wastage, i;
+      int oldflagsize = (chunkindex[0] & FLG_PRESENT) ? 4 : 0;
+      int newflagsize = (f->version >= 7) ? 4 : 0;
+      int flagextend = newflagsize - oldflagsize;
+
+      if (flagextend) {
+        er(myflex_midextend("Pixflags word",(flex_ptr)filepp,chunkoff+oldflagsize,flagextend));
+        if (newflagsize) chunkindex[0] = (f->bpp) ? FLG_PRESENT : FLG_PRESENT | FLG_DEPENDENCIES;
+        for (i=chunk+1;i<=nchunks(f);i++) chunkoffset(f,i) += flagextend;
+      }
+
+      chunkindex += newflagsize / sizeof(int);
+      chunkoff += newflagsize;
+
+      wastage = chunkend-chunkoff-32*4;         /* in case all 32 chars are undefined */
+      for (i=0;i<=31;i++) if (chunkindex[i]) { wastage = chunkindex[i]-32*4; break; }
+      wastage &= ~3;                            /* assume chunk is word-aligned already */
+
+      if (f->bpp == 0) wastage -= 4;            /* dependency word present if outlines */
+
+      if (wastage) {
+        er(myflex_midextend("Dependencies",(flex_ptr)filepp, chunkoff+32*4+4+wastage, -wastage));
+        for (i=0;i<=31;i++) if (chunkindex[i]) chunkindex[i] -= wastage;
+        if (f->bpp == 0) chunkindex[32] = 0;    /* 4 extra bytes at end of index */
+        for (i=chunk+1;i<=nchunks(f);i++) chunkoffset(f,i) -= wastage;
+      }
+    } /* if */
+  } /* for */
+
+  return(NULL);
+}
+
+
+/* Alter title string in font file data */
+
+os_error *changetitle(Font_Block *font, int tablesize, const char *title1, const char *title2)
+{
+  char buffer1[128];
+  char buffer2[128];
+  FFile_FontHdr *f = font->filedata;
+  char *ch, *oldstart = ((char *)f->table) + f->table[0];
+  int oldend = f->chunk.new.chunkoff & ~IN_BASE_FILE;          /* same as chunkoff[0] for old files */
+  int len1, newend, i;
+
+  if (title1 == NULL) { strcpy(buffer1, oldstart); title1 = buffer1; }
+  if (title2 == NULL) { strcpy(buffer2, oldstart+strlen(oldstart)+1); title2 = buffer2; }
+
+  len1 = strlen(title1) + 1;
+  newend = (((char *)f->table) - ((char *)f) + tablesize + len1 + strlen(title2) + 1 + 3) & ~3;
+
+  er(myflex_midextend("Change title",(flex_ptr)&font->filedata, oldend, newend-oldend));
+
+  f->table[0] = tablesize;
+  strcpy(ch = ((char *)f->table)+tablesize, title1);
+  strcpy(ch + len1, title2);
+
+  if (f->version >= 8) f->chunk.new.chunkoff += newend-oldend;
+
+  for (i=0;i<=nchunks(f);i++) chunkoffset(f,i) += newend-oldend;
+
+  return(NULL);
+}
+
+
+/* Alter number of chunks in font file data */
+
+os_error * changenchunks(FFile_FontHdr **filepp, int numchunks)
+{
+  FFile_FontHdr *f = *filepp;
+  int oldnumchunks = nchunks(f);
+  int oldstart = f->chunk.new.chunkoff;
+  int oldend = oldstart + (oldnumchunks+1)*sizeof(int);
+  int newend = oldstart + (numchunks+1)*sizeof(int);
+  int fsize;
+  int i;
+
+  if (f->version < 8) returnerr("You need version 8 to have more than 256 characters");
+
+  mytracef("changenchunks: fontdata=&%p, at %d by %d\n",f,oldend,newend-oldend);
+
+  er(myflex_midextend("Change nchunks",(flex_ptr)filepp, oldend, newend-oldend));
+
+  if (oldnumchunks > numchunks) oldnumchunks = numchunks;
+
+  for (i=0;i<=oldnumchunks;i++) chunkoffset(f,i) += newend-oldend;
+  f->chunk.new.nchunks = numchunks;
+  for (i=oldnumchunks+1;i<=numchunks;i++) chunkoffset(f,i) = chunkoffset(f,oldnumchunks);
+
+  fsize = flex_size((flex_ptr)filepp);
+  er(myflex_midextend("changenchunks: crap at end",(flex_ptr)filepp,fsize,chunkoffset(f,numchunks)-fsize));
+
+  return(NULL);
+}
+
+
+/* Alter number of chars in font block */
+
+os_error * changenchars(Font_Block *font, int nchars)
+{
+  int oldnchars = font->nchars;
+  Char_Block **newchars;
+  int i;
+
+  mytracef("changenchars: font->chars=&%p, at %d by %d\n",
+                          font->chars,oldnchars*sizeof(Char_Block *),(nchars-oldnchars)*sizeof(Char_Block *));
+
+  if (nchars <= oldnchars) {
+    if (nchars < oldnchars) er(deletechardata(font, nchars, oldnchars-1));
+  } else {
+    newchars = heap_alloc(nchars*sizeof(Char_Block *));
+    if (!newchars) returnerr("Heap full");
+    for (i=0; i<oldnchars; i++) { newchars[i] = font->chars[i]; }
+    for (   ; i<nchars;    i++) { newchars[i] = NULL; }
+    heap_free(font->chars);
+    font->chars = newchars;
+  }
+  font->nchars = nchars;
+
+  mytracef("changenchars: exit: font->chars=&%p, size=%d\n", font->chars, nchars*sizeof(Char_Block *));
+
+  return(NULL);
+}
+
+
+/* Routines to access chunk offsets in file, taking note of Version >= 8 */
+
+int * chunkoffptr(FFile_FontHdr *f, int i)
+{
+  if (f->version >= 8) {
+    return(((int *)((char *)f + f->chunk.new.chunkoff))+i);
+  } else {
+    return(&f->chunk.offsets[i]);
+  }
+}
+
+int nchunks(FFile_FontHdr *f)
+{
+  if (f->version >= 8) {
+    return(f->chunk.new.nchunks);
+  } else {
+    return(8);
+  }
+}
+
+
+/* My versions of the flex routines return os_error pointers, as one ought to expect!
+ */
+
+os_error *myflex_alloc(flex_ptr p, int size)
+{
+#if 1
+  if (heaptrace)
+  mytracef("flex_alloc(&%p, %d)\n", *p, size);
+#endif
+  if (flex_alloc(p, size)) return(NULL); else returnerr("Flex area full");
+}
+
+
+os_error *myflex_midextend(char *debug, flex_ptr p, int offset, int amount)
+{
+#if 1
+  if (heaptrace)
+  mytracef("%s: flex_midextend(&%p, %d, %d)\n", debug, *p, offset, amount);
+#else
+  debug = debug;       /* shut up compiler! */
+#endif
+  if (flex_midextend(p, offset, amount)) return(NULL); else returnerr("Flex area full");
+}

@@ -1,0 +1,1841 @@
+; > Core.SWIs
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_Info implementation
+;
+;   Entry: -
+;
+;   Exit:  R0 (top 16 bits) identifies general type of printer driven.
+;          R0 (bottom 16 bits) = 100 * version number of printer driver.
+;          R1 = X pixel resolution of printer driven (pixels/inch).
+;          R2 = Y pixel resolution of printer driven (pixels/inch).
+;          R3 = features word:
+;               Bit 0 set => colour
+;               If bit 0 set, bit 1 set => full colour range not available.
+;               Bit 2 set => only a discrete set of colours supported.
+;               Bit 8 set => cannot handle filled shapes well.
+;               Bit 9 set => cannot handle thick lines well.
+;               Bit 10 set => cannot handle overwriting well.
+;               Bit 11 set => can handle transformed sprite plotting.
+;               Bit 12 set => can handle new Font Manager features (transforms, encodings etc..).
+;               Bit 13 set => can handle new DrawPage features (flag byte in R0)
+;               Bit 24 set => supports the PDriver_ScreenDump call.
+;               Bit 25 set => supports arbitrary transformations (else only
+;                             axis-preserving ones).
+;               Bit 26 set => supports the PDriver_InsertIllustration call.
+;               Bit 27 set => supports the PDriver_MiscOp call.
+;               Bit 28 set => supports the PDriver_SetDevice call.
+;               Bit 29 set => supports the PDriver_DeclareFont call.
+;
+;          R4 -> adjectival description of printers supported (a maximum of
+;               20 characters ???, excluding the zero-termination).
+;          R5 = X halftone resolution (repeats/inch). If no halftoning is
+;               done, this is equal to the value returned in R1.
+;          R6 = Y halftone resolution (repeats/inch). If no halftoning is
+;               done, this is equal to the value returned in R2.
+;          R7 identifies a specific configured printer and is zero unless it
+;             has been changed via PDriver_SetInfo.
+;
+; Some of these values can be changed by the PDriver_SetInfo call. If
+; PDriver_Info is called while a print job is selected, the values returned
+; are those that were in effect when that print job was started (i.e. when
+; it was first selected using PDriver_SelectJob). If PDriver_Info is called
+; when no print job is active, the values returned are the current ones.
+;
+; Initially, these values should be correct for some standard printer within
+; the class of printers supported by the printer driver.
+;
+;----------------------------------------------------------------------------
+
+info    Push    "LR"
+      
+        CLRV
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        ASSERT  info_endvalues - info_values = 4*7
+        ASSERT  info_globalendvalues - info_globalvalues = 4*7
+
+        LDMIA   R12,{R1-R2}                     ;R1:=currenthandle, R2:=currentws
+        TEQ     R1,#0
+        ADREQ   R1,info_globalvalues            ;If no print job active, use
+        ADDNE   R1,R2,#:INDEX:info_values       ;  global values, else local
+        LDMIA   R1,{R1-R7}
+  Debug JPEG, "PDriver_Info features word = ",R3
+            
+        TEQ     R4,#0                           ; any messages block?
+        BNE     info_return
+
+        Push    "R1-R3, R5"                     ; preserve important registers
+
+        ADR     R0, blank_description
+        BL      LookupToken                     ; look up name string
+        BVS     info_returnbefore               ; return because invalid
+
+        MOV     R5, R0
+        MOV     R3, R1
+        STR     R3, info_globalnamelength       ; = length of name doofer
+
+        MOV     R0, #ModHandReason_Claim
+        SWI     XOS_Module
+        BVS     info_returnbefore               ; return if it failed to get the workspace
+
+        STR     R2, info_globalprintername      ; save pointer to name string
+info_copynametoworkspace
+        LDRB    LR, [R5], #1
+        CMP     LR, #32
+        MOVLT   LR, #0                          ; terminate with a null
+        STRB    LR, [R2], #1
+        BGE     info_copynametoworkspace        ; loop until all fully copied
+                          
+        LDR     R4, info_globalprintername      ; -> info name to be returned
+info_returnbefore
+        Pull    "R1-R3, R5"
+
+info_return
+        LDRVC   R0,=FullVersion                 ; Hard coded version number
+        Pull    "PC"
+
+blank_description
+        DCB     "none", 0
+        ALIGN
+
+        LTORG
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_SetInfo implementation
+;
+;   Entry: R1 = X pixel resolution of printer driven (pixels/inch).
+;          R2 = Y pixel resolution of printer driven (pixels/inch).
+;          R3 (bit 0) is zero to set monochrome, 1 to set colour. The other
+;               bits of R3 are currently ignored.
+;          R4 = pointer to printer name
+;          R5 = X halftone resolution (repeats/inch). If no halftoning is
+;               to be done, this should be equal to the value in R1.
+;          R6 = Y halftone resolution (repeats/inch). If no halftoning is
+;               to be done, this should be equal to the value in R2.
+;          R7 identifies a specific configured printer.
+;
+;   Exit:  -
+;
+; This call should be used to reconfigure the printer driver for a specific
+; printer within the general class of printers it supports (e.g. an Apple
+; LaserWriter within the class of PostScript printers). Note that it only
+; affects print jobs started after it is called - existing print jobs use
+; whatever values were in effect when they were started.
+;
+;----------------------------------------------------------------------------
+
+setinfo ROUT
+
+        Push    "R0-R4, R8, LR"
+
+        BL      configure_vetinfo
+        Pull    "R0-R4, R8, PC", VS
+
+        LDR     R8, info_globalfeatures
+        EOR     R8, R8, R3
+        BIC     R8, R8, #&00000001      ;Only allow colour/monochrome bit
+        EOR     R3, R8, R3              ;  modification
+
+        ASSERT  info_globalendvalues - info_globalvalues = 4*7
+
+        ADR     LR, info_globalvalues
+        STMIA   LR!, {R1-R3}
+        ADR     LR, info_globalxhtoneres
+        STMIA   LR!, {R5-R7}             ; stash specified configuration
+            
+        LDR     R2, info_globalprintername
+        TEQ     R2,#0                   ; any global printer name?
+        BEQ     %05
+  
+        MOV     R0, #ModHandReason_Free
+        SWI     XOS_Module              ; attempt to release the block!
+        BVS     %90
+
+        MOV     R0, #0                  ; reset global printer name pointer
+        STR     R0, info_globalprintername
+05
+        MOVS    R3, R4                  ; any name string?
+        BEQ     %90
+00
+        LDRB    LR, [R3], #1
+        CMP     LR, #32           
+        BGE     %00             
+        SUB     R3, R3, R4              ; = length of name
+
+        ADD     R3, R3, #3
+        BIC     R3, R3, #3              ; word align size
+        STR     R3, info_globalnamelength
+
+        MOV     R0, #ModHandReason_Claim
+        SWI     XOS_Module
+        BVS     %90                     ; give up if it went wrong
+
+        STR     R2, info_globalprintername
+10
+        LDRB    LR, [R4], #1
+        CMP     LR, #32                 ; end of the string yet?
+        MOVLT   LR, #0                  ; mark with a null then
+        STRB    LR, [R2], #1
+        BGE     %10                     ; loop until all done
+90
+        STRVS   R0,[SP]
+        Pull    "R0-R4, R8, PC"         ; return it all seemed to work
+                    
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_CheckFeatures implementation
+;
+;   Entry: R0 = features word mask.
+;          R1 = features word value.
+;
+;   Exit:  If the features word that PDriver_Info would return in R3
+;          satisfies ((features word) AND R0) = (R1 AND R0), return is
+;          normal with all registers preserved. Otherwise a suitable error
+;          is generated, if appropriate - e.g. no error will be generated
+;          if the printer driver has the ability to support arbitrary
+;          rotations and your features word value merely requests axis-
+;          preserving ones.
+;
+;----------------------------------------------------------------------------
+
+checkfeatures
+        Push    "R1,R2,R11,LR"
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R2,R11}            ;R2:=currenthandle, R11:=currentws
+        TEQ     R2,#0
+        LDREQ   R2,info_globalfeatures  ;If no print job active, use global
+        LDRNE   R2,info_features        ;  value, else local value
+        AND     R2,R2,R0
+        AND     R1,R1,R0
+        CMP     R2,R1                   ;If EQ, then must clear V
+        BLNE    configure_makeerror
+        Pull    "R1,R2,R11,PC"
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_PageSize implementation
+;
+;   Entry: -
+;
+;   Exit:  R1 = X size of paper, including margins. (Units 1/72000 inch)
+;          R2 = Y size of paper, including margins. (Units 1/72000 inch)
+;          R3 = left edge of printable area of paper, relative to the left
+;               edge of the paper. (Units 1/72000 inch)
+;          R4 = bottom edge of printable area of paper, relative to the
+;               bottom edge of the paper. (Units 1/72000 inch)
+;          R5 = right edge of printable area of paper, relative to the left
+;               edge of the paper. (Units 1/72000 inch)
+;          R6 = top edge of printable area of paper, relative to the bottom
+;               edge of the paper. (Units 1/72000 inch)
+;
+; These values can be changed by the PDriver_SetPageSize call. If
+; PDriver_PageSize is called while a print job is selected, the values
+; returned are those that were in effect when that print job was started
+; (i.e. when it was first selected using PDriver_SelectJob). If
+; PDriver_PageSize is called when no print job is active, the values
+; returned are the current ones.
+;
+; Initially, these values should be correct for the same standard printer as
+; the values initially returned by PDriver_Info, and a standard size of paper
+; for that printer.
+;
+;----------------------------------------------------------------------------
+
+pagesize
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R1,R2}             ;R1:=currenthandle, R2:=currentws
+        TEQ     R1,#0
+        ADREQ   R1,size_globalvalues            ;If no print job active, use
+        ADDNE   R1,R2,#:INDEX:size_values       ;  global values, else local
+
+        ASSERT  size_globalendvalues - size_globalvalues = 4*6
+        ASSERT  size_endvalues - size_values = 4*6
+        LDMIA   R1,{R1,R2,R3,R4,R5,R6}
+        Return
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_SetPageSize implementation
+;
+;   Entry: R1 = X size of paper, including margins. (Units 1/72000 inch)
+;          R2 = Y size of paper, including margins. (Units 1/72000 inch)
+;          R3 = left edge of printable area of paper, relative to the left
+;               edge of the paper. (Units 1/72000 inch)
+;          R4 = bottom edge of printable area of paper, relative to the
+;               bottom edge of the paper. (Units 1/72000 inch)
+;          R5 = right edge of printable area of paper, relative to the left
+;               edge of the paper. (Units 1/72000 inch)
+;          R6 = top edge of printable area of paper, relative to the bottom
+;               edge of the paper. (Units 1/72000 inch)
+;
+;   Exit:  -
+;
+; This call should be used to reconfigure the printer driver for a specific
+; printer/size of paper within the general class of printers/sizes of paper
+; it supports (e.g. an Apple LaserWriter and A4 paper within the class of
+; PostScript printers). Note that it only affects print jobs started after
+; it is called - existing print jobs use whatever values were in effect when
+; they were started.
+;
+;----------------------------------------------------------------------------
+
+setpagesize
+        Push    "LR"
+        ASSERT  size_globalendvalues - size_globalvalues = 4*6
+        ADR     LR,size_globalvalues
+        STMIA   LR,{R1,R2,R3,R4,R5,R6}
+        CLRV
+        Pull    "PC"
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_SelectIllustration implementation
+;
+;   Entry: R0 = file handle for print job to be selected, or zero to cease
+;               having any print job selected.
+;          R1 is zero or points to a title string for the job. This title
+;               string is terminated by any character outside the range
+;               ASCII 32-126.
+;
+;   Exit:  R0 = file handle for print job that was previously active, or zero
+;               if no print job was active.
+;
+; This SWI is exactly like SWI PDriver_SelectJob below, except that if it
+; starts a new job, the job it starts is forced to contain exactly one page
+; by the printer-independent code, and the printer-dependent code may treat
+; it differently. For instance, the PostScript printer driver takes advantage
+; of the guarantee of precisely one page to make the output into an
+; Encapsulated PostScript file.
+;   Any particular printer-specific code is quite at liberty to treat this
+; call identically with PDriver_SelectJob.
+;
+;----------------------------------------------------------------------------
+
+selectillustration
+
+        Push    "R1-R7,R10,R11,LR"
+        MOV     R6,#1                   ;Record which entry point was used
+        B       selectjob_common
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_SelectJob implementation
+;
+;   Entry: R0 = file handle for print job to be selected, or zero to cease
+;               having any print job selected.
+;          R1 is zero or points to a title string for the job. This title
+;               string is terminated by any character outside the range
+;               ASCII 32-126.
+;
+;   Exit:  R0 = file handle for print job that was previously active, or zero
+;               if no print job was active.
+;
+; A print job is identified by a file handle, which must be that of a file
+; that is open for output. The printer output for the job concerned is sent
+; to this file.
+;
+; Calling PDriver_SelectJob with R0=0 will cause the current print job (if
+; any) to be suspended, and the printer driver will cease intercepting any
+; plotting calls.
+;   Calling PDriver_SelectJob with R0 containing a file handle will cause the
+; current print job (if any) to be suspended, and a print job with the given
+; file handle to be selected. If a print job with this file handle already
+; exists, it is resumed; otherwise a new print job is started. The printer
+; driver will start to intercept plotting calls if it is not already doing
+; so.
+;   Note that this call never ends a print job - to do so, use one of the
+; calls PDriver_EndJob and PDriver_AbortJob.
+;
+; The title string pointed to by R1 is treated by different printer drivers
+; in different ways. It is only ever used if a new print job is being
+; started, not when an old one is being resumed. Typical uses are:
+;   (a) A simple printer driver might ignore it.
+;   (b) The PostScript printer driver adds a line "%%Title: " followed by the
+;       given title string to the generated PostScript header.
+;   (c) Printer drivers whose output is destined for an expensive central
+;       printer in a large organisation might use it when generating a cover
+;       sheet for the document.
+;
+; Printer drivers may also use the following OS variables when creating
+; cover sheets, etc.:
+;   PDriver$For     - indicates who the output is intended to go to
+;   PDriver$Address - indicates where to send the output.
+; These variables should not contain characters outside the range ASCII
+; 32-126.
+;
+;----------------------------------------------------------------------------
+
+selectjob
+
+; Start by returning quickly if correct job already selected
+
+ Debug  PageBox,"PDriver_SelectJob ",R0
+
+        Push    "R1-R7,R10-R11,LR"
+        MOV     R6,#0                   ;Record which entry point was used
+
+selectjob_common
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+        CMP     R0,R10                  ;Ensures V clear if EQ
+        Pull    "R1-R7,R10-R11,PC",EQ
+
+; Preserve old handle for return
+
+        Push    "R10"
+
+; Check whether the old handle is zero - if not, we need to suspend the old
+; job.
+
+        CMP     R10,#0                  ;NB clears V
+        BLNE    managejob_suspend
+        [       DevelopmentChecks
+        BVS     selectjob_return
+        ]
+
+; We know a change is happening. Check for the new handle being zero - if
+; so, we can simply store appropriate information and return. Otherwise,
+; search the list for the job requested and resume the job if found, or start
+; a new one if not.
+
+        ADDS    R10,R0,#0               ;NB clears V
+        BEQ     selectjob_nonewjob
+        BL      findjob
+        BVC     selectjob_existingjob
+
+; This is a new job. We need to allocate a new print job workspace, then
+; do the standard initialisation, then allow the printer specific code to
+; initialise it.
+
+        BL      managejob_allocate
+        BVS     selectjob_previousjob
+        ADD     R11,R11,#jobwsoffset
+
+        MOV     R1,R10                  ;Link new workspace into list
+        LDR     R2,printjoblist
+        MOV     R3,#0                   ;Also set up "no current page" state
+        MOV     R4,#0                   ;  and "no user-specified rectangles"
+        ASSERT  :BASE:jobhandle = R11
+        ASSERT  :INDEX:jobhandle = 0
+        ASSERT  joblink = jobhandle + 4
+        ASSERT  copiestodo = joblink + 4
+        ASSERT  rectlist = copiestodo + 4
+        STMIA   R11,{R1,R2,R3,R4}       ;jobhandle := R1, joblink := R2,
+                                        ;  copiestodo := 0, rectlist := 0
+        STR     R11,printjoblist
+
+        STR     R3,jobfontlist          ;No job font list yet
+        STRB    R6,illustrationjob      ;Record which entry point was used
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        STMIA   R12,{R10-R11}           ;currenthandle:=R10, currentws:=R11
+
+        ASSERT  info_endvalues - info_values = 4*7
+        ASSERT  info_globalendvalues - info_globalvalues = 4*7
+        ADR     R0,info_globalvalues
+        LDMIA   R0,{R1-R7}
+        ADR     R0,info_values
+        MOV     R4,#0                   ; ensure that the value is zero by default (no temp block)
+        STMIA   R0,{R1-R7}
+
+        LDR     R1, info_globalprintername
+        TEQ     R1, #0                  ; any printer name?
+        BEQ     selectjob_nonametocopy
+                  
+        MOV     R0, #ModHandReason_Claim
+        LDR     R3, info_globalnamelength
+        SWI     XOS_Module
+        BVS     selectjob_deallocateandpreviousjob
+
+        STR     R2, info_printer        ; store pointer to name block allocated
+        STR     R2, info_nameat         ; this is the real place to store the name at
+selectjob_copyname
+        LDRB    LR, [R1], #1
+        STRB    LR, [R2], #1
+        TEQ     LR, #0
+        BNE     selectjob_copyname      ; loop until complete name has been copied
+
+selectjob_nonametocopy          
+        ASSERT  size_globalendvalues - size_globalvalues = 4*6
+        ASSERT  size_endvalues - size_values = 4*6
+        ADR     R0,size_globalvalues
+        LDMIA   R0,{R1-R6}
+        ADR     R0,size_values
+        STMIA   R0,{R1-R6}
+
+        MOV     R0,#0
+        STRB    R0,persistenterror
+        STRB    R0,wrchqueuepos
+        STRB    R0,textbufferpos
+        [       DoFontSpriteVdu
+        STRB    R0,doingfontplot
+        ]
+
+        ADR     R0,jobspriteparams      ;Signal that the job's sprite is the
+        BL      setscreenparams         ;  screen (by default)
+
+        BL      readcurvduvariables     ;Read the things the printer driver
+                                        ;  needs to know about the current
+                                        ;  screen mode and state.
+        BLVC    initvdu5info            ;Initialise to 8x8 size and spacing,
+                                        ;  cursor sontrol byte of &40.
+        BVS     selectjob_deallocateandpreviousjob
+
+        MOV     R0,#-1                  ;Initialise the 'fontpalette' table
+        ADR     R1,fontpalette          ;  to all "undefined".
+        ADR     R2,fontpalette + ?fontpalette
+selectjob_setfontpaletteloop
+        STR     R0,[R1],#4
+        CMP     R1,R2
+        BLO     selectjob_setfontpaletteloop
+
+        SWI     XFont_CurrentFont       ;Find out about the current font
+        BLVC    font_fg                 ;  colours
+        BLVC    font_bg
+        STRVC   R3,fontcoloffset
+        BLVC    font_coloffset
+
+        MOVVC   R0,#disabled_nopage
+        STRVCB  R0,disabled
+
+        MOVVC   LR,#0
+        STRVC   LR,numberofpages
+
+        LDRVC   R1,[R13,#4]             ;Recover entry value of R1
+        BL      enableescapes
+        BLVC    managejob_init
+        BLVC    selectjob_copyfontlist
+        BL      disableandcheckescapes
+        BVC     selectjob_return
+
+; Deal properly with errors during job initialisation by possibly
+; deallocating workspace, then reverting to the previous print job,
+; then passing the error up.
+
+selectjob_deallocateandpreviousjob
+        Push    "R0"
+        ADR     R3,printjoblist
+        BL      deletejob
+        Pull    "R0"
+
+selectjob_previousjob
+        Pull    "R10"                           ;Get previous job handle
+        Push    "R0"                            ;Push error
+        
+        TEQ     R10,#0                          ;If no previous job, stop
+        BEQ     selectjob_previousjob_none      ;  intercepting vectors
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        STMIA   R12,{R10-R11}                   ;currenthandle:=R10, currentws:=R11
+
+        BL      managejob_resume
+
+        B       selectjob_previousjob_storeandreturn
+
+selectjob_previousjob_none
+        MOV     R11,#TopBit                     ;A suitable address exception generator!
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        STMIA   R12,{R10,R11}                   ;currenthandle:=R10, currentws:=R11
+
+selectjob_previousjob_storeandreturn
+        SETV                                    ;Return with error
+        BL      adjustintercept
+        Pull    "R0-R7,R10-R11,PC"
+
+; There is no new job. Update currenthandle and currentws, then return.
+
+selectjob_nonewjob
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        MOV     R11,#TopBit                     ;A suitable address exception generator!
+        STMIA   R12,{R10,R11}                   ;currenthandle:=R10, currentws:=R11
+        B       selectjob_return
+
+; This is an old job, and we have its handle in R10 and its workspace pointer
+; in R11.
+
+selectjob_existingjob
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        STMIA   R12,{R10-R11}                   ;currenthandle:=R10, currentws:=R11
+
+        BL      managejob_resume
+
+; Return, passing possible error back to caller
+
+selectjob_return
+        BL      adjustintercept
+        STRVS   R0,[R13]
+        Pull    "R0-R7,R10-R11,PC"
+             
+
+; Copy the current global font list and allocate it to the current job,
+; this is required so that the global list can be removed and not disturb
+; the local one to this job.  Copying the blocks results in them being linked
+; in the wrong order.
+
+        ASSERT  fontblock_next =0
+
+selectjob_copyfontlist
+        Push    "R0-R7,LR"
+
+        ADR     R4,fontlist                     ;Pointer to the block font list
+
+selectjob_copyfontsloop       
+        LDR     R4,[R4,#fontblock_next]         ;Is there another block? (comparison clears the V bit)
+        CMP     R4,#0                          
+        BEQ     selectjob_copyfontsreturn
+
+        LDR     R3,[R4,#fontblock_size]
+        MOV     R0,#ModHandReason_Claim
+        SWI     XOS_Module
+        BVS     selectjob_copyfontsreturn       ;Allocate and then return if fails
+
+        ASSERT  fontblock_size =4
+        ASSERT  fontblock_flags =8
+        ASSERT  fontblock_alienname =12
+                     
+        ADD     LR,R4,#fontblock_size
+        LDMIA   LR,{R5-R7}                      ;Get size, flags and alien name pointer
+        SUB     R7,R7,R4
+        ADD     R7,R7,R2                        ;Convert the pointer to index into the new block
+
+        LDR     R0,jobfontlist
+        STR     R2,jobfontlist                  ;Link the new block to head of the chain
+        
+        ADD     LR,R2,#fontblock_next
+        STMIA   LR,{R0,R5-R7}                   ;And then setup other words within the record (size, link, flags)
+
+        ADD     R2,R2,#fontblock_namestart      ;Pointer to destination buffer
+        SUB     R5,R5,#fontblock_namestart      ;Amount of data to be copied
+        ADD     R6,R4,#fontblock_namestart      ;Pointer to the source buffer
+
+selectjob_copyfontscopynames                
+        SUBS    R5,R5,#4
+        LDRPL   LR,[R6],#4
+        STRPL   LR,[R2],#4                      ;Copy a word from the data blocks
+        BPL     selectjob_copyfontscopynames    ;Loop whilst positive
+
+        B       selectjob_copyfontsloop
+
+selectjob_copyfontsreturn
+        STRVS   R0,[SP]
+        Pull    "R0-R7,PC"
+
+        LTORG
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_CurrentJob implementation
+;
+;   Entry: -
+;
+;   Exit:  R0 = file handle for print job that is currently active, or zero
+;               if no print job is active.
+;
+;----------------------------------------------------------------------------
+
+currentjob
+        LDR     R0,currenthandle
+        Return
+
+;----------------------------------------------------------------------------
+;
+; The implementation of SWI PDriver_FontSWI is among the interception
+; routines below.
+;
+;----------------------------------------------------------------------------
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_EndJob implementation
+;
+;   Entry: R0 = file handle for print job to be ended.
+;
+;   Exit:  -
+;
+; This call should be used to end a print job normally. This may result in
+; further printer output - e.g. the PostScript printer driver will produce
+; the standard trailer comments.
+;   If the print job being ended is the currently active one, there will be
+; no current print job after this call (so plotting calls will not be
+; intercepted).
+;   If the print job being ended is not currently active, it will be ended
+; without altering which print job is currently active or whether plotting
+; calls are being intercepted.
+;
+;----------------------------------------------------------------------------
+
+endjob
+
+  Debug PageBox, "PDriver_EndJob ",R0
+
+        Push    "R0-R3,R10,R11,LR"
+        MOVS    R10,R0                  ;Put file handle somewhere safer
+
+; Error if the job concerned doesn't exist or if the job has a persistent
+; error.
+
+        BL      findjob                 ;If found, sets R3 and R11
+        ADRVS   R0,ErrorBlock_PrintNoSuchJob
+        BLVS    LookupSingle            ; Always sets the V flag
+        BLVC    checkpersistenterror
+        BVS     endjob_persistentreturn
+
+; Error if this is supposed to be a one page illustration job and there
+; isn't exactly one page, or if we're in the middle of printing a page.
+
+        ADR     R0,ErrorBlock_PrintNotOnePage   ;Note V is clear here
+        LDRB    LR,illustrationjob
+        TEQ     LR,#0
+        LDRNE   LR,numberofpages
+        TEQNE   LR,#1
+        ADREQ   R0,ErrorBlock_PrintPrintingPage
+        LDREQ   LR,copiestodo
+        TEQEQ   LR,#0
+        BLNE    LookupSingle            ;So now V set <=> error occurred
+
+; Do printer specific finalisation, then delete job and its workspace
+
+        BL      enableescapes
+        BLVC    managejob_finalise
+        BL      disableandcheckescapes
+        BLVC    deletejob
+        BVS     endjob_return
+
+; If the file handle is that of the current job, we need to change to having
+; no job selected.
+
+        LDR     R0,currenthandle
+        CMP     R0,R10
+        MOVEQ   R10,#0
+        MOVEQ   R11,#TopBit     ;A suitable address exception generator!
+        STMEQIA R12,{R10,R11}           ;currenthandle:=R10, currentws:=R11
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        BL      adjustintercept
+
+; Return, passing possible error back to caller
+
+endjob_return
+        BLVS    makepersistenterror
+endjob_persistentreturn
+        STRVS   R0,[R13]
+        Pull    "R0-R3,R10,R11,PC"
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_AbortJob implementation
+;
+;   Entry: R0 = file handle for print job to be aborted.
+;
+;   Exit:  -
+;
+; This call should be used to end a print job abnormally - it is generally
+; called after fatal errors while printing. In general, it will not try to
+; produce any further printer output; if it does do so, it will take care to
+; handle possible further errors (particularly filing system errors) itself.
+;   If the print job being aborted is the currently active one, there will be
+; no current print job after this call (so plotting calls will not be
+; intercepted).
+;   If the print job being aborted is not currently active, it will be
+; aborted without altering which print job is currently active or whether
+; plotting calls are being intercepted.
+;
+;----------------------------------------------------------------------------
+
+abortjob
+        Push    "R0-R3,R10,R11,LR"
+        MOVS    R10,R0                  ;Put file handle somewhere safer
+
+; Error if the job concerned doesn't exist.
+
+        BL      findjob                 ;If found, sets R3 and R11
+        ADRVS   R0,ErrorBlock_PrintNoSuchJob
+        BLVS    LookupSingle            ; Always sets V flag
+        BVS     abortjob_return
+
+; Do printer specific aborting, then delete job and its workspace. Note
+; that 'managejob_abort' is not allowed to return an error.
+
+        BL      managejob_abort
+        BL      deletejob
+        BVS     abortjob_return
+
+        MOV     R0, #0
+        STR     R0, counting_pass       ; make sure we reset this flag
+
+; If the file handle is that of the current job, we need to deselect it
+
+        LDR     R0,currenthandle
+        CMP     R0,R10
+        MOVEQ   R10,#0
+        MOVEQ   R11,#TopBit     ;A suitable address exception generator!
+        STMEQIA R12,{R10,R11}           ;currenthandle:=R10, currentws:=R11
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+
+; Return, passing possible error back to caller
+
+abortjob_return
+        BL      adjustintercept
+        STRVS   R0,[R13]
+        Pull    "R0-R3,R10,R11,PC"
+
+        MakeInternatErrorBlock  PrintNoSuchJob,,NoJob
+
+        MakeInternatErrorBlock  PrintPrintingPage,,PrintP
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_Reset implementation
+;
+;   Entry: -
+;
+;   Exit:  -
+;
+; This aborts all print jobs known to the printer driver, leaving the printer
+; driver with no active or suspended print jobs and ensuring that plotting
+; calls are not being intercepted.
+;   Normal applications don't make this call, but it can be useful as an
+; emergency recovery measure!
+;
+;----------------------------------------------------------------------------
+
+reset
+        Push    "R0-R3,R10,R11,LR"
+
+; Now repeatedly abort and delete the first job in the list
+
+reset_loop
+        LDR     R11,printjoblist
+        CMP     R11,#0                  ;Clears V
+        BEQ     reset_return            ;Return if no jobs left
+        LDR     R10,jobhandle
+        BL      managejob_abort
+        ADR     R3,printjoblist
+        BL      deletejob
+        BVC     reset_loop
+
+; Deselect the current job, if any
+
+reset_return
+        MOV     R10,#0
+        MOV     R11,#TopBit     ;A suitable address exception generator!
+        STMIA   R12,{R10,R11}           ;currenthandle:=R10, currentws:=R11
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+
+        BL      adjustintercept
+        ADRVC   R2,fontlist                     ; pointer to he font list
+        BLVC    miscop_removefontsR2
+
+        STRVS   R0,[R13]
+        Pull    "R0-R3,R10,R11,PC"
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_GiveRectangle implementation
+;
+;   Entry: R0 = rectangle identification word. This word is reported back to
+;               the application when it is requested to plot all or part of
+;               this rectangle.
+;          R1 -> 4 word block, containing rectangle to be plotted. Units are
+;               OS units.
+;          R2 -> 4 word block, containing dimensionless transformation to be
+;               applied to the specified rectangle before printing it. The
+;               entries are given as fixed point numbers with 16 binary
+;               places, so the transformation is:
+;                 x' = (x * R2!0 + y * R2!8)/2^16
+;                 y' = (x * R2!4 + y * R2!12)/2^16
+;          R3 -> 2 word block, containing the position where the bottom left
+;               corner of the rectangle is to be plotted on the printed page.
+;               Units are 1/72000 inch.
+;          R4 = background colour for rectangle, in form &BBGGRRXX.
+;
+;   Exit:  -
+;
+; This SWI allows an application to specify a rectangle from its workspace to
+; be printed, how it is to be transformed and where it is to appear on the
+; printed page. An application should make one or more calls to SWI
+; PDriver_GiveRectangle before a call to SWI PDriver_DrawPage and the
+; subsequent calls to SWI PDriver_GetRectangle. (Multiple calls allow the
+; application to print multiple rectangles from its workspace to one printed
+; page - e.g. for "two up" printing).
+;   The printer driver may subsequently ask the application to plot the
+; specified rectangles or parts thereof in any order that is compatible with
+; the order in which the PDriver_GiveRectangle calls were issued. An
+; application should not make any assumptions about this order or whether the
+; rectangles it specifies will be split. (A common reason why a printer
+; driver might split a rectangle is that it prints the page in strips to
+; avoid using excessively large page buffers.)
+;   Assuming that a non-zero number of copies is requested and that none of
+; the requested rectangles go outside the area available for printing, it is
+; certain to ask the application to plot everything requested at least once.
+; It may ask for some areas to be plotted more than once, even if only one
+; copy is being printed, and it may ask for areas marginally outside the
+; requested rectangles to be plotted (this can typically happen if the
+; boundaries of the requested rectangles are not on exact device pixel
+; boundaries).
+;   If SWI PDriver_GiveRectangle is used to specify a set of rectangles that
+; overlap on the output page, the rectangles will be printed in the order of
+; the SWI PDriver_GiveRectangle calls. For appropriate printers (i.e. most
+; printers, but not e.g. XY plotters), this means that rectangles supplied
+; via later PDriver_GiveRectangle calls will overwrite rectangles supplied
+; via earlier calls.
+;
+;----------------------------------------------------------------------------
+
+giverectangle
+        Push    "R5-R11,LR"
+
+; Get the current print job's handle and workspace pointer. Error if there
+; is no current print job or if the current print job has a persistent error.
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+        CMP     R10,#0                  ;NB clears V
+        ADREQ   R0,ErrorBlock_PrintNoJobSelected
+        BLEQ    LookupSingle            ; Always sets V
+        BLVC    checkpersistenterror    ;So V is set here <=> error occurred
+        BVS     giverectangle_persistentreturn
+
+; Error if we are currently printing a page for this print job
+
+        LDR     R5,copiestodo
+        CMP     R5,#0                   ;NB clears V
+        ADRNE   R0,ErrorBlock_PrintPrintingPage
+        BLNE    LookupSingle            ; Always sets V
+        BVS     giverectangle_return    ;So V is set here <=> error occurred
+
+; Get a chunk of workspace to contain this rectangle
+
+        Push    "R0,R2,R3"
+        MOV     R0,#ModHandReason_Claim
+        LDR     R3,=rectanglelength
+        SWI     XOS_Module
+        MOVVC   R9,R2
+        STRVS   R0,[R13]
+        Pull    "R0,R2,R3"
+        BVS     giverectangle_return
+
+; Link it to the end of the chain of rectangles
+
+        MOV     R5,#0
+        STR     R5,nextrectangle
+        ADR     R5,rectlist
+giverectangle_findlistendloop
+        LDR     LR,[R5]
+        TEQ     LR,#0                   ;NB leaves V clear
+        ADDNE   R5,LR,#:INDEX:nextrectangle
+        BNE     giverectangle_findlistendloop
+        STR     R9,[R5]
+
+; Store rectangle ID and background colour
+
+        STR     R0,rectangleid
+        STR     R4,rectanglebg
+
+; Transfer parameters to rectangle, in suitable modified form
+
+        LDMIA   R1,{R5-R8}              ;Get user's box
+        SUB     R7,R7,R5                ;Convert to left/right/width/height
+        SUB     R8,R8,R6
+        ASSERT  rectbox = rectoffset + 8
+        ADR     LR,rectoffset
+        STMIA   LR,{R5-R6,R7-R8}        ;And store the results
+
+        LDMIA   R2,{R5-R8}              ;Copy transformation
+        ADR     LR,recttransform
+        STMIA   LR,{R5-R8}
+
+        LDMIA   R3,{R5-R6}
+        ADR     LR,rectbottomleft       ;Copy bottom left destination point
+        STMIA   LR,{R5-R6}
+                                        ;NB V still clear at this point
+; And return
+
+giverectangle_return
+        BLVS    makepersistenterror
+giverectangle_persistentreturn
+        Pull    "R5-R11,PC"
+
+        LTORG
+
+        MakeInternatErrorBlock  PrintNoJobSelected,,NoJbSel
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_DrawPage implementation
+;
+;   Entry: R0 bits 0..23  = number of copies to print.
+;          R0 bits 24..31 = flags
+;               bit 24 = 1 if application can deal with pre-scan of rectangles, 0 if not
+;               bits 25..31 reserved (set to 0)
+;          R1 -> 4 word block, to receive the rectangle to print.
+;          R2 is zero or contains the page's sequence number within the
+;               document being printed (i.e. 1-n for an n-page document).
+;          R3 is zero or points to a string, terminated by a character in
+;               the ASCII range 33-126 (note spaces are not allowed), which
+;               gives the 'real' page number. (Examples: "23", "viii", "A-1")
+;
+;   Exit:  R0 is zero if and only if no more plotting is required.
+;          else number of copies still requiring printing (and bit 24 set if 'counting pass')
+;          If R0 is non-zero, the area pointed to by R1 has been filled in
+;               with the rectangle that needs to be plotted, and R2 contains
+;               the rectangle identification word for the user-specified
+;               rectangle that this is a part of.
+;          If R0 is zero, the contents of R2 and the area pointed to by R1
+;               are undefined.
+;
+; If the pre-scan flag is set on entry, the drivers may choose to pre-scan all
+; previously given rectangles, before the main printing pass. This is intended
+; to allow the printing requirements to be assessed before the main printing task
+; begins. Currently, this feature is used to calculate memory requirements for
+; JPEG printing, but may be used for other items in the future. The pre-scan only
+; occurs if the flag is set on entry, so that there is no risk of confusing old
+; applications. During the pre-scan, the application can plot as normal, so the
+; new feature is relatively transparent (there may be minor considerations, such
+; as calculations of how much of print job is complete needing changes).
+;
+; The information passed in R2 and R3 is not particularly important, though
+; it helps to make output produced by the PostScript printer driver conform
+; better to Adobe's structuring conventions. If non-zero values are supplied,
+; they should be correct. Note that R2 is NOT the sequence number of the page
+; in the print job, but in the document.
+;   An example: if a document consists of 11 pages, numbered "" (the title
+; page), "i"-"iii" and "1"-"7", and the application is requested to print the
+; entire preface part, it should use R2 = 2, 3, 4 and R3 -> "i", "ii", "iii"
+; for the three pages.
+;
+;----------------------------------------------------------------------------
+
+drawpage
+        Push    "R1,R3-R11,LR"
+
+; Get the current print job's handle and workspace pointer. Error if there
+; is no current print job or if the current print job has a persistent error.
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+        CMP     R10,#0                  ;NB clears V
+        ADREQ   R0,ErrorBlock_PrintNoJobSelected
+        BLEQ    LookupSingle            ; Always sets V
+        BLVC    checkpersistenterror    ;So V is set here <=> error occurred
+        BVS     getrectangle_persistentreturn
+
+; Error if we are currently printing a page for this print job
+
+        LDR     R4,copiestodo
+        CMP     R4,#0                   ;NB clears V
+        ADRNE   R0,ErrorBlock_PrintPrintingPage
+        BLNE    LookupSingle            ; Always sets V
+        BVS     getrectangle_return     ;So V is set here <=> error occurred
+
+; Error if any reserved flag bits set.
+
+        TST     R0, #&FE000000          ; currently, bits 25..31 reserved
+        ADRNE   R0,ErrorBlock_PrintInvalidCopies
+        BLNE    LookupSingle            ; Always sets V 
+        BVS     getrectangle_return
+
+        AND     LR, R0, #&01000000      ; select pre-scan allowed flag
+        MOV     LR, LR, LSR #24         ; move it to bit 0
+        STR     LR, counting_pass       ; store it 
+   Debug PageBox,"DrawPage pre-scan allowed flag ",LR
+
+        AND     LR, R0, #&FF000000
+        SUB     R0, R0, LR              ; zap flags byte from copies word
+   Debug PageBox,"DrawPage copies (excluding flags) = ",R0
+
+; Increment the page count and check for error if an illustration job.
+
+        LDR     LR,numberofpages
+        ADD     LR,LR,#1
+        STR     LR,numberofpages
+        TEQ     LR,#1                   ;NB V is clear at this point
+        LDRNEB  LR,illustrationjob
+        TEQNE   LR,#0
+        ADRNE   R0,ErrorBlock_PrintNotOnePage
+        BLNE    LookupSingle            ; Always sets V flag
+
+; Now let the printer-specific routines prepare to plot the page
+
+        BL      enableescapes
+        BLVC    pagebox_setup           ;So V is set here <=> error occurred
+
+; If no error, combine with DrawPage_GetRectangle code
+
+        Debug   PageBox,"drawpage jumping to getrectangle shared code"
+        B       getrectangle_sharedcode
+
+        MakeInternatErrorBlock  PrintInvalidCopies,,BadCops
+
+        MakeInternatErrorBlock  PrintNoCurrentPage,,NoPage
+
+        MakeInternatErrorBlock  PrintNotOnePage,,NotOneP
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_GetRectangle implementation
+;
+;   Entry: R1 -> 4 word block, to receive the rectangle to print.
+;
+;   Exit:  R0 = number of copies still requiring printing (bit 24 set if 'counting pass' rectangle)
+;               Or, this is zero if and only if no more plotting is required.
+;          If R0 is non-zero, the area pointed to by R1 has been filled in
+;               with the rectangle that needs to be plotted, and R2 contains
+;               the rectangle identification word for the user-specified
+;               rectangle that this is a part of.
+;          If R0 is zero, the contents of R2 and the area pointed to by R1
+;               are undefined.
+;
+;----------------------------------------------------------------------------
+
+getrectangle
+        Push    "R1,R3-R11,LR"
+
+; Get the current print job's handle and workspace pointer. Error if there
+; is no current print job or if the current print job has a persistent error.
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+        CMP     R10,#0                  ;NB clears V
+        ADREQ   R0,ErrorBlock_PrintNoJobSelected
+        BLEQ    LookupSingle            ; Always sets V
+        BLVC    checkpersistenterror    ;So V is set here <=> error occurred
+        BVS     getrectangle_persistentreturn
+
+; Error if we are not currently printing a page for this print job
+
+        LDR     R0,copiestodo
+        CMP     R0,#0                   ;NB clears V
+        ADREQ   R0,ErrorBlock_PrintNoCurrentPage
+        BLEQ    LookupSingle            ; Always sets V
+
+; Flush any buffered VDU 5 characters
+
+        BLVC    vdu5_flush
+
+        BL      enableescapes
+
+getrectangle_sharedcode                 ;Shared code entry point. Note V is
+                                        ;  correct on branch to here, so V
+                                        ;  is set here <=> error occurred.
+                                        ;Note also that ESCAPEs have been
+                                        ;  enabled at this point.
+; Get the next box
+
+        BLVC    pagebox_nextbox
+        BL      disableandcheckescapes
+        BVS     getrectangle_return
+
+; If box doesn't exist, clear the list of rectangles, disable plotting and
+; return.
+
+        TEQ     R0,#0
+        BNE     getrectangle_boxexists
+        BL      clearrectangles
+        MOVVC   R1,#disabled_nopage
+        B       getrectangle_return         ;With V clear
+
+
+getrectangle_boxexists
+        LDR     LR, counting_pass
+        CMP     LR, #0
+        BEQ     getrectangle_not_counting
+        STMIA   R1,{R3-R6}
+        MOV     R1, #0
+        STR     R1, disabled
+        STR     R0,copiestodo
+        ORR     R0, R0, #1:SHL:24       ; flag 'counting pass' rectangle
+        Debug   PageBox,"drawpage/getrectangle exit counting, R0 = ",R0
+        Pull    "R1,R3-R11,PC"
+
+getrectangle_not_counting
+; Otherwise, translate it to correct position and store it
+        Debug   PageBox,"drawpage/getrectangle not counting"
+        ADR     LR,usersoffset
+        LDMIA   LR,{R7,R8}
+        ADD     R3,R3,R7
+        ADD     R4,R4,R8
+        ADD     R5,R5,R7
+        ADD     R6,R6,R8
+        STMIA   R1,{R3-R6}
+
+; Initialise graphics clipping box, and set origin and cursors to (0,0) -
+; i.e. effectively a VDU 26.
+        BL      wrch_defaultbox
+
+; Set default dot pattern.
+
+        BLVC    defaultdotpattern
+
+; Set "no current sprite" state.
+
+        MOVVC   LR,#-1
+        STRVC   LR,currentsprite
+
+; Clear the box to its appropriate background colour, and set the background
+; colour to be that absolute colour.
+
+        BLVC    pagebox_cleartobg
+        MOVVC   LR,#0
+        STRVC   LR,bgmode
+        MOVVC   LR,#&80
+        STRVCB  LR,bggcol+3
+        LDRVC   LR,usersbg
+        STRVC   LR,bgrgb
+
+; Re-initialise the VDU 5 system.
+
+        BLVC    initvdu5info
+
+; Enable plotting
+
+        MOVVC   R1,#0
+
+; Return, updating copies to do.
+
+getrectangle_return
+        STRVCB  R1,disabled
+        STRVC   R0,copiestodo
+        BLVS    makepersistenterror
+getrectangle_persistentreturn
+        Pull    "R1,R3-R11,PC"
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_CancelJob implementation
+;
+;   Entry: R0 = file handle for job to be cancelled.
+;
+;   Exit:  -
+;
+; This call causes subsequent attempts to output to the print job associated
+; with the given file handle to do nothing other than generate the error
+; "Print job cancelled". An application is expected to respond to this error
+; by aborting the print job.
+;
+;----------------------------------------------------------------------------
+
+canceljob
+        Push    "R0-R3,R10,R11,LR"
+        MOV     R10,R0                  ;Put file handle somewhere safer
+
+; Error if the job concerned doesn't exist
+
+        BL      findjob                 ;If found, sets R11
+        ADRVS   R0,ErrorBlock_PrintNoSuchJob
+        BLVS    LookupSingle            ; Always sets V
+        BVS     canceljob_return
+
+; Otherwise cancel the job
+
+        ADR     R0,ErrorBlock_PrintCancelled
+        BL      LookupSingle            ; Always sets V
+        BL      makepersistentnosuffix
+        CLRV
+
+; And return
+
+canceljob_return
+        STRVS   R0,[R13]
+        Pull    "R0-R3,R10,R11,PC"
+
+        MakeInternatErrorBlock  PrintCancelled,,PCancel
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_EnumerateJobs implementation
+;
+;   Entry: R0 = 0 or file handle of previous print job.
+;
+;   Exit:  R0 = file handle of next print job or 0
+;
+;----------------------------------------------------------------------------
+
+enumeratejobs
+        Push    "R2,R3,R10,R11,LR"
+
+        CLRV
+        MOVS    R10,R0
+        ADREQ   R11,printjoblist - :INDEX:joblink       ;Fake previous job
+        ASSERT  :BASE:joblink = R11
+        BLNE    findjob                 ;Sets V if job not found
+
+        LDRVC   R11,joblink
+        TEQ     R11,#0                  ;NB leaves V unchanged
+        MOVEQ   R0,#0
+        LDRNE   R0,jobhandle
+
+        ADRVSL  R0,ErrorBlock_PrintNoSuchJob    ;Only error that can happen!
+        BLVS    LookupSingle            ; Always sets V
+        Pull    "R2,R3,R10,R11,PC"
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_CancelJobWithError implementation
+;
+;   Entry: R0 = file handle for job to be cancelled.
+;          R1 points to an error block.
+;
+;   Exit:  -
+;
+; This call causes subsequent attempts to output to the print job associated
+; with the given file handle to do nothing other than generate the specified
+; error. An application is expected to respond to this error by aborting the
+; print job.
+;
+;----------------------------------------------------------------------------
+
+canceljobwitherror
+        Push    "R0-R3,R10,R11,LR"
+        MOV     R10,R0                  ;Put file handle somewhere safer
+
+; Error if the job concerned doesn't exist
+
+        BL      findjob                 ;If found, sets R11
+      [ debug
+        ADRVSL  R0,ErrorBlock_PrintNoSuchJob
+      |
+        ADRVS   R0,ErrorBlock_PrintNoSuchJob
+      ]
+        BLVS    LookupSingle            ; Always sets V
+        BVS     canceljobwitherror_return
+
+; Otherwise cancel the job
+
+        MOV     r0, r1                  ; Get the error passed into R0
+        BL      makepersistentnosuffix
+        CLRV
+
+; And return
+
+canceljobwitherror_return
+        STRVS   R0,[R13]
+        Pull    "R0-R3,R10,R11,PC"
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_SelectIllustration implementation is above, near the SWI
+;   PDriver_SelectJob implementation.
+;
+;----------------------------------------------------------------------------
+                        
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_DeclareFont implementation
+;
+;   Entry: R0  = font handle / =0
+;          R1 -> font name if r0 =0
+;          R2  = Flags
+;                 bit 0 set => DON'T download font if not present within device
+;                 bit 1 set => Kerning will be applied when this font is used.
+;   Exit:  -
+;
+; This SWI allows you to declare the fonts that are to be used within
+; a document, this implementation simply resolves the meaning of r0 and
+; r1 and then passes it onto the printer dependant code to handle
+; the actual meaning of the functions.
+;
+; DeclareFont is only valid when there is an active job and prior to any
+; draw page commands.
+;                                     
+;----------------------------------------------------------------------------
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+
+declarefont ROUT
+
+        Push    "R0-R7,R9-R11,LR"
+
+;Setup a return frame pointer needed later on when buffers allocated.
+        MOV     R9,SP
+                                         
+;Check to see if a job is currently active.
+
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+        CMP     R10,#0                  ;NB clears V
+        ADREQ   R0,ErrorBlock_PrintNoJobSelected
+        BLEQ    LookupSingle            ;Always sets V
+        BLVC    checkpersistenterror    ;So V is set here <=> error occurred
+        BVS     declarefont_return
+
+;There is currently a job running so we must now attempt to see
+;if we are currently building a page, if the copies count is non-zero
+;then we are so this must then be faulted.
+
+        LDR     LR,copiestodo
+        CMP     LR,#0                   ;NB clears V
+        ADRNE   R0,ErrorBlock_PrintNoCurrentPage
+        BLNE    LookupSingle
+        BVS     declarefont_return      ;Return because of error
+
+;We are currently not building a page so we must now attempt to
+;handle the call, first we must take a copy of the current stack pointer
+;as the buffer that may be allocated for the name will be stored on
+;the current stack.  Then we check to see if a handle was passed in R0
+;ie. is it non-zero?
+                    
+        TEQ     R0,#0                   ;Absolute handle reference?
+        BEQ     declarefont_namegiven
+                 
+;We have decided that R1 does not point to a suitable buffer containing
+;the font name so we must attempt to read it, this is done by two calls
+;to Font_ReadDefn with R3 set to a magic word.  The first call is made
+;to read the buffer size required and the second is to actually
+;read the information.
+;
+;R9 contains the current return frame pointer, R0 the handle and R2 the
+;flags word for the declare call.  R10 and R11 are setup as normal.
+
+        Push    "R2"                    ; store flags on stack
+
+        LDR     R3,=&4C4C5546           ;Always read the full information
+        Push    "R3"                    ; keep magic word, the SWI corrupts R3
+        MOV     R1,#0
+        SWI     XFont_ReadDefn          ;Attempt to read the buffer size into R2
+        Pull    "R3"                    ; get magic word back
+        Pull    "R2",VS
+        BVS     declarefont_return      ;Return because first call failed
+
+        Pull    "R1"                    ; get flags into R1 for now...
+        ADD     R2,R2,#3
+        BIC     R2,R2,#3         
+        SUB     SP,SP,R2                ;Ensure buffer is a word multiple and allocate on the stack
+        MOV     R2, R1                  ; flags now in R2 where the routine expects them
+
+        MOV     R1, SP          
+        Push    "R1,R2"                 ;Setup pointer and remember it & flags
+
+;R0 contains the handle, R1 contains the buffer pointer and R3 the magic word.
+;R2 contains the declarefont flags
+        SWI     XFont_ReadDefn          ;Read the information about the font
+        Pull    "R1,R2"                 ; recover pointer & flags
+        BVS     declarefont_return      ;Return as unable to read again
+
+;Now we have [R1] containing the data for the font to declare and R2
+;contains the flags word we must pass to the actual device to be 
+;declared.  Declaration is handled by the printer-specific code.
+
+declarefont_namegiven
+        BL      font_declare
+
+;We must now tidy up an exit returning any errors that may have been
+;generated.
+
+declarefont_return
+        MOV     SP,R9                   ;Restore the proper value of the stack pointer
+        STRVS   R0,[SP]
+        Pull    "R0-R7,R9-R11,PC"
+
+        LTORG        
+
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_MiscOp implementation
+;
+;   Entry: R0  = reason code
+;                       0 => add font
+;                       1 => remove fonts
+;                       2 => enumerate fonts
+;                     
+;   Exit:  V set, r0 -> error block.
+;          V clear, depends on reason code.
+;
+; This code allows the handling of the MiscOp operations supported by the printer
+; drivers.  All reason codes with bit 31 clear are processed by the printer independant
+; code, others are passed to the printer dependant code to be processed.
+;
+; When a job is selected then these functions take effect on that job, otherwise
+; they effect the current global settings.
+;
+;----------------------------------------------------------------------------
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+
+miscop  ROUT
+
+        LDMIA   R12,{R10,R11}           ;Get job handle and pointer (no job then R10=0)
+
+        TST     R0,#TopBit
+        BNE     miscop_decode           ;If bit 16 set then pass to device specific code
+
+        CMP     R0,#(miscop_invalid -miscop_jumptablestart)/4     
+        ADDCC   PC,PC,R0,LSL#2          ;If reason within a valid range then despatch
+        B       miscop_invalid          ;Otherwise pass back an error message
+
+miscop_jumptablestart
+        B       miscop_addfont
+        B       miscop_removefonts
+        B       miscop_enumfonts
+
+miscop_invalid
+        ADR     R0,ErrorBlock_PrintBadMiscOp
+        B       LookupSingle            ;Lookup the error message to be returned
+
+        MakeInternatErrorBlock PrintBadMiscOp,,BadMOp
+         
+;----------------------------------------------------------------------------
+;
+; MiscOp_AddFont implementation
+;
+;   Entry: R0  = Reason code (0)
+;          R1 -> RISC OS name
+;          R2 -> Alien font name
+;          R3  = flags word to associate with record
+;          R4  = flags word for adding font
+;                       bit 0 set => over-write existing entries
+;
+;   Exit:  V set, r0 -> error block.
+;          V clear all preserved.
+;                   
+; This code adds a fpmt to either the global list or the local list 
+; associated with a job. 
+;
+; The global list is the list of fonts known by the printer and the local
+; list is the one associated with each job and describes the fonts and their
+; mappings within the job.  Each record is stored as a seperate block
+; within the RMA.  Blocks within the global list are copied to each
+; job when PDriver_SelectJob is called.
+;
+; On entry R1 contains the pointer to the RISC OS name, ideally this will
+; contain the encoding vector used, ie. /F<font name> /E<encoding>, you
+; can also include matrix information for derived fonts.  This name is
+; case insensitive.  Duplicate names are also filtered out.
+;
+; R2 contains a pointer to the Alien name to be associated with the RISC OS
+; name, this is used by the printer dependant code as required.
+;
+; R3 is a flags word to be used by the printer dependent code, see specific
+; printer documentation for further details.
+;
+; R4 contains a flags word to associate with the addition of the record, currently
+; only bit 0 is used and all others should be zero.  
+; 
+;----------------------------------------------------------------------------
+
+addfontflag_Overwrite   * 1:SHL:0       ;Set => Overwrite existing entry
+
+        ASSERT  fontblock_next =0
+
+miscop_addfont ROUT
+        Push    "R0-R7,R8-R9,LR"
+
+        TEQ     R10,#0                  ;Am I adding this to the current job or main records?
+        ADRNE   R9,jobfontlist
+        ADREQ   R9,fontlist             ;Setup anchor point for linked list
+        MOV     R7,R4                   ;Take a copy of the flags word
+
+miscop_addfontcheckloop
+        LDR     R8,[R9,#fontblock_next]
+        CMP     R8,#0                   ;Any more blocks in the list?  (will clear V bit)
+        BEQ     miscop_addfontnew       ;Add a new font then, otherwise we check for duplicates
+        ADD     R0,R8,#fontblock_namestart
+        MOV     R2,#0                   ;Index into the names
+
+miscop_comparenames
+        LDRB    R3,[R0,R2]
+        LDRB    R4,[R1,R2]              ;Get two characters from the names
+        LowerCase R3,LR
+        LowerCase R4,LR                 ;Convert to the same case
+
+        CMP     R4,#32
+        MOVLT   R4,#0                   ;If less than space then terminate with a null
+
+        TEQ     R3,R4                   ;Are the characters the same?
+        BNE     miscop_comparenamesnext
+        
+        TEQ     R3,#0                   ;End of the name strings?
+        ADDNE   R2,R2,#1
+        BNE     miscop_comparenames     ;Loop until end of name strings found
+
+        TST     R7,#addfontflag_Overwrite
+        BNE     addfont_overwrite       ;Over-write the existing entry
+
+        ADR     R0,ErrorBlock_PrintNoDuplicates
+        BL      LookupSingle            ;Generate an error string
+        B       miscop_addfontreturn
+
+miscop_comparenamesnext
+        MOV     R9,R8                   ;Attempt to try the next record in the list
+        B       miscop_addfontcheckloop
+
+        MakeInternatErrorBlock PrintNoDuplicates,,NoDup
+
+miscop_addfontnew
+        BL      addfont_countR1
+        ADD     R3,R3,#fontblock_SIZE   ;Get size of alien block
+
+        Push    "R1,R3"                 ;Preserve pointer and size  
+        LDR     R1,[SP,#16]             ;Get the pointer to the alien name
+        BL      addfont_countR1
+        Pull    "R1,R6"                 ;Pull back original pointer + size into another register
+
+        ADD     R3,R3,R6                ;Calculate the total size of the block
+        ADD     R3,R3,#3
+        BIC     R3,R3,#3                ;Word align the size word
+
+        MOV     R0,#ModHandReason_Claim
+        SWI     XOS_Module              ;Attempt to claim block
+        BVS     miscop_addfontreturn    ;Return because of an error
+                    
+        LDR     R0,[R9,#fontblock_next]
+        STR     R2,[R9,#fontblock_next]
+        STR     R0,[R2,#fontblock_next] ;Link block in at head of the list
+
+        ADD     LR,SP,#8
+        LDMIA   LR,{R4-R5}              ;Get alien name pointer and flags
+
+        STR     R3,[R2,#fontblock_size]
+        STR     R5,[R2,#fontblock_flags]
+        
+        ADD     R0,R2,#fontblock_namestart
+
+miscop_addfontcopyriscos
+        LDRB    LR,[R1],#1
+        CMP     LR,#32                  ;End of string found yet?
+        MOVLT   LR,#0                   ;Yes, so convert termination character to a null
+        STRB    LR,[R0],#1              ;Store the data away
+        BGE     miscop_addfontcopyriscos
+        
+        ADD     R0,R2,R6                ;Pointer to buffer to place the alien name
+        STR     R0,[R2,#fontblock_alienname]
+
+miscop_addfontcopyalien
+        LDRB    LR,[R4],#1
+        CMP     LR,#32                  ;End of the string yet?
+        MOVLT   LR,#0                   ;Yes so convert termiator to a null
+        STRB    LR,[R0],#1
+        BGE     miscop_addfontcopyalien
+
+        CLRV
+
+miscop_addfontreturn
+        STRVS   R0,[SP]                 ;Store error pointer and then return
+        Pull    "R0-R7,R8-R9,PC"
+
+
+;  in: R1 -> string to count
+; out: R3  = length of string at [R1] terminating on char <32
+
+addfont_countR1
+        Push    "LR"
+        MOV     R3,R1
+addfont_countR1loop
+        LDRB    LR,[R3],#1        
+        CMP     LR,#32                  ;Reached the end yet?
+        BGE     addfont_countR1loop     ;Loop whilst it is valid
+        SUBS    R3,R3,R1                ;Then resolve and work out the length
+        Pull    "PC",,^
+
+                 
+; in    R7 flags word
+;       R8 ->current block
+;       R9 ->block which indexes the current block
+;
+; out   -
+
+addfont_overwrite
+        LDR     R1,[R8,#fontblock_next] ;Get forward link of block being removed
+
+        MOV     R0,#ModHandReason_Free
+        MOV     R2,R8              
+        SWI     XOS_Module              ;Attempt to release the block containing duplicate
+
+        STRVC   R1,[R9,#fontblock_next] ;Setup in the previous block so one released no longer in list
+
+        LDMVCIA SP,{R0-R4}              ;Get the entry parameters
+        BLVC    miscop_addfont          ;Attempt to add again and hope that it 
+        B       miscop_addfontreturn
+
+;----------------------------------------------------------------------------
+;
+; MiscOp_RemoveFonts implementation
+;
+;   Entry: r0  = Reason code (1)
+;
+;   Exit:  V set, r0 -> error block.
+;          V clear all preserved.
+;
+; Remove either the list of font blocks, if a job is selected then the 
+; ones associated with that job will be removed, otherwise the global
+; list is zapped.
+;
+;----------------------------------------------------------------------------
+
+miscop_removefonts
+        Push    "R2,LR"
+
+        TEQ     R10,#0                  ;Is there a job selected?
+        ADREQ   R2,fontlist
+        ADRNE   R2,jobfontlist          ;Address the relevant font list
+        BL      miscop_removefontsR2    ;Zap this list of fonts at r0
+
+        Pull    "R2,PC"                 ;Return passing back any errors that may occur
+
+
+; miscop_removefontsR0, this routine will remove all blocks linked to the word
+; at r0.  It is assumed that the first  word is actually the pointer to the
+; next block or zero if there are no more blocks.
+
+        ASSERT  fontblock_next =0
+
+miscop_removefontsR2
+        Push    "R0-R3,LR"
+
+        MOV     R0,#ModHandReason_Free
+        LDR     R2,[R2,#fontblock_next]
+
+miscop_removefontsloop
+        CMP     R2,#0                   ;Any more blocks in the chain? (clears V flag)
+        LDREQ   R0,[SP,#8]
+        STREQ   R2,[R0]                 ;Reset first word in chain if no more and then return
+        BEQ     miscop_removefontsreturn                                         
+        
+        LDR     R3,[R2,#fontblock_next]
+        SWI     XOS_Module              ;Free the block if non-zero
+        MOVVC   R2,R3                   ;Move to next block if that worked
+        BVC     miscop_removefontsloop
+                          
+miscop_removefontsreturn
+        STRVS   R0,[SP]                 ;Store the updated error pointer
+        Pull    "R0-R3,PC"
+
+
+;----------------------------------------------------------------------------
+;
+; MiscOp_EnumerateFonts implementation
+;
+;   Entry: R0  = Reason code (2)
+;          R1 -> Return buffer / =0 to return maximum size of buffer needed
+;          R2  = Size of return buffer / =0 to return maximum size of buffer needed
+;          R3  = Handle from previous call, =0 if first call.
+;          R4  = Flags
+;                  all bits reserved and should be zero.
+;
+;   Exit:  V set, r0 -> error block.
+;          V clear:
+;
+;            if R1 <> 0 on entry then;
+;  
+;               [R1] +0 -> RISC OS name
+;                    +4 -> Alien name
+;                    +8  = Flags word
+;
+;               .... until buffer is full
+;
+;               R1 -> free byte in buffer
+;               R2  = number of free bytes in buffer (<12)
+;               R3  = handle to be passed to read rest of data, =0 if none
+;                                     
+;            else;
+;
+;               R1 preserved.
+;               R2 = maximum size of buffer to return data.
+;               R3 preserved.
+;               R4 preserved.
+; 
+; Fill the buffer with three word records listing the fonts that have
+; been added to either the global list or the local list stored with the 
+; job.  The routine accepts a pointer to the buffer which if zero 
+; returns the size of buffer required, infact it is R3 +size to allow you
+; to pre-allocate room for a header if needed.
+;
+; The buffer is filled until the size is <12, all pointers point to blocks
+; stored within the RMA.  Ideally a copy should be made of these strings
+; as someone could perform a remove list call to zap them.  
+;
+; R3 on entry for the first call should contain zero and then passed in on
+; subsequent calls to read the remaining data.  When the last object has
+; been read it will be returned as zero.
+; 
+;----------------------------------------------------------------------------
+
+                        ^ 0             ;Structure returned by enumerate
+miscop_enumblock_RISCOS # 4
+miscop_enumblock_Alien  # 4
+miscop_enumblock_Flags  # 4
+miscop_enumblock_SIZE   * :INDEX: @
+
+        ASSERT  fontblock_next =0
+                       
+miscop_enumfonts ROUT
+
+        Push    "R4-R8,LR"
+
+        TEQ     R10,#0                  ;Is there a pending job?
+        ADREQ   R5,fontlist
+        ADRNE   R5,jobfontlist          ;If so address the correct block.
+        MOV     R6,R3
+
+miscop_enumfontsskip
+        SUBS    R6,R6,#1                ;Have we finished skipping records yet?
+        BMI     miscop_enumfontsskipover
+
+        LDR     R5,[R5,#fontblock_next]
+        CMP     R5,#0                   ;Are there any more blocks?
+        BNE     miscop_enumfontsskip    ;Yes, so try another block
+
+miscop_enumfontsreturn
+        Pull    "R4-R8,PC",,^           ;Return after storing the error pointer
+
+miscop_enumfontsskipover
+        LDR     R5,[R5,#fontblock_next]
+        CMP     R5,#0                   ;Have we finished the enumeration yet?
+        MOVEQ   R3,#0
+        BEQ     miscop_enumfontsreturn  ;Will have cleared the V bit
+
+        TEQ     R1,#0                   ;Are we returning any data?
+        ADDEQ   R2,R2,#miscop_enumblock_SIZE
+        ADDEQ   R3,R3,#1                ;And increase the returned index
+        BEQ     miscop_enumfontsskipover
+
+        CMP     R2,#miscop_enumblock_SIZE
+        BLT     miscop_enumfontsreturn  ;If not enough space in the buffer then return
+
+        ADD     R6,R5,#fontblock_namestart
+        LDR     R7,[R5,#fontblock_alienname]
+        LDR     R8,[R5,#fontblock_flags]
+        STMIA   R1!,{R6-R8}             ;Write the block containing the name pointers and flags
+
+        SUB     R2,R2,#miscop_enumblock_SIZE
+        ADD     R3,R3,#1                ;Increase the return index and then return
+        B       miscop_enumfontsskipover 
+
+        END

@@ -1,0 +1,292 @@
+; > MiscOp
+                                                                                           
+;----------------------------------------------------------------------------
+;
+; miscop_decode implementation
+;
+;   Entry:     R0 reason code, bit 31 set.
+;          R1..R7 reserved for the call.
+;                     
+;   Exit:  V set, r0 -> error block.
+;          V clear, as defined by the call.
+;
+; This routine decodes the reason code specified in R0 and despatches to
+; the relevant routine.  The call takes the reason code and sees if it
+; is greater than or equal to the base of PDumper specific reasons, if it
+; is then we despatch to the handler within the PDumper.  If a job is selected
+; then the call is directed at the routines local to that job otherwise they
+; go to the global handler.
+;
+; A set of reason codes are reserved for the PDumper manager itself to
+; handle the registering and deregistering of PDumpers for instance.
+;
+;----------------------------------------------------------------------------
+
+miscop_decode ROUT
+
+        Debug   Configure,"Reason code",R0
+
+        BIC     R0,R0,#TopBit                   ;Convert to useable reason code
+                   
+        CMP     R0,#(PDumperMiscOp_DumperSpecific -PDriverMiscOp_DriverSpecific)
+        BLT     miscop_ours                     ;If not greater than the to dumper threshold then handle
+
+        Debug   Configure,"Attempting to direct at device"
+
+        Push    "R9,LR"
+
+        TEQ     R10,#0                          ;Is there a job currently?
+        BNE     miscop_tojob
+
+; We could use conditional coding here, but because the device may corrupt
+; the flags and possibly R10 it is safer to have two specific cases.
+                
+        MOV     R11,#PDumperReason_MiscOp
+        BL      CallPDumper                     ;Despatch to current global PDumper
+        Pull    "R9,PC"                         ;And return allowing flags and registers through
+
+miscop_tojob
+        MOV     R9,#PDumperReason_MiscOp
+        BL      CallPDumperForJob               ;Direct at the current job (R10 -> record)
+        Pull    "R9,PC"                         ;Return allowing flags and registers through
+
+miscop_ours
+        CMP     R0,#(%10-%00)/4                 ;Is the reason code valid?
+        ADDCC   PC,PC,R0,LSL #2                 ;Yes so despatch
+        B       miscop_invalid
+00
+        B       miscop_addpdumper
+        B       miscop_removepdumper
+        B       miscop_getpdumperstriptypemask
+10
+
+;----------------------------------------------------------------------------
+;
+; miscop_addpdumper implementation
+;
+;   Entry: R1 PDumper number
+;          R2 PDriverDP version required
+;          R3 -> Branch code
+;          R4 Workspace (private word) pointer
+;          R5 Bit mask describing the branches supported
+;          R6 Bit mask describing the strip types supported
+;                     
+;   Exit:  V set, r0 -> error block.
+;
+; This call registers a new PDumper with the PDriverDP manager, the routine
+; first validates R2 to see if the PDriverDP being used is suitable for
+; handling the pdumper.
+;
+; We then scan the list of installed PDumpers to see if this PDumper is
+; already registered, if it is then we will error otherwise we allocate
+; a new block and link it into the PDumper list.
+;
+; R5 contains a bit mask used to work out which calls are supported by the
+; driver.
+;
+;----------------------------------------------------------------------------
+                   
+miscop_addpdumper ROUT
+
+        Push    "R0-R9,LR"
+
+        Debug   Configure,"PDumper number",R1
+        Debug   Configure,"PDumperDP version required",R2
+        Debug   Configure,"Workspace pointer (private word)",R3
+        Debug   Configure,"Branch table at",R4
+        Debug   Configure,"Branch table mask",R5
+        Debug   Configure,"Strip mask",R6
+     
+        LDR     R8,=VersionNumber
+        CMP     R2,R8                   ; valid PDriverDP module installed?
+        ADRGT   R0,ErrorBlock_PDumperTooOld
+        BGT     %90
+
+      [ VersionNumber >= 323
+
+        BL      miscop_removepdumper    ; attempt to remove it
+        BVC     %FT05
+
+        DebugE  Configure,"(register) 'removedumper' gave error "
+
+        LDR     LR,[R0]                 ; get the error number
+        LDR     R9,ErrorBlock_PDumperUndeclared
+        TEQ     R9,LR
+        BNE     %FT90                   ; if not complaining about it being already registered exit
+05      
+      ]
+
+        Debug   Configure,"(register) checking for dumper ID",R1
+
+        ASSERT  (:INDEX: pdumper_next) =0
+
+        ADDR    R8,pdumper_list
+00
+        LDR     R8,[R8,#pdumper_next]   ; -> block in list
+        TEQ     R8,#0
+        BEQ     %10                     ; not installed so allocate a new block
+
+        LDR     LR,[R8,#pdumper_number]
+        TEQ     R1,LR                   ; is it already registered?
+        BNE     %00                     ; loop back until duplicate or what ever
+
+        ADR     R0,ErrorBlock_PDumperDuplicateModule
+90
+        BL      LookupSingle
+91
+        ADD     SP,SP,#4                ; skip stack entry
+        Pull    "R1-R9,PC"
+10
+
+        MOV     R0,#ModHandReason_Claim
+        LDR     R3,=pdumper_SIZE
+        SWI     XOS_Module              ; get some new memory for block
+        BVS     %91                     ; and then leave if it errors
+
+        MOV     R9,R2                   ; -> new record block
+        LDMIA   SP,{R0-R3}
+        ADD     R0,R9,#pdumper_number
+        STMIA   R0,{R1-R6}              ; setup the record              
+
+        LDR     R0,pdumper_list         ; -> first record
+        STR     R9,pdumper_list         ; -> first record (now the block allocated)
+        STR     R0,[R9,#pdumper_next]
+
+                   
+        LDR     R0,printer_pdumper_number
+        Debug   Configure,"PDumper number to be configured",R0,R1
+
+        TEQ     R0,R1                   ; is it the one we are currently using?
+        Pull    "R0-R9,PC",NE,^         ; return if not because cannot configure
+
+       
+        STR     R9,printer_pdumper_pointer
+
+        LDR     R0,pending_info_flag
+        TEQ     R0,#0                   ; any pending info?
+        ADRNE   R2,pending_pdumper_command
+        ADRNEL  R3,pending_info_data
+        ADRNE   R4,printer_dump_depth
+        LDRNE   R5,printer_configureword
+
+      [ debugConfigure
+        BEQ     %FT10
+        DebugS  Configure,"PDumper command executed",R2
+        DebugS  Configure,"PDumper palette filename",R3
+        Debug   Configure,"PDumper dump data is at",R4
+        Debug   Configure,"PDumper flags word",R5
+10
+      ]
+        BLNE    configure_setdriver     ; setup the configuration
+
+        MOV     LR,#0
+        STR     LR,pending_info_flag    ; mark as no pending info
+99
+        STRVS   R0,[SP]
+        Pull    "R0-R9,PC"              ; return because all done now
+
+        MakeInternatErrorBlock PDumperDuplicateModule,,DupPDNo
+        MakeInternatErrorBlock PDumperTooOld,,TooOld
+
+;----------------------------------------------------------------------------
+;
+; miscop_removepdumper implementation
+;
+;   Entry: R1 PDumper number to be removed.
+;                     
+;   Exit:  V set, r0 -> error block.
+;
+; This call scans the list of PDumpers and then attempts to remove the pdumper
+; if found or generate an error if it cannot be found.
+;
+;----------------------------------------------------------------------------
+
+        ASSERT  pdumper_next =0
+
+miscop_removepdumper ROUT
+
+        Push    "R0-R3,R11,LR"
+
+      [ VersionNumber >= 323
+
+        ADR     R11,printjoblist -(:INDEX: joblink)
+10
+        LDR     R11,joblink
+        TEQ     R11,#0                  ; end of the list yet?
+        BEQ     %FT15                   ; yes, so PDumper is not being used so exit
+
+        LDR     LR,job_pdumper_number
+        TEQ     LR,R1                   ; is the PDumper in use?
+        BNE     %BT10                   ; ...nope so loop back until we have finished checking
+        
+        ADR     R0,ErrorBlock_PDumperInUse
+        B       %FT90                   ; lookup the error and exit if it is
+15
+      ]
+
+        ADDR    R0,pdumper_list         ; -> head of the list (pointer)
+        LDR     R2,[R0]                 ; -> head of the list
+00
+        TEQ     R2,#0                   ; is the end of the list?
+        ADREQ   R0,ErrorBlock_PDumperUndeclared
+        BEQ     %90                     ; return because of an error
+
+        LDR     R3,[R2,#pdumper_number]
+        TEQ     R3,R1                   ; is it the PDumper we want?
+        MOVNE   R0,R2
+        LDRNE   R2,[R0,#pdumper_next]
+        BNE     %00                     ; loop until all scanned
+
+        Debug   Configure,"My record at",R2
+        Debug   Configure,"Previous record at",R0
+
+        LDR     LR,[R2,#pdumper_next]
+        STR     LR,[R0,#pdumper_next]   ; unlink around the block
+  
+        MOV     R0,#ModHandReason_Free
+        SWI     XOS_Module
+        BVS     %95                     ; return because free failed!
+
+        LDR     R2,printer_pdumper_number
+        TEQ     R1,R2                   ; killing the current pdumper?
+
+        Debug   Configure,"PDumper being removed",R1
+        Debug   Configure,"Current PDumper",R2
+
+        MOVEQ   R0,#-1
+        STREQ   R0,printer_pdumper_number
+
+        MOVEQ   R0,#0                   ; mark as no pdumper or pending data
+        STREQ   R0,printer_pdumper_pointer
+        STREQ   R0,pending_pdumper_command
+        
+        Pull    "R0-R3,R11,PC",,^
+90
+        BL      LookupSingle
+95
+        STR     R0,[SP]                 ; store error pointer
+        Pull    "R0-R3,R11,PC"
+
+        MakeInternatErrorBlock PDumperUndeclared,,PDUndec
+        MakeInternatErrorBlock PDumperInUse,,PDuUsed
+
+; On entry, R1 = dumper number
+; On exit, R0 = strip type mask if dumper loaded, otherwise regs preserved
+miscop_getpdumperstriptypemask ROUT
+        Push    "R0 - R2, LR"
+        LDR     R0, pdumper_list
+10      TEQ     R0, #0
+        BEQ     %FT20
+        LDR     R2, [R0, #pdumper_number]
+        TEQ     R2, R1
+        LDRNE   R0, [R0, #pdumper_next]
+        BNE     %BT10
+        LDR     R1, [R0, #pdumper_striptypemask]
+        STR     R1, [R13]               ; overwrite value that was stacked
+        Pull    "R0 - R2, PC"
+
+20      ; no match on dumper number
+        Pull    "R0 - R2, PC"
+
+        END
+ 

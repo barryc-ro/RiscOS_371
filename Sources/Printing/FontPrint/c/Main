@@ -1,0 +1,516 @@
+#include "main.h"
+#include "menu.h"
+#include "panes.h"
+#include "fonts.h"
+#include "icons.h"
+
+#define TASKNAME "taskname"
+#define ICONNAME "iconname"
+#define WINNAME  "winname"
+#define NWINNAME "nwinname"
+#define RUNNING  "running"
+
+static int Messages [] =
+   {  0x502, 0x400c1, 0x400C9, PSPrinterAck, PSPrinterDefaulted,
+      SetPrinter, PSPrinterQuery, PSPrinterNotPS, PSIsFontPrintRunning,
+      0
+   };
+
+int mousex, mousey, buttons;
+int info[5];
+int buf[64];
+int taskhandle, iconhandle;
+int xEig, yEig;
+MsgRec msgs;
+int window_enabled;
+
+static Bool mode_changed = FALSE;
+static char querybuf[1024];
+static char printername[100];
+static char printertype[100];
+static char printerfile[256];
+
+
+char *strsave (char *s)
+{
+    char *t;
+    if (!s)
+        return NULL;
+    t = malloc(strlen(s) + 1);
+    return strcpy(t, s);
+}
+
+static Bool already_running ()
+{
+    int send[5];
+    send[0] = sizeof(send);
+    send[3] = 0;
+    send[4] = PSIsFontPrintRunning;
+    swi(Wimp_SendMessage,  R0, 18,  R1, send,  R2, 0,  END);    /* broadcast */
+
+    for (;;)
+    {
+        int action;
+        swi(Wimp_Poll, R0, 0x1973, R1, buf, OUT, R0, &action, END);
+        switch(action)
+        {
+        case 17:
+            if (buf[4] == PSIsFontPrintRunning)
+                return TRUE;
+            break;
+        case 19:
+            if (buf[4] == PSIsFontPrintRunning)
+                return FALSE;
+            break;
+        }
+    }
+}
+
+
+int main ()
+{
+    int task;
+
+    /* Messages */
+    message_openfile(&msgs, "<FontPrint$Dir>.Messages", 256);    /* should check for error */
+
+    /* Start the wimp */
+    strncpy((char *)&task, "TASK", 4);
+    swi(Wimp_Initialise,
+        R0, 300,
+        R1, task,
+        R2, message_lookup(&msgs, TASKNAME),
+        R3, Messages,
+        OUT,
+        R1, &taskhandle,
+        END);
+
+    if (already_running())
+    {
+        char taskname[40];
+        strncpy(taskname, message_lookup(&msgs, TASKNAME), sizeof(TASKNAME));
+        taskname[sizeof(taskname) - 1] = 0;
+
+        swi(Wimp_ReportError,  R0, message_lookup(&msgs, RUNNING),
+                               R1, 1,  R2, taskname,  END);
+        swi(Wimp_CloseDown, END);
+        exit(1);
+    }
+
+    /* Install iconbar sprite */
+    {
+        char *mysprite = strsave(message_lookup(&msgs, ICONNAME));
+        int sx, sy, sm;
+        if (!mysprite)
+            mysprite = "!FontPrint";    /* limp on */
+
+        swi(Wimp_SpriteOp,
+            R0, 40,
+            R2, mysprite,
+            OUT,
+            R3, &sx,
+            R4, &sy,
+            R6, &sm,
+            END);
+
+        get_eig_factors(sm);
+
+        sx <<= xEig; sy <<= yEig;
+
+        memset((void *)buf, 0, sizeof(buf));
+        buf[0] = -1;        /* App icon */
+        buf[1] = 0;         /* Min x */
+        buf[2] = 0;         /* Min y */
+        buf[3] = sx;        /* Max x */
+        buf[4] = sy;        /* Max y */
+        buf[5] = (1<<1) | (1<<3) | (1<<8) | (3<<12) | (7<<24) | (1<<28);
+        buf[6] = (int) mysprite;
+        buf[7] = 1;
+        buf[8] = strlen((char *)(buf[6]));
+
+        swi(Wimp_CreateIcon, R1, (int) buf, OUT, R0, &iconhandle, END);
+    }
+
+
+    /* Deal with the templates */
+
+    swi(Wimp_OpenTemplate, R1, (int) TEMPLATE, END);
+    load_template(PANE_MAIN);
+    load_template(PANE_LIST);
+    load_template(PANE_INFO);
+    swi(Wimp_CloseTemplate, END);
+
+    set_title_memory(PANE_MAIN, printername, sizeof(printername));
+    set_icon_memory(PANE_MAIN, ICON_PTYPE, printertype, sizeof(printertype));
+
+    /* Create windows */
+
+    create_window(PANE_MAIN);
+    create_window(PANE_LIST);
+    create_window(PANE_INFO);
+
+    fix_extent(FALSE);
+    find_offsets();
+    {
+	int screenmode;
+        swi(OS_Byte,  R0, 135,  OUT,  R2, &screenmode,  END);
+        get_eig_factors(screenmode);
+    }
+    set_icon_positions(sizex);
+
+    init_iconmenu();
+    init_windowmenu();
+
+    window_enabled = FALSE;
+    fix_extent(FALSE);
+
+    query_printer(NULL);     /* Send initial query message to !Printers */
+
+    /* Main loop */
+
+    while (1)
+    {
+        int action;
+        swi(Wimp_Poll, R0, 0x1831, R1, (int) buf,
+            OUT,       R0, &action,            END);
+        
+        switch (action)
+        {
+        case 1:
+            if (buf[0] == handle_of(PANE_LIST))
+                redraw_win(buf);
+            break;
+        case 2:
+            reopenwins(buf, mode_changed);
+            mode_changed = FALSE;
+            break;
+        case 3:
+            closewins(); break;
+        case 6:
+            mouse(buf); break;
+        case 9:
+            decode_menus(buf); break;
+        case 17:
+        case 18:
+        case 19:
+            message(action, buf); break;
+        }
+    }
+}
+                           
+
+
+void mouse (int *buf)
+{
+    mousex = buf[0];
+    mousey = buf[1];
+    buttons = buf[2];
+    
+    if (buf[3] == -2)     /* icon-bar icon */
+    {
+        if (buttons == 2)
+            post_iconmenu();
+        else
+            openwins();
+    } else if (buf[3] == handle_of(PANE_LIST))
+    {
+        if (buttons == 2)
+        {
+            if (num_selected == 0 || tempsel)
+            {
+                /* Make a temporary selection */
+                buttons = 4; icon_clicked();     /* ugh */
+                tempsel = TRUE;
+            }
+            post_windowmenu();
+        }
+        else
+            icon_clicked();
+    } else if (window_enabled && buf[3] == handle_of(PANE_MAIN))
+    {
+        switch (buf[4])
+        {
+        case ICON_DEFAULTS:
+            buf[0] = 20;
+            buf[3] = 0;
+            buf[4] = PSPrinterDefaults;
+            swi(Wimp_SendMessage,  R0, 17,  R1, buf,  R2, 0,  END);
+            /* that should probably be sent directly if we know the task handle */
+            break;
+
+        case ICON_SAVE:
+            if (*printerfile)
+            {
+                FontPtr font;
+                FILE *out = fopen(printerfile, "w");
+                if (!out)
+                    return;     /* XXXX Should raise error */
+                for (font = firstFont; font; font = font->next)
+                {
+                    if (font->type == Downloaded)
+                        fprintf(out, "%s\n", font->local);
+                    else
+                        fprintf(out, "%s %s %s\n", font->local, font->foreign,
+                                *font->encoding ? font->encoding : DEFAULT_ENCODING);
+                }
+                fclose(out);
+                buf[0] = 20;
+                buf[3] = 0;
+                buf[4] = PSPrinterModified;
+                swi(Wimp_SendMessage,  R0, 17,  R1, buf,  R2, 0,  END);
+                /* that should probably be sent directly if we know the task handle */
+            } else
+                return;         /* XXXX Should raise error */
+            break;
+        }
+    }
+}
+
+
+
+void message (int reason, int *buf)
+{
+    char *help = (char *) (buf + 5);
+
+    switch (buf[4])
+    {   
+    case 0:
+        swi(Wimp_CloseDown, END);
+        exit(0);
+    case 0x502:
+    {   int w = buf [8], i = buf [9];
+        char *token;
+
+        buf[3] = buf[2];
+        buf[4] = 0x503;
+
+        token = NULL;
+        if (w == -2 /*icon bar*/)
+           token = "iconhelp";
+        else if (w == handle_of (PANE_MAIN) /*main window - border*/)
+            token = "winhelp";
+        else if (w == handle_of (PANE_LIST) /*pane window - pane*/)
+            token = "panehelp";
+        else if (w == handle_of (PANE_INFO) /*info dbox*/)
+            token = "infohelp";
+        else
+        {   /*some other window - check if it's our menu*/
+            int menu_tree [25];
+
+            swi (Wimp_GetMenuState, NONX, R0, 1, R1, menu_tree, R2, w, R3, i,
+                    END);
+
+            if (menu_tree [0] == 0)
+                token = "menuhelp0";
+            else if (menu_tree [0] == 1)
+                token = "menuhelp1";
+        }
+
+        if (token != NULL)
+        {   strcpy (help, message_lookup (&msgs, token));
+            buf[0] = (20 + strlen(help) + 4) & ~3;
+            swi(Wimp_SendMessage,  NONX, R0, 17,  R1, (int) buf,  R2, buf[1],
+                END);
+    }   }
+    break;
+    case 0x400c1:
+    {   int screenmode;
+
+        swi(OS_Byte,  R0, 135,  OUT,  R2, &screenmode,  END);
+        get_eig_factors(screenmode);
+	set_icon_positions(sizex);
+        mode_changed = TRUE;
+    }
+    break;
+    case 0x400C9:    /* MenusDeleted */
+        if (tempsel)
+        {
+            deselect_unhighlight();
+        }
+    break;
+    case PSPrinterAck:
+        /* The information in querybuf has been set */
+        read_printer_file();
+    break;
+    case PSPrinterDefaulted:
+        /* The printer file referenced by querybuf has been defaulted */
+        read_printer_file();
+    break;
+    case SetPrinter:
+        /* The printer has been changed by the user */
+        query_printer(buf);
+    break;
+    case PSPrinterQuery:
+        if (reason == 19)
+        {
+            /* Recorded delivery failed; grey out window, etc */
+            memset((void *) querybuf, 0, sizeof(querybuf));
+            read_printer_file();
+        }
+    break; /*forgotten JRC 17 Feb '92*/
+    case PSPrinterNotPS:
+        /* !Printers says that the current printer is not PostScript; grey the
+         * window out.
+         */
+        memset((void *) querybuf, 0, sizeof(querybuf));
+        read_printer_file();
+    break;
+    case PSIsFontPrintRunning:
+        /* Someone wants to know if FontPrint is running.  Tell them "yes" by
+         * sending the message back to them.  This is the mechanism used to
+         * prevent multiple FontPrints being run, but it is conceivably
+         * useful for other programs to be able to do this too.
+         */
+        buf[3] = buf[2];  /* Ack */
+        swi(Wimp_SendMessage, R0, 17, R1, buf, R2, buf[1], END);
+    break;
+    }
+}
+
+
+void get_eig_factors (int mode)
+{
+    swi(OS_ReadModeVariable,  R0, mode,  R1, 4,
+        OUT,                  R2, &xEig,  END);
+
+    swi(OS_ReadModeVariable,  R0, mode,  R1, 5,
+        OUT,                  R2, &yEig,  END);
+
+    icon_distance = (ICON_HEIGHT + ICON_SPACING) + (1 << yEig) - 1;
+    icon_distance >>= yEig;
+    icon_distance <<= yEig;
+}
+
+
+/*
+ * Query printer, possibly in response to a message from !Printers
+ */
+
+void query_printer (int *mess)
+{
+    int send[7];
+    int target = 0;
+    if (mess) target = mess[1];
+
+    send[0] = sizeof(send);
+    send[3] = 0;
+    send[4] = PSPrinterQuery;
+    send[5] = (int) querybuf;
+    send[6] = sizeof(querybuf);
+
+    swi(Wimp_SendMessage, R0, 18,  R1, send,  R2, target,  END);
+}
+
+
+/*
+ * Pull the next zero-separated string out of src and
+ * put as much of it as will fit in dest (whose size
+ * is max).  Return the address of the char after the
+ * terminator.
+ */
+
+static char *fillin (char *dest, char *src, int max)
+{
+    for (; *src; src++)
+        if (max > 1)
+        {
+            max--;
+            *dest++ = *src;
+        }
+    *dest = 0;
+    return src + 1;
+}
+
+
+/*
+ * Read a line from the Printers file
+ */
+
+static int readline (FILE *f, char **first, char **second, char **third)
+{
+    static char line[1024];
+    
+    if (fgets(line, sizeof(line), f) != NULL)
+    {
+        *first  = strtok(line, " \n");
+        *second = strtok(NULL, " \n");
+        *third  = strtok(NULL, " \n");
+        return 0;
+    }
+    return -1;
+}
+
+    
+/*
+ * read printer file in response to a message
+ */
+
+void read_printer_file ()
+{
+    char *qb = querybuf;
+    FontPtr font;
+    FILE *f;
+    char buf[256];
+
+    window_enabled = FALSE;
+
+    qb = fillin(buf, qb, sizeof(buf));
+    if (*buf)
+    {
+        char *format = message_lookup(&msgs, WINNAME);
+        int room = sizeof(printername) - strlen(format) - 1;
+        if (room < strlen(buf))
+            buf[room] = 0;
+        sprintf(printername, format, buf);
+    }
+    else
+        sprintf(printername, message_lookup(&msgs, NWINNAME), "");
+
+    qb = fillin(printertype, qb, sizeof(printertype));
+    qb = fillin(printerfile, qb, sizeof(printerfile));
+
+    /* Clear old contents, if any */
+
+    for (font = firstFont; font; font = font->next)
+        remove_font(font);
+    firstFont = lastFont = NULL;
+
+    /* If filename, fill in new contents */
+    if (*printerfile)
+    {
+        f = fopen(printerfile, "r");
+        if (f != NULL)
+        {
+            char *local, *foreign, *encoding;
+            while (readline(f, &local, &foreign, &encoding) != EOF)
+            {
+                if (local == NULL)
+                    continue;
+                add_font(lastFont, local, foreign, encoding);
+            }
+            window_enabled = TRUE;
+            fclose(f);
+        }
+    }
+
+    make_mapmenu();
+    make_encmenu();      /* see menus.c -- only gets done once, really */
+    fix_extent(FALSE);
+    fix_enabled(window_enabled);      /* Grey out the command buttons */
+
+    /* Force redraw of whole window */
+    if (opencount)
+    {
+        force_redraw_titlebar(PANE_MAIN);
+        force_redraw_win(PANE_MAIN);
+        force_redraw_win(PANE_LIST);
+    }
+}
+
+
+void fix_enabled (Bool enabled)
+{
+    unsigned int eor   = enabled ? 0           : ICON_GREYED;
+    change_icon_flags(PANE_MAIN, ICON_DEFAULTS, ICON_GREYED, eor);
+    change_icon_flags(PANE_MAIN, ICON_SAVE,     ICON_GREYED, eor);
+}

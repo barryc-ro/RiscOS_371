@@ -1,0 +1,2835 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/ShareFS/filer.c:networking  1.12  $
+ * $Source: /ax/networking:Starling/ShareFS/ShareFS/filer.c: $
+ *
+ * Copyright (c) 1995 ANT Ltd., Cambridge, England
+ *
+ * $Log:	filer.c,v $
+ * Revision 1.12  95/05/16  10:38:03  pwain
+ * Fixed problem where a *sharefslogoff did not shut down
+ * directory view windows associated with the share.
+ *
+ * Revision 1.11  95/05/04  16:27:29  pwain
+ * Changed filer_run of boot.!shareboot to a straight Run.
+ *
+ * Revision 1.10  95/05/04  14:50:07  pwain
+ * Fix to interactive help (line 2674 ish) ; word offset for
+ * 2nd layer menu is 1 not 2.
+ *
+ * Revision 1.9  95/03/20  15:07:08  pwain
+ * Halfway stage checkin of "share::$.boot.!shareboot" bits.
+ * Ultimate aim is to lose fat auto variable; this version
+ * has that code #ifdef ACCESSPLUS'ed out. Still looking
+ * for a fat global buffer.
+ *
+ * Revision 1.8  95/03/15  11:43:54  pwain
+ * Fixed the share::.boot.!shareboot not working for AccessPlus.
+ * Upped WINDOWSIZE to 4 for all versions. Added *sharefswindow
+ * command to view WINDOWSIZE and set WINDOWSIZE (in internet.c)
+ * Version number changed to x.33
+ *
+ * Revision 1.7  95/02/27  16:41:44  pwain
+ * All existing malloc() calls changed to use rmalloc().
+ * This is because ShareFS uses a different module entry
+ * code which means that its stack is kept in RMA. DO NOT
+ * USE MALLOC IN ShareFS CODE.
+ *
+ * Revision 1.6  95/02/23  15:24:35  pwain
+ * Fixed bug which causes Access+ menu operations to do a
+ * CMOS save every time the Access+ menu is used.
+ *
+ * Revision 1.5  95/02/02  09:56:57  pwain
+ * Moved tmp_wimp_icon to only be in Access+ code
+ * (Compiler warning)
+ *
+ * Revision 1.4  95/02/01  09:47:41  pwain
+ * Redefinition of filer_init to return a status code indicating
+ * if the templates file was read (allows retry for Rom based
+ * versions). Added in some debug Printf()s
+ *
+ * Revision 1.3  95/01/17  09:42:26  pwain
+ * Correction to Access+ menu.
+ *
+ * Revision 1.2  95/01/17  09:03:31  pwain
+ * Removed compilation warning messages.
+ *
+ * Revision 1.1  95/01/09  13:53:04  kwelton
+ * Initial revision
+ *
+ */
+
+/* $Id: c.filer 1.19 93/11/16 23:07:08 brian Exp $ */
+#ifndef MINIMAL_FILER
+# define HASEXPORTWINDOW		/* provide the export window stuff */
+# define HASIMPORTMENU		/* provide the import list menu */
+# define HASTRANSPORTMENU	/* provide the transport list menu */
+# define HASABOUTMENU		/* provide about option */
+# define HASINFOWINDOW		/* provide info window */
+# define HASQUITMENU		/* Provide a Quit menu item */
+#endif
+
+#define USESTEMPLATES		/* define if we use a template file */
+#define HASUNIMPORTMENU		/* provide unimport option */
+
+ /* #define NOSPECIALFIELDS *//* Use bare filenames */
+ /* #define SHOWDISCS *//* Use ShareFS style Resources:$.Discs */
+ /*
+  * #define RUNNABLE *//* to enable direct running (instead of
+  * *desktop)
+  */
+ /*#define AUTOOPEN *//* To open discs when adding them to icon bar */
+
+#define ICONPOS 0x68000000
+
+#define CMOSBASE 0x52		/* defining this uses CMOS locations
+				 * to save discs */
+#define CMOSSIZE 25		/* &52..&6A inclusive */
+#define CMOSKEYLOC 0x51
+#define CMOSKEYMASK 15
+#define CMOSKEYVAL 15
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "ker.h"
+#include "swis.h"
+#include "ModuleWrap.h"
+#include "util.h"
+#include "cstart.h"
+#include "wimp.h"
+#include "remswis.h"
+#include "ralloc.h"
+#include "modface.h"
+
+#ifdef HASEXPORTWINDOW
+# include "how.h"
+#endif
+
+#include "wimpswis.h"
+
+#ifdef SHOWDISCS
+# include "freeway.h"
+#endif
+
+#include "util.h"
+
+error *fs_receive(int c, char *p, int n);
+
+#define TASK    ('K' << 24 | 'S' << 16 | 'A' << 8 | 'T')
+typedef struct
+{
+    wimp_menuhdr hdr;
+    wimp_menuitem item[1];
+} wimp_menu;
+
+#define FS FSNAME
+static int FilingSystemNumber = RemoteFSNumber;
+
+int taskhandle;
+int taskstack;
+
+static int filertaskhandle = 0;
+extern char ModuleName[];
+
+static enum
+{
+    BARMENU, EXPORTMENU, APLUSMENU
+} lastmenu;
+#define MENUFLAGS wimp_ITEXT | wimp_IFORECOL*7 | wimp_IBACKCOL*0
+
+static wimp_menu *barmenustr;
+#define Barmenustr (*barmenustr)
+#ifdef MINIMAL_FILER
+enum
+{
+    MGUNGE = -1
+    ,MSHOWDISCS
+    ,MUNIMPORT
+#ifndef AACLIENT
+    ,MSAVEDISCS
+#endif
+    ,MFREE
+#ifdef ACCESSPLUS
+    ,MACCPLUS
+#endif
+    ,BARMENUDEPTH
+};
+static MENUDEF(BARMENUDEPTH) barmenudef =
+{
+    {
+	 "bmtit", 7, 2, 7, 0, 44, 0
+    }
+    ,
+    {
+	{
+	     "bmshowd", 0, 0, MENUFLAGS
+	},
+	{
+	     "bmunimp", 0, 0, MENUFLAGS
+	},
+#ifndef AACLIENT
+	{
+	     "bmsaved", 0, 0, MENUFLAGS
+	},
+#endif
+#ifndef ACCESSPLUS
+	{
+	     "bmfree", wimp_MLAST, 0, MENUFLAGS
+	}
+#endif
+#ifdef ACCESSPLUS
+	{
+	     "bmfree", wimp_MSEPARATE, 0, MENUFLAGS
+	},
+	{
+	     "bmaccpl", wimp_MLAST, 0, MENUFLAGS
+	}
+#endif
+    }
+};
+#else
+enum
+{
+    MGUNGE = -1
+#ifdef HASINFOWINDOW
+    ,MINFO
+#endif
+#ifdef HASIMPORTMENU
+    ,MIMPORT
+#endif
+#ifdef HASEXPORTWINDOW
+    ,MEXPORT
+#endif
+#ifdef HASTRANSPORTMENU
+    ,MTRANSPORTS
+#endif
+#ifdef SHOWDISCS
+    ,MSHOWDISCS
+    ,MSAVEDISCS
+#endif
+#ifdef HASABOUTMENU
+    ,MABOUT
+#endif
+    ,MFREE
+#ifdef HASUNIMPORTMENU
+    ,MUNIMPORT
+#endif
+#ifdef HASQUITMENU
+    ,MQUIT
+#endif
+    ,BARMENUDEPTH
+};
+static MENUDEF(BARMENUDEPTH) barmenudef =
+{
+    {
+	 "bmtit", 7, 2, 7, 0, 44, 0
+    }
+    ,
+    {
+#ifdef HASINFOWINDOW
+	{
+	     "bminfo", 0, 0, MENUFLAGS
+	},
+#endif
+#ifdef HASIMPORTMENU
+	{
+	     "bmimpor", 0, 0, MENUFLAGS
+	},
+#endif
+#ifdef HASEXPORTWINDOW
+	{
+	     "bmexpor", 0, 0, MENUFLAGS
+	},
+#endif
+#ifdef HASTRANSPORTMENU
+	{
+	     "bmtrans", 0, 0, MENUFLAGS
+	},
+#endif
+#ifdef SHOWDISCS
+	{
+	     "bmshowd", 0, 0, MENUFLAGS
+	},
+	{
+	     "bmsaved", 0, 0, MENUFLAGS
+	},
+#endif
+#ifdef HASABOUTMENU
+	{
+	     "bmabout", 0, 0, MENUFLAGS
+	},
+#endif
+#ifdef HASQUITMENU
+	{
+	     "bmfree", 0, 0, MENUFLAGS
+	},
+#ifdef HASUNIMPORTMENU
+	{
+	     "bmunimp", 0, 0, MENUFLAGS
+	},
+#endif
+	{
+	     "bmquit", wimp_MLAST, 0, MENUFLAGS
+	}
+#else
+#ifdef HASUNIMPORTMENU
+	{
+	     "bmfree", 0, 0, MENUFLAGS
+	},
+	{
+	     "bmunimp", wimp_MLAST, 0, MENUFLAGS
+	}
+#else
+	{
+	     "bmfree", wimp_MLAST, 0, MENUFLAGS
+	}
+#endif
+#endif
+    }
+};
+#endif
+#ifdef ACCESSPLUS
+enum
+{
+    MPLLOGON, MPLLOGOFF, MPLSHOWLOG, APLUSMENUDEPTH
+};
+static wimp_menu *aplusmenustr;
+#define Aplusmenustr (*aplusmenustr)
+static MENUDEF(APLUSMENUDEPTH) aplusmenudef =
+{
+    {
+	 "aplmt", 7, 2, 7, 0, 44, 0
+    }
+    ,
+    {
+	{
+	     "apllo", 0, 0, MENUFLAGS
+	}
+	,
+	{
+	     "apllf", 0, 0, MENUFLAGS
+	}
+	,
+	{
+	     "aplsh", wimp_MLAST, 0, MENUFLAGS
+	}
+    }
+};
+#endif
+
+#ifdef HASEXPORTWINDOW
+enum
+{
+    MEALTER, MEUNEXPORT, MECHOOSEDIR, MESAVE, EXPORTMENUDEPTH
+};
+static wimp_menu *exportmenustr;
+#define Exportmenustr (*exportmenustr)
+static MENUDEF(EXPORTMENUDEPTH) exportmenudef =
+{
+    {
+	 "emtit", 7, 2, 7, 0, 44, 0
+    }
+    ,
+    {
+	{
+	     "emalter", 0, 0, MENUFLAGS
+	}
+	,
+	{
+	     "emunexp", 0, 0, MENUFLAGS
+	}
+	,
+	{
+	     "emnewex", 0, 0, MENUFLAGS
+	}
+	,
+	{
+	     "emsave", wimp_MLAST, 0, MENUFLAGS
+	}
+    }
+};
+static int exportnumber;	/* export number menu refers to */
+static int exportschanged = 0;
+static int exportssaved = 1;
+static int dragbutton;
+#endif
+
+static int wimpversion;
+static wimp_menustr *current_menu;
+static int current_menu_x;
+static int current_menu_y;
+
+#define MAXVOLS 20
+
+#ifdef SHOWDISCS
+static char *volumenames[MAXVOLS];	/* These persist whenever
+					 * module is loaded */
+static int volumetypes[MAXVOLS];/* -1 for not known. */
+#else
+static char *volumenames[MAXVOLS];	/* temp copy of remotefs
+					 * import state */
+static char *transportnames[MAXVOLS];	/* both valid only within
+					 * filer task */
+#endif
+
+static int volumeicons[MAXVOLS];/* contain icon number or -1 */
+static int discsicon = -1;	/* icon for no-discs version */
+static int numvolumes = 0;
+static int volumeschanged = 0;	/* set of volumes changed */
+#ifdef HASIMPORTMENU
+static void freeimportmenu(void);
+static void freedetailmenu(void);
+
+static wimp_menuhdr importhdr = {"Import", 7, 2, 7, 0, 7 * 16, 44, 0};
+static int importmenusize = 0;
+static char *importbb = 0;
+static wimp_menustr *importmenu = 0;
+static wimp_menuitem *importmenuitem;
+
+static int detailmenusize = 0;
+static char *detailbb = 0;
+static wimp_menustr *detailmenu = 0;
+static wimp_menuitem *detailmenuitem;
+
+static char detailbuf[30] = "";
+#endif
+
+#ifdef ACCESSPLUS
+static wimp_menuhdr logoffhdr = {"Logoff", 7, 2, 7, 0, 7 * 16, 44, 0};
+static int logoffmenusize = 0;
+static wimp_menustr *logoffmenu = 0;
+static wimp_menuitem *logoffmenuitem;
+static void freelogoffmenu(void);
+
+static wimp_menuhdr showlhdr = {"Show", 7, 2, 7, 0, 7 * 16, 44, 0};
+static int showlmenusize = 0;
+static wimp_menustr *showlmenu = 0;
+static wimp_menuitem *showlmenuitem;
+static void freeshowlmenu(void);
+#endif
+
+#ifdef HASTRANSPORTMENU
+static int transportmenusize = 0;
+static wimp_menustr *transportmenu = 0;
+static wimp_menuitem *transportmenuitem;
+static void freetransportmenu(void);
+static int lasttransportmenu;
+#endif
+
+#ifdef USESTEMPLATES
+typedef struct
+{
+    wimp_wind w;
+    wimp_icon i[1];
+} wimp_temp;
+#ifdef MINIMAL_FILER
+static wimp_temp *logontemplate;
+#else
+static wimp_temp *infotemplate, *exporttemplate, *abouttemplate, *dragtemplate, *optionstemplate;
+#endif
+static char *temindirectp, *temindirectq;
+static char *templateindirectbuf;
+#endif
+
+#ifdef SHOWDISCS
+static int addvolume(char *name);
+#endif
+static void freevols(void);
+static void freestuff(void)	/* free up anything the filer task
+				 * uses */
+{
+#ifdef HASTRANSPORTMENU
+     freetransportmenu();
+#endif
+#ifdef HASIMPORTMENU
+    freeimportmenu();
+    freedetailmenu();
+#endif
+#ifndef SHOWDISCS
+    freevols();
+#endif
+}				/* P:3 */
+
+static void removetask(void)
+{
+    int t = taskhandle;		/* P:3 */
+    taskhandle = 0;
+    if (t && t != -1)		/* P:0 */
+	_swix(Wimp_CloseDown, _INR(0, 1), t, TASK);	/* P:0 */
+    if (taskstack)
+	_swix(OS_Module, _IN(0) | _IN(2), 7, taskstack);	/* P:0 */
+    taskstack = 0;
+    freestuff();
+}
+
+void filer_clear(void)
+{
+     removetask();		/* P:0 */
+#ifdef SHOWDISCS
+    freevols();
+#endif
+#ifdef USESTEMPLATES
+#ifdef MINIMAL_FILER
+    free(logontemplate);
+#else
+    free(exporttemplate);
+    free(infotemplate);
+    free(abouttemplate);
+    free(dragtemplate);
+    free(optionstemplate);
+    free(templateindirectbuf);
+#endif
+#endif
+    free(barmenustr);
+#ifdef HASEXPORTWINDOW
+    free(exportmenustr);
+#endif
+}
+
+#ifdef USESTEMPLATES
+static error *loadtemplate(char *s, wimp_temp ** ret)
+{
+    char buf[2000];
+    error *err;
+    int k;
+    char temname[12];
+    memset(temname, 0, 12);
+    strcpy(temname, s);
+    err = _swix(Wimp_LoadTemplate, _INR(1, 6) | _OUT(2) | _OUT(6),
+		buf, temindirectp, temindirectq, -1, temname, 0, &temindirectp, &k);
+    if (err)
+	return err;
+    if (!k)
+	return lookuperr(0, "NoAny", "template");
+    k = ((wimp_wind *) & buf)->nicons * sizeof(wimp_icon) + sizeof(wimp_wind);
+    *ret = rmalloc(k);
+    if (!*ret)
+	return ERR(NoMem);
+    memcpy(*ret, buf, k);
+    return NULL;
+}
+#endif
+
+error *filer_init(int *no_templates)
+{
+    error *err = 0;		/* P:3 */
+    taskhandle = 0;		/* Must record fact filer task is not
+				 * running */
+    taskstack = 0;		/* and that its stack is not yet
+				 * allocated */
+
+#ifdef USESTEMPLATES
+#ifdef DEBUG
+    Printf("FIT> Looking for templates\n");
+#endif
+
+    templateindirectbuf = rmalloc(2000);
+    if (!templateindirectbuf)
+	return ERR(NoMem);
+
+# if 0
+    err = _swix(Wimp_OpenTemplate, _IN(1), FS "FS:Templates");
+# else
+    /*
+     * 941124 KWelton
+     *
+     * use explicit resources path
+     */
+#ifdef DEBUG
+    Printf("FIT> Attempting to open templates file...\n");
+#endif
+    err = _swix(Wimp_OpenTemplate, _IN(1),
+		"Resources:$.Resources.ShareFS.Templates");
+    if (err) {
+#ifdef DEBUG
+      printf("FIT> Unable to open: Resources:$.Resources.ShareFS.Templates\n");
+#endif
+        _swix(Wimp_CloseTemplate, 0);
+	*no_templates=1;
+	return err;
+	}
+#ifdef DEBUG
+    Printf("FIT> Opened templates file...\n");
+#endif
+    *no_templates=0;
+# endif
+
+    temindirectp = templateindirectbuf;
+    temindirectq = templateindirectbuf + 2000;
+
+# ifdef MINIMAL_FILER
+    if (!err)
+	err = loadtemplate("logon_dbox", &logontemplate);
+# endif
+
+# ifdef HASEXPORTWINDOW
+    if (!err)
+	err = loadtemplate("export", &exporttemplate);
+
+    if (!err)
+	err = loadtemplate("dragme", &dragtemplate);
+
+    if (!err)
+	err = loadtemplate("expoptions", &optionstemplate);
+# endif
+
+# ifdef HASINFOWINDOW
+    if (!err)
+	err = loadtemplate("info", &infotemplate);
+
+    if (!err)
+    {
+	infotemplate->i[3].data.indirecttext.
+	    buffer[infotemplate->i[3].data.indirecttext.bufflen - 1] = 0;
+	strncpy(infotemplate->i[3].data.indirecttext.buffer,
+	   strchr((char *) Image_RO_Base + Image_RO_Base[5], 9) + 1,
+		infotemplate->i[3].data.indirecttext.bufflen - 1);
+    }
+# endif
+
+# ifdef HASABOUTMENU
+    if (!err)
+	err = loadtemplate("about", &abouttemplate);
+# endif
+
+    _swix(Wimp_CloseTemplate, 0);
+
+    if (templateindirectbuf != realloc(templateindirectbuf,
+				temindirectp - templateindirectbuf))
+	return (ERR(NoMem));
+
+    temindirectq = temindirectp = 0;
+#endif
+
+    barmenustr = rmalloc(MENUSIZE(BARMENUDEPTH));
+    if (!err)
+	err = lookupmenu((char *) (&barmenudef), (char *) barmenustr,
+			 MENUSIZE(BARMENUDEPTH));	/* P:3 */
+
+#ifdef HASEXPORTWINDOW
+    exportmenustr = rmalloc(MENUSIZE(EXPORTMENUDEPTH));
+    if (!err)
+	err = lookupmenu((char *) (&exportmenudef), (char *) exportmenustr,
+			 MENUSIZE(EXPORTMENUDEPTH));
+#endif
+
+#ifdef ACCESSPLUS
+    aplusmenustr = rmalloc(MENUSIZE(APLUSMENUDEPTH));
+    if (!err)
+	err = lookupmenu((char *) &aplusmenudef, (char *) aplusmenustr,
+			 MENUSIZE(APLUSMENUDEPTH));
+#endif
+
+#ifdef SHOWDISCS
+# ifdef CMOSBASE
+    {
+	int x, i;
+	char cmos[CMOSSIZE + 1];
+	char *p, *startp;
+
+	_swix(OS_Byte, _INR(0, 1) | _OUT(2), 161, CMOSKEYLOC, &x);
+
+	numvolumes = 0;
+	if ((x & CMOSKEYMASK) == CMOSKEYVAL)
+	{
+	    for (x = 0; x < CMOSSIZE; x++)	/* P:81 */
+		_swix(OS_Byte, _INR(0, 1) | _OUT(2), 161, CMOSBASE + x, &i), cmos[x] = i;	/* P:75 */
+
+	    cmos[x] = 0;
+
+	    startp = cmos;
+	    for (p = startp; *p && p < &cmos[CMOSSIZE]; p++)
+	    {
+		if (*p == '#')
+		{
+		    startp = ++p;
+		    break;
+		}
+	    }
+
+	    for (p = startp; *p && p < &cmos[CMOSSIZE]; p += strlen(p) + 1)
+	    {
+		/* P:18 */
+		if (!strlen(p))
+		    break;	/* 28/7/94 gw */
+		addvolume(p);	/* P:6 */
+	    }
+	}
+    }
+# else
+    {
+	FILE *fp = fopen(FS "FS:ConfImport", "r");
+	char buf[1000];
+	char name[32];
+	if (!fp)
+	{
+	    err = (os_error *) _kernel_last_oserror();
+	    goto error;
+	}
+
+	setvbuf(fp, buf, _IOFBF, sizeof(buf));
+	for (numvolumes = 0;
+	     numvolumes < MAXVOLS && fgets(name, sizeof(name), fp);)
+	{
+	    name[strlen(name) - 1] = 0;
+	    addvolume(name);
+	}
+	fclose(fp);
+    }
+# endif
+#endif
+    return err;			/* P:3 */
+}
+
+/*
+        Service call handler
+*/
+
+void filer_service(regs * r)
+{
+    switch (r->r[1])		/* P:19884 */
+    {
+      case Service_RemoteFSVolume:	/* P:19 */
+	volumeschanged++;
+	break;
+
+#ifdef HASEXPORTWINDOW
+      case Service_RemoteFSExport:
+	exportschanged++;
+	exportssaved = 0;
+	break;
+#endif
+
+      case Service_StartFiler:	/* P:0 */
+	if (!taskhandle)
+	{
+	    filertaskhandle = r->r[0];	/* P:0 */
+	    taskhandle = -1;	/* attempting start flag */
+	    r->r[0] = (int) ("Desktop_" FS "FSFiler");
+	    r->r[1] = 0;
+	}
+	break;
+
+      case Service_StartedFiler:	/* P:0 */
+	if (taskhandle == -1)
+	    taskhandle = 0;	/* P:0 */
+	break;
+
+      case Service_Reset:	/* P:0 */
+	taskhandle = 0;
+	break;
+
+      case Service_FilerDying:	/* P:0 */
+	removetask();
+	break;
+    }
+}
+
+/*
+        command processor
+*/
+error *filer_command(int cmd_no, int argc, char *argv[])
+{
+    char *c, *cc;
+    argc = argc;
+    argv = argv;		/* P:3 */
+
+    switch (cmd_no)		/* P:3 */
+    {
+      case 0:			/* *Desktop_FSnameFSFiler *//* P:3 */
+	if (taskhandle != -1)
+	{
+	    removetask();	/* P:3 */
+	    taskhandle = -1;
+	}
+	return _swix(OS_Module, _INR(0, 2), OSModule_Enter,
+		     ModuleName, "");	/* P:3 */
+
+#ifdef SHOWDISCS
+      case 1:			/* *ShareFSIcon    *//* P:0 */
+	{
+	    c = strchr(argv[1], '.');
+	    if (c && strncmp(++c, "Logon.", 6) == 0)
+	    {
+		c = strchr(c, '.');
+		if (c)
+		{
+		    {
+			for (cc = ++c; *cc; cc++)
+			    if (*cc == '.')
+				*cc = '@';
+		    }
+		}
+	    }
+	    else
+		c = 0;
+	    addvolume(c ? c : leaf(argv[1]));
+	    return NULL;	/* P:0 */
+	}
+#endif
+
+      default:			/* P:0 */
+	return NULL;		/* P:0 */
+    }
+}
+
+int filertask(char *cmdtail);
+
+#ifdef HASIMPORTMENU
+static int compitextmenuitem(const void *va, const void *vb)
+{
+    const wimp_menuitem *a = va;
+    const wimp_menuitem *b = vb;
+    return stricmp(a->data.indirecttext.buffer, b->data.indirecttext.buffer);
+}
+
+static int comptextmenuitem(const void *va, const void *vb)
+{
+    const wimp_menuitem *a = va;
+    const wimp_menuitem *b = vb;
+    return stricmp(a->data.text, b->data.text);
+}
+
+static void freeimportmenu(void)
+{
+    rfree(importbb);
+    importbb = 0;
+    rfree(importmenu);
+    importmenu = 0;
+}
+
+static void buildimportmenu(void)
+{
+    int c, m, k, l, z;
+    int bbsize = 2000;
+    char *bbpos, *bbend;
+    freeimportmenu();
+    importmenusize = 0;
+    importbb = rmalloc(bbsize);
+    if (!importbb)
+	return;
+    bbend = importbb + bbsize;
+    for (bbpos = importbb, k = 0, l = 6;; k++)
+    {
+	_swix(OS_ServiceCall, _INR(0, 3) | _OUT(1) | _OUT(3), k,
+	      Service_TransportEnumerate, bbpos, bbend - bbpos, &c, &m);
+	if (c || m < 0)
+	    break;
+	z = strlen(bbpos);
+	if (l < z)
+	    l = z;
+    }
+    if (m >= 0)
+	importbb = rrealloc(importbb, m);
+    importmenusize = k;
+    if (!k)
+	return;
+    importmenu = rmalloc(sizeof(wimp_menustr) + importmenusize * sizeof(wimp_menuitem));
+    if (!importmenu)
+	return;
+    importmenu->hdr = importhdr;
+    importmenuitem = (wimp_menuitem *) (importmenu + 1);
+    for (bbpos = importbb, k = 0, l = 6; k < importmenusize; k++)
+    {
+	int w;
+	_swix(OS_ServiceCall, _INR(0, 3) | _OUT(0) | _OUT(1) | _OUT(3),
+	      k, Service_TransportEnumerate, bbpos, bbend - bbpos,
+	      &w, &c, &m);
+	if (c || m < 0)
+	    break;
+	importmenuitem[k].flags = 0;
+	importmenuitem[k].submenu = (wimp_menuptr) - 1;
+	importmenuitem[k].iconflags = wimp_ITEXT | wimp_INDIRECT | wimp_IFORECOL * 7 | wimp_IBACKCOL * 0;
+	if (w & 1)
+	    importmenuitem[k].iconflags |= wimp_INOSELECT;
+	z = strlen(bbpos);
+	if (m > z)
+	{
+	    importmenuitem[k].flags |= wimp_MSUBLINKMSG;
+	    importmenuitem[k].submenu = (wimp_menuptr) (k | 0x100);
+	}
+	importmenuitem[k].data.indirecttext.buffer = bbpos;
+	importmenuitem[k].data.indirecttext.validstring = "";
+	importmenuitem[k].data.indirecttext.bufflen = z + 1;
+	if (l < z)
+	    l = z;
+	bbpos += z + 1;
+    }
+    if (k)
+    {
+	qsort(&importmenuitem[0], k, sizeof(wimp_menuitem), &compitextmenuitem);
+	importmenuitem[k - 1].flags |= wimp_MLAST;
+    }
+    importmenu->hdr.width = (l + 1) * 16;
+}
+
+static void freedetailmenu(void)
+{
+     rfree(detailbb);
+    detailbb = 0;
+    rfree(detailmenu);
+    detailmenu = 0;
+}
+
+static void builddetailmenu(int w)
+{
+    int c, m, k, l, z;
+    char *p;
+    int bbsize = 2000;
+    freedetailmenu();
+    detailbb = rmalloc(bbsize);
+    if (!detailbb)
+	return;
+    _swix(OS_ServiceCall, _INR(0, 3) | _OUT(1) | _OUT(3),
+	  w, Service_TransportEnumerate, detailbb, bbsize, &c, &l);
+    if (c || l < 0)
+    {
+	detailmenu = 0;
+	return;
+    }
+    for (k = 0, p = detailbb, m = l;
+	 0 != (p += (z = strlen(p)) + 1) && (m -= z + 1) > 0; k++)
+	;
+
+    detailbb = rrealloc(detailbb, p - detailbb);
+    detailmenusize = k;
+    detailmenu = rmalloc(sizeof(wimp_menustr) + (detailmenusize + 1) * sizeof(wimp_menuitem));
+    if (!detailmenu)
+	return;
+    detailmenuitem = (wimp_menuitem *) (detailmenu + 1);
+    detailmenu->hdr = importhdr;
+    strncpy(detailmenu->hdr.title, detailbb, sizeof(detailmenu->hdr.title));
+    for (k = 0, m = l, l = 7, p = detailbb; 0 != (p += (z = strlen(p)) + 1) && (m -= z + 1) > 0 && k < detailmenusize; k++)
+    {
+	detailmenuitem[k].flags = 0;
+	detailmenuitem[k].submenu = (wimp_menuptr) - 1;
+	detailmenuitem[k].iconflags = wimp_ITEXT | wimp_INDIRECT | wimp_IFORECOL * 7 | wimp_IBACKCOL * 0;
+	detailmenuitem[k].data.indirecttext.buffer = p;
+	detailmenuitem[k].data.indirecttext.validstring = "";
+	detailmenuitem[k].data.indirecttext.bufflen = z + 1;
+	if (l < z)
+	    l = z;
+    }
+    if (k)
+	qsort(&detailmenuitem[0], k, sizeof(wimp_menuitem), &compitextmenuitem);
+    detailmenuitem[k].flags = wimp_MLAST | wimp_MWRITABLE;
+    detailmenuitem[k].submenu = (wimp_menuptr) - 1;
+    detailmenuitem[k].iconflags = wimp_ITEXT | wimp_IFORECOL * 7 | wimp_IBACKCOL * 0 | wimp_INDIRECT;
+    detailmenuitem[k].data.indirecttext.buffer = detailbuf;
+    detailmenuitem[k].data.indirecttext.validstring = "";
+    detailmenuitem[k].data.indirecttext.bufflen = sizeof(detailbuf);
+    detailmenu->hdr.width = (l + 1) * 16;
+}
+#endif
+
+#ifdef ACCESSPLUS
+static void buildlogoffmenu(void)
+{
+    int l, m, k = 0;
+    int nlogons = 0;
+    char name[32];
+    freelogoffmenu();
+    while ((k = enum_owners(name, k)) != -1)
+	nlogons++;
+    logoffmenusize = nlogons;
+    logoffmenu = rmalloc(sizeof(wimp_menustr) + (logoffmenusize + 1) * sizeof(wimp_menuitem));
+    if (!logoffmenu)
+	return;
+    logoffmenuitem = (wimp_menuitem *) (logoffmenu + 1);
+    logoffmenu->hdr = logoffhdr;
+    for (l = 10, k = 0; k < nlogons; k++)
+    {
+	if (enum_owners(name, k) == -1)
+	    break;
+	strncpy(logoffmenuitem[k].data.text, name, sizeof(logoffmenuitem[k].data.text));
+	logoffmenuitem[k].iconflags = (wimp_iconflags)(wimp_ITEXT | wimp_IFORECOL * 7 | wimp_IBACKCOL * 0);
+	logoffmenuitem[k].submenu = (wimp_menuptr) - 1;
+	logoffmenuitem[k].flags = (wimp_menuflags)0;
+	m = strlen(name);
+	if (l < m)
+	    l = m;
+    }
+    logoffmenuitem[k - 1].flags = wimp_MLAST;
+    logoffmenu->hdr.width = (l + 1) * 16;
+}
+
+static void freelogoffmenu(void)
+{
+    rfree(logoffmenu);
+    logoffmenu = 0;
+    logoffmenusize = 0;
+}
+
+static void buildshowlmenu(void)
+{
+    int l, m, k = 0;
+    int nlogons = 0;
+    char name[32];
+    freeshowlmenu();
+    while ((k = enum_owners(name, k)) != -1)
+	nlogons++;
+    showlmenusize = nlogons;
+    showlmenu = rmalloc(sizeof(wimp_menustr) + (showlmenusize + 1) * sizeof(wimp_menuitem));
+    if (!showlmenu)
+	return;
+    showlmenuitem = (wimp_menuitem *) (showlmenu + 1);
+    showlmenu->hdr = showlhdr;
+    for (l = 10, k = 0; k < nlogons; k++)
+    {
+	if (enum_owners(name, k) == -1)
+	    break;
+	strncpy(showlmenuitem[k].data.text, name, sizeof(showlmenuitem[k].data.text));
+	showlmenuitem[k].iconflags = (wimp_iconflags)(wimp_ITEXT | wimp_IFORECOL * 7 | wimp_IBACKCOL * 0);
+	showlmenuitem[k].submenu = (wimp_menuptr) - 1;
+	showlmenuitem[k].flags = (wimp_menuflags)0;
+	m = strlen(name);
+	if (l < m)
+	    l = m;
+    }
+    showlmenuitem[k - 1].flags = wimp_MLAST;
+    showlmenu->hdr.width = (l + 1) * 16;
+}
+
+static void freeshowlmenu(void)
+{
+    rfree(showlmenu);
+    showlmenu = 0;
+    showlmenusize = 0;
+}
+#endif
+
+#ifdef HASTRANSPORTMENU
+static void freetransportmenu(void)
+{
+    rfree(transportmenu);
+    transportmenu = 0;
+    transportmenusize = 0;
+}
+
+static void buildtransportmenu(void)
+{
+    _kernel_osgbpb_block b;
+    int k = 0, l, m;
+    char *p;
+#define bbsize 2000
+    char bb[bbsize];
+    freetransportmenu();
+    b.dataptr = bb;
+    b.nbytes = bbsize / 10;
+    b.fileptr = 0;
+    b.buf_len = bbsize;
+    b.wild_fld = 0;
+    if (_kernel_ERROR == _kernel_osgbpb(9, (int) "<" FS "FS$Path>Transport", &b) || !b.nbytes)
+	return;
+    transportmenusize = b.nbytes + 1;
+    transportmenu = rmalloc(sizeof(wimp_menustr) + (transportmenusize + 1) * sizeof(wimp_menuitem));
+    if (!transportmenu)
+	return;
+    transportmenuitem = (wimp_menuitem *) (transportmenu + 1);
+    transportmenu->hdr = importhdr;
+    strcpy(transportmenu->hdr.title, "Transports");
+    for (l = 10, p = b.dataptr, k = 0; k < b.nbytes; k++)
+    {
+	strncpy(transportmenuitem[k].data.text, p, sizeof(transportmenuitem[k].data.text));
+	transportmenuitem[k].iconflags = wimp_ITEXT | wimp_IFORECOL * 7 | wimp_IBACKCOL * 0;
+	transportmenuitem[k].flags = 0;
+	m = strlen(p);
+	if (l < m)
+	    l = m;
+	p += m + 1;
+    }
+    if (k)
+	qsort(&transportmenuitem[0], k, sizeof(wimp_menuitem), &comptextmenuitem);
+    transportmenuitem[k - 1].flags |= wimp_MSEPARATE;
+    transportmenuitem[k].flags = wimp_MLAST;
+    transportmenuitem[k].submenu = (wimp_menuptr) - 1;
+    transportmenuitem[k].iconflags = wimp_ITEXT | wimp_IFORECOL * 7 | wimp_IBACKCOL * 0;
+    strcpy(transportmenuitem[k].data.text, "Save");
+    transportmenu->hdr.width = (l + 1) * 16;
+}
+
+static void fixtransportmenu(void)
+{
+    int k;
+    for (k = 0; k < transportmenusize - 1; k++)
+    {
+	char buf[256], v[256];
+	int c, m;
+	strcpy(buf, "Remote$");
+	strcat(buf, transportmenuitem[k].data.text);
+	if (!_kernel_getenv(buf, v, sizeof(v)) && stricmp(v, "Off"))
+	    transportmenuitem[k].flags |= wimp_MTICK;
+	else
+	    transportmenuitem[k].flags &= ~wimp_MTICK;
+	if (_swix(OS_ServiceCall, _INR(0, 1) | _OUTR(0, 1), transportmenuitem[k].data.text, Service_TransportMenu, &c, &m))
+	    m = 1;
+	if (m)			/* not claimed */
+	{
+	    transportmenuitem[k].submenu = (wimp_menuptr) - 1;
+	    transportmenuitem[k].flags &= ~wimp_MSUBLINKMSG;
+	}
+	else
+	{
+	    transportmenuitem[k].submenu = (wimp_menuptr) c;
+	    transportmenuitem[k].flags |= wimp_MSUBLINKMSG;
+	}
+    }
+}
+#endif
+
+static void freevols(void)
+{
+    int icon;			/* P:0 */
+    for (icon = 0; icon < numvolumes; icon++)	/* P:0 */
+    {
+#ifndef SHOWDISCS
+	free(volumenames[icon]);
+	free(transportnames[icon]);
+#else
+	free(volumenames[icon]);/* P:0 */
+#endif
+    }
+    numvolumes = 0;
+}
+
+static int slen(char *t)
+{
+    char *s = t;		/* P:0 */
+    while (*s >= ' ')		/* P:0 */
+	s++;			/* P:0 */
+    *s = 0;
+    return s - t;		/* P:0 */
+}
+
+static char *sstr(char *t)
+{
+    slen(t);			/* P:0 */
+    return t;			/* P:0 */
+}
+
+#ifdef HASEXPORTWINDOW
+static int get_icon_flags(wimp_w w, wimp_i i)
+{
+    wimp_icon ic;
+    error *err;
+    if (wimp_get_icon_info(w, i, &ic))
+	return 0;
+    return ic.flags;
+}
+
+#define icon_selected(w,i) (0!=(get_icon_flags(w,i)&wimp_ISELECTED))
+
+static struct how how;
+
+static int numexports, exportheight, exportwidth;
+#define move(x,y) plot(4,x,y)
+#define plot(t,x,y) _swix(OS_Plot,_INR(0,2),t,x,y)
+
+static int exportbasey = 0;
+
+static void showexports(int x, int y, int f)
+{
+    int k;
+    exportwidth = 20 * 16;
+    if (f)
+    {
+	char buf[256];
+	lookup("elabels", buf, sizeof(buf));
+	_swix(Wimp_SetColour, _IN(0), 4);
+	move(x, y);
+	plot(97, 4096, -52);
+	_swix(Wimp_SetColour, _IN(0), 0);
+	move(x + 16, y - 16);
+	printf(buf);
+	_swix(Wimp_SetColour, _IN(0), 7);
+    }
+    y -= 52;
+    exportbasey = y;
+    for (k = 0;; k++)
+    {
+	char *name, *path;
+	char buf[300];
+	struct how *h;
+	int l;
+	if (_swix(RemoteDaemon_Exports, _IN(0) | _OUTR(0, 2), k, &name, &path, &h) || !name)
+	    break;
+	sprintf(buf, "%-10s R%c %s %4dK  %s ", name, h->readonly ? ' ' : 'W', h->owner ? "OWNER" : "     ", h->buffersize / 512, path);
+	l = strlen(buf) * 16;
+	if (f)
+	{
+	    move(x, y - 44 * k - 8);
+	    printf(" %s", buf);
+	}
+	if (exportwidth < l)
+	    exportwidth = l;
+    }
+    numexports = k;
+    exportheight = 44 * k + 52;
+    exportwidth += 16;
+}
+static os_error *showexport(wimp_w exportwindow)
+{
+    os_error *err;
+    wimp_wstate s;
+    wimp_redrawstr r;
+    how = defaulthow;
+    showexports(0, exportbasey + 52, 0);
+    r.w = exportwindow;
+    r.box.x0 = 0;
+    r.box.x1 = exportwidth;
+    r.box.y0 = -exportheight;
+    r.box.y1 = 0;
+    r.scx = 0;
+    r.scy = 0;
+    lookup("etit", exporttemplate->w.title.indirecttext.buffer, exporttemplate->w.title.indirecttext.bufflen);
+    if (!exportssaved)
+	strcat(exporttemplate->w.title.indirecttext.buffer, " *");
+    wimp_close_wind(exportwindow);
+    err = wimp_set_extent(&r);
+    if (err)
+	return err;
+    err = wimp_get_wind_state(exportwindow, &s);
+    if (err)
+	return err;
+    s.o.behind = -1;
+    err = wimp_open_wind(&s.o);
+    exportschanged = 0;
+    return err;
+}
+
+static os_error *showdragme(wimp_w dragwindow)
+{
+    char *p;
+    char buf[30];
+    how = defaulthow;
+    if (!_kernel_getenv("Export$Options", buf, sizeof(buf)))
+    {
+	p = strtok(buf, " ");
+	while (p)
+	{
+	    if (howread(&how, p))
+		break;
+	    p = strtok(NULL, " ");
+	}
+    }
+    _kernel_setenv("Export$Options", howprint(how));
+    wimp_set_icon_state(dragwindow, 2, how.owner ? wimp_ISELECTED : 0, wimp_ISELECTED);
+    wimp_set_icon_state(dragwindow, 4, how.readonly ? 0 : wimp_ISELECTED, wimp_ISELECTED);
+    dragtemplate->i[7].data.indirecttext.buffer[0] = 0;
+    sprintf(dragtemplate->i[6].data.indirecttext.buffer, "%d", how.buffersize / 512);
+    if (!_kernel_getenv(FS "FS$Path", dragtemplate->i[0].data.indirecttext.buffer,
+		      dragtemplate->i[0].data.indirecttext.bufflen))
+    {
+	p = strrchr(dragtemplate->i[0].data.indirecttext.buffer, '$');
+	if (p)
+	    p[1] = 0;
+    }
+    else
+	dragtemplate->i[0].data.indirecttext.buffer[0] = 0;
+    return NULL;
+}
+
+static struct how optionshow;
+static char *optionspath;
+static char *optionsalias;
+
+static os_error *showoptions(wimp_w w, struct how how, char *alias, char *path)
+{
+     optionshow = how;
+    optionsalias = alias;
+    optionspath = path;
+    wimp_set_icon_state(w, 2, how.owner ? wimp_ISELECTED : 0, wimp_ISELECTED);
+    wimp_set_icon_state(w, 4, how.readonly ? 0 : wimp_ISELECTED, wimp_ISELECTED);
+    strcpy(optionstemplate->i[3].data.indirecttext.buffer, alias);
+    sprintf(optionstemplate->i[6].data.indirecttext.buffer, "%d", how.buffersize / 512);
+    return NULL;
+}
+#endif
+
+static os_error *doopendir(wimp_msgstr * m, char *name)
+{
+    m->hdr.size = sizeof(wimp_msghdr) + sizeof(int) * 2 + (strlen(name) & ~3) +4;	/* P:10 */
+    m->hdr.your_ref = 0;
+    m->hdr.action = wimp_FilerOpenDir;
+    m->data.words[0] = FilingSystemNumber;
+    m->data.words[1] = 0;
+    strcpy((char *) &m->data.words[2], name);
+    return wimp_sendmessage(wimp_ESEND, m, (wimp_t) filertaskhandle);	/* P:10 */
+}
+
+void dodismount(char *name)
+{
+int mount=0;
+char mountname[64];
+char buffer[128];
+char *n;
+
+    while(volumenames[mount] != NULL) {
+        sprintf(mountname,"%s", volumenames[mount]);
+        for (n = (char *)mountname; *n; n++) {
+            if (*n == '@' && n != name) {
+                *n = 0;
+                if (strcmp(mountname, name) == 0) {
+		    extern int killmedia;
+
+#ifdef NOSPECIALFIELDS
+		    sprintf(buffer, "Filer_CloseDir " FS "::%s",
+		    					 volumenames[mount]);
+#else
+		    sprintf(buffer, "Filer_CloseDir " FS "#%s::%s",
+		                   transportnames[mount], volumenames[mount]);
+#endif
+
+		    killmedia = 1;
+		    _kernel_oscli(buffer);
+                    killmedia = 0;
+		    return;
+                    }
+                }
+            }
+        mount++;
+        }
+}
+
+static os_error *icreate(char *name, char *validstr, int w, int pos, int *icon)
+{
+    wimp_icreate wi;		/* P:21 */
+    int sprx = 34, spry = 17, sprm = 12;
+    int l;
+    l = strlen(name);
+    _swix(Wimp_SpriteOp, _IN(0) | _IN(2) | _OUT(3) | _OUT(4) | _OUT(6), 40, validstr + 1, &sprx, &spry, &sprm);
+    sprx <<= _swi(OS_ReadModeVariable, _INR(0, 1) | _RETURN(2), sprm, 4);
+    spry <<= _swi(OS_ReadModeVariable, _INR(0, 1) | _RETURN(2), sprm, 5);
+    wi.w = w;
+    wi.i.box.x0 = 0;
+    wi.i.box.y0 = -16;		/* base of text, 32 high */
+    wi.i.box.x1 = sprx;
+    if (sprx < l * 16)
+	wi.i.box.x1 = l * 16;	/* P:13 */
+    wi.i.box.y1 = -16 + 32 + 4 + spry;
+    wi.i.flags = (wimp_iconflags)(wimp_ITEXT |
+	wimp_ISPRITE |
+	wimp_IHCENTRE |
+	wimp_INDIRECT |
+	wimp_IBTYPE * wimp_BCLICKDEBOUNCE |
+	wimp_IFORECOL * 7 |
+	wimp_IBACKCOL * 1);
+    wi.i.data.indirecttext.buffer = name;
+    wi.i.data.indirecttext.validstring = validstr;
+    wi.i.data.indirecttext.bufflen = l + 1;
+    return (os_error *) _swix(Wimp_CreateIcon, _INR(0, 1) | _OUT(0), pos, &wi, icon);	/* P:21 */
+}
+#ifdef SHOWDISCS
+static int addvolume(char *name)
+{
+    int i;			/* P:6 */
+    for (i = 0; i < numvolumes; i++)	/* P:15 */
+	if (!stricmp(volumenames[i], name))	/* P:3 */
+	    return i;		/* P:0 */
+    if (numvolumes < MAXVOLS)
+    {
+	volumenames[numvolumes] = strdup(name);	/* P:6 */
+	volumeicons[numvolumes] = -1;
+	volumetypes[numvolumes] = -1;
+	numvolumes++;
+	volumeschanged++;
+    }
+    return numvolumes - 1;	/* P:6 */
+}
+#endif
+extern int strlen_ctrl(char *buf);
+
+int filertask(char *cmdtail)
+{
+    os_error *err;		/* P:6 */
+    int icon = 0;
+    int doquit = 0;
+    wimp_eventstr ev;
+    int invalidtime = 0;
+    wimp_menuitem *tmp_menuitem;	/* Barmenustr replacement */
+#ifdef ACCESSPLUS
+    wimp_icon *tmp_wimp_icon;
+    wimp_menuitem *tmp_aplus_menu;	/* Aplusmenustr replacement */
+#endif /* ACCESSPLUS */
+#ifdef HASINFOWINDOW
+    int infowindow;
+#endif
+#ifdef HASABOUTMENU
+    int aboutwindow = 0;
+#endif
+#ifdef HASEXPORTWINDOW
+    int exportwindow = 0;
+    int dragwindow = 0;
+    int optionswindow = 0;
+    int exportshown = 0;
+#endif
+#ifdef ACCESSPLUS
+    int logonwindow = 0;
+#endif
+    int maydataload = 0;
+    char *pendingcmd = NULL;
+    static int messages_wanted[] = {wimp_MCLOSEDOWN, wimp_MDATASAVEOK, wimp_MDATASAVE, wimp_MDATALOAD,
+	      wimp_MDATAOPEN, wimp_MMENUWARN, wimp_MHELPREQUEST, 0};
+#ifndef RUNNABLE
+    if (taskhandle != -1)
+	return 0;		/* P:6 */
+#else
+    {
+	int x;
+	if (_swix(Wimp_ReadSysInfo, _IN(0) | _OUT(0), 0, &x) || !x)
+	    return 0;
+    }
+#endif
+    cmdtail = cmdtail;		/* Use it to scare off warnings */
+    err = (os_error *) _swix(Wimp_Initialise, _INR(0, 3) | _OUTR(0, 1), 300, TASK, ModuleName, &messages_wanted, &wimpversion, &taskhandle);
+    if (err)
+	goto error;		/* P:0 */
+#ifdef HASINFOWINDOW
+    err = wimp_create_wind(&infotemplate->w, &infowindow);
+    if (err)
+	goto error;
+#endif
+#ifdef HASABOUTMENU
+    err = wimp_create_wind(&abouttemplate->w, &aboutwindow);
+    if (err)
+	goto error;
+#endif
+#ifdef HASEXPORTWINDOW
+    err = wimp_create_wind(&exporttemplate->w, &exportwindow);
+    if (err)
+	goto error;
+    err = wimp_create_wind(&dragtemplate->w, &dragwindow);
+    if (err)
+	goto error;
+    err = wimp_create_wind(&optionstemplate->w, &optionswindow);
+    if (err)
+	goto error;
+#endif
+#ifdef HASTRANSPORTMENU
+    buildtransportmenu();
+#endif
+#ifdef ACCESSPLUS
+    err = wimp_create_wind(&logontemplate->w, &logonwindow);
+    if (err)
+	goto error;
+#endif
+#ifdef SHOWDISCS
+    {
+	int i;
+	for (i = 0; i < numvolumes; i++)	/* P:12 */
+	    volumeicons[i] = -1;	/* P:6 */
+	discsicon = -1;
+    }
+redovolumes:			/* P:17 */
+    volumeschanged = 0;
+    if (!numvolumes)
+    {
+	if (discsicon < 0) {		/* P:0 */
+	    icreate("Discs", "Sdiscs", wimpversion > 201 ? -6 : -2, ICONPOS, &discsicon);
+	    }
+    }
+    else
+    {
+	char buf[64], volbuf[32], *a;	/* P:17 */
+	char *specfield;
+	int load, what;
+	int i, isdir;
+#ifdef ACCESSPLUS
+	int doboot=0; /* pwain - 090395 */
+#endif
+	if (discsicon >= 0)
+	{
+	    wimp_delete_icon(-2, discsicon);	/* P:0 */
+	    discsicon = -1;
+	}
+	for (i = 0; i < numvolumes; i++)	/* P:68 */
+	{
+	    isdir = 0;
+	    strcpy(volbuf, volumenames[i]);
+	    sprintf(buf, "Resources:$.Discs.%s", volbuf);	/* P:34 */
+	    _swix(OS_File, _INR(0, 1) | _OUT(0) | _OUT(2), 5, buf, &what, &load);
+	    if (what != 1)
+	    {
+		for (a = volbuf; *a; a++)
+		{
+		    if (*a == '@' && a != volbuf)
+		    {
+			*a = '.';
+			isdir = 1;
+		    }
+		}
+		if (isdir)
+		{
+		    sprintf(buf, "Resources:$.Logon.%s", volbuf);	/* P:34 */
+		    _swix(OS_File, _INR(0, 1) | _OUT(0) | _OUT(2), 5, buf, &what, &load);
+
+		}
+	    }
+	    if (what != 1)
+		load = 0;	/* P:15 */
+	    load = load >> 8 & 0xfff;
+	    if (load != volumetypes[i] || volumeicons[i] < 0)	/* P:13 */
+	    {
+		if (volumeicons[i] >= 0)	/* P:21 */
+		    wimp_delete_icon(-2, volumeicons[i]);	/* P:15 */
+		volumetypes[i] = load;
+		switch (volumetypes[i])	/* P:21 */
+		{
+		  case FILETYPE_DISCS:
+		    specfield = "S" SPRITE_DISCS;
+		    break;	/* P:10 */
+		  case FILETYPE_DISCSP:
+		    specfield = "S" SPRITE_DISCSP;
+		    break;	/* P:0 */
+		  case FILETYPE_DISCSR:
+		    specfield = "S" SPRITE_DISCSR;
+		    break;	/* P:0 */
+		  case FILETYPE_DISCSD:
+		    specfield = "S" SPRITE_DISCSD;
+#ifdef ACCESSPLUS
+		    doboot=1;
+#endif
+		    break;	/* P:0 */
+		  case FILETYPE_DISCSDP:
+		    specfield = "S" SPRITE_DISCSDP;
+#ifdef ACCESSPLUS
+		    doboot=1;
+#endif
+		    break;	/* P:0 */
+		  case FILETYPE_DISCSCD:
+		    specfield = "S" SPRITE_DISCSCD;
+		    break;	/* P:0 */
+		  default:
+		    volumetypes[i] = 0;
+		    specfield = "Snodisc";
+		    break;	/* P:11 */
+		}
+		icreate(volumenames[i], specfield, wimpversion > 201 ? i ? -4 : -5 : -2,
+				i ? volumeicons[i - 1] : ICONPOS, &volumeicons[i]);
+#ifdef ACCESSPLUS
+		if (doboot) {
+		    char bootit[256];
+		    sprintf(bootit,"run share::%s.boot.!shareboot",volumenames[i]);
+		    _swix(OS_CLI,_IN(0),bootit);
+		    doboot=0;
+		    }
+#endif
+	    }
+	}
+    }
+#else
+    discsicon = -1;
+    numvolumes = 0;
+  redovolumes:
+    {
+	int icon, i;
+	if (discsicon >= 0)
+	    wimp_delete_icon(-2, discsicon);
+	discsicon = -1;
+	for (icon = 0; icon < numvolumes; icon++)
+	    if (volumeicons[icon] >= 0)
+	    {
+		wimp_delete_icon(-2, volumeicons[icon]);
+		volumeicons[icon] = -1;
+	    }
+	freevols();
+	volumeschanged = 0;
+	for (numvolumes = 0, i = 0; numvolumes < MAXVOLS;)
+	{
+	    char *vname, *tname;
+	    err = (os_error *) _swix(RemoteFS_EnumerateVolumes, _IN(0) | _OUTR(0, 1), i++, &vname, &tname);
+	    if (err)
+		break;
+	    if (vname[0] == '_')
+		continue;
+	    volumenames[numvolumes] = strdup(vname);
+	    transportnames[numvolumes] = strdup(tname);
+	    err = icreate(volumenames[numvolumes], "Sremserver", wimpversion > 201 ? -6 : -2, 0x13400000 + numvolumes, &volumeicons[numvolumes]);
+	    if (err)
+		goto error;
+	    numvolumes++;
+	}
+	if (!numvolumes)
+	{
+	    err = icreate("Remote", "Sremote", wimpversion > 201 ? -6 : -2, 0x13400000, &discsicon);
+	    if (err)
+		goto error;
+	}
+    }
+#endif
+#ifdef HASEXPORTWINDOW
+    exportschanged = 0;
+#endif
+    for (;;)			/* P:192136 */
+    {
+	int t;
+	maydataload = 0;	/* P:192136 */
+pol:				/* P:192136 */
+	t = _swi(OS_ReadMonotonicTime, _RETURN(0));
+	if (!doquit && !pendingcmd)
+	    t += 10;
+	err = wimp_pollidle(0, &ev, t);
+	if (err)
+	    goto error;		/* P:0 */
+	switch (ev.e)		/* P:192133 */
+	{
+	    char RootName[256];
+
+	  case wimp_ENULL:	/* P:191653 */
+	    if (doquit)
+	    {
+#ifndef MINIMAL_FILER
+		int r1, r2;
+		int *b;
+		char *n;
+		err = (os_error *) _swix(OS_Module, _INR(0, 1), 4, FS "FS");
+	next:	r1 = 0;
+		r2 = 0;
+		while (!_swix(OS_Module, _INR(0, 2) | _OUTR(1, 3), 12, r1, r2, &r1, &r2, &b))
+		{
+		    n = (char *) b + b[4];
+		    if (!strnicmp(n, "Remote", 6) && strcmp(n, ModuleName))
+		    {
+			err = (os_error *) _swix(OS_Module, _INR(0, 1), 4, n);
+			if (err)
+			    goto error;
+			goto next;
+		    }
+		}
+#endif
+		return (int) _swix(OS_ExitAndDie, _INR(0, 3), 0, 0, 0, ModuleName);	/* P:0 */
+	    }
+	    if (pendingcmd)
+	    {
+		_kernel_oscli(pendingcmd);	/* P:0 */
+		pendingcmd = NULL;
+		continue;
+	    }
+	    if (t - invalidtime > 100)
+	    {
+		invalidtime = t;
+		fs_receive(0, 0, -3);
+	    }
+	    if (volumeschanged)
+		goto redovolumes;	/* P:14 */
+
+#ifdef HASEXPORTWINDOW
+	    if (exportschanged)
+	    {
+		if (exportshown)
+		    showexport(exportwindow);
+		exportschanged = 0;
+	    }
+#endif
+	    continue;
+
+#ifdef HASEXPORTWINDOW
+	  case wimp_EREDRAW:
+	    if (ev.data.o.w != exportwindow)
+		continue;
+	    {
+		wimp_redrawstr r;
+		BOOL b;
+		r.w = ev.data.o.w;
+		err = wimp_redraw_wind(&r, &b);
+		if (err)
+		    goto error;
+		while (b)
+		{
+		    showexports(r.box.x0 - r.scx, r.box.y1 - r.scy, 1);
+		    err = wimp_get_rectangle(&r, &b);
+		    if (err)
+			goto error;
+		}
+	    }
+	    continue;
+#endif
+
+	  case wimp_EOPEN:	/* P:0 */
+	    wimp_open_wind(&ev.data.o);
+#ifdef HASEXPORTWINDOW
+	    if (ev.data.o.w == exportwindow)
+		exportbasey = ev.data.o.box.y1 - ev.data.o.y - 52;
+#endif
+	    continue;
+
+	  case wimp_ECLOSE:	/* P:0 */
+#ifdef HASEXPORTWINDOW
+	    if (ev.data.o.w == exportwindow)
+		wimp_close_wind(exportwindow), exportshown = 0;
+#endif
+	    continue;
+
+	  case wimp_EKEY:	/* P:0 */
+#ifdef ACCESSPLUS
+	    if (ev.data.key.c.w == logonwindow && ev.data.key.chcode == 13)
+	    {
+		switch (ev.data.key.c.i)
+		{
+		  case 1:	/* password */
+		    tmp_wimp_icon=(wimp_icon *)logontemplate->i;
+		    if (!owner_logon(logontemplate->i[0].data.indirecttext.buffer,
+		    (++tmp_wimp_icon)->data.indirecttext.buffer, 1))
+			wimp_reporterror(lookuperr(0, "nologon"), 0, ModuleName);
+		    logontemplate->i[0].data.indirecttext.buffer[0] = 0;
+		    tmp_wimp_icon->data.indirecttext.buffer[0] = 0;
+		    wimp_create_menu((wimp_menustr *) - 1, 0, 0);
+		    continue;
+
+		  case 0:	/* name */
+		    tmp_wimp_icon=(wimp_icon *)logontemplate->i;
+		    _swi(Wimp_SetCaretPosition, _IN(0) | _IN(1) | _IN(4) | _IN(5),
+			 logonwindow, 1, -1, strlen_ctrl(++tmp_wimp_icon->data.indirecttext.buffer));
+		    continue;
+		}
+	    }
+#endif
+
+#ifdef HASEXPORTWINDOW
+	    if (ev.data.key.c.w == optionswindow && ev.data.key.chcode == 13)
+		goto dooptionexport;
+	    if (ev.data.key.c.w == dragwindow && ev.data.key.chcode == 13)
+	    {
+		switch (ev.data.key.c.i)
+		{
+		  case 6:	/* buffersize */
+		    how.buffersize = atoi(dragtemplate->i[6].data.indirecttext.buffer) * 512;
+		    _kernel_setenv("Export$Options", howprint(how));
+		    ev.data.key.c.w = -1;
+		    wimp_set_caret_pos(&ev.data.key.c);
+		    continue;
+
+		  case 0:	/* path */
+		    sprintf(RootName, "Export %s %s",
+			dragtemplate->i[7].data.indirecttext.buffer,
+		       dragtemplate->i[0].data.indirecttext.buffer);
+		    if (_kernel_oscli(RootName) == _kernel_ERROR)
+			wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+		    wimp_create_menu((wimp_menustr *) - 1, 0, 0);
+		    continue;
+		}
+	    }
+#endif
+	    wimp_processkey(ev.data.key.chcode);
+	    continue;
+
+#ifdef HASEXPORTWINDOW
+	  case wimp_EUSERDRAG:
+	    {
+		wimp_mousestr m;
+		wimp_get_point_info(&m);
+		ev.data.msg.hdr.action = wimp_MDATASAVE;
+		ev.data.msg.hdr.your_ref = 0;
+		ev.data.msg.data.datasave.w = m.w;
+		ev.data.msg.data.datasave.i = m.i;
+		ev.data.msg.data.datasave.x = m.x;
+		ev.data.msg.data.datasave.y = m.y;
+		ev.data.msg.data.datasave.estsize = 0;
+		ev.data.msg.data.datasave.type = 0;
+		strcpy(ev.data.msg.data.datasave.leaf, "DragMe!");
+		ev.data.msg.hdr.size = sizeof(wimp_msgdatasave) + sizeof(wimp_msghdr);
+		wimp_sendwmessage(wimp_ESEND, &ev.data.msg, m.w, m.i);
+	    }
+	    continue;
+#endif
+	  case wimp_EBUT:	/* P:10 */
+#ifdef HASEXPORTWINDOW
+	    if (ev.data.but.m.w == exportwindow)
+	    {
+		if (ev.data.but.m.y > exportbasey)
+		    exportnumber = -1;
+		else
+		    exportnumber = (exportbasey - ev.data.but.m.y) / 44;
+		if (ev.data.but.m.bbits == wimp_BMID)
+	    crexportmenu:
+		{
+		    char *name, *path;
+		    struct how *h;
+		    if (0 <= exportnumber && exportnumber < numexports &&
+			!_swix(RemoteDaemon_Exports, _IN(0) | _OUTR(0, 2), exportnumber, &name, &path, &h) && name)
+		    {
+			int i;
+			static char buf[50];
+			for (i = MEALTER; i <= MEUNEXPORT; i++)
+			    Exportmenustr.item[i].iconflags &= ~wimp_INOSELECT;
+			showoptions(optionswindow, *h, name, path);
+			sprintf(buf, "Alter '%s'", name);
+			Exportmenustr.item[MEALTER].data.indirecttext.buffer = buf;
+			Exportmenustr.item[MEALTER].data.indirecttext.bufflen = sizeof(buf);
+			Exportmenustr.item[MEALTER].data.indirecttext.validstring = "";
+			Exportmenustr.item[MEALTER].iconflags |= wimp_INDIRECT;
+			i = strlen(buf) + 1;
+			if (i < 13)
+			    i = 13;
+			Exportmenustr.hdr.width = 16 * i;
+		    }
+		    else
+		    {
+			int i;
+			for (i = MEALTER; i <= MEUNEXPORT; i++)
+			    Exportmenustr.item[i].iconflags |= wimp_INOSELECT;
+			Exportmenustr.item[MEALTER].iconflags &= ~wimp_INDIRECT;
+			strcpy(Exportmenustr.item[MEALTER].data.text, "Alter ''");
+			Exportmenustr.hdr.width = 16 * 13;
+		    }
+		    Exportmenustr.item[MEALTER].submenu = (wimp_menuptr) optionswindow;
+		    Exportmenustr.item[MECHOOSEDIR].submenu = (wimp_menuptr) dragwindow;
+		    showdragme(dragwindow);
+		    current_menu = (wimp_menustr *) & Exportmenustr;
+		    current_menu_x = ev.data.but.m.x - 64;
+		    current_menu_y = ev.data.but.m.y - 40;
+		    err = wimp_create_menu((wimp_menustr *) & Exportmenustr,
+			ev.data.but.m.x - 64, ev.data.but.m.y - 40);
+		    if (err)
+			goto error;
+		    lastmenu = EXPORTMENU;
+		    continue;
+		}
+	    }
+	    else
+	    if (ev.data.but.m.w == dragwindow)
+	    {
+		switch (ev.data.but.m.i)
+		{
+		  case 5:	/* OK */
+		    sprintf(RootName, "Export %s %s",
+			dragtemplate->i[7].data.indirecttext.buffer,
+		       dragtemplate->i[0].data.indirecttext.buffer);
+		    if (_kernel_oscli(RootName) == _kernel_ERROR)
+			wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+		    if (ev.data.but.m.i & wimp_BLEFT)
+			wimp_create_menu((wimp_menustr *) - 1, 0, 0);
+		    break;
+
+		  case 2:	/* Owner */
+		    how.owner = icon_selected(dragwindow, 2);
+		    _kernel_setenv("Export$Options", howprint(how));
+		    continue;
+
+		  case 4:	/* readwrite */
+		    how.readonly = !icon_selected(dragwindow, 4);
+		    _kernel_setenv("Export$Options", howprint(how));
+		    continue;
+
+		  case 3:	/* The icon */
+		    {
+			wimp_dragstr d;
+			wimp_mousestr m;
+			wimp_get_point_info(&m);
+			dragbutton = m.bbits;
+			d.type = 5;	/* fixed size box */
+			d.box.x0 = m.x - 34;
+			d.box.y0 = m.y - 34;
+			d.box.x1 = m.x + 34;
+			d.box.y1 = m.y + 34;
+			d.parent.y0 = d.parent.x0 = -32768;
+			d.parent.y1 = d.parent.x1 = 32767;
+			wimp_drag_box(&d);
+		    }
+		    continue;
+
+		  default:
+		    continue;
+		}
+		if (ev.data.but.m.bbits & wimp_BRIGHT)
+		    continue;
+		wimp_close_wind(dragwindow);
+		continue;
+	    }
+	    else
+	    if (ev.data.but.m.w == optionswindow && ev.data.but.m.bbits)
+	    {
+		switch (ev.data.but.m.i)
+		{
+		  case 0:	/* OK */
+	    dooptionexport:
+		    if (!optionspath)
+			continue;
+		    optionshow.buffersize = atoi(optionstemplate->i[6].data.indirecttext.buffer) * 512;
+		    sprintf(RootName, "Export %s %s %s",
+		     optionstemplate->i[3].data.indirecttext.buffer,
+			    optionspath, howprint(optionshow));
+		    if (_kernel_oscli(RootName) == _kernel_ERROR)
+			wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+		    else
+		    if (stricmp(optionstemplate->i[3].data.indirecttext.buffer, optionsalias))
+		    {
+			sprintf(RootName, "UnExport %s", optionsalias);
+			_kernel_oscli(RootName);
+		    }
+		    wimp_create_menu((wimp_menustr *) - 1, 0, 0);
+		    showexport(exportwindow);
+		    optionspath = NULL;
+		    continue;
+
+		  case 2:	/* Owner */
+		    optionshow.owner = !optionshow.owner;
+		    continue;
+
+		  case 4:	/* readwrite */
+		    optionshow.readonly = !optionshow.readonly;
+		    continue;
+
+		  default:
+		    continue;
+		}
+		continue;
+	    }
+#endif
+	    if (ev.data.but.m.w != -2)
+		continue;	/* P:0 */
+#ifdef SHOWDISCS
+	    if (!numvolumes && ev.data.but.m.bbits != wimp_BMID)	/* P:0 */
+	    {
+	      showdiscs:		/* P:0 */
+#if 0
+		err = doopendir(&ev.data.msg, "Resources:$.Discs");
+		if (err)
+		    goto error;
+#else
+		if (_swi(OS_File, _INR(0, 1) | _RETURN(0), 5, "Resources:$.Discs"))
+		{
+		    char buf[200];
+		    int n = 0, k;
+		    int o = 0;
+		    while (o != -1 && !_swix(OS_GBPB, _INR(0, 6) | _OUTR(3, 4), 9, "Resources:$.Discs", buf, 30, o, sizeof(buf), 0, &k, &o))
+			n += k;
+		    sprintf(buf, "Filer_OpenDir Resources:$.Discs 200 %d -LargeIcons", 300 + (n - 1) / 4 * 100);	/* P:0 */
+		    _kernel_oscli(buf);
+		}
+		else
+		    wimp_reporterror(lookuperr(0, "nodiscs"), 0, ModuleName);	/* P:0 */
+#endif
+		continue;
+	    }
+#endif
+	    if (discsicon >= 0 && ev.data.but.m.i == discsicon)	/* P:0 */
+		icon = -1;	/* P:0 */
+	    else
+		for (icon = 0; icon < numvolumes; icon++)	/* P:36 */
+		    if (ev.data.but.m.i == volumeicons[icon])	/* P:16 */
+			break;	/* P:10 */
+	    switch (ev.data.but.m.bbits)	/* P:10 */
+	    {
+	      case wimp_BLEFT:	/* P:10 */
+	      case wimp_BRIGHT:/* P:10 */
+#ifndef SHOWDISCS
+		if (icon < 0)
+		    continue;
+#else
+		if (!volumetypes[icon])
+		    continue;	/* P:0 */
+#endif
+#ifdef AUTOOPEN
+	dobutton:
+#endif
+#ifdef NOSPECIALFIELDS
+		sprintf(RootName, FS "::%s.$", volumenames[icon]);
+#else
+		sprintf(RootName, FS "#%s::%s.$", transportnames[icon], volumenames[icon]);
+#endif
+		err = doopendir(&ev.data.msg, RootName);
+		if (err)
+		    goto error;	/* P:0 */
+		continue;
+
+	      case wimp_BMID:	/* P:0 */
+	      crmenu:		/* P:0 */
+
+/* Start PWain 13-01-95 */
+		tmp_menuitem=(wimp_menuitem *)Barmenustr.item;
+
+#ifdef SHOWDISCS
+		if (numvolumes > 0 && volumetypes[icon])	/* P:0 */
+#else
+		if (icon >= 0)
+#endif
+		{
+#ifdef HASABOUTMENU
+		    (tmp_menuitem+MABOUT)->iconflags &= (wimp_iconflags) ((tmp_menuitem+MABOUT)->iconflags &  ~wimp_INOSELECT);
+#endif
+		    (tmp_menuitem+MFREE)->iconflags = (wimp_iconflags) ((tmp_menuitem+MFREE)->iconflags & ~wimp_INOSELECT);
+    							/* P:0 */
+#ifdef HASUNIMPORTMENU
+		    (tmp_menuitem+MUNIMPORT)->iconflags =
+		        (wimp_iconflags) ((tmp_menuitem+MUNIMPORT)->iconflags & ~wimp_INOSELECT);
+#endif
+#ifdef HASABOUTMENU
+		    strncpy(abouttemplate->i[1].data.indirecttext.buffer, volumenames[icon],
+		     abouttemplate->i[1].data.indirecttext.bufflen);
+		    strncpy(abouttemplate->i[2].data.indirecttext.buffer, transportnames[icon],
+		     abouttemplate->i[2].data.indirecttext.bufflen);
+#endif
+		}
+		else
+		{
+#ifdef HASABOUTMENU
+		    (tmp_menuitem+MABOUT)->iconflags = (wimp_iconflags) ((tmp_menuitem+MABOUT)->iconflags | wimp_INOSELECT);
+#endif
+		    (tmp_menuitem+MFREE)->iconflags = (wimp_iconflags) ((tmp_menuitem+MFREE)->iconflags | wimp_INOSELECT); /* P:0 */
+#ifdef HASUNIMPORTMENU
+#ifdef SHOWDISCS
+		    if (numvolumes)
+			(tmp_menuitem+MUNIMPORT)->iconflags = (wimp_iconflags) ((tmp_menuitem+MUNIMPORT)->iconflags & ~wimp_INOSELECT); /* P:0 */
+		    else
+#endif
+			(tmp_menuitem+MUNIMPORT)->iconflags = (wimp_iconflags)((tmp_menuitem+MUNIMPORT)->iconflags | wimp_INOSELECT); /* P:0 */
+#endif
+		}
+#ifdef HASINFOWINDOW
+		(tmp_menuitem+MINFO)->submenu = (wimp_menuptr) infowindow;
+#endif
+#ifdef HASABOUTMENU
+		(tmp_menuitem+MABOUT)->submenu = (wimp_menuptr) aboutwindow;
+#endif
+#ifdef HASEXPORTWINDOW
+		if (_swix(RemoteDaemon_Exports, _IN(0), 0))
+		    (tmp_menuitem+MEXPORT)->iconflags = (wimp_iconflags)((tmp_menuitem+MEXPORT)->iconflags | wimp_INOSELECT);
+		else
+		    (tmp_menuitem+MEXPORT)->iconflags = (wimp_iconflags)((tmp_menuitem+MEXPORT)->iconflags & ~wimp_INOSELECT);
+#endif
+#ifdef HASIMPORTMENU
+		buildimportmenu();
+		(tmp_menuitem+MIMPORT)->flags |= wimp_MSUBLINKMSG;
+		(tmp_menuitem+MIMPORT)->submenu = (wimp_menuptr) 53;
+		if (importmenusize)
+		    (tmp_menuitem+MIMPORT)->iconflags = (wimp_iconflags)((tmp_menuitem+MIMPORT)->iconflags & ~wimp_INOSELECT);
+		else
+		    (tmp_menuitem+MIMPORT)->iconflags |= (wimp_iconflags)((tmp_menuitem+MIMPORT)->iconflags | wimp_INOSELECT);
+#endif
+#ifdef HASTRANSPORTMENU
+		fixtransportmenu();
+		(tmp_menuitem+MTRANSPORTS)->submenu = (wimp_menuptr) transportmenu;
+#endif
+#ifdef ACCESSPLUS
+		(tmp_menuitem+MACCPLUS)->submenu = (wimp_menuptr) aplusmenustr;
+		tmp_aplus_menu=(wimp_menuitem *)Aplusmenustr.item;
+		(tmp_aplus_menu+MPLLOGON)->submenu = (wimp_menuptr) logonwindow;
+
+		buildlogoffmenu();
+		(tmp_aplus_menu+MPLLOGOFF)->flags =
+		    (wimp_menuflags)((tmp_aplus_menu+MPLLOGOFF)->flags | wimp_MSUBLINKMSG);
+		(tmp_aplus_menu+MPLLOGOFF)->submenu = (wimp_menuptr) 28;
+		if (logoffmenusize)
+		    (tmp_aplus_menu+MPLLOGOFF)->iconflags =
+		        (wimp_iconflags)((tmp_aplus_menu+MPLLOGOFF)->iconflags & ~wimp_INOSELECT);
+		else
+		    (tmp_aplus_menu+MPLLOGOFF)->iconflags =
+		         (wimp_iconflags)((tmp_aplus_menu+MPLLOGOFF)->iconflags | wimp_INOSELECT);
+
+		buildshowlmenu();
+		(tmp_aplus_menu+MPLSHOWLOG)->flags = (wimp_menuflags)((tmp_aplus_menu+MPLSHOWLOG)->flags | wimp_MSUBLINKMSG);
+		(tmp_aplus_menu+MPLSHOWLOG)->submenu = (wimp_menuptr) 29;
+		if (showlmenusize)
+		    (tmp_aplus_menu+MPLSHOWLOG)->iconflags =
+		        (wimp_iconflags)((tmp_aplus_menu+MPLSHOWLOG)->iconflags & ~wimp_INOSELECT);
+		else
+		    (tmp_aplus_menu+MPLSHOWLOG)->iconflags =
+		        (wimp_iconflags)((tmp_aplus_menu+MPLSHOWLOG)->iconflags | wimp_INOSELECT);
+		if (numvolumes > 0 && volumetypes[icon])
+		{
+		    char *n;
+		    for (n = volumenames[icon]; *n; n++)
+			if (*n == '@' && n != volumenames[icon])
+			    break;
+		    if (*n)
+			(tmp_menuitem+MFREE)->iconflags =
+			(wimp_iconflags)((tmp_menuitem+MFREE)->iconflags | wimp_INOSELECT);
+		    else
+			(tmp_menuitem+MFREE)->iconflags =
+			(wimp_iconflags)((tmp_menuitem+MFREE)->iconflags & ~wimp_INOSELECT);
+		}
+#endif
+		current_menu = (wimp_menustr *) & Barmenustr;
+		current_menu_x = ev.data.but.m.x - 64;
+		current_menu_y = 96 + BARMENUDEPTH * 44;
+#ifndef ACCESSPLUS
+		err = wimp_create_menu((wimp_menustr *) & Barmenustr, ev.data.but.m.x - 64, 96 + BARMENUDEPTH * 44);
+#else
+		err = wimp_create_menu((wimp_menustr *) & Barmenustr, ev.data.but.m.x - 64, 96 + BARMENUDEPTH * 44 + 24);	/* compensate for
+																 * presence of dotted
+																 * line */
+#endif
+		if (err)
+		    goto error;	/* P:0 */
+		lastmenu = BARMENU;
+		continue;
+	    }
+	    break;
+
+	  case wimp_EMENU:	/* P:0 */
+	    {
+		wimp_mousestr m;
+		wimp_get_point_info(&m);
+#ifdef HASEXPORTWINDOW
+		if (lastmenu == EXPORTMENU)
+		    switch (ev.data.menu[0])
+		    {
+		      case MEUNEXPORT:
+			{
+			    char buf[256];
+			    char *name;
+			    if (_swix(RemoteDaemon_Exports, _IN(0) | _OUT(0), exportnumber, &name))
+				break;
+			    sprintf(buf, "UnExport %s", name);
+			    if (_kernel_ERROR == _kernel_oscli(buf))
+				wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+			    showexport(exportwindow);
+			}
+			break;
+
+		      case MECHOOSEDIR:
+			break;
+
+		      case MESAVE:
+			if (_kernel_ERROR == _kernel_oscli("Exports <" FS "FS$Path>ConfExport"))
+			    wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+			else
+			    exportssaved = 1;
+			showexport(exportwindow);
+			break;
+		     }
+		else
+#endif
+		    if (lastmenu == BARMENU)
+			switch (ev.data.menu[0])	/* P:0 */
+			{
+#ifdef HASINFOWINDOW
+			  case MINFO:
+#ifdef DEBUG
+			    {
+				_swix(Wimp_CommandWindow, _IN(0), ModuleName);
+				printf("rcheckall:\n");
+				rcheckall();
+				_swix(Wimp_CommandWindow, _IN(0), 0);
+				break;
+			    }
+#endif
+				break;
+#endif
+#ifdef SHOWDISCS
+		      case MSHOWDISCS:	/* P:0 */
+			goto showdiscs;	/* this is a hideous mess;
+					 * kindly clear it up -gw */
+#ifdef ACCESSPLUS
+		      case MACCPLUS:
+			switch (ev.data.menu[1])
+			{
+			  case MPLLOGOFF:
+			    {
+				char name[32];
+				if (enum_owners(name, ev.data.menu[2]) != -1)
+				    owner_logoff(name);
+				break;
+			    }
+			  case MPLSHOWLOG:
+			    {
+				char name[32], pname[64], buf[200];
+				if (enum_owners(name, ev.data.menu[2]) == -1)
+				    break;
+				sprintf(pname, "Resources:$.Logon.%s", name);
+				if (_swi(OS_File, _INR(0, 1) | _RETURN(0), 5, pname))
+				{
+				    int n = 0, k;
+				    int o = 0;
+				    while (o != -1 && !_swix(OS_GBPB, _INR(0, 6) | _OUTR(3, 4), 9, pname, buf, 30, o, sizeof(buf), 0, &k, &o))
+					n += k;
+				    sprintf(buf, "Filer_OpenDir %s 200 %d -LargeIcons", pname, 300 + (n - 1) / 4 * 100);	/* P:0 */
+				    _kernel_oscli(buf);
+				}
+				else
+				    wimp_reporterror(lookuperr(0, "nodiscs"), 0, ModuleName);	/* P:0 */
+				break;
+			    }
+			}
+			/*
+			 * This line stops Access+ commands
+			 * doing a savediscs too!
+			 * Pwain 23-02-95
+			 */
+			break;
+#endif
+#ifndef AACLIENT
+		      case MSAVEDISCS:	/* P:0 */
+#ifdef CMOSBASE
+			{
+			    char cmos[CMOSSIZE + 1];
+			    char *p, *startp;
+			    int i, x;
+			    _swix(OS_Byte, _INR(0, 1) | _OUT(2), 161, CMOSKEYLOC, &x);
+			    startp = cmos;
+			    if ((x & CMOSKEYMASK) == CMOSKEYVAL)
+			    {
+				for (x = 0; x < CMOSSIZE; x++)	/* P:81 */
+				    _swix(OS_Byte, _INR(0, 1) | _OUT(2), 161, CMOSBASE + x, &i), cmos[x] = i;	/* P:75 */
+				cmos[x] = 0;
+				for (p = cmos; *p && p < &cmos[CMOSSIZE]; p++)
+				{
+				    if (*p == '#')
+				    {
+					startp = ++p;
+					break;
+				    }
+				}
+			    }
+			    for (p = startp; p < &cmos[CMOSSIZE]; p++)
+			    {	/* 28/7/94 gw */
+				*p = 0;
+			    }
+
+			    for (p = startp, i = 0; i < numvolumes; i++, p += strlen(p) + 1)	/* P:0 */
+			    {
+				if ((int) strlen(volumenames[i]) > (int) (&cmos[CMOSSIZE] - p))	/* P:0 */
+				{
+				    char disks[256];	/* P:0 */
+				    char *q;
+				    for (disks[0] = 0, q = startp; q < p; q += strlen(q) + 1)	/* P:0 */
+				    {
+					if (disks[0])
+					    strcat(disks, ",  ");	/* P:0 */
+					strcat(disks, q);
+				    }
+				    if (wimp_reporterror(lookuperr(0, "cmosfull", disks), 3, ModuleName) == 2)
+					goto skipit;	/* P:0 */
+				    break;
+				}
+				strcpy(p, volumenames[i]);
+			    }
+			    _swix(OS_Byte, _INR(0, 2), 162, CMOSKEYLOC, CMOSKEYVAL);
+			    for (i = 0; i < CMOSSIZE; i++)	/* P:0 */
+				_swix(OS_Byte, _INR(0, 2), 162, CMOSBASE + i, cmos[i]);	/* P:0 */
+		    skipit:break;	/* P:0 */
+			}
+#else
+			{
+			    FILE *fp = fopen(FS "FS:ConfImport", "w");
+			    char buf[1000];
+			    int i;
+			    if (!fp)
+			    {
+				wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+				continue;
+			    }
+			    setvbuf(fp, buf, _IOFBF, sizeof(buf));
+			    for (i = 0; i < numvolumes; i++)
+				fprintf(fp, "%s\n", volumenames[i]);
+			    fclose(fp);
+			    break;
+			}
+#endif
+#endif
+#endif
+		      case MFREE:	/* P:0 */
+#ifdef SHOWDISCS
+			if (!volumetypes[icon])
+			    break;	/* P:0 */
+#else
+			if (icon < 0)
+			    break;
+#endif
+#ifdef NOSPECIALFIELDS
+			sprintf(RootName, "ShowFree -fs " FS " :%s", volumenames[icon]);
+#else
+			sprintf(RootName, "ShowFree -fs " FS " #%s::%s", transportnames[icon], volumenames[icon]);
+#endif
+			if (_kernel_oscli(RootName) == _kernel_ERROR)
+			{
+			    sprintf(RootName, "WimpTask " FS ":Free %s", volumenames[icon]);	/* P:0 */
+			    _kernel_oscli(RootName);
+			}
+			break;
+#ifdef HASEXPORTWINDOW
+		      case MEXPORT:
+			err = showexport(exportwindow);
+			if (err)
+			    goto error;
+			exportshown = 1;
+			break;
+#endif
+#ifdef HASTRANSPORTMENU
+		      case MTRANSPORTS:
+			if (ev.data.menu[1] < 0)
+			    break;
+			if (ev.data.menu[1] < transportmenusize - 1)
+			{
+			    char buf[256];
+			    int k = ev.data.menu[1];
+			    if (ev.data.menu[2] >= 0)
+			    {
+				err = (os_error *) _swix(lasttransportmenu, _INR(0, 2), 2, 0, &ev.data.menu[2]);
+				if (err)
+				    wimp_reporterror(err, 0, ModuleName);
+			    }
+			    else
+			    if (transportmenuitem[k].flags & wimp_MTICK)
+			    {
+				sprintf(buf, "Remote%s Off", transportmenuitem[k].data.text);
+				if (_kernel_ERROR == _kernel_oscli(buf))
+				    wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+			    }
+			    else
+			    {
+				sprintf(buf, "Remote%s On", transportmenuitem[k].data.text);
+				if (_kernel_ERROR == _kernel_oscli(buf))
+				{
+				    sprintf(buf, "/" FS "FS:Transport.%s", transportmenuitem[k].data.text);
+				    if (_kernel_ERROR == _kernel_oscli(buf))
+					wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+				}
+			    }
+			}
+			else
+			{
+			    FILE *fp;
+			    int k;
+			    char buf[1000];
+			    fp = fopen("<" FS "FS$Path>ConfTrans", "w");
+			    if (!fp)
+			    {
+				wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+				break;
+			    }
+			    setvbuf(fp, buf, _IOFBF, sizeof(buf));
+			    {
+				char buf[256];
+				lookup("confhead", buf, sizeof(buf));
+				fprintf(fp, "%s\n", buf);
+			    }
+			    for (k = 0; k < transportmenusize - 1; k++)
+			    {
+				char buf[256], v[256];
+				strcpy(buf, "Remote$");
+				strcat(buf, transportmenuitem[k].data.text);
+				if (!_kernel_getenv(buf, v, sizeof(v)) && stricmp(v, "Off"))
+				    fprintf(fp, "/" FS "FS:Transport.%s %s\n", transportmenuitem[k].data.text, v);
+			    }
+			    fclose(fp);
+			}
+			break;
+#endif
+#ifdef HASIMPORTMENU
+		      case MIMPORT:
+			if (ev.data.menu[1] < 0)
+			    break;
+			strcpy(RootName, FS "#");
+			strcat(RootName, sstr(importmenuitem[ev.data.menu[1]].data.indirecttext.buffer));
+			if (ev.data.menu[2] != -1)
+			{
+			    strcat(RootName, ";");
+			    strcat(RootName, sstr(detailmenuitem[ev.data.menu[2]].data.indirecttext.buffer));
+			}
+			else
+			if (importmenuitem[ev.data.menu[1]].flags & wimp_MSUBLINKMSG)
+			    break;
+			strcat(RootName, "::ALL.$");
+			err = doopendir(&ev.data.msg, RootName);
+			if (err)
+			    goto error;
+			break;
+		      case MABOUT:
+			break;
+#endif
+#ifdef HASUNIMPORTMENU
+		      case MUNIMPORT:	/* P:0 */
+#ifndef SHOWDISCS
+			if (icon < 0)
+			    break;
+#endif
+#ifdef NOSPECIALFIELDS
+			sprintf(RootName, "Filer_CloseDir " FS "::%s", volumenames[icon]);
+#else
+			sprintf(RootName, "Filer_CloseDir " FS "#%s::%s", transportnames[icon], volumenames[icon]);
+#endif
+#ifdef SHOWDISCS
+			{
+			    extern int killmedia;
+			    killmedia = 1;
+			    _kernel_oscli(RootName);
+			    killmedia = 0;
+			}
+			sprintf(RootName, "Share:Dismount :%s", volumenames[icon]);
+			_kernel_oscli(RootName);
+#else
+			_kernel_oscli(RootName);
+#endif
+#ifndef SHOWDISCS
+			sprintf(RootName, "UnImport %s %s", volumenames[icon], transportnames[icon]);
+			pendingcmd = RootName;
+#else
+			if (volumeicons[icon] >= 0)
+			    wimp_delete_icon(-2, volumeicons[icon]);	/* P:0 */
+			free(volumenames[icon]);
+			for (; icon + 1 < numvolumes; icon++)	/* P:0 */
+			{
+			    volumeicons[icon] = volumeicons[icon + 1];	/* P:0 */
+#ifdef SHOWDISCS
+			    volumetypes[icon] = volumetypes[icon + 1];
+#else
+			    transportnames[icon] = transportnames[icon + 1];
+#endif
+			    volumenames[icon] = volumenames[icon + 1];
+			}
+			numvolumes--;
+			if (!numvolumes)
+			    goto redovolumes;	/* P:0 */
+#endif
+			continue;
+#endif
+#ifdef HASQUITMENU
+		      case MQUIT:
+			{
+			    int icon;
+			    char buf[256];
+			    lookup("quitwarn", buf, sizeof(buf));
+			    if (1 != _swi(Wimp_ReportError, _INR(0, 2) | _RETURN(1), buf, 3 + (1 << 4), ModuleName))
+				continue;
+			    for (icon = 0; icon < numvolumes; icon++)
+			    {
+#ifdef NOSPECIALFIELDS
+				sprintf(RootName, FS "::%s", volumenames[icon]);
+#else
+				sprintf(RootName, FS "#%s::%s", transportnames[icon], volumenames[icon]);
+#endif
+				strcpy((char *) &ev.data.msg.data.words[2], RootName);
+				ev.data.msg.hdr.size = sizeof(wimp_msghdr) + sizeof(int) * 2 + (strlen(RootName) & ~3) +4;
+				ev.data.msg.hdr.your_ref = 0;
+				ev.data.msg.hdr.action = wimp_FilerCloseDir;
+				ev.data.msg.data.words[0] = FilingSystemNumber;
+				ev.data.msg.data.words[1] = 0;
+				err = wimp_sendmessage(wimp_ESEND, &ev.data.msg, (wimp_t) filertaskhandle);
+				if (err)
+				    goto error;
+			    }
+#ifdef HASIMPORTMENU
+			    for (icon = 0; icon < importmenusize; icon++)
+			    {
+				sprintf(RootName, FS "#%s::ALL", importmenuitem[icon].data.indirecttext.buffer);
+				strcpy((char *) &ev.data.msg.data.words[2], RootName);
+				ev.data.msg.hdr.size = sizeof(wimp_msghdr) + sizeof(int) * 2 + (strlen(RootName) & ~3) +4;
+				ev.data.msg.hdr.your_ref = 0;
+				ev.data.msg.hdr.action = wimp_FilerCloseDir;
+				ev.data.msg.data.words[0] = FilingSystemNumber;
+				ev.data.msg.data.words[1] = 0;
+				err = wimp_sendmessage(wimp_ESEND, &ev.data.msg, (wimp_t) filertaskhandle);
+				if (err)
+				    goto error;
+			    }
+#endif
+			    doquit = 1;
+			}
+#endif
+		}
+		if (m.bbits & wimp_BRIGHT)
+		    switch (lastmenu)	/* P:0 */
+		{
+#ifdef HASEXPORTWINDOW
+		      case EXPORTMENU:
+			goto crexportmenu;
+#endif
+		      case BARMENU:
+			goto crmenu;	/* P:0 */
+		}
+#ifdef HASIMPORTMENU
+		freeimportmenu();
+		freedetailmenu();
+#endif
+		continue;
+		if ((m.bbits & wimp_BRIGHT) && current_menu)
+		{
+		    err = wimp_create_menu(current_menu, ev.data.but.m.x - 64, 96 + BARMENUDEPTH * 44);
+		}
+		break;
+	    }
+	  case wimp_ESEND:
+	  case wimp_ESENDWANTACK:	/* P:908 */
+	    switch (ev.data.msg.hdr.action)	/* P:470 */
+	    {
+	      case wimp_MCLOSEDOWN:	/* P:0 */
+		break;
+#ifdef HASEXPORTWINDOW
+	      case wimp_MDATASAVEOK:
+		{
+		    char *p = strrchr(ev.data.msg.data.datasaveok.name, '.');
+		    char buf[256];
+		    if (!p || strcmp(p, ".DragMe!"))
+			continue;
+		    *p = 0;
+		    sprintf(buf, "Export %s %s",
+			dragtemplate->i[7].data.indirecttext.buffer,
+			    ev.data.msg.data.datasaveok.name);
+		    if (_kernel_ERROR == _kernel_oscli(buf))
+			wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+		    if (dragbutton & wimp_BLEFT)
+			wimp_create_menu((wimp_menustr *) - 1, 0, 0);
+		}
+		continue;
+#endif
+	      case wimp_MDATASAVE:	/* P:0 */
+#ifdef HASEXPORTWINDOW
+		if (ev.data.msg.data.dataload.w == exportwindow)
+		{
+		    continue;	/* Ignore app saving into
+				 * exportwindow */
+		}
+#endif
+		if (ev.data.msg.data.dataload.w != -2)
+		    continue;	/* P:0 */
+		for (icon = 0; icon < numvolumes; icon++)	/* P:0 */
+		    if (ev.data.msg.data.datasave.i == volumeicons[icon])	/* P:0 */
+			break;	/* P:0 */
+#ifndef SHOWDISCS
+		if (icon < 0)
+		    continue;
+#endif
+#ifdef NOSPECIALFIELDS
+		sprintf(ev.data.msg.data.datasaveok.name, FS "::%s.$.%s", volumenames[icon], sstr(ev.data.msg.data.datasaveok.name));
+#else
+		sprintf(ev.data.msg.data.datasaveok.name, FS "#%s::%s.$.%s", transportnames[icon], volumenames[icon], sstr(ev.data.msg.data.datasaveok.name));
+#endif
+		ev.data.msg.hdr.size = (strlen(ev.data.msg.data.datasaveok.name) | 3) + 1 + 44;
+		ev.data.msg.hdr.your_ref = ev.data.msg.hdr.my_ref;
+		ev.data.msg.hdr.action = wimp_MDATASAVEOK;
+		wimp_sendmessage(wimp_ESEND, &ev.data.msg, ev.data.msg.hdr.task);
+		maydataload = 1;/* flag to bounce next dataload */
+		goto pol;
+	      case wimp_MDATALOAD:	/* P:0 */
+		if (maydataload)
+		{
+		    ev.data.msg.hdr.your_ref = ev.data.msg.hdr.my_ref;	/* P:0 */
+		    ev.data.msg.hdr.action = wimp_MDATALOADOK;
+		    wimp_sendmessage(wimp_ESEND, &ev.data.msg, ev.data.msg.hdr.task);
+		    maydataload = 0;
+		    continue;
+		}
+#ifdef HASEXPORTWINDOW
+		if (ev.data.msg.data.dataload.w == exportwindow || ev.data.msg.data.dataload.w == -2)
+		{
+#if 1
+		    char buf[256];
+		    sprintf(buf, "Export %s", sstr(ev.data.msg.data.dataload.name));
+		    if (_kernel_ERROR == _kernel_oscli(buf))
+			wimp_reporterror((os_error *) _kernel_last_oserror(), 0, ModuleName);
+#else
+		    char *p, *q, *n = sstr(ev.data.msg.data.dataload.name);
+		    char *b = FS "#local::ALL.$.";
+		    int k = strlen(b);
+		    p = strrchr(n, '.');
+		    q = strrchr(n, ':');
+		    if (q && (!p || p < q))
+			p = q;
+		    if (p == n + k - 1 && !strnicmp(b, n, k))
+		    {
+			exporttemplate->i[0].data.indirecttext.buffer[0] = 0;
+			strcpy(exporttemplate->i[2].data.indirecttext.buffer, p ? p + 1 : "");
+			strcpy(exporttemplate->i[6].data.indirecttext.buffer, "UnExport");
+		    }
+		    else
+		    {
+			strcpy(exporttemplate->i[0].data.indirecttext.buffer,
+			       ev.data.msg.data.dataload.name);
+			strcpy(exporttemplate->i[2].data.indirecttext.buffer, p ? p + 1 : "");
+			strcpy(exporttemplate->i[6].data.indirecttext.buffer, "Export");
+		    }
+		    wimp_set_icon_state(exportwindow, 0, 0, 0);
+		    wimp_set_icon_state(exportwindow, 2, 0, 0);
+		    wimp_set_icon_state(exportwindow, 6, 0, 0);
+#endif
+		    ev.data.msg.hdr.your_ref = ev.data.msg.hdr.my_ref;
+		    ev.data.msg.hdr.action = wimp_MDATALOADOK;
+		    wimp_sendmessage(wimp_ESEND, &ev.data.msg, ev.data.msg.hdr.task);
+		    if (ev.data.msg.data.dataload.w == -2)
+		    {
+			err = showexport(exportwindow);
+			if (err)
+			    goto error;
+		    }
+		}
+#endif
+		continue;
+
+	      case wimp_MDATAOPEN:	/* P:29 */
+#ifndef SHOWDISCS
+		if (!strnicmp(sstr(ev.data.msg.data.dataopen.name), FS, strlen(FS)))
+		{
+		    char *p = strchr(ev.data.msg.data.dataopen.name, ':');
+		    int k;
+		    if (!p)
+			continue;
+		    if (strnicmp(p, "::ALL.$.", 8) || p[8] == '!' || strchr(p + 8, '.'))
+			continue;
+		    if (_swix(OS_File, _INR(0, 1) | _OUT(0), 5, ev.data.msg.data.dataopen.name, &k) ||
+			k != 2)
+			continue;
+		    ev.data.msg.hdr.your_ref = ev.data.msg.hdr.my_ref;
+		    ev.data.msg.hdr.action = wimp_MDATALOADOK;
+		    wimp_sendmessage(wimp_ESEND, &ev.data.msg, ev.data.msg.hdr.task);
+		    memmove(p + 2, p + 8, strlen(p + 8) + 1);
+		    p = strchr(p, '.');
+		    if (!p)
+			p = ev.data.msg.data.dataopen.name + strlen(ev.data.msg.data.dataopen.name);
+		    memmove(p + 2, p, strlen(p) + 1);
+		    memcpy(p, ".$", 2);
+		    strcpy(RootName, ev.data.msg.data.dataopen.name);
+		    err = doopendir(&ev.data.msg, RootName);
+		    if (err)
+			goto error;
+		}
+#else
+		if (ev.data.msg.data.dataopen.type == FILETYPE_DISCS || ev.data.msg.data.dataopen.type == FILETYPE_DISCSP)	/* P:29 */
+		{
+		    char *p = strrchr(ev.data.msg.data.dataopen.name, '.');	/* P:0 */
+		    ev.data.msg.hdr.your_ref = ev.data.msg.hdr.my_ref;
+		    ev.data.msg.hdr.action = wimp_MDATALOADOK;
+		    wimp_sendmessage(wimp_ESEND, &ev.data.msg, ev.data.msg.hdr.task);
+		    if (p)
+		    {
+#ifdef AUTOOPEN
+			goto dobutton;
+#endif
+			icon = addvolume(p + 1);	/* P:0 */
+		    }
+		}
+#endif
+		continue;
+#ifdef SHOWDISCS
+	      case wimp_SAVEDESK:	/* P:0 */
+		{
+		    int fh = ev.data.msg.data.savedesk.filehandle;
+		    int i;
+		    for (i = 0; i < numvolumes; i++)	/* P:0 */
+		    {
+			char buf[256];	/* P:0 */
+			sprintf(buf, "ShareFSIcon %s\n", volumenames[i]);
+			_swix(OS_GBPB, _INR(0, 3), 2, fh, buf, strlen(buf));
+		    }
+		}
+		continue;
+#endif
+	      case wimp_MMENUWARN:	/* P:0 */
+#ifdef ACCESSPLUS
+		if (ev.data.msg.data.words[0] == 28)
+		{
+		    buildlogoffmenu();
+		    wimp_create_submenu((wimp_menustr *) logoffmenu,
+					ev.data.msg.data.words[1], ev.data.msg.data.words[2]);
+		    continue;
+		}
+		if (ev.data.msg.data.words[0] == 29)
+		{
+		    buildshowlmenu();
+		    wimp_create_submenu((wimp_menustr *) showlmenu,
+					ev.data.msg.data.words[1], ev.data.msg.data.words[2]);
+		    continue;
+		}
+#endif
+#ifdef HASIMPORTMENU
+		if (ev.data.msg.data.words[0] == 53)
+		{
+		    buildimportmenu();
+		    wimp_create_submenu((wimp_menustr *) importmenu,
+					ev.data.msg.data.words[1], ev.data.msg.data.words[2]);
+		    continue;
+		}
+		else
+		if (lastmenu == BARMENU && ev.data.msg.data.words[0] < 0x200)
+		{
+		    builddetailmenu(ev.data.msg.data.words[0] & 255);
+		    wimp_create_submenu((wimp_menustr *) detailmenu,
+					ev.data.msg.data.words[1], ev.data.msg.data.words[2]);
+		    continue;
+		}
+#endif
+#ifdef HASTRANSPORTMENU
+		{
+		    wimp_menustr *m;
+		    lasttransportmenu = ev.data.msg.data.words[0];
+		    err = (os_error *) _swix(lasttransportmenu, _INR(0, 1) | _OUT(1), 0, 0, &m);
+		    if (err)
+			wimp_reporterror(err, 0, ModuleName);
+		    else
+			wimp_create_submenu(m,
+					    ev.data.msg.data.words[1], ev.data.msg.data.words[2]);
+		}
+#endif
+		continue;
+	      case wimp_MHELPREQUEST:	/* P:0 */
+		{
+		    char tagbuf[20], *tag = tagbuf;
+		    char *p = "xxx";
+		    char pbuf[30];
+		    wimp_w w = ev.data.msg.data.helprequest.m.w;
+		    wimp_i i = ev.data.msg.data.helprequest.m.i;
+		    char *wind =
+#ifdef HASINFOWINDOW
+		    w == infowindow ? "i" :
+#endif
+#ifdef HASEXPORTWINDOW
+		    w == exportwindow ? "e" :
+		    w == optionswindow ? "o" :
+		    w == dragwindow ? "d" :
+#endif
+#ifdef HASABOUTMENU
+		    w == aboutwindow ? "a" :
+#endif
+#ifdef ACCESSPLUS
+		    w == logonwindow ? "l" :
+#endif
+		    0;
+		    if (wind)
+			sprintf(tag, i >= 0 ? "%s%x" : "%sb", wind, i);
+		    else
+		    if (w == -2)/* P:0 */
+		    {
+			int ic;	/* P:0 */
+			tag = "nbarhelp";
+			for (ic = 0; ic < numvolumes; ic++)	/* P:0 */
+			{
+			    if (volumeicons[ic] == i)	/* P:0 */
+			    {
+				p = volumenames[ic];	/* P:0 */
+#ifdef SHOWDISCS
+				tag = volumetypes[ic] ? "barhelp" : "xbarhelp";
+#else
+				tag = "barhelp";
+#endif
+				break;
+			    }
+			}
+		    }
+		    else
+		    {
+			int buf[10];	/* P:0 */
+			if (_swix(Wimp_GetMenuState, _INR(0, 3), 1, &buf, w, i))
+			    tag = "unrecog";	/* P:0 */
+			else
+			{
+			    char *p;	/* P:0 */
+			    int *i;
+			    strcpy(tag, lastmenu == BARMENU ? "mb" : "me");
+			    p = tag + strlen(tag);
+			    for (i = buf; *i != -1; i++)	/* P:0 */
+				*p++ = *i < 10 ? *i + '0' : *i + ('A' - 10);	/* P:0 */
+			    *p++ = 0;
+#ifdef ACCESSPLUS
+			    if ((lastmenu == BARMENU) && (*buf == 4) && (*(buf + 1) != -1)
+				&& (*(buf + 2) != -1))
+			    {	/* 27/7/94 gw */
+				tag = (*(buf + 1) == 1) ? "mblgof" : "mbshow";
+			    }
+#endif
+			}
+			if (numvolumes)
+			    p = volumenames[icon];	/* P:0 */
+			else
+			    p = lookup("animp", pbuf, sizeof(pbuf));	/* P:0 */
+		    }
+		    lookup(tag, ev.data.msg.data.helpreply.text, sizeof(ev.data.msg.data.helpreply.text),
+			   p);
+		    ev.data.msg.hdr.size = sizeof(wimp_msghdr) + (strlen(ev.data.msg.data.helpreply.text) | 3) + 1;
+		    ev.data.msg.hdr.your_ref = ev.data.msg.hdr.my_ref;
+		    ev.data.msg.hdr.action = wimp_MHELPREPLY;
+		    wimp_sendmessage(wimp_ESEND, &ev.data.msg, ev.data.msg.hdr.task);
+		    continue;
+		}
+
+	      default:		/* P:441 */
+		continue;
+	    }
+	    break;
+
+	  default:		/* P:0 */
+	    continue;
+	}
+	break;
+    }
+    freestuff();
+    return 0;			/* P:0 */
+
+  error:			/* P:0 */
+    freestuff();
+    wimp_reporterror(err, 0, ModuleName);
+    return (int) err;		/* P:0 */
+}
+
+#ifndef NOTMODULE
+char ModuleName[] = FS "FSFiler";
+
+void module_finalise(void)
+{
+    filer_clear();
+    lookup_clear();
+#ifdef DEBUG
+    rfreeall();
+#endif
+}
+
+error *module_initialise(char *cmd_tail, int podule_base, void *privw)
+{
+    int templates;
+
+    private_word = privw;
+    cmd_tail = cmd_tail;
+    podule_base = podule_base;
+    atexit(module_finalise);
+    lookup_init("RemoteFS:Messages");
+    return filer_init(&templates);
+}
+
+void module_service(int service_number, regs * r, void *private_word)
+{
+    service_number = service_number;
+    private_word = private_word;
+    filer_service(r);
+}
+
+error *module_command(char *s, int argc, int cmd_no, void *privw)
+{
+    char buf[256];
+    char *t;
+    char *argv[20];
+    int c, f, b;
+    argc = argc;
+    privw = privw;
+    for (c = 1, f = 0, t = buf; t < buf + sizeof(buf) && (b = *s++) >= ' ';)
+    {
+	if (f)
+	    *t++ = (b == ' ') ? f = 0 : b;
+	else
+	if (b != ' ')
+	    argv[c++] = t, *t++ = b, f = 1;
+    }
+    *t = 0;
+#ifdef DEBUG
+    if (argc >= 2 && !strnicmp(argv[1], "rallocDEBUG ", 10))
+    {
+	rallocdebug = atoi(argv[2]);
+	return NULL;
+    }
+    else
+    if (argc >= 1 && !strnicmp(argv[1], "rcheckall", 9))
+    {
+	rcheckall();
+	return NULL;
+    }
+#endif
+#ifdef PROFILING
+    else
+    if (argc >= 2 && !stricmp(argv[1], "mapstore"))
+    {
+	_fmapstore(argv[2]);
+	return 0;
+    }
+#endif
+    return filer_command(cmd_no, argc, argv);
+}
+
+error *fs_receive(int c, char *p, int n)	/**/
+{
+     return _swix(RemoteFS_Receive, _INR(0, 3), p, n, 0, c);
+}
+
+#endif
+
+/* EOF filer.c */

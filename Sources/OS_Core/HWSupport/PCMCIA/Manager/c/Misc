@@ -1,0 +1,304 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Misc.c                                                                           ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA_Support Code Module                                        ***/
+/***  Version:       0.001                                                             ***/
+/***                                                                                   ***/
+/***  By:            Neil Critchell, Acorn Computers Ltd.                              ***/
+/***  Date:          6th August 1993                                                   ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains various misc routines, which are part of the main        ***/
+/***                 code.                                                             ***/
+/***                                                                                   ***/
+/***  NOTE:          This code contains statics                                        ***/
+/***                                                                                   ***/
+/***  History:       0.01 6th August 1993 - Original version                           ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Routines:-                                                                       ***/
+/***    CopyTempIntoCardDrive()                                                        ***/
+/***    ScanCardsToDrive()                                                             ***/
+/***    ScanCardsToUnDrive()                                                           ***/
+/***    ClaimRMAWorkspace()                                                            ***/
+/***    ReleaseRMAWorkspace()                                                          ***/
+/***    LowLevelFormat()                                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Misc.h"
+#include "Variables.h"
+#include "Driver.h"
+#include "Cis.h"
+#include "Error.h"
+
+#include "Debug.h"
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  CopyTempIntoCardDrive(start drive)                                               ***/
+/***                                                                                   ***/
+/***  Copies the temp card drive into a permanent one.                                 ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    Carddrive allocated, or -1 if no free carddrives.                              ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+int CopyTempIntoCardDrive(int StartDrive)
+    {
+    int                         loop;
+    int                         EndDrive;
+
+    if(StartDrive == MEM_CARDDRIVE) EndDrive = IO_CARDDRIVE;
+    else EndDrive = MAX_CARDDRIVES; /** Set the range **/
+
+    for(loop = 0;((CardDrive[loop].HardwareDriver != -1) && (loop < EndDrive)); loop++);
+    if(CardDrive[loop].HardwareDriver != -1) return(-1);
+
+    CardDrive[loop] = CardDrive[TempCardDrive];
+    #if Debug == TRUE
+        DebugMessage("mK","Copied the temp card drive into drive %d\n",loop);
+    #endif
+
+    return(loop);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  ScanCardsToDrive(driver number)                                                  ***/
+/***                                                                                   ***/
+/***  Scans through the hardware slots to see whether the inserted cards already have  ***/
+/***  a PCCard driver associated with them. If not, the newly-installed driver is      ***/
+/***  given a chance to take control of the card.                                      ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    void                                                                           ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+void ScanCardsToDrive(int driver_number)
+    {
+    char                        loop = 0;
+    int                         driver;
+    char                        copyloop;
+
+    #if Debug == TRUE
+        DebugMessage("mK","Entered 'ScanCardsToDrive'\n");
+    #endif
+
+    /* Find the _slots_ that use the SRAM driver */
+    for(loop = 0; loop < (IO_CARDDRIVE - MEM_CARDDRIVE); loop++) { /** Go through all mem carddrives **/
+        #if Debug == TRUE
+            DebugMessage("mK","Scanning carddrive %d - ", loop);
+            DebugMessage("mK","Max PCCard driver is %d\n", MAX_PCCARD_DRIVERS);
+        #endif
+        if((CardDrive[loop].Status != PARTITION_STATUS__DRIVEEMPTY) && (CardDrive[loop].PCCardDriver == MAX_PCCARD_DRIVERS)) {
+            /** Well, there's something there, and it uses the SRAM driver... **/
+            #if Debug == TRUE
+                DebugMessage("mK","    Identifying carddrive %d\n", loop);
+            #endif
+            driver = IdentifyCard(loop);
+            if(driver != -1) { /** Anybody recognise it??? **/
+                /** Whoo we've id'd it **/
+                /**Right, lets tell all the carddrives (including me!).... */
+                for(copyloop = loop; copyloop < (IO_CARDDRIVE - MEM_CARDDRIVE); copyloop++) {
+                    if((CardDrive[loop].HardwareDriver == CardDrive[copyloop].HardwareDriver)
+                        && (CardDrive[loop].SlotHandle == CardDrive[copyloop].SlotHandle))
+                            CardDrive[copyloop].PCCardDriver = driver;
+                            /** Also, link the irqs to this slot if reqd **/
+                }
+            }
+        }
+    }/* go try the next carddrive until all exhausted */
+}
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  IdentifyCard(carddrive)                                                          ***/
+/***                                                                                   ***/
+/***  Reads the level1 and level2 tuples off the specified carddrive, and queries the  ***/
+/***  PCCard drivers to see whether they wish to handle the card. If so, it returns the***/
+/***  driver number of the requesting driver.                                          ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCCard driver index if successful identification                               ***/
+/***    -1 if not successfully identified                                              ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+int IdentifyCard(int card_drive)
+    {
+    PCMCIAManager_ErrorCode             error;
+    DRIVER_REGISTERS                    driver_regs;
+    DRIVER_REGISTERS                    hw_regs;
+    _kernel_swi_regs                    kernregs;
+    int                                 loop = 0;
+    char                                tempbuff1[257];
+    char                                tempbuff2[257];
+
+
+    /*** So, give it a whirl ***/
+    SetUpHWDriver_CallRegs(CardDrive[card_drive].HardwareDriver, &hw_regs);
+    /* save (stack) its state */
+/*    HardwareFunction(HARDWARE_FUNCTION__SAVE_SLOT_STATE, &hw_regs, &DRV_Error); */
+    /* read the tuples _DIRECT_ off the card */
+    #if Debug == TRUE
+        DebugMessage("mK","Going to find the level one and level two tuples from DeviceIdentify.\n");
+    #endif
+    kernregs.r[0] = 5;              /* Find tuple for level1 info */
+    kernregs.r[1] = card_drive; /* Indicates the carddrive */
+    kernregs.r[2] = 0;          /* Read direct from the card */
+    kernregs.r[3] = 0xffff;     /* dummy value - the CIS will finish before this! Damn well best do! */
+    kernregs.r[4] = 0;
+    kernregs.r[5] = CISTPL_VERS_1;
+    kernregs.r[6] = 1;          /* Find 1st occurence */
+    error = Cis_FindTuple(&kernregs);
+    if(error == NO_ERROR) {
+        #if Debug == TRUE
+            DebugMessage("mK","found the level 1 tuple....");
+        #endif
+        kernregs.r[0] = 3;
+        kernregs.r[7] = (int)tempbuff1;
+        error = Cis_ReadTuple(&kernregs);
+        if(error != NO_ERROR) tempbuff1[0] = 0; /* pretend we never found the tuple */
+    }
+    kernregs.r[0] = 5;              /* Find tuple for level2 info */
+    kernregs.r[1] = card_drive;  /* Indicates the carddrive */
+    kernregs.r[2] = 0;
+    kernregs.r[3] = 0xffff;      /* dummy value - the CIS will finish before this! */
+    kernregs.r[4] = 0;
+    kernregs.r[5] = CISTPL_VERS_2;
+    kernregs.r[6] = 1;
+    error = Cis_FindTuple(&kernregs);
+    if(error == NO_ERROR) {
+        #if Debug == TRUE
+            DebugMessage("mK","found the level 2 tuple....");
+        #endif
+        kernregs.r[0] = 3;
+        kernregs.r[7] = (int)tempbuff2;
+        error = Cis_ReadTuple(&kernregs);
+        if(error != NO_ERROR) tempbuff2[0] = 0; /* pretend we never found the tuple */
+    }
+
+    /* Call the identify function for each PCCard driver in turn, until we get a 'yay'*/
+    do {
+        SetUpPCCDriver_CallRegs(card_drive, &driver_regs);
+        driver_regs.r[0] = PCCARD_FUNCTION__IDENTIFY;   /* Identify reason code */
+        driver_regs.r[1] = CardDrive[card_drive].SlotHandle;
+        driver_regs.r[2] = (int)(&(HardwareDriver[CardDrive[card_drive].HardwareDriver].NumberOfSlots));
+        driver_regs.r[5] = (int)tempbuff1;
+        driver_regs.r[6] = (int)tempbuff2;
+        #if Debug == TRUE
+            DebugMessage("mK","Gonna call driver %d from identifycard\n", loop);
+        #endif
+        if(PCCardDriver[loop].FunctionAddress != 0) {
+            PCCardFunction(PCCardDriver[loop].FunctionAddress, PCCardDriver[loop].R12Value, &driver_regs, &DRV_Error);
+        }
+        loop++;
+    } while((driver_regs.r[0] == 0) && loop < MAX_PCCARD_DRIVERS);
+
+    /** Restore the original state **/
+/*    HardwareFunction(HARDWARE_FUNCTION__RESTORE_SLOT_STATE, &hw_regs, &DRV_Error);  */
+
+    /* if it was an ident, call initialise */
+    if(driver_regs.r[0] != 0) {
+        loop--;   /** Compensates for the last loop++ **/
+        #if Debug == TRUE
+            DebugMessage("mK","Good golly, you know this card! (said the support code, suprisedly)\n");
+        #endif
+
+        driver_regs.r[0] = PCCARD_FUNCTION__INITIALISE; /* Initialise Reason code */
+        driver_regs.r[1] = CardDrive[card_drive].SlotHandle;
+        driver_regs.r[2] = (int)(&(HardwareDriver[CardDrive[card_drive].HardwareDriver].NumberOfSlots));
+        PCCardFunction(PCCardDriver[loop].FunctionAddress, PCCardDriver[loop].R12Value, &driver_regs, &DRV_Error);
+        /** Be aware that this could leave the card in any old state... **/
+        return(loop);
+    }
+    else return(-1);
+}
+
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  ScanCardsToUnDrive(driver number)                                                ***/
+/***                                                                                   ***/
+/***  Scans through the currently inserted cards to see which ones use the specified   ***/
+/***  driver. As this driver is to be deregistered, these cards are changed to use the ***/
+/***  standard SRAM driver instead.                                                    ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    void                                                                           ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+void ScanCardsToUnDrive(int driver_number)
+    {
+    char                loop;
+
+    for(loop=0; loop < MAX_CARDDRIVES; loop++) if(CardDrive[loop].PCCardDriver == driver_number) CardDrive[loop].PCCardDriver = MAX_PCCARD_DRIVERS;
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  ClaimRMAWorkspace(size)                                                          ***/
+/***                                                                                   ***/
+/***  Claims RMA memory. The amount of memory to be claimed is passed in 'size' which  ***/
+/***  is in bytes.                                                                     ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    MEMORY_PTR, pointing to start of allocated RMA memory if successful.           ***/
+/***    MEMORY_PTR = NULL if failed for undefined reasons.                             ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+MEMORY_PTR ClaimRMAWorkspace(int size)
+    {
+    _kernel_swi_regs inregs;
+
+    inregs.r[0] = CLAIM_RMA_SPACE;
+    inregs.r[3] = size;
+    if (_kernel_swi(OS_Module, &inregs, &inregs) == NULL) return((MEMORY_PTR) inregs.r[2]);
+    else return(NULL);
+}
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  ReleaseRMAWorkspace(memory)                                                      ***/
+/***                                                                                   ***/
+/***  Releases previously claimed RMA area. The routine is passed the address of the   ***/
+/***  memory, which in turn is used to release the allocated RMA space.                ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    TRUE, if function sucessful.                                                   ***/
+/***    FALSE, if failed.                                                              ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+BOOL ReleaseRMAWorkspace(MEMORY_PTR memory_address)
+    {
+    _kernel_swi_regs inregs;
+
+    inregs.r[0] = FREE_RMA_SPACE;
+    inregs.r[2] = (int) memory_address;
+    if (_kernel_swi(OS_Module, &inregs, &inregs) == NULL) return(TRUE);
+    else return(FALSE);
+}

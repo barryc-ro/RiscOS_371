@@ -1,0 +1,523 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/* Title: c.xfersend
+ * Purpose: generalised data transfer to a concurrent wimp program.
+ * History: IDJ: 07-Feb-92: prepared for source release 
+ *          SJM: 12-Mar-92: fixed PrintFile entry in unknown handler to get around problem
+ *                          of name field not being set up.
+ *                          added use of dragasprite and pointer change to hand.
+ */
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "os.h"
+#include "bbc.h"
+#include "wimpx.h"
+#include "wimpt.h"
+#include "win.h"
+#include "xfersend.h"
+#include "fileicon.h"
+#include "werr.h"
+#include "menu.h"
+#include "event.h"
+#include "msgs.h"
+#include "strfn.h"
+
+#define SELECTION   msgs_lookup("selection:Selection")
+
+static int rcvbufsize ;
+static int xfersend__msgid = 0;           /* my_ref of last DataSave message */
+static xfersend_saveproc xfersend__saveproc;
+static xfersend_sendproc xfersend__sendproc;
+static xfersend_printproc xfersend__printproc;
+static int xfersend__filetype;
+static void *xfersend__savehandle;
+static int xfersend__estsize = 0;
+static wimp_t xfersend__receiver = 0 ;
+static BOOL xfersend__fileissafe ;
+static char *xfersend__filename = NULL;
+
+static wimp_msgstr xfersend__msg;
+
+
+static BOOL xfersend__close = FALSE;
+static wimp_w xfersend__w;
+
+static BOOL xfersend_dragsprite_used = FALSE;
+
+#define OS_File 8
+
+#define DragASprite_Start       0x42400
+#define DragASprite_Stop        0x42401
+
+void xfersend_close_on_xfer(BOOL do_we_close, wimp_w w)
+{  
+   xfersend__close = do_we_close;
+   xfersend__w = w;
+}
+
+static void xfersend__winclose(void)
+{  
+   wimp_eventdata e;
+   e.o.w = xfersend__w;
+   wimpt_noerr(wimp_sendwmessage(wimp_ECLOSE, (wimp_msgstr*) &e, e.o.w, -1));
+}
+
+static void setup_datasave(wimp_msgstr *mp)
+{
+    char *dot;
+    mp->hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdatasave);
+    mp->hdr.your_ref = 0;
+    mp->hdr.action = wimp_MDATASAVE;
+    mp->data.datasave.type = xfersend__filetype;
+    mp->data.datasave.estsize = xfersend__estsize;
+    dot = strrchr(xfersend__filename, '.');
+    strcpy(mp->data.datasave.leaf, dot == NULL ? xfersend__filename : dot+1);
+}
+
+static BOOL xfersend__unknowns(wimp_eventstr *e, void *handle)
+{
+   handle = handle ;
+   switch (e->e)
+   { 
+      case wimp_EUSERDRAG:
+       {
+          wimp_mousestr xfersend__mousestr;
+          if (xfersend_dragsprite_used)
+            os_swi0(os_X|DragASprite_Stop);
+
+          wimp_get_point_info(&xfersend__mousestr);
+          if (xfersend__mousestr.w == -1)
+          {
+             /* do nothing */
+          }
+          else
+          {
+             wimp_msgstr msg;
+
+             msg.data.datasave.w = xfersend__mousestr.w;
+             msg.data.datasave.i = xfersend__mousestr.i;
+             msg.data.datasave.x = xfersend__mousestr.x;
+             msg.data.datasave.y = xfersend__mousestr.y;
+             setup_datasave(&msg);
+
+             no_err(wimp_sendwmessage(wimp_ESENDWANTACK, &msg, xfersend__mousestr.w, xfersend__mousestr.i));
+
+             xfersend__msgid = msg.hdr.my_ref; /* filled in by wimp. */
+          }
+       }
+       return TRUE;
+
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+      if (e->data.msg.hdr.your_ref == xfersend__msgid)
+       switch (e->data.msg.hdr.action)
+       {
+          case wimp_MRAMFETCH:
+            if (xfersend__sendproc != 0)
+            {
+               xfersend__fileissafe = FALSE ;
+
+               /* He wants to do an in-core transfer, and we can do this. */
+               /* Note that this can't be other than the first response, as others
+                  are grabbed by sendbuf */
+
+               /* Prepare the reply record. */
+               xfersend__msg = e->data.msg;
+               xfersend__msg.hdr.your_ref = xfersend__msg.hdr.my_ref;
+               xfersend__msg.hdr.action = wimp_MRAMTRANSMIT;
+               xfersend__msg.data.ramtransmit.addr = e->data.msg.data.ramfetch.addr;
+               xfersend__msg.data.ramtransmit.nbyteswritten = 0; /* so far. */
+               rcvbufsize = e->data.msg.data.ramfetch.nbytes;
+
+               xfersend__receiver = e->data.msg.hdr.task ;
+               /* the copy in xfersend__msg.hdr.task is overwritten by the Wimp
+                  message sending */
+
+               if (xfersend__sendproc(xfersend__savehandle, &rcvbufsize))
+               {
+                  /* See sendbuf for all the real work for this case... */
+
+                  /* We may have transferred some data but not yet told the
+                  other end about it. xfersend__msg contains a final RAMTRANSMIT,
+                  which does not quite fill his buffer (or we'd have sent it already)
+                  thus signalling to him that the transfer is over. */
+
+                  wimpt_noerr(wimp_sendmessage
+                  ( wimp_ESEND,
+                    &xfersend__msg,
+                    xfersend__receiver));
+                  if(xfersend__close) xfersend__winclose();
+
+               }
+               else
+               {
+               }
+
+               return TRUE;
+            }
+            break ;
+
+          case wimp_MPrintFile:       /* was dropped on a printer application */
+            if (xfersend__printproc != 0)
+            {
+               int res ;
+               wimp_t xfersend__printer = 0;
+
+               xfersend__fileissafe = FALSE ;
+
+/* This fixes a bug in RO3.00 (and maybe 3.1) */
+               if (strcmp(e->data.msg.data.print.name, xfersend__filename) == 0)
+                  strcpy(e->data.msg.data.print.name, "<Printer$Temp>");
+
+               res = xfersend__printproc(&e->data.msg.data.print.name[0],
+                                             xfersend__savehandle) ;
+
+               xfersend__printer = e->data.msg.hdr.task ;
+               xfersend__msg = e->data.msg;
+               xfersend__msg.hdr.your_ref = xfersend__msg.hdr.my_ref;
+               xfersend__msg.hdr.action =
+                  res >= 0 ? wimp_MDATALOAD : wimp_MWillPrint;
+               xfersend__msg.data.print.type = res ;  /* in case it's been saved */
+               wimpt_noerr(wimp_sendmessage(
+                  wimp_ESEND,
+                  &xfersend__msg,
+                  xfersend__printer));
+               if(xfersend__close && res) xfersend__winclose();
+               return TRUE;
+            }
+            break ;
+
+          case wimp_MDATASAVEOK:
+            win_remove_unknown_event_processor(xfersend__unknowns, 0);
+
+            xfersend__fileissafe = e->data.msg.data.datasaveok.estsize >= 0 ;
+            xfersend__receiver = xfersend__fileissafe ? 0 : e->data.msg.hdr.task ;
+
+            if (xfersend__saveproc != NULL &&
+                xfersend__saveproc(&e->data.msg.data.datasaveok.name[0],
+                                 xfersend__savehandle))
+            {
+
+               xfersend__msg = e->data.msg;
+                                      /* sets hdr.size, data.w,i,x,y, size, name */
+               xfersend__msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+               xfersend__msg.hdr.action = wimp_MDATALOAD;
+               xfersend__msg.data.dataload.type = xfersend__filetype ;
+               wimpt_noerr(wimp_sendmessage(
+                 wimp_ESENDWANTACK,
+                 &xfersend__msg,
+                 e->data.msg.hdr.task));
+               if(xfersend__close) xfersend__winclose();
+            }
+            else
+            {
+               /* he has already reported the error: nothing more to do. */
+            }
+
+            return (xfersend__saveproc == NULL) ? FALSE : TRUE;
+       }
+      return FALSE ;      /* unknown not dealt with */
+
+    case wimp_EACK:
+      if (e->data.msg.hdr.my_ref == xfersend__msgid)
+      {
+        win_remove_unknown_event_processor(xfersend__unknowns, handle);
+        return TRUE;
+      }
+      break;
+   }
+   return FALSE ;
+}
+
+
+static int sendbuf__state ;
+
+
+static BOOL sendbuf__unknowns(wimp_eventstr *e, void *h)
+{
+   h = h ;
+
+   if ((e->e == wimp_ESENDWANTACK || e->e == wimp_ESEND) &&
+       e->data.msg.hdr.your_ref == xfersend__msg.hdr.my_ref &&
+       e->data.msg.hdr.action == wimp_MRAMFETCH)
+   {
+      /* Prepare xfersend__msg as the next RAMTRANSMIT. Most of
+      the fields are already set up. */
+
+      xfersend__msg.data.ramtransmit.addr = e->data.msg.data.ramfetch.addr;
+      xfersend__msg.data.ramtransmit.nbyteswritten = 0;
+      xfersend__msg.hdr.your_ref = e->data.msg.hdr.my_ref ;
+      rcvbufsize = e->data.msg.data.ramfetch.nbytes;
+
+      sendbuf__state = 1 ;
+      return TRUE ;      /* We've had another RAMFETCH: off we go again */
+   }
+
+   if (e->e == wimp_EACK &&
+      e->data.msg.hdr.my_ref == xfersend__msg.hdr.my_ref)
+   {
+      sendbuf__state = 2 ;
+      return TRUE ;/* our message bounced back; give up */
+   }
+
+   return FALSE ;    /* we don't want it */
+}
+
+
+BOOL xfersend_sendbuf(char *buffer, int size)
+{
+   /* Called by his sendproc when sending things in memory. The
+      reply record is in xfersend__msg. */
+    
+   wimpt_noerr(wimp_transferblock(
+        wimpt_task(),
+        buffer,
+        xfersend__receiver,
+        xfersend__msg.data.ramtransmit.addr +
+          xfersend__msg.data.ramtransmit.nbyteswritten,
+        size));
+
+   /* record bytes to be sent to the other end */
+   xfersend__msg.data.ramtransmit.nbyteswritten += size;
+   rcvbufsize -= size ;
+
+   /* if size != 0, there are still bytes to send. */
+
+    if (rcvbufsize > 0) return TRUE;
+
+   /* Tell him that you've done it */
+   wimpt_noerr(wimp_sendmessage(
+        wimp_ESENDWANTACK,
+        &xfersend__msg,
+        xfersend__receiver));
+
+    /* Get his reply. Poll and despatch events until get nack or message */
+
+   sendbuf__state = 0 ;
+
+   win_add_unknown_event_processor(sendbuf__unknowns, 0) ;
+   do { event_process() ; } while (sendbuf__state == 0) ;
+   win_remove_unknown_event_processor(sendbuf__unknowns, 0) ;
+
+    /* This exit happens in the cases where the buffers at each end
+        are of identical size. So, return for another call to sendbuf, or
+        so that the sendbuf procedure can return. */
+
+   return sendbuf__state != 2 ;  /* OK unless state = broken */
+}
+
+static void check_filename(const char *filename)
+{
+    if (filename == NULL)
+         strrplc(&xfersend__filename, SELECTION);
+    else
+         strrplc(&xfersend__filename, filename);
+}
+
+
+BOOL xfersend (int filetype,
+               char *filename,
+               int estsize,
+               xfersend_saveproc saver,
+               xfersend_sendproc sender,
+               xfersend_printproc printer,
+               wimp_eventstr *e,
+               void *handle)
+{  
+   wimp_dragstr dr;
+   wimp_wstate wstate;
+   wimp_icon icon;
+   wimp_w w = e->data.but.m.w;
+   wimp_mousestr mouse_str;
+   int
+      x_limit = bbc_vduvar (bbc_XWindLimit) << bbc_vduvar (bbc_XEigFactor),
+      y_limit = bbc_vduvar (bbc_YWindLimit) << bbc_vduvar (bbc_YEigFactor),
+      screen_x0, screen_y0,
+      mouse_x, mouse_y,
+      x0, y0, x1, y1;
+
+   xfersend__saveproc = saver;
+   xfersend__sendproc = sender;
+   xfersend__printproc = printer;
+   xfersend__filetype = filetype;
+   xfersend__estsize = estsize;
+   xfersend__savehandle = handle;
+
+   check_filename(filename);
+
+/* Get pointer position to allow icon to be dragged partially off-screen */
+   wimp_get_point_info (&mouse_str);
+   mouse_x = mouse_str.x;
+   mouse_y = mouse_str.y;
+
+/* Find screen origin */
+   wimp_get_wind_state (w, &wstate);
+   screen_x0 = wstate.o.box.x0 - wstate.o.x;
+   screen_y0 = wstate.o.box.y1 - wstate.o.y;
+
+/* Get initial icon position */
+   wimp_get_icon_info (w, e->data.but.m.i, &icon);
+   x0 = screen_x0 + icon.box.x0;
+   y0 = screen_y0 + icon.box.y0;
+   x1 = screen_x0 + icon.box.x1;
+   y1 = screen_y0 + icon.box.y1;
+
+/* Set up drag */
+   dr.window    = w; /*not relevant*/
+   dr.type      = wimp_USER_FIXED;
+   dr.box.x0    = x0;
+   dr.box.y0    = y0;
+   dr.box.x1    = x1;
+   dr.box.y1    = y1;
+
+   {                         
+      int r1 = 28, r2;
+      os_byte(161, &r1, &r2);
+      if (r2 & 2 && (icon.flags & (wimp_ISPRITE|wimp_ITEXT)) == wimp_ISPRITE)
+      {
+         xfersend_dragsprite_used = TRUE;
+         os_swi4(DragASprite_Start, 0xC5,
+                icon.flags & wimp_INDIRECT ? (int)icon.data.indirectsprite.spritearea : 1,
+                icon.flags & wimp_INDIRECT ? (int)icon.data.indirectsprite.name : (int)icon.data.sprite_name,
+                (int) &dr.box);                        
+      }
+      else
+      {
+         xfersend_dragsprite_used = FALSE;
+         dr.parent.x0 = x0 - mouse_x; /*Expanded parent by box overlap*/
+         dr.parent.y0 = y0 - mouse_y;
+         dr.parent.x1 = x1 - mouse_x + x_limit;
+         dr.parent.y1 = y1 - mouse_y + y_limit;
+         wimp_drag_box (&dr);
+      }
+   }
+
+   win_add_unknown_event_processor (xfersend__unknowns, NULL);
+   return TRUE;
+}
+
+
+BOOL xfersend_pipe(int filetype, 
+                   char *filename, 
+                   int estsize,
+                   xfersend_saveproc saver,
+                   xfersend_sendproc sender,
+                   xfersend_printproc printer,
+                   void *handle, wimp_t task)
+{
+    wimp_msgstr msg;
+
+    xfersend__saveproc = saver;
+    xfersend__sendproc = sender;
+    xfersend__printproc = printer;
+    xfersend__filetype = filetype;
+    xfersend__estsize = estsize;
+    xfersend__savehandle = handle;
+
+    check_filename(filename);
+
+    memset(&msg, 0, sizeof(msg));
+    setup_datasave(&msg);
+    no_err(wimp_sendmessage(wimp_ESENDWANTACK, &msg, task));
+    xfersend__msgid = msg.hdr.my_ref; /* filled in by wimp. */
+
+    win_add_unknown_event_processor(xfersend__unknowns, 0);
+    return TRUE;
+}
+
+BOOL xfersend_paste(wimp_msgdatasave *datasave,
+        xfersend_saveproc saver,
+        xfersend_sendproc sender,
+        void *handle,
+        int your_ref,
+        wimp_t task)
+{
+    wimp_msgstr msg;
+
+    xfersend__saveproc = saver;
+    xfersend__sendproc = sender;
+    xfersend__printproc = 0;
+    xfersend__filetype = datasave->type;
+    xfersend__estsize = datasave->estsize;
+    xfersend__savehandle = handle;
+
+    check_filename(datasave->leaf);
+
+    msg.hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdatasave);
+    msg.hdr.your_ref = your_ref;
+    msg.hdr.action = wimp_MDATASAVE;
+    msg.data.datasave = *datasave;
+
+    no_err(wimp_sendmessage(wimp_ESENDWANTACK, &msg, task));
+    xfersend__msgid = msg.hdr.my_ref; /* filled in by wimp. */
+
+    win_add_unknown_event_processor(xfersend__unknowns, 0);
+    return TRUE;
+}
+
+BOOL xfersend_file_is_safe(void)
+{  
+   return xfersend__fileissafe;
+}
+
+void xfersend_set_fileissafe(BOOL value)
+{  
+   xfersend__fileissafe = value;
+}
+
+void xfersend_clear_unknowns(void)
+{
+   win_remove_unknown_event_processor(sendbuf__unknowns, 0);
+   win_remove_unknown_event_processor(xfersend__unknowns, 0);
+}
+
+int xfersend_read_last_ref(void)
+{
+   return(xfersend__msgid);        /* my_ref of last DataSave message */
+}
+
+wimp_t xfersend_receiver(void)
+{
+    return xfersend__receiver;
+}
+
+BOOL xfersend_sendfile(void *data, int size, int *maxbuf)
+{
+    int sent = 0;
+
+    do
+    {
+        int tosend = *maxbuf;
+        if (tosend > size)
+            tosend = size;
+        if (!xfersend_sendbuf((char *)data + sent, tosend))
+            break;
+
+        size -= tosend;
+        sent += tosend;
+    }
+    while (size > 0);
+
+    return size == 0;
+}
+
+/* end xfersend.c */

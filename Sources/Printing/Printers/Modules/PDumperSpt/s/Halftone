@@ -1,0 +1,222 @@
+; >Halftone
+; This file does all the halftoning calcs
+; Macros are defined to make it easier to read/edit...
+
+; This macro moves the x,y within a halftone to then next position in the 'same row'
+        MACRO
+        NextRow $x,$y,$halfsize,$rowmove
+        ADD   $x,$x,#1                                     ;increment x
+        CMP   $x,$halfsize                                 ;off the end?
+
+        ASSERT  $x=R2
+        ASSERT  $y=R3
+        ASSERT  $rowmove=R5
+        BLGE    move_the_row
+        MEND
+
+move_the_row
+
+        SUB     R5,R4,R6, LSL #2
+        LDR     R2,[R5,R3,LSL #2]                      ;load x'y'x''y'' (rownext/colnext)
+        MOV     R3,R2,LSR #8                                 ;fetch y'
+        AND     R2,R2,#&FF                                   ;fetch and straighten x'
+        AND     R3,R3,#&FF                                   ;straighten y'
+        STR     R3,[R7,#4]
+        MOV     PC,lr
+
+        MACRO
+        NextRow2 $x,$y,$halfsize,$rowmove
+        ADD   $x,$x,#1                                     ;increment x
+        CMP   $x,$halfsize                                 ;off the end?
+        LDRGE $x,[$rowmove,$y,LSL #2]                      ;load x'y'x''y'' (rownext/colnext)
+        MOVGE $y,$x,LSR #8                                 ;fetch y'
+        ANDGE $x,$x,#&FF                                   ;fetch and straighten x'
+        ANDGE $y,$y,#&FF                                   ;straighten y'
+        MEND
+
+; This macro moves the x,y within a halftone to then next position in the 'same column'
+        MACRO
+        NextColumn $x,$y,$halfsize,$rowmove,$xstart,$ystart
+        MOV   $x,$xstart                                   ;go back to x,y at start of line
+        ADD   $y,$ystart,#1                                ;increment y
+        CMP   $y,$halfsize                                 ;off the end?
+        LDRGE $x,[$rowmove,$x,LSL #2]                      ;load x'y'x''y'' (rownext/colnext)
+        MOVGE $x,$x,LSR #16                                ;fetch x''
+        MOVGE $y,$x,LSR #8                                 ;fetch and straighten y''
+        ANDGE $x,$x,#&FF                                   ;straighten x''
+        MOV   $xstart,$x                                   ;keep for next start of line
+        MOV   $ystart,$y
+        MEND
+
+; This macro is the fundamental halftone comparison
+        MACRO
+        HalfTone $x,$y,$halfsize,$table,$level,$temp
+        MLA   $temp,$halfsize,$y,$x                       ;work out the index (should be quick, all numbers are small)
+        LDRB  $temp,[$table,$temp]                        ;and load the level
+        CMP   $level,$temp                                ;exit HS if dot to be set
+        MEND
+
+; This macro is for colour 'same column' changes (four halftones involved)
+        MACRO
+        ColourNextColumn $x,$y,$halfsize,$table,$rowmove,$HalfInfo,$xstart,$ystart,$ptr
+        ADR   $ptr,$HalfInfo                                ;address the relevant table
+        LDMIA $ptr,{$x,$y,$table,$halfsize,$xstart,$ystart} ;load loads of stuff
+        SUB   $rowmove,$table,$halfsize,LSL #2              ;index to rowend table
+        NextColumn $x,$y,$halfsize,$rowmove,$xstart,$ystart
+        STMIA $ptr,{$x,$y,$table,$halfsize,$xstart,$ystart} ;redundant stores, but what the hell
+        MEND
+
+; This macro is for colour 'same row' changes (four halftones involved), and halftone comparison
+        MACRO
+        ColourHalfTone $pixel,$x,$y,$halfsize,$table,$rowmove,$HalfInfo,$Value,$Bit,$ptr,$level,$temp
+        ADR   $ptr,$HalfInfo                               ;address relevant info
+        LDMIA $ptr,{$x,$y,$table,$halfsize}                ;load it
+
+        ASSERT  $halfsize=R6
+        ASSERT  $table=R4
+        ASSERT  $rowmove=R5
+
+        LDRB  $level,$Value                                ;load the colour level
+        HalfTone $x,$y,$halfsize,$table,$level,$temp       ;halftone it
+        ORRHS $pixel,$pixel,#1 :SHL: $Bit                  ;set bit required
+        NextRow $x,$y,$halfsize,$rowmove                   ;shift halftone on one in row
+        ASSERT $ptr=R7
+        STR   $x,[$ptr]                                 ;and store result
+        MEND
+
+; Halftone goes
+; Size (all halftones are stored square)
+; Rowend data * 4* halfsize
+; (if simple, will be 00000000 00010100 00020200 00030300 etc. same row/column, zap to 0)
+; Halftone pattern (may include repeats!) * halfsize * halfsize
+
+Do_HalftoneColourSprite
+; Halftone a colour sprite with screen-angle rotation...
+; Entry:   R0=columncount
+;          R1=rowcount
+;          R10=sprite
+;          R12,KCMYTable=inverse table (8-bit only)
+;          R12,XXXHalfInfo=info on halftone, suitably initialised (at start of image!!!)
+        STMFD SP!,{R0,R14}                         ;Keep columncount for later
+
+;if 32 bit colour (KCMYTable is 0), jump to new code
+        LDR     R14,KCMYTable
+        CMP     R14,#0
+        LDMEQFD SP!,{R0,R14}
+        BEQ     Do_HalftoneColourSprite32
+
+hc_rowloop
+        LDR   R0,[SP]                              ;Reinstate columncount
+hc_columnloop
+;** Initialise the pixel fetching change within ** for different colour methods
+        LDR   R14,KCMYTable                        ;Relevant inverse table
+        [ fullrgb
+        CMP   R14,#1                               ;Check for harder load
+        LDRHIB  R11,[R10]                            ;Load pixel from sprite
+        LDRHI R11,[R14,R11,LSL #2]                 ;Convert to corrected KCMY
+        BLLS  FullRGB
+        |
+        LDRB  R11,[R10]                            ;Load pixel from sprite
+        LDR   R11,[R14,R11,LSL #2]                 ;Convert to corrected KCMY
+        ]
+        STR   R11,KCMYValues                       ;Easiest if stored and reloaded (R11 reusable now)
+        LDRB  R11,Overlap                          ;Get the overlap flag
+        TEQ   R11,#0                               ;Is it set?
+        BLNE  hc_overlap                           ;Compensate for overlaps
+;**
+hc_colourloop1
+        MOV   R11,#0                               ;Clear the pixel
+;set the relevant bits and move the halftones on a pixel
+        ColourHalfTone R11,R2,R3,R6,R4,R5,KeyHalfInfo,    KeyValue,    3,R7,R9,R14
+        ColourHalfTone R11,R2,R3,R6,R4,R5,CyanHalfInfo,   CyanValue,   2,R7,R9,R14
+        ColourHalfTone R11,R2,R3,R6,R4,R5,MagentaHalfInfo,MagentaValue,1,R7,R9,R14
+        ColourHalfTone R11,R2,R3,R6,R4,R5,YellowHalfInfo, YellowValue, 0,R7,R9,R14
+        TEQ   R11,#2_111          ;Always best to use K
+        MOVEQ R11,#2_1000         ;Instead of C=M=Y
+;You must not set Key and another bit
+        TST   R11,#1 :SHL: 3
+        TSTNE R11,#2_111
+        BLNE  hc_keywithother
+
+        STRB  R11,[R10],#1                         ;Store the result
+        SUBS  R0,R0,#1                             ;Next column
+        BNE   hc_columnloop
+
+;move the halftones down a line
+        ColourNextColumn R2,R3,R6,R4,R5,KeyHalfInfo,    R7,R8,R9
+        ColourNextColumn R2,R3,R6,R4,R5,CyanHalfInfo,   R7,R8,R9
+        ColourNextColumn R2,R3,R6,R4,R5,MagentaHalfInfo,R7,R8,R9
+        ColourNextColumn R2,R3,R6,R4,R5,YellowHalfInfo, R7,R8,R9
+
+        SUBS  R1,R1,#1                             ;Next row
+        BNE   hc_rowloop
+
+        LDMFD SP!,{R0,PC}^
+; All done!
+hc_keywithother
+;        BIC   R11,#2_111            ;Zap the odd bits
+                                     ;Image will be a bit dark UNLESS you
+                                     ;expand the size of the other dots
+        MOVS  PC,R14
+
+hc_overlap
+        TEQ    R11,#1
+        BNE    hc_overlap2
+;1 means that overlap is complete, so we need to add K back onto CMY
+;EXCEPT if C=M=Y (so should keep K for Key halftone)
+        STMFD   SP!,{R0-R3,R14}
+        LDR     R11,KCMYValues
+        MOV     R14,#&FF
+        AND     R0,R14,R11
+        AND     R1,R14,R11,LSR#8
+        AND     R2,R14,R11,LSR#16
+        AND     R3,R14,R11,LSR#24
+        TEQ     R1,R2
+        TEQEQ   R2,R3
+        LDMEQFD SP!,{R0-R3,PC}
+        ADD     R1,R1,R0
+        ADD     R2,R2,R0
+        ADD     R3,R3,R0
+        MOV     R11,R1,LSL#8
+        ADD     R11,R11,R2,LSL#16
+        ADD     R11,R11,R3,LSL#24
+        STR     R11,KCMYValues
+        LDMFD   SP!,{R0-R3,PC}
+hc_overlap2
+        TEQ    R11,#2
+        MOVNE  PC,R14
+;2 means random overlap i.e. compensate by multiplying by 1+k and clamping
+;Note this is an approximation anyway so inaccuaracies will make no difference
+;they will simply shift the error elsewhere!
+        STMFD  SP!,{R0-R2,R14}
+        LDR    R11,KCMYValues
+        MOV    R14,#&FF
+        AND    R0,R14,R11
+        MOV    R2,R0                  ;K stays the same
+        ADD    R0,R0,#&100            ;Being a small amount out won't matter!
+        AND    R1,R14,R11,LSR#8       ;Get component
+        MUL    R1,R0,R1               ;Multiply by (1+K)
+        MOV    R1,R1,LSR#8            ;Get rid of the lower bits
+        CMP    R1,#&FF                ;Clamp into position
+        MOVHI  R1,#&FF                ;Ouch!
+        ADD    R2,R2,R1,LSL#8         ;And add in the result
+        AND    R1,R14,R11,LSR#16
+        MUL    R1,R0,R1
+        MOV    R1,R1,LSR#8
+        CMP    R1,#&FF
+        MOVHI  R1,#&FF
+        ADD    R2,R2,R1,LSL#16
+        AND    R1,R14,R11,LSR#24
+        MUL    R1,R0,R1
+        MOV    R1,R1,LSR#8
+        CMP    R1,#&FF
+        MOVHI  R1,#&FF
+        ADD    R2,R2,R1,LSL#24
+        STR    R2,KCMYValues
+        LDMFD  SP!,{R0-R2,PC}
+
+;this code moved to s.Halftone32
+;Do_HalftoneGreySprite
+
+
+        END

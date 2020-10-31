@@ -1,0 +1,1038 @@
+/*
+ *  c.pcdovervw
+ *
+ *  Routines for handling and viewing
+ *  an Overview Pac 'contact sheet'.
+ *
+ */
+
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "win.h"
+#include "msgs.h"
+#include "help.h"
+#include "template.h"
+#include "werr.h"
+#include "visdelay.h"
+
+
+#include "pcdlib.h"
+
+#include "pcdovervw.h"
+#include "sprparam.h"
+
+
+
+#define  MAX_PATH_LEN  256
+#define  MAX_OVWS      12
+
+
+
+typedef struct
+{
+   BOOL          portrait;
+   PCDbitmapHdl  sprite;
+
+} spr_str;
+
+
+typedef struct
+{
+   char         path[MAX_PATH_LEN];   /* filepath of the Overview Pac */
+   wimp_w       whandle;              /* window handle of the view */
+   PCDoviewHdl  pcdhdl;               /* handle supplied by PhotoCD module */
+   int          numimgs;              /* number of images in Overview Pac */
+   int          columns;              /* current number of columns in view */
+   spr_str     *image;                /* image data */
+
+   BOOL         persist;              /* style of overview (see pcdovervw for details) */
+   ovw_selected_fn func;              /* user-supplied fn for when 'persisting' view is used */
+   void        *data;                 /* user-supplied data value for this function */
+
+   int          selected;             /* set to slide no when 'non-persisting' view is to close */
+
+} ovw_str;
+
+
+static ovw_str  *overviews;
+
+static int     num_ovws;
+
+static int     default_columns = 4;
+
+static wimp_icon  *slide_icons;    /* pointer to the slide icons in the template */
+static int         slide1_xstart;
+static int         slide1_xoffset;
+static int         slide2_xoffsetL;
+static int         slide2_yoffsetL;
+static int         slide2_xoffsetP;
+static int         slide2_yoffsetP;
+static int         slide2_wid;
+static int         slide2_hgt;
+static int         slide3_xoffset;
+static int         slide3_yoffset;
+static int         slide3_wid;
+static int         slide3_hgt;
+
+
+static BOOL     regenerate_thumbs;
+
+static PCDspriteform  modeform;      /* details of the current mode for when generating the thumbnails */
+
+
+PCDpaletteHdl  palettehdl = NULL;    /* always contains a palette suitable for the current screen mode */
+
+
+
+
+/*==========================================================================*/
+/*      Some tool functions                                                 */
+/*==========================================================================*/
+
+
+int  strcmpi(char *s1, char *s2)
+{
+   /*--- case-insensitive string compare ---*/
+
+   while ((*s1 != '\0') && (tolower(*s1) == tolower(*s2)))
+   {
+      s1++;
+      s2++;
+   }
+
+   return (*s1 - *s2);
+}
+
+
+
+/*==========================================================================*/
+/*      Miscellaneous overview functions                                             */
+/*==========================================================================*/
+
+
+/*
+ * overvw_find
+ *
+ * Tests to see whether the given overview
+ * has already been opened.
+ *
+ */
+
+static ovw_str  *overvw_findpath(char *path)
+{
+   int     i;
+
+
+   for (i = 0; i < num_ovws; i++)
+      if ((strcmpi(path, overviews[i].path) == 0) && (overviews[i].whandle != 0))
+         return (&overviews[i]);
+
+   /* a match wasn't found - return NULL */
+   return NULL;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+/*
+ * overvw_findhdl
+ *
+ * Finds the entry with the give window handle.
+ *
+ */
+
+static int  overvw_findhdl(wimp_w w)
+{
+   int     i = 0;
+
+   while(i < MAX_OVWS)
+   {
+      if (overviews[i].whandle == w)
+         return i;
+      i++;
+   }
+
+   return -1;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  overvw_recalc_extent(ovw_str *ovw)
+{
+   wimp_redrawstr   r;
+   int              j;
+
+
+   j = (ovw->numimgs + ovw->columns - 1) / ovw->columns;
+
+   r.w = ovw->whandle;
+   r.box.x0 = 0;
+   r.box.x1 = slide1_xstart + (ovw->numimgs * slide1_xoffset);
+   r.box.y1 = 0;
+   r.box.y0 = -slide1_xstart - (j * slide1_xoffset);
+   wimpt_complain(wimp_set_extent(&r));
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  overvw_redraw(wimp_openstr *o)
+{
+   wimp_redrawstr  r;
+   int             more, n, i,w,x,y;
+   ovw_str        *ovw;
+   wimp_icon      *slide1, *slide2, *slide3;
+   int             rworky0, rworky1;
+   BOOL            thumb_fail = FALSE;
+   BOOL            thumb_some_regenerated = FALSE;
+   static BOOL     thumb_fail_informed = FALSE;
+   BOOL            rt;
+   PCDoviewHdl     pcdh;
+   _kernel_swi_regs  rg;
+
+
+   ovw = &overviews[overvw_findhdl(o->w)];
+
+   w = ovw->columns;
+
+   slide1 = slide_icons;
+   slide2 = slide_icons + 1;
+   slide3 = slide_icons + 2;
+
+   r.w = o->w;
+   wimp_redraw_wind(&r, &more);
+
+   if (!more)
+      return;
+
+
+   visdelay_begin();
+
+   /* set up some stuff that might be required by the redraw */
+   pcdh = ovw->pcdhdl;
+   PCDOsetResolution(pcdh, PCD_BASE_OVER_64);
+
+   rt = regenerate_thumbs;
+
+
+   /*--- do the redraw loop ---*/
+   while (more)
+   {
+      /* calculate Y clip coordinates */
+      rworky0 = r.g.y0 - (r.box.y1 - r.scy);
+      rworky1 = r.g.y1 - (r.box.y1 - r.scy);
+
+      n = 0;
+      y = 0;
+
+      /*--- vertical loop ---*/
+      while (n < ovw->numimgs)
+      {
+         slide1->box.y1 = y - slide1_xstart;
+         slide1->box.y0 = y - slide1_xoffset;
+
+         slide3->box.y1 = y + slide3_yoffset;
+         slide3->box.y0 = slide3->box.y1 + slide3_hgt;
+
+
+         if (rt)
+         {
+            i = n;
+            while ((i < n+w) && (i < ovw->numimgs))
+            {
+               /*--- get rid of old thumbnail sprite ---*/
+               if (ovw->image[i].sprite != 0)
+               {
+                  PCDfreeBitmap(ovw->image[i].sprite);
+                  ovw->image[i].sprite = 0;
+               }
+
+               i++;
+            }
+         }
+
+
+         /* if row of slides is outside redraw graphics window, then skip them */
+         if ((slide1->box.y0 >= rworky1) || (slide1->box.y1 <= rworky0))
+         {
+            y -= slide1_xoffset;
+            n += w;
+            continue;
+         }
+
+         x = 0;
+         i = 0;
+         while ((i < w) && (n < ovw->numimgs))
+         {
+            /*--- plot the slide frame icon ---*/
+            slide1->box.x0 = x + slide1_xstart;
+            slide1->box.x1 = x + slide1_xoffset;
+            wimp_ploticon(slide1);
+
+            /*--- calculate the position for the the slide window icon ---*/
+            if (ovw->image[n].portrait)
+            {
+               slide2->box.x0 = x + slide2_xoffsetP;
+               slide2->box.x1 = slide2->box.x0 + slide2_hgt;
+               slide2->box.y1 = y + slide2_yoffsetP;
+               slide2->box.y0 = slide2->box.y1 - slide2_wid;
+            }
+            else
+            {
+               slide2->box.x0 = x + slide2_xoffsetL;
+               slide2->box.x1 = slide2->box.x0 + slide2_wid;
+               slide2->box.y1 = y + slide2_yoffsetL;
+               slide2->box.y0 = slide2->box.y1 - slide2_hgt;
+            }
+
+            /*--- generate the thumbnail if not already done ---*/
+            if ((ovw->image[n].sprite == 0) && (!thumb_fail))
+            {
+               PCDstatus      err;
+
+               err = PCDOsetSelect(pcdh, n+1);
+               if ((err == NULL) && (modeform.bpp <= 8))
+                  err = PCDOsetPalette(pcdh, palettehdl);
+
+               if (err == NULL)
+                    err = PCDOloadImage(pcdh, &modeform, &ovw->image[n].sprite);
+
+               if (err != NULL)
+               {
+                  ovw->image[n].sprite = 0;
+                  thumb_fail = TRUE;
+               }
+               else
+                  thumb_some_regenerated = TRUE;
+            }
+
+            /*--- plot the thumbnail sprite ---*/
+
+            if (ovw->image[n].sprite != 0)
+            {
+               /* plot it */
+               rg.r[0] = 0x222;    /* put sprite at user coords */
+               rg.r[1] = 42;       /* a non-zero value */
+               rg.r[2] = PCDgetSpritePtr(ovw->image[n].sprite);
+               rg.r[3] = slide2->box.x0 + (r.box.x0 - r.scx);
+               rg.r[4] = slide2->box.y0 + (r.box.y1 - r.scy);
+               rg.r[5] = 0;        /* plot action */
+               _kernel_swi(OS_SpriteOp, &rg, &rg);
+
+               /* clear any text that might be in the icon (ie. "N/A") */
+               slide2->data.indirecttext.buffer[0] = '\0';
+            }
+            else
+            {
+               /* sprite is unavailable - say so */
+               char   *str = msgs_lookup("notavail1:N/A");
+               int     ii;
+
+               ii = slide2->data.indirecttext.bufflen - 1;
+               if (strlen(str) < ii)
+                  ii = strlen(str);
+               memcpy(slide2->data.indirecttext.buffer, str, ii);
+               slide2->data.indirecttext.buffer[ii] = '\0';
+            }
+
+            /*--- plot the slide window icon ---*/
+            wimp_ploticon(slide2);
+
+            /*--- plot the slide label icon ---*/
+            slide3->box.x0 = x + slide3_xoffset;
+            slide3->box.x1 = slide3->box.x0 + slide3_wid;
+            sprintf(slide3->data.text, "%d",n+1); 
+            wimp_ploticon(slide3);
+
+            x += slide1_xoffset;
+            n++;
+            i++;
+         }
+
+         y -= slide1_xoffset;
+      }
+
+      /* (If regenerating thumbnails, then by this stage through
+         the loop, all the old thumbnails will have been deleted.
+         So we can turn 'rt' off so we don't try to do them again
+         the next time through the loop.) */
+      rt = FALSE;
+
+      wimp_get_rectangle(&r, &more);
+   }
+
+
+   if (thumb_some_regenerated)      /* conditions must have changed (some were regenerated)
+      thumb_fail_informed = FALSE;     - so we can clear the 'informed' flag */
+
+   if (thumb_fail)
+   {
+      if (!thumb_fail_informed)
+      {
+         werr(FALSE, msgs_lookup("thmbfail:Some thumbnail images could not be generated due to lack of memory"));
+         thumb_fail_informed = TRUE;            /* we don't want a message every redraw! */
+      }
+   }
+
+
+   /*--- tell sprparam that the thumbnails have been regenerated ---*/
+   if (regenerate_thumbs)
+      sprparam_newthumbnail();
+
+   regenerate_thumbs = FALSE;
+
+   visdelay_end();
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  overvw_mouse(wimp_eventdata *ed)
+{
+   wimp_wstate  state;
+   int          ovw_id;
+   ovw_str     *ovw;
+   wimp_bbits   mb = ed->but.m.bbits;
+   int          mx, my;
+   int          row, col, slide;
+
+
+   /*--- if not click-select or click-right then ignore ---*/
+   if (mb != wimp_BRIGHT && mb != wimp_BLEFT)
+      return;
+
+   wimp_get_wind_state(ed->but.m.w, &state);
+
+   /* where within the work area was the click? */
+   mx = ed->but.m.x + (state.o.x - state.o.box.x0);
+   my = -(ed->but.m.y + (state.o.y - state.o.box.y1));
+
+   /*--- work out which slide it was ---*/
+
+   /* exclude any clicks which are between the slides */
+   if ((mx % slide1_xoffset) < slide1_xstart)
+      return;
+   if ((my % slide1_xoffset) < slide1_xstart)
+      return;
+
+   row = my / slide1_xoffset;
+   col = mx / slide1_xoffset;
+
+   ovw_id = overvw_findhdl(ed->but.m.w);
+   ovw = &overviews[ovw_id];
+
+   /* make sure these values are within limits */
+   if (col >= ovw->columns)
+      return;
+
+   slide = (row * ovw->columns) + col + 1;
+   if (slide > ovw->numimgs)
+      return;
+
+
+   /*--- a valid slide has been clicked on, call user's routine ---*/
+
+   if (ovw->persist)
+   {
+      if (ovw->func != NULL)
+         ovw->func(ovw_id, ovw->path, slide, (mb == wimp_BRIGHT), ovw->data);
+
+      return;
+   }
+
+   /* ..else record the slide number so that the
+      non-'persisting' event loop can terminate */
+
+   ovw->selected = slide;
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  overvw_redo_palette(void)
+{
+   /*--- recreates the palette used when generating the thumbnails ---*/
+
+   if (palettehdl)
+      PCDfreePalette(palettehdl);
+
+   if (modeform.bpp <= 8)
+   {
+      if (wimpt_complain((os_error *)PCDcreateRISCOSPalette(-1, TRUE, &palettehdl)) != NULL)
+         return;
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+static void  overvw_remove(int i)
+{
+   /*--- The view corresponding to entry 'i' is has been closed,
+         so do some tidying up. */
+
+   int     j;
+
+
+   /* get rid of any generated images */
+   for (j=0; j<overviews[i].numimgs; j++)
+      if (overviews[i].image[j].sprite != 0)
+         PCDfreeBitmap(overviews[i].image[j].sprite);
+
+   /* free the array of bitmap handles */
+   flex_free((flex_ptr)&overviews[i].image);
+
+   /* free up the array slot */
+   overviews[i].whandle = 0;
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  overvw_event_handler(wimp_eventstr *e, void *handle)
+{
+
+   switch(e->e)
+   {
+
+      case wimp_EOPEN:
+         {
+            int            c;
+            ovw_str       *ovw;
+            wimp_wstate    ws;
+            BOOL           toggle_size;
+
+
+            /* check for change of mode */
+            overvw_mode_change();
+
+            /*--- we need to read the window flags now to find out if
+                  this open event was due to a click on toggle size ---*/
+            wimpt_noerr(wimp_get_wind_state(e->data.o.w, &ws));
+            toggle_size = ((ws.flags & wimp_WCLICK_TOGGLE) != 0);
+
+            /*--- open the window now ---*/
+            wimpt_noerr(wimp_open_wind(&e->data.o));
+
+            /*--- we now have to re-read the window state so we know
+                  exactly how big the window was when it was actually
+                  opened (things like toggle size can cause this). ---*/
+            wimpt_noerr(wimp_get_wind_state(e->data.o.w, &ws));
+
+            /*--- calculate the correct number of columns of thumbnails to
+                  put across the window ---*/
+            c = (ws.o.box.x1 - ws.o.box.x0) / slide1_xoffset;
+            ovw = &overviews[overvw_findhdl(e->data.o.w)];
+            if (c != ovw->columns)
+            {
+               wimp_redrawstr  r;
+
+               ovw->columns = c;
+               overvw_recalc_extent(ovw);
+
+               /*--- if open event was due to toggle size, we need to re-open
+                     the window (so that the changed extent can be displayed
+                     correctly) ---*/
+               if (toggle_size)
+                  wimpt_noerr(wimp_open_wind(&ws.o));
+
+               /*--- now, make sure whole window is redrawn ---*/
+               r.w = ovw->whandle;
+               r.box.x0 = 0;
+               r.box.x1 = ws.o.box.x1 - ws.o.box.x0;
+               r.box.y0 = ws.o.box.y0 - ws.o.box.y1 + ws.o.y;
+               r.box.y1 = 0;
+               wimpt_noerr(wimp_force_redraw(&r));
+            }
+
+         }
+         break;
+
+      /*----------*/
+
+      case wimp_ECLOSE:
+         {
+            int   i = overvw_findhdl(e->data.o.w);
+
+
+            /*--- if there is a sprparam dialogue box open from this
+                  thumbnail window, then arrange for it to be closed ---*/
+            sprparam_closing(overviews[i].pcdhdl);
+
+            wimpt_noerr(wimp_close_wind(e->data.o.w));
+
+            /*--- remove and tidy up array entry ---*/
+            if (overviews[i].persist)
+               overvw_remove(i);            /* remove and tidy up array entry */
+            else
+               overviews[i].selected = -1;  /* hold off for the moment, we need to inform caller */
+
+            /*--- close the Overview Pac ---*/
+            PCDOclose(overviews[i].pcdhdl);
+
+         }
+         break;
+
+      /*----------*/
+
+      case wimp_EREDRAW:
+
+         overvw_redraw(&e->data.o);
+         break;
+
+      /*----------*/
+
+      case wimp_EBUT: /* mouse button pressed */
+
+         overvw_mouse(&e->data);
+         break;
+
+   };
+
+   return;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+
+/*==========================================================================*/
+/*      External functions                                                  */
+/*==========================================================================*/
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  overvw_mode_change(void)
+{
+   /*--- Check if screen mode has changed, and if it has
+         then update a few things.
+         Should be called in response to a MODECHANGE message. ---*/
+
+   if (pcdovervw_read_modeinfo(&modeform))       /* read info on new screen mode */
+   {
+      /* recreate the palette */
+      overvw_redo_palette();
+
+      /* arrange for thumbnails to be regenerated on next redraw */
+      regenerate_thumbs = TRUE;
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  pcdovervw_palettechange(void)
+{
+   /*--- Called to let us know that a PALETTECHANGE message has occurred.
+         on RISC OS 3.1x machine, nothing happens (we don't want things
+         like small palette changes to cause the regeneration of the
+         thumbnails.  However, on the new machines, we do regenerate
+         them when a PALETTECHANGE message occurs.  This is because
+         the function 'pcdovervw_read_modeinfo()' does not handle
+         changes between, for eg, a 256 colour mode and a 256 greyscale
+         mode very well.  PALETTECHANGE messages will be rare on the
+         new machines because there is no longer any palette utility. ---*/
+
+#ifndef OS_ScreenMode
+#define OS_ScreenMode 0x65
+#endif
+
+   _kernel_swi_regs   rg;
+   _kernel_oserror   *oe;
+
+
+   rg.r[0] = 1;    /* return mode specifier for current mode */
+   oe = _kernel_swi(OS_ScreenMode, &rg, &rg);
+
+   /*--- if no error was returned, then we must be on a machine
+         with the new type modes/mode specifiers - so arrange for
+         the thumbnails to be regenerated.. ---*/
+
+   if (oe == NULL)
+   {
+      /* read info on new screen mode */
+      pcdovervw_read_modeinfo(&modeform);
+
+      /* recreate the palette */
+      overvw_redo_palette();
+
+      /* arrange for thumbnails to be regenerated on next redraw */
+      regenerate_thumbs = TRUE;
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+#define  ERR(x)  if (wimpt_complain((os_error *)x) != NULL) return FALSE;
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL  pcdovervw_popup(char *path, BOOL persist, ovw_selected_fn func, void *data)
+{
+   template    *t;
+   wimp_w       wh;
+   int          i, j;
+   char         title[300];
+   char         volstr[PCDVOLSIZE];
+   wimp_wstate  ws;
+   PCDoviewHdl  pcdh;
+   int          numimgs;
+   PCDtransform xf;
+
+
+   /*--- if overview pac is already being displayed, then just return ---*/
+   if (overvw_findpath(path) != NULL)
+      return NULL;
+
+   if (num_ovws == MAX_OVWS)
+   {
+      werr(FALSE, msgs_lookup("ovw2many:Too many contact sheets open (maximum of %d)"), MAX_OVWS);
+      return FALSE;
+   }
+
+   /*--- find the first free array slot ---*/
+   i = overvw_findhdl(0);
+
+
+   /*--- create the window ---*/
+   t = template_copy(template_find("Overview"));
+   ERR(wimp_create_wind(&t->window, &wh));
+
+   strncpy(overviews[i].path, path, MAX_PATH_LEN);
+   overviews[i].path[MAX_PATH_LEN-1] = '\0';
+
+
+   /*--- preserve the provided parameters ---*/
+   overviews[i].persist = persist;
+   overviews[i].func    = func;
+   overviews[i].data    = data;
+
+
+   /*--- read info on current screen mode ---*/
+   overvw_mode_change();
+
+
+   /*--- open the Overview Pac ---*/
+   ERR(PCDOopen(path, &pcdh));
+   overviews[i].pcdhdl = pcdh;
+
+   ERR(PCDOgetCount(pcdh, &numimgs));
+   overviews[i].numimgs = numimgs;
+   overviews[i].columns = default_columns;
+
+
+   /*--- allocate the array of bitmap pointers and orientation flags ---*/
+   if (!flex_alloc((flex_ptr)&overviews[i].image, numimgs*sizeof(spr_str)))
+   {
+      werr(FALSE, msgs_lookup("ovwnomem:Not enough memory to create contact sheet"));
+      return FALSE;
+   }
+   /*--- initialise the array ---*/
+   for (j=0; j<numimgs; j++)
+   {
+      ERR(PCDOsetSelect(pcdh, j+1));
+      ERR(PCDOgetRotation(pcdh, &xf));
+      xf = (xf & (~PCD_VERT_MIRROR)) % 180;
+      overviews[i].image[j].portrait = (xf == 90) ? TRUE : FALSE;
+      overviews[i].image[j].sprite = 0;
+   }
+
+
+   overviews[i].whandle = wh;
+   num_ovws++;
+
+   overviews[i].selected = 0;
+
+
+   /*--- set the work area extent bases on the number of thumbnails etc ---*/
+   overvw_recalc_extent(&overviews[i]);
+
+   /*--- event handler for the window ---*/
+   win_register_event_handler(wh, overvw_event_handler, NULL);
+
+
+   wimpt_noerr(wimp_get_wind_state(wh, &ws));
+
+   /*--- set the window size ---*/
+   ws.o.box.x1 = ws.o.box.x0 + slide1_xstart + (default_columns * slide1_xoffset);
+
+   ws.o.behind = -1;
+   ERR(wimp_open_wind(&ws.o));
+   win_activeinc();      /* count active windows */
+
+   /*--- give the window an appropriate title ---*/
+   ERR(PCDgetVolume(path, volstr));
+   volstr[12] = '\0';          /* discard the date part of the volume string */
+   sprintf(title, "PhotoCD: %s (Ser# %s)", path, volstr);
+   win_settitle(wh, title);
+
+
+   /*--- set up some image-reading parameters ---*/
+   ERR(PCDOsetResolution(pcdh, PCD_BASE_OVER_64));
+   ERR(PCDOsetFormat(pcdh, PCD_PALETTE));
+
+
+   if (persist)
+      return (i);
+   else
+   {
+      /*--- loop until a thumbnail is selected ---*/
+
+      while ((j = overviews[i].selected) == 0)
+         event_process();
+
+      if (j == -1)    /* view closed without anything being selected */
+         overvw_remove(i);     /* remove and tidy up array entry */
+
+      return (j);
+   }
+
+   return TRUE;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+/*--- Can be called (by whoever asked for the thumbnail window
+      to be opened) to close it again, rather than just waiting
+      for the user to close it. ---*/
+
+void  pcdovervw_close(int ovw_id)
+{
+   if (overviews[ovw_id].whandle == 0)
+      return;
+
+   /*--- if there is a sprparam dialogue box open from this
+         thumbnail window, then arrange for it to be closed ---*/
+   sprparam_closing(overviews[ovw_id].pcdhdl);
+
+   /*--- close the window now ---*/
+   wimpt_noerr(wimp_close_wind(overviews[ovw_id].whandle));
+
+   /*--- remove and tidy up array entry ---*/
+   overvw_remove(ovw_id);            /* remove and tidy up array entry */
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  pcdovervw_quitting(void)
+{
+   int     i;
+
+
+   for (i = 0; i < MAX_OVWS; i++)
+   {
+      if (overviews[i].whandle != 0)
+         PCDOclose(overviews[i].pcdhdl);
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL  pcdovervw_init(void)
+{
+   wimp_wind  *w;
+   int         u,v;
+
+
+   /*--- do some setting up for the overview template ---*/
+
+   w = template_syshandle("Overview");
+   if (w->nicons != 3)
+      werr(TRUE, "Bad template: 'Overview'");
+
+   /* get pointer to the icons in the template definition */
+   slide_icons = (wimp_icon *)(w + 1);
+
+   w->nicons = 0;       /* hide the icons from the template routines */
+
+   slide1_xstart  = slide_icons[0].box.x0;
+   slide1_xoffset = slide_icons[0].box.x1;
+   u = slide_icons[0].box.x1 - slide_icons[0].box.x0;
+   v = slide_icons[0].box.y1 - slide_icons[0].box.y0;
+   PCDlistResolution(PCD_BASE_OVER_64, &slide2_wid, &slide2_hgt);
+   slide2_wid *= 2;     /* convert to OS units */
+   slide2_hgt *= 2;     /* convert to OS units */
+   slide2_xoffsetL = slide1_xstart + (u - slide2_wid) / 2;
+   slide2_yoffsetL = - slide1_xstart - (v - slide2_hgt) / 2;
+   slide2_xoffsetP = slide1_xstart + (u - slide2_hgt) / 2;
+   slide2_yoffsetP = - slide1_xstart - (v - slide2_wid) / 2;
+   slide3_xoffset = slide_icons[2].box.x0;
+   slide3_yoffset = slide_icons[2].box.y1;
+   slide3_wid     = slide_icons[2].box.x1 - slide3_xoffset;
+   slide3_hgt     = slide_icons[2].box.y0 - slide3_yoffset;
+
+   if ((overviews = calloc(MAX_OVWS, sizeof(ovw_str))) == NULL)
+      return FALSE;
+
+   num_ovws = 0;
+
+   regenerate_thumbs = FALSE;
+
+   /* create an appropriate palette for the current screen mode */
+   overvw_mode_change();
+
+   modeform.haspalette = FALSE;    /* the sprites generated won't need a palette */
+
+   atexit(pcdovervw_quitting);
+
+   return TRUE;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL  pcdovervw_read_modeinfo(PCDspriteform *modeinfo)
+{
+   /*
+    * Fills in the screen mode related fields of the
+    * 'modeinfo' structure with information on the
+    * current mode.
+    *
+    * Returns TRUE if the current values are different
+    * from the values in the struct when passed in.
+    *
+    */
+
+   _kernel_swi_regs  r;
+   BOOL              changed = FALSE;
+   int               tmp;
+
+
+   r.r[0] = -1;    /* current mode */
+
+   r.r[1] = 9;     /* Log2BPP */
+   _kernel_swi(OS_ReadModeVariable, &r,&r);
+   if ((tmp = 1 << r.r[2]) != modeinfo->bpp)
+   {
+      modeinfo->bpp = tmp;
+      changed = TRUE;
+   }
+
+   r.r[1] = 4;     /* XEig factor */
+   _kernel_swi(OS_ReadModeVariable, &r,&r);
+   tmp = (r.r[2] <= 1) ? 90 : 45;
+   if (tmp != modeinfo->Xdpi)
+   {
+      modeinfo->Xdpi = tmp;
+      changed = TRUE;
+   }
+
+   r.r[1] = 5;     /* YEig factor */
+   _kernel_swi(OS_ReadModeVariable, &r,&r);
+   tmp = (r.r[2] <= 1) ? 90 : 45;
+   if (tmp != modeinfo->Ydpi)
+   {
+      modeinfo->Ydpi = tmp;
+      changed = TRUE;
+   }
+
+   return (changed);
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+PCDoviewHdl  pcdovervw_get_pcdhandle(int ovw_id)
+{
+   /*--- returns to caller the pcdhandle of the Overview Pac
+         corresponding to identifier 'ovw_id'.
+         Returns 0 if identifier is not valid. ---*/
+
+   if (overviews[ovw_id].whandle != 0)
+      return (overviews[ovw_id].pcdhdl);
+
+   return (PCDoviewHdl)0;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+int  pcdovervw_get_spriteptr(int ovw_id, int thumbno)
+{
+   /*--- returns to caller the sprite pointer of the
+         thumbnail sprite in the Overview Pac corresponding
+         to identifier 'ovw_id' and thumbnail number 'thumbno'.
+         Returns 0 if if sprite is not available. ---*/
+
+   if (overviews[ovw_id].whandle == 0)
+      return 0;
+
+   return PCDgetSpritePtr(overviews[ovw_id].image[thumbno-1].sprite);
+}
+
+
+
+/*--------------------------------------------------------------------------*/

@@ -1,0 +1,1548 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Internet/riscos/socket_swi.c:networking  1.4  $
+ * $Source: /ax/networking:Internet/riscos/socket_swi.c: $
+ *
+ * Copyright(c) 1994 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	socket_swi.c,v $
+ * Revision 1.4  95/02/03  15:26:02  kwelton
+ * Increased the size of the socket table (SOCKTABSIZE) from 32 to 96.
+ * 
+ * Revision 1.3  95/01/03  13:42:50  kwelton
+ * Whoops - last fix was wrong: it cleared n->m_type *twice*, and
+ * didn't touch n->m_next.
+ * 
+ * Revision 1.2  94/12/06  17:09:06  kwelton
+ * n->m_next now cleared after successful ALLOC_U of up->len1, up->buf1
+ * in sendtosm().
+ * 
+ * Revision 1.1  94/12/02  11:46:06  kwelton
+ * Initial revision
+ * 
+ */
+#include "sys/param.h"
+#include "sys/errno.h"
+#include "sys/uio.h"
+#include "sys/mbuf.h"
+#include "sys/domain.h"
+#include "sys/protosw.h"
+#include "sys/socket.h"
+#include "sys/socketvar.h"
+#include "sys/ioctl.h"
+#include "sys/stat.h"
+#include "sys/time.h"
+#include "sys/file.h"
+
+#include "debug.h"
+
+#define SOCKTABSIZE 96
+
+struct socket *socktab[SOCKTABSIZE] = { 0 };
+struct socket *getsock();
+int selwait = 0;
+
+static void setsockslot(int sockid, struct socket *so)
+{
+    socktab[sockid] = so;
+}
+
+static int sendit(int s, struct msghdr *mp, int flags, int *rval)
+{
+    struct socket *so;
+    struct uio auio;
+    struct iovec *iov;
+    int i;
+    struct mbuf *to, *rights;
+    int len, error;
+
+    if ((so = getsock(s)) == 0)
+	return (EBADF);
+
+    auio.uio_iov = mp->msg_iov;
+    auio.uio_iovcnt = mp->msg_iovlen;
+    auio.uio_segflg = 0;
+    auio.uio_offset = 0;		    /* XXX */
+    auio.uio_resid = 0;
+    iov = mp->msg_iov;
+
+    for (i = 0; i < mp->msg_iovlen; i++, iov++)
+    {
+	if (iov->iov_len < 0)
+	    return (EINVAL);
+
+	if (iov->iov_len == 0)
+	    continue;
+
+	auio.uio_resid += iov->iov_len;
+    }
+
+    if (mp->msg_name)
+    {
+	error = sockargs(&to, mp->msg_name, mp->msg_namelen, MT_SONAME);
+	if (error)
+	    return (error);
+    }
+    else
+	to = 0;
+
+    if (mp->msg_accrights)
+    {
+	error = sockargs(&rights, mp->msg_accrights, mp->msg_accrightslen,
+			 MT_RIGHTS);
+	if (error)
+	    goto bad;
+    }
+    else
+	rights = 0;
+
+    len = auio.uio_resid;
+
+    /* TRACE */
+#ifdef DEBUGSEND
+    Printf("sendit: calling sosend\n");
+#endif
+
+    error = sosend((struct socket *)so, to, &auio, flags, rights);
+    *rval = len - auio.uio_resid;
+    if (rights)
+    {
+#ifdef OldCode
+	m_freem(rights);
+#else
+	FREEM(rights);
+#endif
+    }
+
+  bad:
+    if (to)
+    {
+#ifdef OldCode
+	m_freem(to);
+#else
+	FREEM(to);
+#endif
+    }
+    return (error);
+}
+
+static int recvit(int s, struct msghdr *mp, int flags, caddr_t namelenp,
+       caddr_t rightslenp, int *rval)
+{
+	struct socket *so;
+	struct uio auio;
+	struct iovec *iov;
+	int i;
+	struct mbuf *from, *rights;
+	int len, error;
+
+	if ((so = getsock(s)) == 0)
+		return (EBADF);
+	auio.uio_iov = mp->msg_iov;
+	auio.uio_iovcnt = mp->msg_iovlen;
+	auio.uio_segflg = 0;
+	auio.uio_offset = 0;
+	auio.uio_resid = 0;
+	iov = mp->msg_iov;
+	for (i = 0; i < mp->msg_iovlen; i++, iov++) {
+		if (iov->iov_len < 0)
+			return (EINVAL);
+		auio.uio_resid += iov->iov_len;
+	}
+	len = auio.uio_resid;
+	error =
+	    soreceive(so, &from, &auio,
+		flags, &rights);
+	*rval = len - auio.uio_resid;
+	if (mp->msg_name) {
+		len = mp->msg_namelen;
+		if (len <= 0 || from == 0)
+			len = 0;
+		else {
+			if (len > from->m_len)
+				len = from->m_len;
+			(void) copyout((caddr_t)mtod(from, caddr_t),
+			    (caddr_t)mp->msg_name, (unsigned)len);
+		}
+		(void) copyout((caddr_t)&len, namelenp, sizeof (int));
+	}
+	if (mp->msg_accrights) {
+		len = mp->msg_accrightslen;
+		if (len <= 0 || rights == 0)
+			len = 0;
+		else {
+			if (len > rights->m_len)
+				len = rights->m_len;
+			(void) copyout((caddr_t)mtod(rights, caddr_t),
+			    (caddr_t)mp->msg_accrights, (unsigned)len);
+		}
+		(void) copyout((caddr_t)&len, rightslenp, sizeof (int));
+	}
+#ifdef OldCode
+	if (rights)
+		m_freem(rights);
+	if (from)
+		m_freem(from);
+#else
+	if( rights )
+	    FREEM(rights);
+
+	if( from )
+	    FREEM(from);
+#endif
+	return (error);
+}
+
+socket(int *r, int *rval)
+{
+    struct a
+    {
+	int domain;
+	int type;
+	int protocol;
+    } *up = (struct a *)r;
+    struct socket *so;
+    int error, sockid;
+
+    sockid = getsockslot();
+    if (sockid < 0)
+	return (EMFILE);
+
+    error = socreate(up->domain, &so, up->type, up->protocol);
+    if (error)
+	return (error);
+
+    *rval = sockid;
+    setsockslot(sockid, so);
+    so->so_pgrp = sockid+1;
+    return (0);
+}
+
+bind(int *r)
+{
+    struct a
+    {
+	int s;
+	char *name;
+	int namelen;
+    } *up = (struct a *)r;
+    struct socket *so;
+    struct mbuf *nam;
+    int error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    error = sockargs(&nam, up->name, up->namelen, MT_SONAME);
+    if (error)
+	return (error);
+
+    error = sobind((struct socket *)so, nam);
+#ifdef OldCode
+    m_freem(nam);
+#else
+    FREEM(nam);
+#endif
+    return (error);
+}
+
+listen(int *r)
+{
+    struct a
+    {
+	int s;
+	int backlog;
+    } *up = (struct a *)r;
+    struct socket *so;
+    int error;
+
+    so = getsock(up->s);
+    if (so == 0)
+	return (EBADF);
+
+    error = solisten((struct socket *)so, up->backlog);
+    return (error);
+}
+
+accept(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	char *name;
+	int *anamelen;
+    } *up = (struct a *)r;
+    struct mbuf *nam;
+    int namelen, sockid;
+    struct socket *so, *aso;
+    int error;
+
+    if (up->name == 0)
+	goto noname;
+
+    error = copyin((char *)(up->anamelen), (char *)&namelen, sizeof(namelen));
+    if (error)
+	return (error);
+
+  noname:
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    if ((so->so_options & SO_ACCEPTCONN) == 0)
+	return (EINVAL);
+
+    if ((so->so_state & SS_NBIO) && so->so_qlen == 0)
+	return (EWOULDBLOCK);
+
+    while (so->so_qlen == 0 && so->so_error == 0)
+    {
+	if (so->so_state & SS_CANTRCVMORE)
+	{
+	    so->so_error = ECONNABORTED;
+	    break;
+	}
+
+	if (sleep((caddr_t)&so->so_timeo, PZERO+1) != 0)
+	{
+	    so->so_error = ECONNABORTED;
+	    break;
+	}
+    }
+
+    if (so->so_error)
+    {
+	error = so->so_error;
+	so->so_error = 0;
+	return (error);
+    }
+
+    aso = so->so_q;
+    if (soqremque(aso, 1) == 0)
+	panic("accept");
+
+    so = aso;
+#ifdef OldCode
+    nam = m_get(M_DONTWAIT, MT_SONAME);
+    if (nam == NULL)
+    {
+	error = ENOBUFS;
+	goto out;
+    }
+#else
+    if( (nam = ALLOC_S(MINCONTIG, NULL)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("accept: ALLOC_S failed\n");
+#endif
+	error = ENOBUFS;
+	goto out;
+    }
+    nam->m_type = MT_SONAME;
+#endif
+
+    error = soaccept(so, nam);
+    if (error)
+	goto out;
+
+    sockid = getsockslot();
+    if (sockid < 0)
+    {
+	error = EBADF;
+	goto out;
+    }
+
+    setsockslot(sockid, so);
+    so->so_pgrp = sockid+1;
+    *rval = sockid;
+
+    if (up->name)
+    {
+	if (namelen > nam->m_len)
+	    namelen = nam->m_len;
+
+	error = copyout(mtod(nam, caddr_t), (char *)(up->name),
+			(u_int)namelen);
+
+	if( !error )
+	    error = copyout((char *)&namelen, (char *)(up->anamelen),
+			    sizeof (*(up->anamelen)));
+    }
+
+  out:
+    if (nam != NULL)
+    {
+#ifdef OldCode
+	m_freem(nam);
+#else
+	FREEM(nam);
+#endif
+    }
+
+    return (error);
+}
+
+
+connect(int *r)
+{
+    struct a
+    {
+	int s;
+	char *name;
+	int namelen;
+    } *up = (struct a *)r;
+    struct socket *so;
+    struct mbuf *nam;
+    int error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    if((so->so_state & SS_NBIO) && (so->so_state & SS_ISCONNECTING) )
+	return (EALREADY);
+
+    error = sockargs(&nam, up->name, up->namelen, MT_SONAME);
+    if (error)
+	return (error);
+
+    error = soconnect(so, nam);
+    if (error)
+		goto bad;
+
+    if( (so->so_state & SS_NBIO) && (so->so_state & SS_ISCONNECTING) )
+    {
+#ifdef OldCode
+	m_freem(nam);
+#else
+	FREEM(nam);
+#endif
+	return (EINPROGRESS);
+    }
+
+    while ((so->so_state & SS_ISCONNECTING) && so->so_error == 0)
+    {
+	if (sleep((caddr_t)&so->so_timeo, 0) != 0)
+	    so->so_error = ECONNABORTED;
+    }
+
+    error = so->so_error;
+    so->so_error = 0;
+
+  bad:
+    so->so_state &= ~SS_ISCONNECTING;
+#ifdef OldCode
+    m_freem(nam);
+#else
+    FREEM(nam);
+#endif
+    return (error);
+}
+
+sendtosm(int *r)
+{
+    struct a
+    {
+	int	s;
+	char	*buf;
+	int	len;
+	char	*buf1;
+	int	len1;
+	char	*to;
+    } *up = (struct a *)r;
+    struct socket *so;
+    struct mbuf *to, *m, *n;
+    int error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    error = sockargs(&to, up->to, sizeof(struct sockaddr), MT_SONAME);
+    if (error)
+	return (error);
+
+    m = 0; n = 0;
+
+#ifdef OldCode
+    MGET(m, M_WAIT, MT_DATA);
+
+    if (m == 0)
+    {
+	error = ENOBUFS;
+	goto release;
+    }
+
+    m->m_len = up->len;
+    m->m_datp = up->buf;
+    m->m_indir = 1;
+    m->m_off = 0;
+#else /* OldCode */
+    if( (m = ALLOC_U(up->len, up->buf)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("sosendsm: ALLOC_U#1 failed\n");
+#endif
+	error = ENOBUFS;
+	goto release;
+    }
+
+    m->m_type = MT_DATA;
+#endif /* OldCode */
+
+    if (up->len1 > 0)
+    {
+#ifdef OldCode
+	MGET(n, M_WAIT, MT_DATA);
+
+	if (n == 0)
+	{
+	    error = ENOBUFS;
+	    goto release;
+	}
+
+	n->m_len = up->len1;
+	n->m_datp = up->buf1;
+	n->m_indir = 1;
+	n->m_off = 0;
+	n->m_next = 0;
+#else /* OldCode */
+	if( (n = ALLOC_U(up->len1, up->buf1)) == NULL )
+	{
+#ifdef DEBUG
+	    if( DODEBUG(DBGMMAN) )
+		Printf("sosendsm: ALLOC_U#2 failed\n");
+#endif
+	    error = ENOBUFS;
+	    goto release;
+	}
+
+	n->m_next = 0;
+	n->m_type = MT_DATA;
+#endif /* OldCode */
+    }
+
+    m->m_next = n;
+    error = udp_usrreq(so, PRU_SEND, m, (caddr_t)to, 0);
+    m = 0;
+
+  release:
+#ifdef OldCode
+    if (m)
+	m_freem(m);
+
+    m_freem(to);
+#else
+    if( m )
+	FREEM(m);
+
+    FREEM(to);
+#endif
+    return (error);
+}
+
+sendto(int *r, int *rval)
+{
+    struct a
+    {
+	int	s;
+	char	*buf;
+	int	len;
+	int	flags;
+	char	*to;
+	int	tolen;
+    } *up = (struct a *)r;
+    struct msghdr msg;
+    struct iovec aiov;
+
+    msg.msg_name = up->to;
+    msg.msg_namelen = up->tolen;
+    msg.msg_iov = &aiov;
+    msg.msg_iovlen = 1;
+    aiov.iov_base = up->buf;
+    aiov.iov_len = up->len;
+    msg.msg_accrights = 0;
+    msg.msg_accrightslen = 0;
+
+    /* TRACE */
+#ifdef DEBUGSEND
+    Printf("sendit: %d bytes to '%.*s'\n", up->len, up->tolen, up->to);
+#endif
+
+    return(sendit(up->s, &msg, up->flags, rval));
+}
+
+send(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	char *buf;
+	int len;
+	int flags;
+    } *up = (struct a *)r;
+    struct msghdr msg;
+    struct iovec aiov;
+
+    msg.msg_name = 0;
+    msg.msg_namelen = 0;
+    msg.msg_iov = &aiov;
+    msg.msg_iovlen = 1;
+    aiov.iov_base = up->buf;
+    aiov.iov_len = up->len;
+    msg.msg_accrights = 0;
+    msg.msg_accrightslen = 0;
+
+    return (sendit(up->s, &msg, up->flags, rval));
+}
+
+sendmsg(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	char *msgptr;
+	int flags;
+    } *up = (struct a *)r;
+    struct msghdr msg;
+    struct iovec aiov[MSG_MAXIOVLEN];
+    int error;
+
+    error = copyin(up->msgptr, (caddr_t)&msg, sizeof (msg));
+    if (error)
+	return (error);
+
+    if ((u_int)msg.msg_iovlen >= sizeof (aiov) / sizeof (aiov[0]))
+	return (EMSGSIZE);
+
+    error = copyin((caddr_t)msg.msg_iov, (caddr_t)aiov,
+		   (unsigned)(msg.msg_iovlen * sizeof(aiov[0])));
+    if (error)
+	return (error);
+
+    msg.msg_iov = aiov;
+    return (sendit(up->s, &msg, up->flags, rval));
+}
+
+recvfrom(int *r, int *rval)
+{
+    struct a
+    {
+	int	s;
+	char	*buf;
+	int	blen;
+	int	flags;
+	char	*from;
+	int	*fromlenaddr;
+    } *up = (struct a *)r;
+    struct msghdr msg;
+    struct iovec aiov;
+    int len, error;
+
+    error = copyin((caddr_t)(up->fromlenaddr), (caddr_t)&len, sizeof(len));
+    if (error)
+	return (error);
+
+    msg.msg_name = up->from;
+    msg.msg_namelen = len;
+    msg.msg_iov = &aiov;
+    msg.msg_iovlen = 1;
+    aiov.iov_base = up->buf;
+    aiov.iov_len = up->blen;
+    msg.msg_accrights = 0;
+    msg.msg_accrightslen = 0;
+
+    return(recvit(up->s, &msg, up->flags, (char *)(up->fromlenaddr),
+		  (caddr_t)0, rval));
+}
+
+recv(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	char *buf;
+	int len;
+	int flags;
+    } *up = (struct a *)r;
+    struct msghdr msg;
+    struct iovec aiov;
+
+    msg.msg_name = 0;
+    msg.msg_namelen = 0;
+    msg.msg_iov = &aiov;
+    msg.msg_iovlen = 1;
+    aiov.iov_base = up->buf;
+    aiov.iov_len = up->len;
+    msg.msg_accrights = 0;
+    msg.msg_accrightslen = 0;
+
+    return (recvit(up->s, &msg, up->flags, (char *)0, (char *)0, rval));
+}
+
+recvmsg(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	char *mp;
+	int flags;
+	int *rval;
+    } *up = (struct a *)r;
+    struct msghdr msg, *msgptr;
+    struct iovec aiov[MSG_MAXIOVLEN];
+    int error;
+
+    error = copyin(up->mp, (caddr_t)&msg, sizeof (msg));
+    if (error)
+	return (error);
+
+    msgptr = (struct msghdr *)up->mp;
+    if ((u_int)msg.msg_iovlen >= sizeof (aiov) / sizeof (aiov[0]))
+	return (EMSGSIZE);
+
+    error = copyin((caddr_t)msg.msg_iov, (caddr_t)aiov,
+		   (unsigned)(msg.msg_iovlen * sizeof (aiov[0])));
+    if (error)
+	return (error);
+
+    msg.msg_iov = aiov;
+    return (recvit(up->s, &msg, up->flags, (caddr_t)&(msgptr->msg_namelen),
+		   (caddr_t)&(msgptr->msg_accrightslen), rval));
+}
+
+shutdown(int *r)
+{
+    struct a
+    {
+	int s;
+	int how;
+    } *up = (struct a *)r;
+    struct socket *so;
+
+    if( (so = getsock(up->s)) == 0 )
+	return (EBADF);
+
+    return (soshutdown(so, up->how));
+}
+
+setsockopt(int *r)
+{
+    struct a
+    {
+	int s;
+	int level;
+	int name;
+	char *val;
+	int valsize;
+    } *up = (struct a *)r;
+    struct socket *so;
+    struct mbuf *m = NULL;
+#ifdef OldCode
+    int error;
+#endif
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    if (up->valsize > MINCONTIG)
+	return (EINVAL);
+
+    if (up->val)
+    {
+#ifdef OldCode
+	if ((m = m_get(M_DONTWAIT, MT_SOOPTS)) == 0)
+	    return (ENOBUFS);
+
+	error = copyin(up->val, mtod(m, caddr_t), (u_int)(up->valsize));
+	if (error)
+	    (void) m_free(m);
+	    return (error);
+#else
+	if( (m = ALLOC_S((u_int)(up->valsize), up->val)) == NULL )
+	{
+#ifdef DEBUG
+	    if( DODEBUG(DBGMMAN) )
+		Printf("setsockopt: ALLOC_S failed\n");
+#endif
+	    return(ENOBUFS);
+	}
+
+	/*
+	 * old code's use of copyin() could never fail, in the same
+	 * way that we are assured of no errors if reached this far
+	 */
+	m->m_type = MT_SOOPTS;
+#endif
+
+	m->m_len = up->valsize;
+    }
+    return (sosetopt(so, up->level, up->name, m));
+}
+
+getsockopt(int *r)
+{
+    struct a
+    {
+	int s;
+	int level;
+	int name;
+	char *val;
+	int *avalsize;
+    } *up = (struct a *)r;
+    struct socket *so;
+    struct mbuf *m = NULL;
+    int valsize, error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    if (up->val)
+    {
+	error = copyin((char *)(up->avalsize), (char *)&valsize,
+		       sizeof(valsize));
+	if (error)
+	    return (error);
+    }
+    else
+	valsize = 0;
+
+    error = sogetopt(so, up->level, up->name, &m);
+    if (error)
+	goto bad;
+
+    if (up->val && valsize && m != NULL)
+    {
+	if (valsize > m->m_len)
+	    valsize = m->m_len;
+
+	error = copyout(mtod(m, caddr_t), up->val, (u_int)valsize);
+	if (error)
+	    goto bad;
+
+	error = copyout((caddr_t)&valsize, (char *)(up->avalsize),
+			sizeof (valsize));
+    }
+
+  bad:
+    if (m != NULL)
+    {
+#ifdef OldCode
+	(void) m_free(m);
+#else
+	FREE(m);
+#endif
+    }
+
+    return (error);
+}
+
+/*
+ * Get socket name.
+ */
+getsockname(int *r)
+{
+    struct a
+    {
+	int s;
+	char *asa;
+	int *alen;
+    } *up = (struct a *)r;
+    struct socket *so;
+    struct mbuf *m;
+    int len, error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    error = copyin((char *)(up->alen), (caddr_t)&len, sizeof (len));
+    if (error)
+	return (error);
+
+#ifdef OldCode
+    if ((m = m_getclr(M_DONTWAIT, MT_SONAME)) == 0)
+	return (ENOBUFS);
+#else
+    if( (m = ALLOC_C(MINCONTIG, NULL)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("getsockname: ALLOC_C failed\n");
+#endif
+	return(ENOBUFS);
+    }
+
+    m->m_type = MT_SONAME;
+#endif
+
+    error = (*so->so_proto->pr_usrreq)(so, PRU_SOCKADDR, 0, m, 0);
+    if (error)
+	goto bad;
+
+    if (len > m->m_len)
+	len = m->m_len;
+
+    error = copyout(mtod(m, caddr_t), (char *)(up->asa), (u_int)len);
+    if (error)
+	goto bad;
+
+    error = copyout((caddr_t)&len, (char *)(up->alen), sizeof (len));
+
+  bad:
+#ifdef OldCode
+    m_freem(m);
+#else
+    FREEM(m);
+#endif
+    return (error);
+}
+
+/*
+ * Get name of peer for connected socket.
+ */
+getpeername(int *r)
+{
+    struct a
+    {
+	int s;
+	char *asa;
+	int *alen;
+    } *up = (struct a *)r;
+    struct socket *so;
+    struct mbuf *m;
+    int len, error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    if ((so->so_state & SS_ISCONNECTED) == 0)
+	return (ENOTCONN);
+
+#ifdef OldCode
+    if ((m = m_getclr(M_DONTWAIT, MT_SONAME)) == 0)
+	return (ENOBUFS);
+#else
+    if( (m = ALLOC_C(MINCONTIG, NULL)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("getpeername: ALLOC_C failed\n");
+#endif
+	return(ENOBUFS);
+    }
+    m->m_type = MT_SONAME;
+#endif
+
+    error = copyin((char *)(up->alen), (caddr_t)&len, sizeof (len));
+    if (error)
+	return (error);
+
+    error = (*so->so_proto->pr_usrreq)(so, PRU_PEERADDR, 0, m, 0);
+    if (error)
+	goto bad;
+
+    if (len > m->m_len)
+	len = m->m_len;
+
+    error = copyout(mtod(m, caddr_t), (char *)(up->asa), (u_int)len);
+    if (error)
+	goto bad;
+
+    error = copyout((caddr_t)&len, (char *)(up->alen), sizeof (len));
+
+  bad:
+#ifdef OldCode
+    m_freem(m);
+#else
+    FREEM(m);
+#endif
+    return (error);
+}
+
+static int sockargs(struct mbuf **aname, caddr_t name, int namelen, int type)
+{
+    struct mbuf *m;
+    int error;
+
+    if ((u_int)namelen > MINCONTIG)
+	return (EINVAL);
+
+#ifdef OldCode
+    m = m_get(M_DONTWAIT, type);
+    if (m == NULL)
+	return (ENOBUFS);
+#else
+    if( (m = ALLOC_S(MINCONTIG, NULL)) == NULL )
+    {
+#ifdef DEBUG
+	if( DODEBUG(DBGMMAN) )
+	    Printf("sockargs: ALLOC_S failed\n");
+#endif
+	return(ENOBUFS);
+    }
+
+    m->m_type = type;
+#endif
+
+    m->m_len = namelen;
+    error = copyin(name, mtod(m, caddr_t), (u_int)namelen);
+    if (error)
+    {
+#ifdef OldCode
+	(void) m_free(m);
+#else
+	FREE(m);
+#endif
+    }
+    else
+	*aname = m;
+
+    return (error);
+}
+
+socketclose(int *r)
+{
+    struct a
+    {
+	int s;
+    } *up = (struct a *)r;
+    struct socket *so;
+    int sockid;
+
+    sockid = up->s;
+    if ((so = getsock(sockid)) == 0)
+	return (EBADF);
+
+    soclose(so);
+    setsockslot(sockid, (struct socket *)0);
+    return (0);
+}
+
+socketioctl(int *r)
+{
+    struct a
+    {
+	int s;
+	int cmd;
+	char *cmarg;
+    } *up = (struct a *)r;
+    struct socket *so;
+    int error = 0;
+    int com;
+    u_int size;
+    char data[IOCPARM_MASK+1];
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    com = up->cmd;
+
+    /*
+     * Interpret high order word to find
+     * amount of data to be copied to/from the
+     * user's address space.
+     */
+    size = (com &~ (IOC_INOUT|IOC_VOID)) >> 16;
+    if (size > sizeof (data))
+	return (EFAULT);
+
+    if (com & IOC_IN)
+    {
+	if (size)
+	{
+	    error = copyin(up->cmarg, (caddr_t)data, (u_int)size);
+	    if (error)
+		return(error);
+	}
+	else
+	    *(caddr_t *)data = up->cmarg;
+    }
+
+    else if ((com&IOC_OUT) && size)
+	bzero((caddr_t)data, size);
+
+    else if (com&IOC_VOID)
+	*(caddr_t *)data = up->cmarg;
+
+    switch (com)
+    {
+      case FIONBIO:
+	if (*(int *)data)
+	    so->so_state |= SS_NBIO;
+	else
+	    so->so_state &= ~SS_NBIO;
+
+	goto out;
+
+      case FIOASYNC:
+	if (*(int *)data)
+	    so->so_state |= SS_ASYNC;
+	else
+	    so->so_state &= ~SS_ASYNC;
+
+	goto out;
+
+      case FIORXDIR:
+	if (*(int *)data)
+	    so->so_state |= SS_RXDIRECT;
+	else
+	    so->so_state &= ~SS_RXDIRECT;
+
+	goto out;
+
+      case FIONREAD:
+	*(int *)data = so->so_rcv.sb_cc;
+
+	goto out;
+
+      case SIOCATMARK:
+	*(int *)data = (so->so_state & SS_RCVATMARK) != 0;
+
+	goto out;
+    }
+
+#define cmdbyte(x)  (((x) >> 8) & 0xff)
+
+    if (cmdbyte(com) == 'i')
+	error = ifioctl(so, com, data);
+    else if (cmdbyte(com) == 'r')
+	error = rtioctl(com, data);
+    else error = (*so->so_proto->pr_usrreq)(so, PRU_CONTROL,
+					    (struct mbuf *)com,
+					    (struct mbuf *)data,
+					    (struct mbuf *)0);
+
+  out:
+    if (error == 0 && (com&IOC_OUT) && size)
+	error = copyout(data, up->cmarg, (u_int)size);
+
+    return (error);
+}
+
+socketread(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	char *cbuf;
+	unsigned int count;
+    } *up = (struct a *)r;
+    struct uio auio;
+    struct iovec aiov;
+    struct socket *so;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    aiov.iov_base = up->cbuf;
+    aiov.iov_len = up->count;
+    auio.uio_iov = &aiov;
+    auio.uio_iovcnt = 1;
+
+    return (rwuio(so, rval, &auio, UIO_READ));
+}
+
+socketreadv(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	struct iovec *iovp;
+	unsigned int iovcnt;
+    } *up = (struct a *)r;
+    struct uio auio;
+    struct iovec aiov[16];
+    struct socket *so;
+    int error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    if (up->iovcnt > sizeof(aiov)/sizeof(aiov[0]))
+	return (EINVAL);
+
+    auio.uio_iov = aiov;
+    auio.uio_iovcnt = up->iovcnt;
+    error = copyin((char *)up->iovp, (char *)aiov,
+		   up->iovcnt * sizeof(struct iovec));
+    if (error)
+	return (error);
+
+    return (rwuio(so, rval, &auio, UIO_READ));
+}
+
+socketwrite(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	char *cbuf;
+	unsigned int count;
+    } *up = (struct a *)r;
+    struct uio auio;
+    struct iovec aiov;
+    struct socket *so;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    aiov.iov_base = up->cbuf;
+    aiov.iov_len = up->count;
+    auio.uio_iov = &aiov;
+    auio.uio_iovcnt = 1;
+
+    return (rwuio(so, rval, &auio, UIO_WRITE));
+}
+
+socketwritev(int *r, int *rval)
+{
+    struct a
+    {
+	int s;
+	struct iovec *iovp;
+	unsigned int iovcnt;
+    } *up = (struct a *)r;
+    struct uio auio;
+    struct iovec aiov[16];
+    struct socket *so;
+    int error;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    if (up->iovcnt > sizeof(aiov)/sizeof(aiov[0]))
+	return (EINVAL);
+
+    auio.uio_iov = aiov;
+    auio.uio_iovcnt = up->iovcnt;
+    error = copyin((char *)up->iovp, (char *)aiov,
+		   up->iovcnt * sizeof(struct iovec));
+    if (error)
+	return (error);
+
+    return (rwuio(so, rval, &auio, UIO_WRITE));
+}
+
+static int rwuio(struct socket *so, int *rval, struct uio *uio, int flag)
+{
+    struct iovec *iov;
+    int i, count, error;
+
+    uio->uio_resid = 0;
+    uio->uio_offset = 0;
+    iov = uio->uio_iov;
+
+    for (i = 0; i < uio->uio_iovcnt; i++)
+    {
+	if (iov->iov_len < 0)
+	    return (EINVAL);
+
+	uio->uio_resid += iov->iov_len;
+	if (uio->uio_resid < 0)
+	    return (EINVAL);
+
+	iov++;
+    }
+
+    count = uio->uio_resid;
+    if (flag == UIO_READ)
+	error = soreceive(so, 0, uio, 0, 0);
+    else
+	error = sosend(so, 0, uio, 0, 0);
+
+    *rval = count - uio->uio_resid;
+    return (error);
+}
+
+socketstat(int *r)
+{
+    struct a
+    {
+	int s;
+	struct stat *ub;
+    } *up = (struct a *)r;
+    struct socket *so;
+
+    if ((so = getsock(up->s)) == 0)
+	return (EBADF);
+
+    return ((*so->so_proto->pr_usrreq)(so, PRU_SENSE,
+				       (struct mbuf *)(up->ub),
+				       (struct mbuf *)0,
+				       (struct mbuf *)0));
+}
+
+/*ARGSUSED*/
+getstablesize(int *r, int *rval)
+{
+    *rval = SOCKTABSIZE;
+    return (0);
+}
+
+socketselect(int *r, int *rval)
+{
+    struct a
+    {
+	int	nd;
+	fd_set	*in, *ou, *ex;
+	struct	timeval *tv;
+    } *up = (struct a *)r;
+    fd_set ibits[3], obits[3];
+    struct timeval atv;
+    int ni;
+    int tried_once = 0;
+    extern int unselect();
+    int error = 0;
+
+    bzero((caddr_t)ibits, sizeof(ibits));
+    bzero((caddr_t)obits, sizeof(obits));
+
+    if (up->nd > SOCKTABSIZE)
+	up->nd = SOCKTABSIZE;
+
+    ni = howmany(up->nd, NFDBITS);
+
+    if (up->in)
+    {
+	error = copyin((caddr_t)up->in, (caddr_t)&ibits[0],
+		       (unsigned)(ni * sizeof(fd_mask)));
+	if (error)
+	    goto done;
+    }
+
+    if (up->ou)
+    {
+	error = copyin((caddr_t)up->ou, (caddr_t)&ibits[1],
+		       (unsigned)(ni * sizeof(fd_mask)));
+	if (error)
+	    goto done;
+    }
+
+    if (up->ex)
+    {
+	error = copyin((caddr_t)up->ex, (caddr_t)&ibits[2],
+		       (unsigned)(ni * sizeof(fd_mask)));
+	if (error)
+	    goto done;
+    }
+
+    if (up->tv)
+    {
+	error = copyin((char *)(up->tv), (caddr_t)&atv,
+		       sizeof (atv));
+	if (error)
+	    goto done;
+    }
+
+  retry:
+    error = selscan(ibits, obits, up->nd, rval);
+    if (error || *rval || tried_once)
+	goto done;
+
+    if (up->tv)
+    {
+	if (atv.tv_sec == 0 && atv.tv_usec == 0) /* just a poll really */
+	    goto done;
+
+	timeout(unselect, (caddr_t)0, hzto(&atv));
+    }
+
+    if (sleep((caddr_t)&selwait, PZERO+1) != 0)
+	error = EINTR;
+
+    if (up->tv)
+    {
+	untimeout(unselect, (caddr_t)0); /* cancel timeout here */
+    }
+
+    tried_once = 1;
+    if (error)
+	return (error);
+
+    goto retry;
+
+  done:
+    if (error)
+	return (error);
+
+    if (up->in)
+    {
+	error = copyout((caddr_t)&obits[0], (caddr_t)up->in,
+			(unsigned)(ni * sizeof(fd_mask)));
+    }
+
+    if (up->ou)
+    {
+	error = copyout((caddr_t)&obits[1], (caddr_t)up->ou,
+			(unsigned)(ni * sizeof(fd_mask)));
+    }
+
+    if (up->ex)
+    {
+	error = copyout((caddr_t)&obits[2], (caddr_t)up->ex,
+			(unsigned)(ni * sizeof(fd_mask)));
+    }
+
+    return (error);
+}
+
+unselect()
+{
+    wakeup((caddr_t)&selwait);
+}
+
+static int selscan(fd_set *ibits, fd_set *obits, int nfd, int *rval)
+{
+    int which, i, j;
+    fd_mask bits;
+    int flag, s, r;
+    int n = 0;
+
+    for (which = 0; which < 3; which++)
+    {
+	switch (which)
+	{
+	  case 0:
+	    flag = FREAD;
+	    break;
+
+	  case 1:
+	    flag = FWRITE;
+	    break;
+
+	  case 2:
+	    flag = 0;
+	    break;
+	}
+
+	for (i = 0; i < nfd; i += NFDBITS)
+	{
+	    bits = ibits[which].fds_bits[i/NFDBITS];
+
+	    while ((j = ffs(bits)) && i + --j < nfd)
+	    {
+		bits &= ~(1 << j);
+		s = i + j;
+		r = do_sock_select(s, flag);
+		if (r < 0)
+		    return (EBADF);
+
+		if (r == 1)
+		{
+		    FD_SET(s, &obits[which]);
+		    n++;
+		}
+
+		if (r < 0)
+		    return (EBADF);
+	    }
+	}
+    }
+
+    *rval = n;
+    return (0);
+}
+
+/*ARGSUSED*/
+#if 0
+static int seltrue(int dev, int flag)
+{
+    return (1);
+}
+#endif /* 0/1 */
+
+selwakeup(char *p, int coll)
+{
+    wakeup((caddr_t)&selwait);
+}
+
+static int do_sock_select(int d, int which)
+{
+    struct socket *so;
+
+    if ((so = getsock(d)) == 0)
+	return (-1);
+
+    switch (which)
+    {
+      case FREAD:
+	if (soreadable(so))
+	{
+	    return (1);
+	}
+
+	sbselqueue(&so->so_rcv);
+	break;
+
+      case FWRITE:
+	if (sowriteable(so))
+	{
+	    return (1);
+	}
+
+	sbselqueue(&so->so_snd);
+	break;
+
+      case 0:
+	if (so->so_oobmark || (so->so_state & SS_RCVATMARK))
+	{
+	    return (1);
+	}
+
+	sbselqueue(&so->so_rcv);
+	break;
+    }
+
+    return (0);
+}
+
+struct socket *getsock(int s)
+{
+    if (s < 0 || s >= SOCKTABSIZE)
+	return ((struct socket *)0);
+
+    return (socktab[s]);
+}
+
+int getsockid(struct socket *so)
+{
+    int sockid;
+
+    for (sockid = 0; sockid < SOCKTABSIZE; sockid++)
+	if (socktab[sockid] == so)
+	    return (sockid);
+
+    return (-1);
+}
+
+int getsockslot(void)
+{
+    int sockid;
+
+    for (sockid = 0; sockid < SOCKTABSIZE; sockid++)
+	if (socktab[sockid] == 0)
+	    return (sockid);
+
+    return (-1);
+}
+
+void socktabinit(void)
+{
+    int i;
+
+    for (i = 0; i < SOCKTABSIZE; i++)
+	socktab[i] = 0;
+}
+
+int sockstats(void)
+{
+    int i;
+    int sockcnt = 0;
+
+    for (i = 0; i < SOCKTABSIZE; i++)
+	if (socktab[i] != 0)
+	    sockcnt++;
+
+    return (sockcnt);
+}
+
+/* EOF socket_swi.c */

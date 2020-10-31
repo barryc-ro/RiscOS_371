@@ -1,0 +1,3049 @@
+ 
+/***************************************************************************
+ * Audio Panel - CD Audio remote control program for CD-ROM players.
+ *
+ * COMPILE: cc -c c.audio
+ * LINK   : link o.audio l.stubs l.risc_oslib -o audio
+ *
+ * Change List
+ * -----------
+ *                                                                 
+ *  13-Feb-90  1.00  LF  Created C version with new sprites and templates
+ *  05-Mar-90  1.01  LF  Everything but memory functions
+ *  14-Mar-90  1.02  LF  Memory, random, repeat
+ *  15-Mar-90  1.03  LF  Setup
+ *  02-Apr-90  1.04  LF  Debugged, dedrugged and disinfected please!
+ *  10-Apr-90  1.05  LF  More bug fixes and enhancements (!Help)
+ *  13-Nov-90  1.06  MW  Automatically detects drive type for CDFS 2.00
+ *  00-Dec-91  1.10  NC  Change the name to !CD Player, + other mods (Acorn)
+ *  27-Apr-92  1.11  MW  Changed to test for new Toshiba drive
+ *  23-Nov-92  1.12  MW  Changed to test for new Sony 561 drive
+ *  13-May-93  1.13  MW  Now uses CD_Identify so should work with all drives
+ *  18-Oct-93  1.14  MW  Logical unit numbers changed from 0-3 to 0-7
+ *
+ *--------------------------------------------------------------------------
+ **************************************************************************/
+
+
+/* #define DEBUG
+   #define TRACE
+ */
+
+#include <stdio.h>    
+#include <stdlib.h>   
+#include <string.h> 
+
+#include "kernel.h"
+#include "swis.h"
+#include "trace.h"
+
+#include "cd_swis.h"
+
+#include "os.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "res.h"
+#include "resspr.h"
+#include "menu.h"
+#include "template.h"
+#include "dbox.h"
+#include "werr.h"
+                         
+/******************************* CONSTANTS ********************************/
+                  
+
+#define ERRORFILE "<Obey$Dir>.ERROR_LOG"
+#define NeilDebug FALSE
+
+#define PROGRAM_NAME  "CD Player"
+#define RESOURCES_NAME  "AudioPanel"
+
+#define SELECTED  wimp_ISELECTED
+
+/* used by Memory() */
+#define START   0
+#define MINUS   1  
+#define PLUS    2
+#define INCREM  3
+
+/* used by Forget() */
+#define ALL        TRUE
+#define HIGHLIGHT  FALSE
+
+/* used by UpdateTrackDisplay() */
+#define EMPTY  -1
+#define ERROR  -2
+
+/* Menu items */
+#define menu_info     1
+#define menu_keypad   2 
+#define menu_setup    3  
+#define menu_quit     4
+
+/* Info box field for the version string */
+#define info_field    4
+
+/* Addressing modes */                                                
+#define ADR_LOGICAL   0
+#define ADR_REDBOOK   1
+#define ADR_PHYSICAL  2
+
+/* Display mode used for current time display */
+#define ABSOLUTE   0
+#define RELATIVE   1
+#define REMAINING  2
+
+/* Number of blocks to skip when fast search */
+#define FAST_STEP     150
+#define FAST_SUPERST  750                       
+#define FAST_DELAY    6
+
+/* Maximum number of frames the current address can differ */ 
+#define MAXOFFSET     32
+
+/* Time window to detect a double click */
+#define TIMEWINDOW    200   
+
+/* centiseconds interval between refresh of display */
+#define REFRESH_RATE  50   /* 0.5 seconds */
+
+/* program mode */
+#define PROGRAM_TIMEOUT  500   /* centiseconds */
+
+/* main icon handles */
+#define EJECT      7
+#define FAST_BACK  2
+#define FAST_FORW  4
+#define PAUSE      5
+#define PLAY       3
+#define SKIP_NEXT  1
+#define SKIP_PREV  0
+#define STOP       6
+
+/* main display digit handles */
+#define CUR_TRACK_1  10
+#define CUR_TRACK_2  11 
+
+/* main info digit handles */
+#define MAX_TRACK_1  12
+#define MAX_TRACK_2  13
+
+#define MAX_MIN_1    14
+#define MAX_MIN_2    15
+#define MAX_SEC_1    16
+#define MAX_SEC_2    17
+
+#define CUR_MIN_1    18
+#define CUR_MIN_2    19
+#define CUR_SEC_1    20
+#define CUR_SEC_2    21
+
+#define SLASH        22
+#define MAX_COLON    23
+#define CUR_COLON    24
+
+#define LOGO         8
+#define SLIDERBAR    9
+#define SLIDERKNOB   26
+#define KNOB_XSIZE   10
+
+/* keypad icon handles */
+#define KP_0  0
+#define KP_1  1
+#define KP_2  2
+#define KP_3  3
+#define KP_4  4
+#define KP_5  5
+#define KP_6  6
+#define KP_7  7
+#define KP_8  8
+#define KP_9  9
+              
+#define KP_ALL  10
+#define KP_CLR  13
+#define KP_MEM  12
+#define KP_RND  11
+#define KP_RPT  14     
+
+
+/* setup icon handles */
+#define SU_DEV_MINUS  0        /* These are the icon numbers of the +/-*/
+#define SU_DEV_PLUS   1        /* icons on the setup panel */
+#define SU_UNI_MINUS  2
+#define SU_UNI_PLUS   3
+#define SU_CAR_MINUS  4
+#define SU_CAR_PLUS   5
+
+#define SU_DEV  6             /* These are the icon numbers of the digits*/
+#define SU_UNI  7              /* in the middle of the setup panel */
+#define SU_CAR  8
+
+typedef unsigned int   ULONG;
+typedef unsigned short UWORD;
+typedef unsigned short USHORT;
+typedef unsigned char  UBYTE;
+typedef int   LONG;
+typedef short WORD;          
+typedef short SHORT;
+typedef char  BYTE;
+ 
+
+struct AvailTracks {
+   UBYTE mintrack;
+   UBYTE maxtrack;
+   int   maxblock;
+} avail;
+
+struct ControlBlock {
+   int device;
+   int card;
+   int unit;
+   int type;
+   int reserved;
+} controlblock;
+
+struct SubChannel {
+   int relative;
+   int absolute;
+   UBYTE ctrlbits;
+   UBYTE track;
+   UBYTE index;
+} subchannel;
+
+struct TrackInfo {
+   int startaddress;   /* filled by CD_EnquireTrack: LBA of this track */
+   UBYTE ctrlbits;     /* filled by CD_EnquireTrack: control bits */
+   UBYTE track;        /* track number */
+   UBYTE program;      /* to be used by memory programming functions */
+   UBYTE next;         /* to be used by memory programming functions */
+   int endaddress;     /* LBA of last block of this track */
+} trackinfo;  
+
+/***** Added by MEW *****/
+
+struct InquiryData {
+    char crap[ 8 ];           /*** don't care                    ***/
+    char vendorid[ 8 ];       /*** 8 bytes of 'SONY' etc         ***/
+    char productid[ 16 ];     /*** 16 bytes of 'CDU' etc         ***/
+    char revisionlevel[ 4 ];  /*** 4 bytes of product version    ***/
+
+} inquirydata;
+
+#define DRIVETYPE0 "SONY"
+#define DRIVETYPE1 "LMS"
+#define DRIVETYPE2 "TOSHIBA"
+#define DRIVETYPE3 "HITACHI"
+#define DRIVETYPE4 "CHINON"
+
+#define drivetype0length 4
+#define drivetype1length 3
+#define drivetype2length 7
+#define drivetype3length 7
+#define drivetype4length 6
+#define drivetype5length 7        /* Totally uneccessary */
+
+#define SONYDRIVE       0
+#define PHILIPSDRIVE    1
+#define TOSHIBADRIVE    2         /* Old Tosh drive */
+#define HITACHIDRIVE    3
+#define CHINONDRIVE     4
+#define TOSHIBA_2_DRIVE 5         /* New Tosh */        
+#define SONY_561        6
+
+#define NEW_TOSH_VERSION 3301     /* Anything before this must be old Tosh */
+
+/*****              *****/
+
+
+struct MyWinfo {
+   wimp_winfo winfo;
+   wimp_icon  icon;
+} mywinfo;
+
+struct Program {
+   wimp_icreate icreate;
+   char text[11];
+   char track;
+} program[99];
+
+/*****************************FUNCTION DECLARATIONS ***********************/
+
+BOOL AudioPause(BOOL);
+BOOL BuildTrackTable(void);
+BOOL CheckFlags(BOOL);
+BOOL Forget(BOOL);
+BOOL GetAvailTracks(void);
+BOOL GetTrackInfo(int);
+#ifdef DEBUG
+   BOOL LogError(char *);
+#endif
+BOOL Memorize(int);
+BOOL MemoryPlay(UBYTE); 
+BOOL PlayTrack(int);
+BOOL ProcessIcon(int);
+BOOL ReadSubChannel(void);
+BOOL ReportError(void);
+BOOL SeekTo(int, int);
+                        
+int EnquireAddress(int);
+int GetCurTime(void);
+int GetCurTrack(void);
+int GetTrackAddress(int);
+int GetTrackIndex(int);
+int GetTrackLength(int);
+int Random(int);
+int To_mmssff(int);
+
+UBYTE convert(char[]);
+
+void Bleep(void);
+void BuildRandom(void);
+void Delay(int);
+void DiscHasGone(void);
+void DisplayDiscInfo(void);
+void Eject(void);
+void FastBackward(int);
+void FastForward(int);
+void GiveHelp(wimp_msgstr *);
+void InitControlBlock(void);
+void Pause(void);
+void Play(void);
+void RedrawMemory(void);
+void RedrawSlider(int);
+void ResetEndOfPlay(void);
+void SetButton(wimp_i);
+void SkipNext(void);
+void SkipPrev(void);
+void Stop(void);
+void UpdateDisplay(BOOL);
+void UpdateSetupDisplay(void);
+void UpdateSlider(wimp_i, int);
+void UpdateTimeDisplay(BOOL);
+void UpdateTrackDisplay(int);
+void ChangeDriveType(void);
+ 
+void process_keypad(wimp_mousestr *);
+void process_main(wimp_mousestr *);
+void process_memory(wimp_mousestr *);
+void process_setup(wimp_mousestr *);
+
+/****************************** GLOBAL DATA *******************************/
+
+/* Application version */
+static char *Version_String = "1.14 (18 Oct 1993)";
+
+/* The top of the menu tree */
+static menu mymenu;
+
+/* Handle for the example window */
+static wimp_w main_h, keypad_h, memory_h, setup_h;
+
+/* Flag - is the window open */
+BOOL main_open = FALSE;
+BOOL keypad_open = FALSE;
+BOOL memory_open = FALSE;
+BOOL setup_open = FALSE;
+
+os_error *error;
+os_regset regs;
+              
+BOOL repeat = FALSE;
+
+BOOL paused;   /* TRUE if in pause mode, FALSE otherwise */
+BOOL playing;  /* TRUE if currently playing music, FALSE otherwise */ 
+BOOL skipped = FALSE;
+BOOL disc_in = FALSE;
+BOOL stopped = FALSE;                    /* Added by N.C.    */
+                                             
+UBYTE dispmode = ABSOLUTE;
+
+int mincurblock;
+int maxcurblock;
+
+/* program  mode */ 
+int prog_timeout = 0;
+int display;
+
+wimp_i knob = SLIDERKNOB;
+wimp_icreate knob_icreate;
+int ix0, idx;
+
+wimp_icreate text_icreate;
+int memory = 0;
+int iy0, idy;
+        
+struct TrackInfo tracktable[99]; 
+int trackindex;
+
+static int device = 0;
+static int card = 0;
+static int unit = 0;
+
+
+#ifdef DEBUG
+   char message[80];
+#endif
+
+/****************************** WINDOW FUNCTIONS **************************/
+
+   /* Create the window, yielding its handle. Return TRUE if ok.
+    */
+   static BOOL 
+create_window(char *name, wimp_w *handle)
+{
+wimp_wind *window;    /* Pointer to window definition */
+
+   /* Find template for the window */
+   window = template_syshandle(name);
+   if (window == 0)
+      return (FALSE);
+
+   /* Create the window, dealing with errors */
+   return (wimpt_complain(wimp_create_wind(window, handle)) == 0);
+
+} /* end of create_window */
+
+/**************************************************************************/
+
+   /* Individual event routines for the window.
+    */
+   static void
+redraw_window(wimp_w handle)
+{
+/* Redrawing the window here does nothing - just go through the loop */
+int more;
+wimp_redrawstr r;
+
+   tracef0("redraw_window()\n");
+
+   /* Start the redraw */
+   r.w = handle;
+   wimpt_noerr(wimp_redraw_wind(&r, &more));
+
+   /* Do the redraw loop */
+   while (more)
+      wimp_get_rectangle(&r, &more);
+  
+
+} /* end of redraw_window */
+
+/**************************************************************************/
+
+   static void
+open_window(wimp_openstr *o)
+{
+
+   tracef0("open_window()\n");
+
+   /* Just pass the open request on to the wimp */
+   wimpt_noerr(wimp_open_wind(o));
+
+} /* end of open_window */
+
+/******************************* EVENT HANDLERS ***************************/
+
+   /* Event handler called on a left click on the icon.
+    */
+   static void
+open_main()
+{
+wimp_wstate wstate;
+   
+   if (!main_open)
+      UpdateDisplay(FALSE);
+
+   /* Get the state of the window */
+   if (wimpt_complain(wimp_get_wind_state(main_h, &wstate)) == 0)
+      {
+      wstate.o.behind = -1;   /* Make sure window is opened in front */
+      wimpt_noerr(wimp_open_wind(&wstate.o));
+      main_open = TRUE;
+      }
+
+} /* end of open_main */
+
+/**************************************************************************/
+
+   /* Display the program info box - called from the  processor.
+    */
+   static void
+info_about_program(void)
+{
+dbox d;  /* Dialogue box handle */
+
+   /* Create the dialogue box */
+   if (d = dbox_new("ProgInfo"), d != NULL)
+      {
+      /* Fill in the version number */
+      dbox_setfield(d, info_field, Version_String) ;
+
+      /* Show the dialogue box */
+      dbox_show(d);
+
+      /* Keep it on the screen as long as needed */
+      dbox_fillin(d);
+
+      /* Dispose of the dialogue box */
+      dbox_dispose(&d);
+      }
+
+} /* end of info_about_program */
+
+/**************************************************************************/
+
+   /* Display keypad window - called from the menu processor.
+    */
+   static void
+open_keypad(void)
+{  
+wimp_wstate state;
+   
+   if (!main_open)
+      open_main();
+
+   /* Get the state of the window */
+   if (wimpt_complain(wimp_get_wind_state(keypad_h, &state)) == 0)
+      {
+      state.o.behind = -1;   /* Make sure window is opened in front */
+      wimpt_noerr(wimp_open_wind(&state.o));
+      keypad_open = TRUE;
+      }
+
+} /* end of open_keypad */
+
+/**************************************************************************/
+
+   /* Display setup window - called from the menu processor.
+    */
+   static void
+open_setup(void)
+{  
+wimp_wstate state;
+   
+   /* Get the state of the window */
+   if (wimpt_complain(wimp_get_wind_state(setup_h, &state)) == 0)
+      {
+      state.o.behind = -1;   /* Make sure window is opened in front */
+      wimpt_noerr(wimp_open_wind(&state.o));
+      setup_open = TRUE;
+      device = 255;
+      card = 255;
+      unit = 255;
+      UpdateSetupDisplay();
+      }
+   
+} /* end of open_setup */
+
+/**************************************************************************/
+
+   /* Event handler for the menu.
+    */
+   static void 
+menuproc(void *handle, char *hit)
+{
+handle = handle; /* We don't need handle: this stops compiler warning */
+
+   /* Find which menu item was hit and take action as appropriate */
+   switch (hit[0])
+   {
+   case menu_info:
+      info_about_program();
+      break;
+
+   case menu_keypad:
+      open_keypad();
+      break;
+   
+   case menu_setup:
+      open_setup();
+      break;
+
+   case menu_quit:
+      /* Exit from the program. The wimp gets rid of the window and icon */
+      exit(0);
+   }  
+
+} /* end of menuproc */
+
+/**************************************************************************/
+
+   /* Event handler for all window.
+    */
+   static void 
+event_handler(wimp_eventstr *e, void *argument)
+{
+wimp_w handle = (wimp_w)argument;
+   
+   tracef1("event_handler(%u)\n", (int)e->e);
+   
+   /* Deal with event */
+   switch (e->e)
+   {
+   case wimp_EBUT:
+      if ((e->data.but.m.bbits == wimp_BLEFT) ||
+          (e->data.but.m.bbits == wimp_BRIGHT))
+         {
+         if (handle == main_h)
+            process_main(&(e->data.but.m));
+         else if (handle == keypad_h)
+            process_keypad(&(e->data.but.m));
+         else if (handle == memory_h)
+            process_memory(&(e->data.but.m));
+         else if (handle == setup_h)
+            process_setup(&(e->data.but.m));
+         }
+      break;
+
+   case wimp_EREDRAW:
+      redraw_window(e->data.o.w);
+      break;
+
+   case wimp_EOPEN:
+      open_window(&e->data.o);
+      break;
+    
+   case wimp_ECLOSE:   /* Pass on close request */
+      wimpt_noerr(wimp_close_wind(e->data.o.w));
+      if (handle == main_h)
+         {
+         main_open = FALSE;
+
+         if (memory_open)
+            {
+            wimpt_noerr(wimp_close_wind(memory_h));
+            memory_open = FALSE;
+            }
+
+         if (keypad_open)
+            {
+            wimpt_noerr(wimp_close_wind(keypad_h));
+            keypad_open = FALSE;
+            }
+
+         }
+      else if (handle == keypad_h)
+         keypad_open = FALSE;
+      else if (handle == memory_h)
+         memory_open = FALSE;
+      else if (handle == setup_h)
+         setup_open = FALSE;
+      break;
+
+
+   default:   /* Ignore any other event */
+      break;
+   }     
+
+} /* end of event_handler */
+
+/**************************************************************************/
+
+   /* Event handler for application icon on the iconbar.
+    */
+   static void 
+iconbar_handler(wimp_eventstr *e, void *handle)
+{
+handle = handle; /* We don't need handle: this stops compiler warning */
+
+   tracef1("iconbar_handler(%u)\n", (int)e->e);
+   
+   /* Deal with event */
+   switch (e->e)
+      {
+      case wimp_EBUT:
+         switch (e->data.but.m.bbits)
+            {
+            case wimp_BLEFT:
+            case wimp_BRIGHT:
+               open_main();
+               break;
+        
+            case wimp_BMID:
+               wimpt_fake_event(e);
+               event_process();
+               break;
+            }
+         break;
+      
+      default:
+         break;
+      }   /* switch */
+
+} /* end of iconbar_handler */
+
+/**************************************************************************/
+
+   void 
+process_keypad(wimp_mousestr *m)
+{              
+int i;
+wimp_mousestr result;
+
+   wimp_set_icon_state(m->w, m->i, SELECTED, wimp_ISELECTED);
+      
+   if ((disc_in) && (trackindex))
+      {
+      switch(m->i)
+         {
+         case KP_0:
+         case KP_1:
+         case KP_2:
+         case KP_3:
+         case KP_4:
+         case KP_5:
+         case KP_6:
+         case KP_7:
+         case KP_8:
+         case KP_9:
+            if (!prog_timeout)
+               display = 0; 
+
+            display *= 10;
+            display += m->i;   /* add the icon handle to the sum */
+
+            while (display >= 100)
+               display -= 100;
+
+            UpdateTrackDisplay(display);
+            break;
+         
+         case KP_ALL:
+            for (i=0; i < trackindex; i++)
+               if (!Memorize((int)tracktable[i].track))
+                  break;
+
+            RedrawMemory();
+            break;
+  
+         case KP_CLR:
+            display = 0;
+
+            if (memory)
+               { 
+               if (m->bbits == wimp_BLEFT)
+                  {
+                  if (Forget(HIGHLIGHT))
+                     RedrawMemory();
+                  }
+               else if (m->bbits == wimp_BRIGHT)
+                  {
+                  Forget(ALL);
+                  ResetEndOfPlay();
+                  Stop();
+                  }
+               } 
+            
+            if ((!memory) && (memory_open))
+               {
+               wimpt_noerr(wimp_close_wind(memory_h));
+               memory_open = FALSE;
+               }
+
+            break;
+
+         case KP_MEM:                        
+            if (Memorize(display))
+               RedrawMemory();
+
+            UpdateTrackDisplay(0);
+            display = 0;
+            break;
+         
+         case KP_RND:
+            BuildRandom();
+            break;
+      
+         case KP_RPT:  
+            repeat = (repeat) ? FALSE : TRUE;
+            break;
+
+         }   /* switch */
+      
+      } 
+
+   do {
+      wimp_get_point_info(&result);
+       
+      } while (!(os_swix(OS_Mouse, &regs)) && (regs.r[2]));
+
+   if ((disc_in) && (trackindex))
+      {
+      switch(m->i)
+         {
+         case KP_0:
+         case KP_1:
+         case KP_2:
+         case KP_3:
+         case KP_4:
+         case KP_5:
+         case KP_6:
+         case KP_7:
+         case KP_8:
+         case KP_9:
+         case KP_ALL:
+         case KP_CLR:
+         case KP_MEM:
+         case KP_RND:
+            wimp_set_icon_state(m->w, m->i, 0, wimp_ISELECTED);
+            prog_timeout = GetCurTime() + PROGRAM_TIMEOUT;
+            break;
+
+         case KP_RPT:
+            if (!repeat)
+               wimp_set_icon_state(m->w, KP_RPT, 0, wimp_ISELECTED);
+            break;  
+        
+         }   /* switch */
+      }
+   else
+      wimp_set_icon_state(m->w, m->i, 0, wimp_ISELECTED);    
+   
+} /* end of process_keypad */             
+
+/**************************************************************************/
+
+   void 
+process_setup(wimp_mousestr *m)
+{
+int i;              
+wimp_mousestr result;
+FILE *handle;
+
+   wimp_set_icon_state(m->w, m->i, SELECTED, wimp_ISELECTED);
+      
+   switch(m->i)
+      {
+      case SU_DEV_MINUS:
+         i = controlblock.device - 1;
+         if (i >= 0)
+            controlblock.device = i;
+         break;
+   
+      case SU_DEV_PLUS:
+         i = controlblock.device + 1;
+         if (i < 7)
+            controlblock.device = i;
+         break;
+  
+      case SU_CAR_MINUS:
+         i = controlblock.card - 1;
+         if (i >= 0)
+            controlblock.card = i;
+         break;
+ 
+      case SU_CAR_PLUS:
+         i = controlblock.card + 1;
+         if (i < 4)
+            controlblock.card = i;
+         break;
+ 
+      case SU_UNI_MINUS:
+         i = controlblock.unit - 1;
+         if (i >= 0)
+            controlblock.unit = i;
+         break;
+ 
+      case SU_UNI_PLUS:
+         i = controlblock.unit + 1;
+         if (i < 8)
+            controlblock.unit = i;
+         break;
+
+
+      }   /* switch */
+
+  /** Do an inquiry to set the drive type to something else **/
+
+   ChangeDriveType();                           /* N.C. Moved this up higher */
+
+   UpdateSetupDisplay();
+
+   do {
+      wimp_get_point_info(&result);
+       
+      } while (!(os_swix(OS_Mouse, &regs)) && (regs.r[2]));
+
+/*** Bounce button back up ? ***/
+
+   switch(m->i)
+      {
+      case SU_DEV_MINUS:
+      case SU_DEV_PLUS:
+      case SU_CAR_MINUS:
+      case SU_CAR_PLUS:
+      case SU_UNI_MINUS:
+      case SU_UNI_PLUS:
+         wimp_set_icon_state(m->w, m->i, 0, wimp_ISELECTED);
+         break;
+
+      }   /* switch */
+
+    
+  if ((handle = fopen("<AudioPanel$Dir>.config", "wb")) != NULL)
+      {
+      fwrite(&controlblock, 20, 1, handle);
+      fclose(handle); 
+      }
+
+
+  /*************************      ****************************/
+
+} /* end of process_setup */             
+
+/**************************************************************************/
+
+   BOOL
+Memorize(int track)
+{
+wimp_i number;
+wimp_wstate state;
+   
+   if ((track == 0) || ((GetTrackIndex(track) >= 0) && (memory < 99)))
+      {
+/*      if (memory_open == FALSE)
+*/      if (FALSE == FALSE)                                     /* Changed by N.C.  */
+         {
+         /* Get the state of the window */
+         if (wimpt_complain(wimp_get_wind_state(memory_h, &state)) == 0)
+            {
+            state.o.behind = -1;   /* Make sure window is opened in front */
+            wimpt_noerr(wimp_open_wind(&state.o));
+            memory_open = TRUE;
+            }
+         }
+      }
+   else
+      {
+      Bleep();
+      UpdateTrackDisplay(ERROR);
+      Delay(100);
+      UpdateTrackDisplay(0);
+      return (FALSE);
+      }
+
+   if (track)
+      {
+      program[memory].track = track;
+      sprintf(program[memory].text, "%02.2d Track%02.2d", memory + 1, track);
+      
+      program[memory].icreate = text_icreate;
+      program[memory].icreate.i.data.indirecttext.buffer = program[memory].text;
+      program[memory].icreate.i.box.y0 = iy0 - memory * (idy + 4);
+      program[memory].icreate.i.box.y1 = program[memory].icreate.i.box.y0+idy;
+              
+      wimp_create_icon(&program[memory].icreate, &number);
+      wimp_set_icon_state(memory_h, number, 0, 0);
+      
+      memory++;
+      }
+
+   return (TRUE);
+ 
+} /* end of Memorize */
+
+/**************************************************************************/
+
+   BOOL
+Forget(BOOL which)
+{
+int i, k, next;
+wimp_which_block wblock;
+wimp_i icon_array[100];   /* 99+1 for the wimp_which_icon -1 terminator */
+      
+   if (which == ALL)
+      {
+      k = memory;
+      next = 0;
+      }
+   else if (which == HIGHLIGHT)  
+      {                      
+      wblock.window = memory_h;
+      wblock.bit_mask = 1 << 21;
+      wblock.bit_set  = 1 << 21;
+
+      wimpt_complain(wimp_which_icon(&wblock, icon_array));
+ 
+      if (icon_array[0] == -1)
+         return (FALSE);
+
+      for (k=0, i=icon_array[k], next=i; i < memory; i++)
+         { 
+         if (i == icon_array[k])
+            k++;
+         else               
+            {                 
+            program[next].track = program[i].track;
+            sprintf(program[next].text, "%02.2d Track%02.2d", 
+                    next + 1, (int)program[next].track);
+            wimp_set_icon_state(memory_h, next++, 0, wimp_ISELECTED);
+            }
+         }
+      }
+
+   memory -= k;
+
+   while (k--)
+      {
+      sprintf(program[next].text, "%.10s", "");
+      wimp_set_icon_state(memory_h, next, 0, wimp_ISELECTED);
+      wimp_delete_icon(memory_h, next++);
+      }
+           
+   return (TRUE);
+
+} /* end of Forget */
+
+/**************************************************************************/
+
+   void
+RedrawMemory()
+{
+/* BOOL updated; */
+wimp_redrawstr redrawstr;
+
+   redrawstr.w = mywinfo.winfo.w;
+   redrawstr.box = mywinfo.winfo.info.ex;
+
+   if (memory > 8)
+      redrawstr.box.y0 -= 40 * (memory - 8);
+   
+   wimp_set_extent(&redrawstr);
+
+/*    wimp_getwindowoutline(&redrawstr);
+    wimp_redraw_wind(&redrawstr, &updated);
+*/    
+
+} /* end of RedrawMemory */
+
+/**************************************************************************/
+
+   UBYTE
+convert(char s[])
+{
+UBYTE n = 0;
+ 
+   n = (s[0] - '0');
+   n = 10 * n + (s[1] - '0');
+   
+   return (n);
+
+} /* end of convert */
+
+/**************************************************************************/
+
+   void 
+process_memory(wimp_mousestr *m)
+{
+wimp_icon icon;
+
+
+   if ((disc_in) && (trackindex))
+      {
+      wimp_get_icon_info(m->w, m->i, &icon);
+
+      if (icon.flags & SELECTED)
+         wimp_set_icon_state(m->w, m->i, 0, wimp_ISELECTED);
+      else
+         wimp_set_icon_state(m->w, m->i, SELECTED, wimp_ISELECTED);
+
+      }
+
+} /* end of process_memory */
+
+/**************************************************************************/
+
+   void
+process_main(wimp_mousestr *m)
+{
+    
+   if ((m->i == knob) || (m->i == SLIDERBAR))
+      ProcessIcon(m->i);
+
+   switch(m->i)
+      {
+      case EJECT:
+      case STOP:
+         wimp_set_icon_state(m->w, m->i, SELECTED, wimp_ISELECTED);
+         ProcessIcon(m->i);
+         stopped = TRUE;
+         break;
+       
+      case PAUSE:
+         if (!disc_in)
+            paused = TRUE;
+         else if (paused)
+            paused = FALSE;
+         else
+            paused = TRUE;
+
+         SetButton(PAUSE);
+         ProcessIcon(m->i);
+         break;
+
+      case PLAY:
+         stopped = FALSE;
+         playing = TRUE;
+         SetButton(PLAY);
+         ProcessIcon(m->i);
+         break;
+
+      case FAST_BACK:
+      case FAST_FORW:
+      case SKIP_NEXT:
+      case SKIP_PREV:
+         wimp_set_icon_state(m->w, m->i, SELECTED, wimp_ISELECTED);
+         ProcessIcon(m->i);
+         break;
+            
+      case CUR_MIN_1:
+      case CUR_MIN_2:
+      case CUR_SEC_1:
+      case CUR_SEC_2:
+      case CUR_COLON:
+         if (dispmode == ABSOLUTE)
+            dispmode = RELATIVE;
+         else if (dispmode == RELATIVE)
+            dispmode = REMAINING;
+         else if (dispmode == REMAINING)
+            dispmode = ABSOLUTE;
+         break;
+      
+      case LOGO:
+         open_keypad();
+         break;
+ 
+      default:
+         break;
+
+      }   /* switch */
+   
+   switch (m->i)
+      {      
+      case PAUSE:
+      case PLAY:
+         while (!(os_swix(OS_Mouse, &regs)) && (regs.r[2]))
+            ;
+         
+         if ((!disc_in) || (!trackindex))
+            {
+            paused = FALSE;
+            playing = FALSE;
+            }
+
+         SetButton(PAUSE);
+         SetButton(PLAY);
+         break;
+
+      case EJECT:
+      case FAST_BACK:
+      case FAST_FORW:
+      case SKIP_NEXT:
+      case SKIP_PREV:
+      case STOP:
+         while (!(os_swix(OS_Mouse, &regs)) && (regs.r[2]))
+            ;
+
+         wimp_set_icon_state(m->w, m->i, 0, wimp_ISELECTED);
+         
+         /* FIXME maybe it would be better to take here the
+            PROGRAM_TIMEOUT when skip NEXT or PREV
+          */
+         break;
+
+      default:
+         break;
+
+      }   /* switch */
+
+} /* end of process_main */
+
+/******************************* INITIALISATION ***************************/
+
+   /*--- Initialise the program, returning TRUE if it was all OK. ---*/
+   static BOOL 
+initialise(void)
+{
+wimp_icon icon;
+wimp_icon temp;
+  
+   /* RISC_OSlib initialisation */
+   wimpt_init(PROGRAM_NAME);        /* Main Wimp initialisation */
+   res_init(RESOURCES_NAME);        /* Resources */
+   resspr_init();                   /* Application sprites */
+   template_init();                 /* Templates */
+   dbox_init();                     /* Dialogue boxes */
+
+   /* Create the main window, and declare its event handler */
+   if (!create_window("MainWindow", &main_h))
+      return (FALSE);    /* Window creation failed */
+   win_register_event_handler(main_h, event_handler, (void *)main_h);
+ 
+   /* Create the keypad window */
+   if (!create_window("Keypad", &keypad_h))
+      return (FALSE);   /* Window creation failed */
+   win_register_event_handler(keypad_h, event_handler, (void *)keypad_h); 
+   
+   /* Create the memory window */
+   if (!create_window("Memory", &memory_h))
+      return (FALSE);   /* Window creation failed */
+                                  
+   mywinfo.winfo.w = memory_h;
+   wimp_get_wind_info(&mywinfo.winfo);   
+   wimp_delete_wind(memory_h);
+   wimp_create_wind(&mywinfo.winfo.info, &memory_h);
+   win_register_event_handler(memory_h, event_handler, (void *)memory_h);      
+   wimp_get_icon_info(memory_h, 0, &temp);
+
+   /* Create the setup window */
+   if (!create_window("Control", &setup_h))
+      return (FALSE);   /* Window creation failed */
+   win_register_event_handler(setup_h, event_handler, (void *)setup_h); 
+
+   /* Create the menu tree */
+   if ((mymenu = menu_new(PROGRAM_NAME, ">Info,Keypad,Setup,Quit")) == NULL)
+      return (FALSE); /* Menu create failed */
+
+   /* Set up the icon on the icon bar, and declare its event handlers */
+   baricon("logo2", (int)resspr_area(), NULL);
+   
+   win_register_event_handler(win_ICONBAR, iconbar_handler, 0);
+
+   if (!event_attachmenu(win_ICONBAR, mymenu, menuproc, 0))
+      return (FALSE); /* Unable to attach menu */
+       
+   /* copy SLIDERBAR icon info, delete old and create new one */
+   wimp_get_icon_info(main_h, knob, &icon); 
+   ix0 = icon.box.x0;
+   idx = icon.box.x1 - ix0;
+   
+   knob_icreate.w = main_h;
+   knob_icreate.i = icon;
+   knob_icreate.i.box.y1 = knob_icreate.i.box.y1 + 4;
+      
+   wimp_delete_icon(main_h, knob);
+   wimp_create_icon(&knob_icreate, &knob);
+   wimp_set_icon_state(main_h, SLIDERBAR, 0, 0);
+   wimp_set_icon_state(main_h, knob, 0, 0);
+         
+   /* copy memory entry icon info, delete old */
+   text_icreate.w = memory_h;
+   text_icreate.i = mywinfo.icon;
+
+   iy0 = mywinfo.icon.box.y0;
+   idy = mywinfo.icon.box.y1 - iy0;
+   
+   wimp_delete_icon(memory_h, 0);
+    
+   /* All went ok */
+   return (TRUE); 
+
+} /* end of initialise */
+
+/**************************************************************************/
+
+   int 
+main()
+{
+int newtime, oldtime;
+wimp_eventstr eventstr;
+   
+   #ifdef TRACE
+      trace_on();
+   #endif
+   
+   #ifdef DEBUG
+      remove(ERRORFILE);
+   #endif
+
+   srand(GetCurTime());
+   
+   InitControlBlock();
+
+   ChangeDriveType();
+
+   if (!initialise())
+      return (10);
+       
+   oldtime = GetCurTime();
+
+   /* The main event loop */   
+   do {      
+      newtime = GetCurTime();
+
+      while ((newtime - oldtime) > 0)
+         oldtime += REFRESH_RATE;
+
+      wimp_pollidle(wimp_EMPTRENTER | wimp_EMPTRLEAVE, &eventstr, oldtime);
+      
+      switch (eventstr.e)
+         {
+         case wimp_ENULL:
+            if (!prog_timeout)  /* && (main_open) */
+               UpdateDisplay(FALSE);
+            else if (newtime >= prog_timeout) 
+               {
+               UpdateTrackDisplay(GetCurTrack());
+               prog_timeout = 0;
+               display = 0;
+               }
+            break;
+    
+         case wimp_EMENU:
+            tracef0("faking(wimp_EMENU)\n");
+            wimpt_fake_event(&eventstr);
+            event_process();
+            break;
+            
+         case wimp_ESEND:
+            tracef1("faking(wimp_ESEND, code: %x)\n",
+                    eventstr.data.msg.hdr.action);
+            wimpt_fake_event(&eventstr);
+            event_process();
+/*            event_process();           Removed by Neil Critchell 4.1.92
+*/            break;
+
+         case wimp_ESENDWANTACK:
+            switch (eventstr.data.msg.hdr.action)
+               {
+               case wimp_MCLOSEDOWN:
+                  wimp_closedown();
+                  exit(0);
+               
+               case wimp_MHELPREQUEST:
+                  GiveHelp(&eventstr.data.msg);
+                  break;
+
+               }
+
+         default:
+            if (win_processevent(&eventstr) == FALSE)
+               tracef1("WIN_PROCESSEVENT(event: %u == FALSE\n", eventstr.e);
+            break;
+
+         }   /* switch */ 
+
+      } while (TRUE);
+
+} /* end of main */
+
+/**************************************************************************/
+
+   void
+GiveHelp(wimp_msgstr *inmsg)
+{
+char *help = NULL;
+wimp_w w;
+wimp_i i;
+wimp_msgstr outmsg;
+         
+   w = inmsg->data.helprequest.m.w;
+   i = inmsg->data.helprequest.m.i;
+       
+   if (w == -2)
+      help = "This is the Audio Panel icon.";
+
+   if (w == main_h)
+      {
+      switch (i)
+         {
+         case -1:
+            help = "This is the Audio Panel main window.";
+            break;
+
+         case EJECT:
+            help = "This is the EJECT button.";
+            break;
+  
+         case FAST_BACK:
+            help = "This is the FAST BACKWARD button.";
+            break;
+   
+         case FAST_FORW:
+            help = "This is the FAST FORWARD button.";
+            break;
+
+         case PAUSE:
+            help = "This is the PAUSE button.";
+            break;
+
+         case PLAY:
+            help = "This is the PLAY button.";
+            break;
+
+         case SKIP_NEXT:
+            help = "This is the SKIP FORWARD button.";
+            break;
+ 
+         case SKIP_PREV:
+            help = "This is the SKIP BACKWARD button.";
+            break;               
+
+         case STOP:
+            help = "This is the STOP button.";
+            break;
+
+         case CUR_TRACK_1:
+         case CUR_TRACK_2:
+            help = "This is the track display.";
+            break;
+        
+         case CUR_MIN_1:
+         case CUR_MIN_2:
+         case CUR_SEC_1:
+         case CUR_SEC_2:
+         case CUR_COLON:
+            help = "Click SELECT to switch the display between the following:|Melapsed disc time/elapsed track time/remaining disc time.";
+            break;
+
+         case MAX_TRACK_1:
+         case MAX_TRACK_2:
+            help = "Highest track number available on the disc.";
+            break;
+
+         case MAX_MIN_1:
+         case MAX_MIN_2:
+         case MAX_SEC_1:
+         case MAX_SEC_2:
+         case MAX_COLON:
+            help = "Total size of the disc in minutes and seconds.";
+            break;
+
+         case LOGO:
+            help = "Click SELECT to bring up the programming keypad.";
+            break;
+
+         case SLIDERBAR:
+            help = "This represents the total disc space.|MClick SELECT to move the pick-up to any position on the disc.";
+            break;
+
+         case SLIDERKNOB:
+            help = "Current position of the pick-up.|MYou can drag it to any part of the disc.";
+            break;
+
+         }   /* switch on main icons */
+
+      }
+   else if (w == keypad_h)
+      {  
+      switch (i)
+         {
+         case -1:
+            help = "This is the Audio Panel keypad window.";
+            break;
+
+         case KP_0:
+         case KP_1:
+         case KP_2:
+         case KP_3:
+         case KP_4:
+         case KP_5:
+         case KP_6:
+         case KP_7:
+         case KP_8:
+         case KP_9:
+            help = "This is a number button.";
+            break;
+
+         case KP_ALL:
+            help = "Click SELECT to put ALL the audio tracks into memory.";
+            break;
+
+         case KP_CLR:
+            help = "Click SELECT to remove the HIGHLIGHTED tracks from memory.|MClick ADJUST to remove ALL the tracks from memory.";
+            break;
+
+         case KP_MEM:
+            help = "Select the track number using the keypad buttons.|MClick SELECT to add track to memory.";
+            break;
+
+         case KP_RND:
+            help = "Click SELECT to put ALL the audio tracks into memory in random order."; 
+            break;
+
+         case KP_RPT:
+            help = "Click SELECT to switch on/off the REPEAT function.";
+            break;
+
+         }   /* switch on keypad icons */
+      }                              
+   else if (w == memory_h)
+      {  
+      if (i == -1)
+         help = "This is the Audio Panel memory window.";
+      else if ((i >= 0) && (i <= 98))
+         help = "Click SELECT to highlight this entry to use with the keypad CLR button."; 
+      }
+   else if (w == setup_h)
+      {   
+      switch (i)
+         {
+         case -1:
+            help = "This is the Audio Panel setup window.";
+            break;
+
+         case SU_DEV:
+            help = "This is the SCSI DEVICE number.";
+            break;
+
+         case SU_DEV_MINUS:
+         case SU_DEV_PLUS:
+            help = "Click SELECT to change the SCSI DEVICE number.";
+            break;
+                  
+         case SU_UNI:
+            help = "This is the LOGICAL UNIT number.";
+            break;
+
+         case SU_UNI_MINUS:
+         case SU_UNI_PLUS:
+            help = "Click SELECT to change the LOGICAL UNIT number.";
+            break;
+
+         case SU_CAR:
+            help = "This is the CARD slot number.";
+            break;
+
+         case SU_CAR_MINUS:
+         case SU_CAR_PLUS:
+            help = "Click SELECT to change the CARD slot number.";
+            break;
+   
+         }    
+      }                
+                                     
+   if (help != NULL)
+      {
+      outmsg.hdr.size = 20 + strlen(help) + (4 - (strlen(help) % 4));
+      outmsg.hdr.your_ref = inmsg->hdr.my_ref;
+      outmsg.hdr.action = wimp_MHELPREPLY; 
+      strcpy(outmsg.data.helpreply.text, help);
+      wimp_sendmessage(wimp_ESEND, &outmsg, inmsg->hdr.task);
+      }
+
+} /* end of GiveHelp */
+
+/**************************************************************************/
+
+   BOOL
+ProcessIcon(int icon)
+{                 
+int stepcount;
+
+   if (!disc_in)
+      return (FALSE);
+   
+   if (!trackindex)
+      { 
+      if (icon == EJECT)
+         Eject();
+      return (TRUE);
+      }
+           
+   if ((!memory) && ((icon == knob) || (icon == SLIDERBAR)))
+      UpdateSlider(icon, avail.maxblock);
+                     
+   switch (icon)
+      {
+      case EJECT:
+         Eject();
+         break;
+      
+      case FAST_BACK:
+         if (playing)
+            {
+            stepcount = 0;
+
+            do {
+               FastBackward((stepcount < 20) ? FAST_STEP : FAST_SUPERST);
+
+               UpdateDisplay(FALSE);
+
+               if (stepcount < 20)
+                  Delay(FAST_DELAY); 
+               
+               stepcount++;
+               } while (!(os_swix(OS_Mouse, &regs)) && (regs.r[2]));
+
+            }
+         break;
+
+      case FAST_FORW:
+         if (playing)
+            {
+            stepcount = 0;
+
+            do {
+               FastForward((stepcount < 20) ? FAST_STEP : FAST_SUPERST);
+
+               UpdateDisplay(FALSE);
+
+               if (stepcount < 20)
+                  Delay(FAST_DELAY); 
+               
+               stepcount++;
+               } while (!(os_swix(OS_Mouse, &regs)) && (regs.r[2]));
+
+            }
+         break;
+      
+      case PAUSE:
+         Pause();
+         break;
+
+      case PLAY:
+         if (memory)
+            {           
+            if (MemoryPlay(START))
+               UpdateDisplay(TRUE);
+            }
+         else
+            Play();
+         break;
+
+      case SKIP_NEXT:
+         if (playing)
+            SkipNext();
+         else if (!memory)
+            {
+            if ((prog_timeout) && (display < avail.maxtrack))
+               display++;
+            else
+               display = avail.mintrack;
+            
+            UpdateTrackDisplay(display);
+            prog_timeout = GetCurTime() + PROGRAM_TIMEOUT;
+            }
+         break;
+
+      case SKIP_PREV:
+         if (playing)
+            SkipPrev();
+         else if (!memory)
+            {
+            if ((prog_timeout) && (display > avail.mintrack))
+               display--;
+            else
+               display = avail.maxtrack;
+            
+            UpdateTrackDisplay(display);
+            prog_timeout = GetCurTime() + PROGRAM_TIMEOUT;
+            }
+         break;
+
+      case STOP:
+         if (playing)
+            Stop();
+         break;
+
+      default:
+         break;
+      
+      }   /* switch */
+      
+   return (TRUE);
+
+} /* end of ProcessIcon */
+
+/**************************************************************************/
+
+   /* Eject - input:  void.
+              output: void.
+              action: eject the disc from the drive.
+    */
+   void
+Eject()
+{
+   
+   regs.r[7] = (int)&controlblock;
+   os_swix(CD_OpenDrawer, &regs);
+   
+   DiscHasGone();
+
+} /* end of Eject */
+
+/**************************************************************************/
+
+   /* FastBackward - input:  void.
+                     output: void.
+                     action: move back the laser pick-up by 2 or 10 seconds.
+    */
+   void
+FastBackward(int step)
+{
+int curblock;
+
+   if (memory) return;                                  /* added by N.C. */
+
+   if ((curblock = EnquireAddress(ADR_LOGICAL)) != -1)
+      {
+      curblock -= step;
+
+      if (curblock > mincurblock)
+         {
+         if (SeekTo(ADR_LOGICAL, curblock))
+            AudioPause(paused);
+         }
+      }
+
+} /* end of FastBackward */
+
+/**************************************************************************/
+      
+   /* FastForward - input:  void.
+                    output: void.
+                    action: advance the laser pick-up by 2 or 10 seconds.
+    */
+   void
+FastForward(int step)
+{
+int curblock;
+   
+   if (memory) return;                                  /* added by N.C. */
+
+   if ((curblock = EnquireAddress(ADR_LOGICAL)) != -1)
+      {
+      curblock += step;
+
+      if (curblock < maxcurblock)  
+         {
+         if (SeekTo(ADR_LOGICAL, curblock))
+            AudioPause(paused);
+         }
+      }
+      
+} /* end of FastForward */
+
+/**************************************************************************/
+
+   /* Pause - input:  void.
+              output: void.
+              action: set/reset the audio pause mode.
+    */      
+   void
+Pause()
+{
+   
+   if (skipped)
+      {
+      SeekTo(ADR_LOGICAL, EnquireAddress(ADR_LOGICAL) - MAXOFFSET);
+      skipped = FALSE;
+      }
+
+   /* BEWARE !!!  This is tricky because we change "paused" before coming
+                  here.  So take everything as meaning the opposite.
+    */
+   if (paused)
+      {
+      if (!AudioPause(TRUE))
+         paused = FALSE;
+      }
+   else
+      {
+      if (!AudioPause(FALSE))
+         paused = TRUE;
+      }
+         
+} /* end of Pause */
+
+/**************************************************************************/
+
+   /* Play - input:  void.
+             output: void.
+             action: play first audio track available on disc. 
+    */
+   void
+Play()
+{
+
+   if (prog_timeout)
+      {
+      prog_timeout = 0;
+
+      if (display)
+         {
+         if (GetTrackIndex(display) < 0)
+            {
+            Bleep();
+            UpdateTrackDisplay(ERROR);
+            Delay(100);
+            display = 0;
+            }
+         else
+            playing = PlayTrack(display);
+         }                                             
+      else
+         playing = PlayTrack((int)tracktable[0].track);
+      }
+   else
+      playing = PlayTrack((int)tracktable[0].track);
+   
+} /* end of Play */
+
+/**************************************************************************/
+   
+   /* SkipNext - input:  void.
+                 output: void.
+                 action: play next available audio track, if any.
+    */
+   void
+SkipNext()
+{
+int index;
+
+   if (memory)
+      MemoryPlay(PLUS);
+   else
+      {
+      if ((index = GetTrackIndex(GetCurTrack())) >= 0)
+         if (++index < trackindex)
+            playing = PlayTrack((int)tracktable[index].track);
+
+      }
+
+   UpdateDisplay(TRUE);
+
+} /* end of SkipNext */
+
+/**************************************************************************/
+   
+   /* SkipPrev - input:  void.
+                 output: void.
+                 action: if double selection within TIMEWINDOW then
+                         play first available track before current one, 
+                         if any, else restart currently playing track.
+    */                
+   void
+SkipPrev()
+{
+static int lasttime = 0; 
+int curtime, curtrack, index;
+
+   if (memory)
+      MemoryPlay(MINUS);
+   else
+      {
+      curtime = GetCurTime();
+      curtrack = GetCurTrack();
+
+      if (curtime < lasttime + TIMEWINDOW)
+         {
+         if ((index = GetTrackIndex(GetCurTrack())) >= 0)
+            if (--index >= 0)
+               curtrack = (int)tracktable[index].track;
+
+         }
+
+      lasttime = curtime;
+      playing = PlayTrack(curtrack);
+      }
+
+   UpdateDisplay(TRUE);
+
+} /* end of SkipPrev */
+
+/**************************************************************************/
+   
+   /* Stop - input:  void.
+             output: void.
+             action: stop the disc.
+    */
+   void
+Stop()
+{
+
+   paused = FALSE;
+   playing = FALSE;
+   SetButton(PAUSE);
+   SetButton(PLAY);
+   stopped = TRUE;
+   UpdateTrackDisplay(0);
+   UpdateTimeDisplay(FALSE); 
+
+   SeekTo(ADR_LOGICAL, 0); 
+
+   regs.r[7] = (int)&controlblock;
+   os_swix(CD_StopDisc, &regs);
+
+} /* end of Stop */
+
+/**************************************************************************/
+   
+   /* PlayTrack - input:  number of track to play.
+                  output: TRUE if successful, FALSE otherwise. 
+                  action: play the specified track.
+    */   
+   BOOL
+PlayTrack(int track)
+{ 
+int address;
+
+
+#if (NeilDebug == TRUE)
+FILE *handle;
+
+if ((handle = fopen("<AudioPanel$Dir>.TrackInfo", "ab+")) != NULL)
+    {
+    fprintf(handle, "PlayTrack %d\n", track);
+    fclose(handle);
+    }
+#endif
+
+ 
+   if (memory)
+      {
+      mincurblock = GetTrackAddress(track);
+      maxcurblock = mincurblock + GetTrackLength(track);
+      regs.r[1] = 254;
+
+#if (NeilDebug == TRUE)
+if ((handle = fopen("<AudioPanel$Dir>.TrackInfo", "ab+")) != NULL)
+    {
+    fprintf(handle, "   mincurblock =  %d\n", mincurblock);
+    fprintf(handle, "   maxcurblock =  %d\n", maxcurblock);
+    fclose(handle);
+    }
+#endif
+      }
+   else 
+      {
+      mincurblock = 0;
+      maxcurblock = avail.maxblock;
+      regs.r[1] = 255;             
+      }
+
+   regs.r[0] = track;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_PlayTrack, &regs))
+      return (FALSE);
+
+      
+#if (NeilDebug == TRUE)
+if ((handle = fopen("<AudioPanel$Dir>.TrackInfo", "ab+")) != NULL)
+    {
+    fprintf(handle, "   Success!\n");
+    fclose(handle);
+    }
+#endif
+
+   if (paused)
+      {
+      if ((address = GetTrackAddress(track)) == -1)
+         return (FALSE);
+      else   
+         {
+         if (SeekTo(ADR_LOGICAL, address + MAXOFFSET))
+            {                                 
+            AudioPause(paused);
+            skipped = TRUE;
+            return (TRUE); 
+            }
+         else
+            return (FALSE);
+         }
+      }
+
+   return (TRUE); 
+
+} /* end of PlayTrack */
+
+/**************************************************************************/
+
+   /* GetAvailTracks - input:  void.
+                       output: TRUE if successful, else NULL.
+                       action: get mintrack, maxtrack & maxblock from disc
+                               and store them in AvailTracks.
+    */
+   BOOL
+GetAvailTracks()
+{
+static ULONG temp[2];
+                   
+   regs.r[0] = ADR_LOGICAL;
+   regs.r[1] = (int)&avail;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_EnquireTrack, &regs))
+      { 
+      tracef0("CD_EnquireTrack failed!\n");
+      return (FALSE);                       
+      }
+   
+   regs.r[0] = ADR_LOGICAL;
+   regs.r[1] = (int)temp;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_DiscUsed, &regs))
+      {
+      tracef0("CD_DiscUsed failed!\n");
+      return (FALSE);
+      }
+   avail.maxblock = temp[0];
+
+   return (TRUE);
+
+} /* GetAvailTracks */
+
+/**************************************************************************/
+
+   int
+GetTrackIndex(int track)
+{
+int i;
+            
+   /* return track index (0 <= index <= 98), or the following errors:
+      -1 track is data,
+      -2 track is too high,
+      -3 track is too low;
+    */
+
+   if (track < avail.mintrack)
+      return (-3);
+
+   if (track > avail.maxtrack)
+      return (-2);
+ 
+   for (i=0; i < trackindex;  i++)
+      if (tracktable[i].track == track)
+         return (i);
+
+   return (-1);
+   
+} /* end of GetTrackIndex */
+
+/**************************************************************************/
+   
+   /* GetTrackInfo - input:  track number you want information about.
+                     output: TRUE if successful, else FALSE.
+                     action: get track address & control bits and store
+                             them in TrackInfo.
+    */
+   BOOL
+GetTrackInfo(int track)
+{                    
+
+   regs.r[0] = track;
+   regs.r[1] = (int)&trackinfo;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_EnquireTrack, &regs))
+      { 
+      tracef0("CD_EnquireTrack failed!\n");
+      return (FALSE);                       
+      }
+
+   return (TRUE);
+
+} /* end of GetTrackInfo */
+
+/**************************************************************************/
+
+   int
+GetTrackAddress(int track)
+{                           
+
+   if (!GetTrackInfo(track))
+      return (-1);
+   else
+      return (trackinfo.startaddress);
+
+} /* end of GetTrackAddress */
+
+/**************************************************************************/
+
+   int
+GetTrackLength(int track)
+{ 
+int start, end;
+   
+   if ((start = GetTrackAddress(track)) == -1)
+      return (0);
+
+   if (track == avail.maxtrack)
+      end = avail.maxblock;
+   else
+      {
+      if ((end = GetTrackAddress(track + 1)) == -1)
+         return (0);
+      }
+
+   return (end - start);
+
+} /* end of GetTrackLength */
+
+/**************************************************************************/
+
+   BOOL
+AudioPause(BOOL state)
+{  
+
+   regs.r[0] = (int)state;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_AudioPause, &regs))
+      return (FALSE);
+   else
+      return (TRUE);
+
+} /* end of AudioPause */
+
+/**************************************************************************/
+
+   int
+EnquireAddress(int addr_mode)
+{
+
+   regs.r[0] = addr_mode;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_EnquireAddress, &regs))
+      return (-1);
+
+   return (regs.r[0]);
+
+} /* end of EnquireAddress */
+
+/**************************************************************************/
+
+   BOOL
+SeekTo(int adr_mode, int address)
+{
+
+   regs.r[0] = adr_mode;
+   regs.r[1] = address;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_SeekTo, &regs))
+      return (FALSE);
+   else
+      return (TRUE);
+
+} /* end of SeekTo */
+
+/**************************************************************************/
+                                           
+   /* InitControlBlock - input:  self-explanatory.
+                         output: void.
+    */ 
+   void
+InitControlBlock()
+{
+FILE *handle;
+
+  if ((handle = fopen("<AudioPanel$Dir>.config", "rb")) != NULL)
+      {
+      fread(&controlblock, 20, 1, handle);
+      fclose(handle); 
+      }
+   else
+      {
+      controlblock.device   = 0;
+      controlblock.card     = 0;
+      controlblock.unit     = 0;
+      controlblock.type     = 0;
+      controlblock.reserved = 0;
+      }
+
+} /* end of InitControlBlock */
+
+/**************************************************************************/
+
+   int
+GetCurTime()
+{
+   
+   if (os_swix(OS_ReadMonotonicTime, &regs))
+      return (0);
+   else
+      return (regs.r[0]);
+
+} /* end of GetCurTime */
+
+/**************************************************************************/
+
+   int 
+GetCurTrack()
+{
+/* int i; */
+   
+   if (playing == FALSE)
+      return (0);        
+
+   /* dubious style */             
+   /* for (i=0; i < trackindex; i++)
+         if (subchannel.absolute <= tracktable[i].endaddress)  
+            return ((int)tracktable[i].track);
+      return (0);   executed only when something very wrong happened */
+    
+
+      /* old style */
+   return ((int)subchannel.track);
+
+} /* end of GetCurTrack */
+
+/**************************************************************************/
+
+   BOOL
+ReadSubChannel()
+{
+
+   regs.r[0] = 64;   /* sub-channel q */
+   regs.r[1] = (int)&subchannel;
+   regs.r[7] = (int)&controlblock;
+   if (os_swix(CD_ReadSubChannel, &regs))
+      return (FALSE);
+   else
+      return (TRUE);
+
+} /* end of ReadSubChannel */
+
+/**************************************************************************/
+
+   void
+Bleep()
+{
+
+   tracef0("BLEEP\n");
+   regs.r[0] = 7;
+   os_swix(OS_WriteC, &regs);  
+
+} /* end of Bleep */
+
+/**************************************************************************/
+
+   void
+UpdateTrackDisplay(int track)
+{
+static int lasttrack = EMPTY;      
+wimp_icon icon1, icon2;
+    
+   if (lasttrack != track)
+      {
+      lasttrack = track;
+    
+      wimp_get_icon_info(main_h, CUR_TRACK_1, &icon1);
+      wimp_get_icon_info(main_h, CUR_TRACK_2, &icon2);
+      
+      switch (track)
+         {
+         case EMPTY:
+            icon1.data.indirecttext.validstring[1] = '-';
+            icon2.data.indirecttext.validstring[1] = '-';
+            break;
+
+         case ERROR: 
+            icon1.data.indirecttext.validstring[1] = 'e';
+            icon2.data.indirecttext.validstring[1] = 'e';
+            break;
+
+         default:
+            icon1.data.indirecttext.validstring[1] = (char)(track/10 + '0');
+            icon2.data.indirecttext.validstring[1] = (char)(track%10 + '0');
+            break;
+         }
+            
+      wimp_set_icon_state(main_h, CUR_TRACK_1, 0, 0);
+      wimp_set_icon_state(main_h, CUR_TRACK_2, 0, 0);
+      }
+
+} /* end of UpdateTrackDisplay */
+
+/**************************************************************************/
+
+   void
+UpdateSetupDisplay()
+{
+
+wimp_icon icon;
+
+    
+   if (controlblock.device != device)
+      {
+      device = controlblock.device;
+ 
+      wimp_get_icon_info(setup_h, SU_DEV, &icon);
+      icon.data.indirecttext.validstring[1] = (char)(device + '0');
+      wimp_set_icon_state(setup_h, SU_DEV, 0, 0);
+      }
+ 
+   if (controlblock.card != card)
+      {
+      card = controlblock.card;
+ 
+      wimp_get_icon_info(setup_h, SU_CAR, &icon);
+      icon.data.indirecttext.validstring[1] = (char)(card + '0');
+      wimp_set_icon_state(setup_h, SU_CAR, 0, 0);
+      }
+ 
+   if (controlblock.unit != unit)
+      {
+      unit = controlblock.unit;
+ 
+      wimp_get_icon_info(setup_h, SU_UNI, &icon);
+      icon.data.indirecttext.validstring[1] = (char)(unit + '0');
+      wimp_set_icon_state(setup_h, SU_UNI, 0, 0);
+      }
+
+} /* end of UpdateSetupDisplay */
+
+/**************************************************************************/
+
+   void
+UpdateTimeDisplay(BOOL active)
+{
+static int oldtime = 0;
+int newpos;
+int number, mmssff, time;
+wimp_icon icon;    
+        
+   if (active)
+      {
+      switch(dispmode)
+         {
+         case ABSOLUTE:
+            time = subchannel.absolute;
+            break;
+  
+         case RELATIVE:        
+            time = subchannel.relative;
+            break;
+     
+         case REMAINING:       
+            time = avail.maxblock - subchannel.absolute;
+            break;        
+      
+         }   /* switch */                    
+      }
+   else
+      time = 0;
+   
+   if (oldtime != time)
+      {
+      oldtime = time;
+ 
+      mmssff = To_mmssff(time);
+
+      number = (mmssff >> 16) & 0xff;   /* minutes */
+      wimp_get_icon_info(main_h, CUR_MIN_1, &icon);
+      icon.data.indirecttext.validstring[3] = (char)(number / 10 + '0');
+   
+      wimp_get_icon_info(main_h, CUR_MIN_2, &icon);
+      icon.data.indirecttext.validstring[3] = (char)(number % 10 + '0');
+   
+      number = (mmssff >> 8) & 0xff;   /* seconds */
+      wimp_get_icon_info(main_h, CUR_SEC_1, &icon);
+      icon.data.indirecttext.validstring[3] = (char)(number / 10 + '0');
+   
+      wimp_get_icon_info(main_h, CUR_SEC_2, &icon);
+      icon.data.indirecttext.validstring[3] = (char)(number % 10 + '0');
+
+      wimp_set_icon_state(main_h, CUR_MIN_1, 0, 0);
+      wimp_set_icon_state(main_h, CUR_MIN_2, 0, 0);
+      wimp_set_icon_state(main_h, CUR_SEC_1, 0, 0);
+      wimp_set_icon_state(main_h, CUR_SEC_2, 0, 0);
+      }
+
+   time = (active) ? subchannel.absolute : 0;
+   
+   newpos = (time) ? time / (avail.maxblock / (230-KNOB_XSIZE)) : 0;
+   
+   RedrawSlider(newpos);
+
+} /* end of UpdateTimeDisplay */
+
+/**************************************************************************/
+
+   void
+DisplayDiscInfo()
+{
+int number, mmssff, track;
+wimp_icon icon;
+   
+   if (!disc_in)
+      {
+      mmssff = 0;
+      track = 0;
+      }
+   else
+      {
+      mmssff = To_mmssff(avail.maxblock); 
+      track = avail.maxtrack;
+      }
+
+   wimp_get_icon_info(main_h, MAX_TRACK_1, &icon);
+   icon.data.indirecttext.validstring[3] = (char)(track / 10 + '0');
+   
+   wimp_get_icon_info(main_h, MAX_TRACK_2, &icon);
+   icon.data.indirecttext.validstring[3] = (char)(track % 10 + '0');
+
+   number = (mmssff >> 16) & 0xff;   /* minutes */
+   wimp_get_icon_info(main_h, MAX_MIN_1, &icon);
+   icon.data.indirecttext.validstring[3] = (char)(number / 10 + '0');
+   
+   wimp_get_icon_info(main_h, MAX_MIN_2, &icon);
+   icon.data.indirecttext.validstring[3] = (char)(number % 10 + '0');
+
+   number = (mmssff >> 8) & 0xff;   /* seconds */
+   wimp_get_icon_info(main_h, MAX_SEC_1, &icon);
+   icon.data.indirecttext.validstring[3] = (char)(number / 10 + '0');
+   
+   wimp_get_icon_info(main_h, MAX_SEC_2, &icon);
+   icon.data.indirecttext.validstring[3] = (char)(number % 10 + '0');
+
+   wimp_set_icon_state(main_h, MAX_TRACK_1, 0, 0);
+   wimp_set_icon_state(main_h, MAX_TRACK_2, 0, 0);
+   wimp_set_icon_state(main_h, MAX_MIN_1, 0, 0);
+   wimp_set_icon_state(main_h, MAX_MIN_2, 0, 0);
+   wimp_set_icon_state(main_h, MAX_SEC_1, 0, 0);
+   wimp_set_icon_state(main_h, MAX_SEC_2, 0, 0);
+   
+   if (disc_in)
+      UpdateTrackDisplay(0);
+
+} /* end of DisplayDiscInfo */
+
+/**************************************************************************/
+
+   void
+UpdateDisplay(BOOL user)
+{                         
+int status;
+   
+   regs.r[7] = (int)&controlblock;
+   if ((error = os_swix(CD_AudioStatus, &regs)) != NULL)
+      {    
+      /* analise error FIXME */
+      
+      if (disc_in)
+         DiscHasGone();               
+
+      }
+   else 
+      { 
+      status = regs.r[0];
+
+      if ((!disc_in) && (GetAvailTracks() == TRUE))
+         {
+         disc_in = TRUE;                        
+         DisplayDiscInfo();
+         BuildTrackTable();
+         }
+
+      switch (status)
+         {
+         case 0:   /* currently playing audio */
+            paused = FALSE;
+            playing = TRUE;
+            
+            if (CheckFlags(user))
+               {    
+               UpdateTrackDisplay(GetCurTrack());
+               UpdateTimeDisplay(TRUE);
+               }
+            break;
+      
+         case 1:   /* currently paused */
+            paused = TRUE;
+            playing = TRUE;
+
+            if (ReadSubChannel())
+               {
+               UpdateTrackDisplay(GetCurTrack());
+               UpdateTimeDisplay(TRUE);
+               }
+            break;
+
+         case 2:   /* audio muting on */
+            break;
+ 
+         case 3:   /* audio play completed successfully */
+         case 5:   /* audio play not requested */
+            if (memory && !stopped)
+               {
+               if (MemoryPlay(INCREM))
+                  {     /* FIXME are they effective ? */
+                  UpdateTrackDisplay(GetCurTrack());
+                  UpdateTimeDisplay(TRUE);
+                  }
+               else Stop();
+               }
+            else if (repeat && !stopped)
+               Play();
+               else if (playing) Stop();   
+            break;
+
+         case 4:   /* error occured during audio play */
+            if (playing)
+               Stop();
+            break;
+
+         }   /* switch */ 
+      
+      SetButton(PAUSE);
+      SetButton(PLAY);   
+      }
+      
+} /* end of UpdateDisplay */
+
+/**************************************************************************/
+
+   void
+SetButton(wimp_i button)
+{              
+static BOOL oldpaused = FALSE;
+static BOOL oldplaying = FALSE;   
+
+   switch (button)
+      {
+      case PAUSE:
+         if (paused != oldpaused)
+            {
+            oldpaused = paused;
+
+            if (paused)
+               wimp_set_icon_state(main_h, PAUSE, SELECTED, wimp_ISELECTED);
+            else
+               wimp_set_icon_state(main_h, PAUSE, 0, wimp_ISELECTED);
+
+            }
+         break;
+
+      case PLAY:
+         if (playing != oldplaying)
+            {
+            oldplaying = playing;
+
+            if (playing)
+               wimp_set_icon_state(main_h, PLAY, SELECTED, wimp_ISELECTED);
+            else
+               wimp_set_icon_state(main_h, PLAY, 0, wimp_ISELECTED);
+
+            }
+         break;
+      
+      }   /* switch */
+
+} /* end of SetButton */
+
+/**************************************************************************/
+
+   void
+DiscHasGone()
+{
+
+   disc_in = FALSE;
+   
+   UpdateTrackDisplay(EMPTY);
+   UpdateTimeDisplay(FALSE);
+
+   paused = FALSE;
+   playing = FALSE;
+   SetButton(PAUSE);
+   SetButton(PLAY);
+
+   repeat = FALSE;
+   wimp_set_icon_state(keypad_h, KP_RPT, 0, wimp_ISELECTED);
+      
+   DisplayDiscInfo();
+
+   if (memory)
+      Forget(ALL);
+
+   if (memory_open)
+      {
+      wimpt_noerr(wimp_close_wind(memory_h));
+      memory_open = FALSE;
+      }
+
+   if (keypad_open)
+      {
+      wimpt_noerr(wimp_close_wind(keypad_h));
+      keypad_open = FALSE;
+      }
+
+} /* end of DiscHasGone */
+
+/**************************************************************************/
+
+   BOOL
+CheckFlags(BOOL user)
+{
+static int disptrack = 100;
+int track;
+   
+   user = user;   /* FIXME */
+
+   if (!ReadSubChannel())
+      return (NULL);
+   else
+      track = GetCurTrack();
+
+   if (track == disptrack)
+      return (TRUE);
+   else
+      disptrack = track;      
+   
+   /* FIXME maybe these should be ruled out !!! */
+   
+   /* if (!user)
+      {         
+      if (memory)
+         {
+         if (repeat)
+            {
+            } 
+         }
+
+      }
+    */
+        
+   /* ATTENTION ATTENTION: MORE LOGIC REQUIRED HERE! */
+   /* if (subchannel.ctrlbits & 0x01)
+      {
+      tracef0("AIUTO!\n");
+      track = subchannel.track;
+
+      while (GetTrackIndex(track) == -1)
+         track++;
+
+      if (GetTrackIndex(track) >= 0)
+         playing = PlayTrack(track);
+      }
+    */
+
+   return (TRUE);
+  
+} /* CheckFlags */
+
+/**************************************************************************/
+     
+   void
+BuildRandom()
+{
+int i, index;
+BOOL array[99];                    
+   
+   if (memory)
+      Forget(ALL);
+      
+   for (i=0; i < trackindex; i++)
+      array[i] = FALSE;
+     
+   do {                            
+      index = Random(trackindex); 
+
+      if (array[index] == FALSE)
+         {
+         array[index] = TRUE;
+         Memorize((int)tracktable[(int)index].track);
+         }
+
+      } while (memory < trackindex);
+   
+   RedrawMemory();
+
+} /* BuildRandom */   
+
+/**************************************************************************/
+
+   int
+Random(int range)
+{        
+char num[4];
+int out, r;
+
+   do {
+      r = rand() & 0xff;
+
+      sprintf(num, "%03.3d", r);
+
+      if (range <= 9)
+         out = atoi(&num[2]);
+      else if (range <= 99)
+         out = atoi(&num[1]);
+      else 
+         return (0);
+      
+      } while (out >= range);
+
+   return (out);
+
+} /* end of Random */
+
+/**************************************************************************/
+
+   BOOL
+MemoryPlay(UBYTE direction)
+{                                      
+static int curprg = 0;
+     
+   tracef2("MemoryPlay()=mem_cur: %d, dir: %d\n", curprg, direction);
+   
+   if (direction == START)
+      {
+      curprg = 0;
+      playing = PlayTrack((int)program[curprg].track);
+      }
+   else if (direction == INCREM)
+      {
+      if (++curprg >= memory)
+         {          
+         curprg = 0;
+         if (repeat)        
+            playing = PlayTrack((int)program[curprg].track);
+         else
+            return (FALSE);
+         }
+      else
+         playing = PlayTrack((int)program[curprg].track);
+      }
+   else if (direction == PLUS)
+      {
+      if (++curprg >= memory)
+         {   
+         if (repeat)
+            {
+            curprg = 0;
+            playing = PlayTrack((int)program[curprg].track);
+            }
+         else
+            {
+            curprg--;
+            return (FALSE);  
+            }
+         }
+      else
+         playing = PlayTrack((int)program[curprg].track);
+         
+      }
+   else if (direction == MINUS)
+      {
+      if (--curprg < 0)
+         {
+         if (repeat)
+            curprg = memory-1;
+         else
+            curprg = 0;
+         }
+      
+      playing = PlayTrack((int)program[curprg].track);   
+      }
+
+   return (TRUE);
+ 
+} /* MemoryPlay */
+
+/**************************************************************************/
+
+   int
+To_mmssff(int absolute)
+{
+UBYTE mmssff[4];
+   
+   mmssff[3] = 0; 
+   mmssff[2] = absolute / 4500;          /* minutes */
+   mmssff[1] = (absolute % 4500) / 75;   /* seconds */
+   mmssff[0] = (absolute % 4500) % 75;   /* frames */
+
+   return (*(int *)mmssff);
+
+} /* end of To_mmssff */
+
+/**************************************************************************/
+
+   void
+Delay(int delay)
+{
+int curtime = GetCurTime();
+
+   while (GetCurTime() < (curtime + delay))
+      ;
+
+} /* end of Delay */
+
+/**************************************************************************/
+
+   void
+UpdateSlider(wimp_i i, int maxblock)
+{      
+int block;          
+int newpos;
+wimp_icon icon; 
+wimp_wstate wstate;
+wimp_mousestr mousestr;
+   
+   /* these are needed if you start playing by dragging the sliderknob and
+      subsequently want to use the fastbackward and fastforward functions.
+    */
+   mincurblock = 0;
+   maxcurblock = avail.maxblock;
+
+   wimp_get_icon_info(main_h, knob, &icon); 
+   
+   wimp_get_wind_state(main_h, &wstate);
+
+   if (i == SLIDERBAR)
+      {
+      wimp_get_point_info(&mousestr);
+       
+      newpos = mousestr.x - wstate.o.box.x0 - ix0 / 2 - KNOB_XSIZE;
+
+      if (newpos > (230-KNOB_XSIZE))
+         newpos = 230-KNOB_XSIZE;
+      else if (newpos < 0)
+         newpos = 0;        
+
+      RedrawSlider(newpos);     
+      }
+   else if (i == knob)
+      {
+      do {
+         os_swix(OS_Mouse, &regs);
+      
+         newpos = regs.r[0] - wstate.o.box.x0 - ix0 / 2 - KNOB_XSIZE;
+
+         if (newpos > (230-KNOB_XSIZE))
+            newpos = 230-KNOB_XSIZE;
+         else if (newpos < 0)
+            newpos = 0;
+                     
+         RedrawSlider(newpos);
+
+         } while (regs.r[2]);
+
+      }
+      
+   block = newpos * (maxblock / (230-KNOB_XSIZE));
+
+   if (SeekTo(ADR_LOGICAL, block))
+      AudioPause(paused);  
+
+   UpdateDisplay(FALSE);
+
+} /* end of UpdateSlider */
+
+/**************************************************************************/
+
+   void
+RedrawSlider(int newpos)
+{
+static int curpos = 0;
+
+   if (newpos != curpos)
+      {
+      curpos = newpos;
+            
+      knob_icreate.i.box.x0 = curpos + ix0;
+      knob_icreate.i.box.x1 = curpos + ix0 + idx;      
+
+      wimp_delete_icon(main_h, knob);
+      wimp_create_icon(&knob_icreate, &knob);
+      wimp_set_icon_state(main_h, SLIDERBAR, 0, 0);
+      wimp_set_icon_state(main_h, knob, 0, 0);
+      }
+
+} /* end of RedrawSlider */
+
+/**************************************************************************/
+
+   BOOL
+ReportError()
+{
+
+   regs.r[0] = (int)error;
+   regs.r[1] = 3;
+   regs.r[2] = (int)PROGRAM_NAME;
+   os_swix(Wimp_ReportError, &regs);
+   
+   if (regs.r[1] == 1)
+      return (TRUE);
+   else
+      return (FALSE);
+
+} /* end of ReportError */
+
+/**************************************************************************/
+
+   BOOL
+BuildTrackTable()
+{        
+struct TrackInfo temp; 
+BOOL found;
+UBYTE i;
+int k;
+int end;
+
+   regs.r[7] = (int)&controlblock;
+   end = avail.maxblock;
+   trackindex = 0;
+   for (i=avail.maxtrack, k=i-avail.mintrack; i >= avail.mintrack; i--, k--)
+      {
+      regs.r[0] = i;
+      regs.r[1] = (int)&tracktable[k];
+      if (os_swix(CD_EnquireTrack, &regs))
+         { 
+         tracef0("CD_EnquireTrack failed!\n");
+         return (FALSE);                       
+         }
+                                            
+      tracktable[k].track = i;
+      tracktable[k].endaddress = end - 1;   /* start of next track - 1 */
+      
+      end = tracktable[k].startaddress; 
+      trackindex++;
+      }
+     
+   /* rudimental bubble-sort */       
+   do {
+      for (k=0, found=FALSE; k < trackindex; k++)
+         {                             
+         if ((found == FALSE) && (tracktable[k].ctrlbits & 1))
+            found = TRUE;
+         
+         if (found == TRUE)
+            {
+            temp = tracktable[k+1];
+            tracktable[k+1] = tracktable[k];
+            tracktable[k] = temp;
+            }
+         }
+      
+      if (found == TRUE)
+         trackindex--;
+
+      } while (found == TRUE);
+
+   return (TRUE);
+
+} /* end of BuildTrackTable */
+
+/**************************************************************************/
+
+/****** Added by MEW ********/
+
+   void
+ChangeDriveType()
+{
+
+ regs.r[7] = (int)&controlblock;
+ if (os_swix(CD_Identify, &regs)==0)
+     if ( regs.r[ 2 ] != -1 )
+        controlblock.type = regs.r[ 2 ] ;
+
+
+
+#ifdef FREDDY
+
+ regs.r[0] = (int)&inquirydata;
+ regs.r[7] = (int)&controlblock;
+ os_swix(CD_Inquiry, &regs);
+
+
+ if ( regs.r[0] == (int)&inquirydata )
+    {
+
+/*    printf( " ERROR %s", regs.r[0] + 4 ); */
+
+/******** sort out the drive type from the inquiry data ******/
+
+/*
+ putchar( inquirydata.vendorid[0] );
+ putchar( inquirydata.vendorid[1] );
+ putchar( inquirydata.vendorid[2] );
+ putchar( inquirydata.vendorid[3] );
+ putchar( inquirydata.vendorid[4] );
+ putchar( inquirydata.vendorid[5] );
+ putchar( inquirydata.vendorid[6] );
+ putchar( inquirydata.vendorid[7] );
+*/
+
+
+ controlblock.type = SONYDRIVE;
+
+ if ( strncmp( inquirydata.vendorid, DRIVETYPE1, drivetype1length ) == 0 )
+            controlblock.type = PHILIPSDRIVE;
+
+ else
+     {
+     if ( strncmp( inquirydata.vendorid, DRIVETYPE2, drivetype2length )==0 )
+            {
+
+             /* It's a TOSHIBA, but new or old ? - version number of drive */
+
+             inquirydata.productid[ 14 ] = '\0' ;
+
+             if ( atoi( &inquirydata.productid[ 10 ] ) < NEW_TOSH_VERSION )
+                 controlblock.type = TOSHIBADRIVE;
+             else
+                 controlblock.type = TOSHIBA_2_DRIVE ;
+
+
+             controlblock.unit = 0;                   /* changed by N.C.  */
+            }
+     else
+         {
+
+ if ( strncmp( inquirydata.vendorid, DRIVETYPE3, drivetype3length ) == 0 )
+            controlblock.type = HITACHIDRIVE;
+
+        else {
+
+ if ( strncmp( inquirydata.vendorid, DRIVETYPE4, drivetype4length ) == 0 )
+    {
+            controlblock.type = CHINONDRIVE;
+     }
+     else
+         {
+           /* Test for SONY 561 drive */
+           if ( (strncmp( inquirydata.vendorid, "SONY", 4 ) == 0 )
+                && (strncmp( inquirydata.productid, "CD-ROM CDU-561", 14 ) == 0 ) )
+              controlblock.type = SONY_561 ;
+         }
+             }
+          }
+      }
+   }
+
+
+
+#endif
+
+}  /* end of ChangeDriveType */
+
+/**************************************************************************/
+
+   void
+ResetEndOfPlay()
+{
+int lastblock = avail.maxblock;
+
+   regs.r[0] = ADR_LOGICAL;
+   regs.r[1] = lastblock - 1;
+   regs.r[2] = lastblock;       
+   regs.r[7] = (int)&controlblock;
+   os_swix(CD_PlayAudio, &regs);
+   
+} /* end of ResetEndOfPlay */
+
+/**************************************************************************/
+
+#ifdef DEBUG
+   
+   BOOL
+LogError(char *error)
+{
+FILE *stream;
+
+   if ((stream = fopen(ERRORFILE, "a")) == NULL)
+      {
+      printf("Can't open ERRORLOG file!!!\n");
+      return (FALSE);                      
+      }
+
+   fprintf(stream, "%.77s\n", error);
+
+   fclose(stream);
+   return (TRUE);
+
+} /* end of LogError */
+
+#endif
+
+/**************************************************************************/
+/**************************************************************************/

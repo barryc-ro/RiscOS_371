@@ -1,0 +1,202 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Read.c                                                                           ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA_Support Code Module                                        ***/
+/***  Version:       0.10                                                              ***/
+/***                                                                                   ***/
+/***  By:            William Turner, Acorn Computers Ltd.                              ***/
+/***  Date:          22nd October 1993                                                 ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains the code to perform read functionality.                  ***/
+/***                                                                                   ***/
+/***  History:       0.10 21st December 1993 - Original Version                        ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Routines:-                                                                       ***/
+/***     MedLevel_Read()                                                               ***/
+/***     LowLevel__Read()  (assembler, in s.read_s)                                    ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include "kernel.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Variables.h"
+#include "Read.h"
+#include "Driver.h"
+#include "Error.h"
+#include "Debug.h"
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  MedLevel_Read(swi_registers)                                                     ***/
+/***                                                                                   ***/
+/***  This routine calculates the page size of the hardware, sets the correct page,    ***/
+/***  and then copies a block of data from src to dest, changing page where necessary. ***/
+/***                                                                                   ***/
+/***  On exit, registers 3 and 4 have been updated as follows;                         ***/
+/***    R3 points to the locn after the last byte writ                                 ***/
+/***    R4 is the number of bytes untransferred                                        ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIA_SupportCode_ErrorCode                                                   ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode MedLevel_Read(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode             error = NO_ERROR;
+    DRIVER_REGISTERS                    regblock;
+    DRIVER_REGISTERS                    DriverCall_Registers;
+    int                                 pagesize;
+    int                                 pccdrvaddr = 0;
+    int                                 pccdrvr12 = 0;
+    int                                 boundaries;
+    int                                 hostaddress;
+
+
+    SetUpHWDriver_CallRegs(CardDrive[reg ->r[1]].HardwareDriver, &DriverCall_Registers);
+    DriverCall_Registers.r[7] = CardDrive[reg ->r[1]].SlotHandle;
+    /** Ok , DriverCall_Registers ae set up for action! **/
+
+    /*************************************************************************************/
+    /***        Get the memory offset                                                  ***/
+    /*************************************************************************************/
+    DriverCall_Registers.r[1] = reg ->r[2];              /* address on card             */
+    DriverCall_Registers.r[2] = 0;                       /* memory mode                 */
+    HardwareFunction(HARDWARE_FUNCTION__GET_MEM_MAP_ADDRESS, &DriverCall_Registers, &DRV_Error);
+    hostaddress = DriverCall_Registers.r[0];
+
+    /** Now, select the right page **/
+    HardwareFunction(HARDWARE_FUNCTION__SELECT_PAGE, &DriverCall_Registers, &DRV_Error);
+
+    pagesize = 1 << HardwareDriver[CardDrive[reg ->r[1]].HardwareDriver].PageSize;
+    #if Debug == TRUE
+        DebugMessage("mK","Page selected is %d\n", DriverCall_Registers.r[1]);
+        DebugMessage("mK","Adaptor page size is &%8X\n",pagesize);
+    #endif
+
+
+
+    /*************************************************************************************/
+    /***        Sort out whether a device driver is required & if so, where is it???   ***/
+    /*************************************************************************************/
+    if(CardDrive[reg ->r[1]].PCCardDriver != MAX_PCCARD_DRIVERS) {
+        /*** Do need to call a device driver ***/
+        #if Debug == TRUE
+            DebugMessage("mK","Calling a PCCard driver to handle the read...\n");
+        #endif
+        pccdrvaddr = PCCardDriver[pccdrvr12].ReadAddress;
+        pccdrvr12  = PCCardDriver[pccdrvr12].R12Value;
+    }
+    else
+    {
+        pccdrvaddr = 0;
+        pccdrvr12  = 0;
+    }
+
+
+    /*************************************************************************************/
+    /***        Perform the low level read                                             ***/
+    /*************************************************************************************/
+    SetUpHWDriver_CallRegs(CardDrive[reg ->r[1]].HardwareDriver, &regblock);
+    /** Quick reg shuffle... **/
+    regblock.r[5] = regblock.r[10];
+    regblock.r[6] = regblock.r[9];
+
+    regblock.r[7] = CardDrive[reg ->r[1]].SlotHandle;
+    regblock.r[1] = reg ->r[0] & (ATTRIBUTE_MEMORY__BIT | SCATTER_LIST__BIT); /* only pass the flags */
+    regblock.r[2] = hostaddress;                 /* Byte address (mapped) */
+    regblock.r[3] = reg ->r[3];
+    regblock.r[4] = reg ->r[4];
+    regblock.r[8] = HardwareDriver[CardDrive[reg ->r[1]].HardwareDriver].DataModesSupported;
+
+#if Debug == TRUE
+        DebugMessage("mK","       Modes available: %d\n", regblock.r[8]);
+#endif
+
+    boundaries = ((reg ->r[2] + reg ->r[4]) / pagesize) - (reg ->r[2] / pagesize);
+#if Debug == TRUE
+        DebugMessage("mK","       Reading from PCMCIA: &%8X\n",reg ->r[2]);
+        DebugMessage("mK","       Thus, boundaries to be crossed = %d\n",boundaries);
+#endif
+    boundaries ++;
+
+    do {
+        if(boundaries > 1)
+                regblock.r[4] = (((reg ->r[2] + pagesize) / pagesize) * pagesize) - reg ->r[2]; /** Num bytes to get off this page **/
+        else
+                regblock.r[4] = reg ->r[4]; /** however many are left **/
+
+        hostaddress = regblock.r[4];    /*** Just use regblock as a temp store while regblock.r[4] gets changed **/
+        if(boundaries > 1) {
+            DriverCall_Registers.r[1] = reg ->r[2] / pagesize;
+            DriverCall_Registers.r[6] = 0;
+            HardwareFunction(HARDWARE_FUNCTION__SELECT_PAGE, &DriverCall_Registers, &DRV_Error);
+            #if Debug == TRUE
+                DebugMessage("mK","Changed to page %d here!\n", reg ->r[2] / pagesize);
+            #endif
+        }
+#if Debug == TRUE
+        DebugMessage("mK","Entering LowLevel__Read from MedLevel_Read\n");
+        DebugMessage("mK","       Reading &%8X bytes\n",regblock.r[4]);
+        DebugMessage("mK","       Boundaries = %d\n",boundaries);
+        DebugMessage("mK","       from &%8X\n",regblock.r[2]);
+        DebugMessage("mK","       to &%8X\n",regblock.r[3]);
+        DebugMessage("mK","       Mem mapped address is at &%8X\n",regblock.r[2]);
+        DebugMessage("mK","       Modes available: %d\n", regblock.r[8]);
+#endif
+        if ((error = LowLevel__Read(pccdrvaddr, pccdrvr12, &regblock)) != NO_ERROR) break;  /* AND PANIC! */
+
+        #if Debug == TRUE
+            DebugMessage("mK","Exited LowLevel__Read\n");
+            DebugMessage("mK"," regblock ->r[3] is &%8X on exit\n",regblock.r[3]);
+            DebugMessage("mK"," regblock ->r[4] is &%8X on exit\n",regblock.r[4]);
+        #endif
+
+        reg ->r[2] = reg ->r[2] + hostaddress - regblock.r[4];   /* increment source by amount read */
+        reg ->r[3] = regblock.r[3];                              /* increment dest */
+        reg ->r[4] = reg ->r[4] - (hostaddress - regblock.r[4]); /* Amount left decr by amount read */
+        regblock.r[2] = regblock.r[2] + (hostaddress - regblock.r[4]); /** Src inc by amnt read */
+        #if Debug == TRUE
+            DebugMessage("mK","       reg ->r[2] is &%8X\n",reg->r[2]);
+            DebugMessage("mK","       reg ->r[3] is &%8X\n",reg->r[3]);
+            DebugMessage("mK","       reg ->r[4] is &%8X\n",reg->r[4]);
+            DebugMessage("mK","\n Exited MedLevel_Read\n");
+        #endif
+
+        boundaries --;
+
+    } while(boundaries > 0);
+
+    return(error);
+}
+
+
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  LowLevel__Read(read routine address, read routine R12, register block)           ***/
+/***                                                                                   ***/
+/***  Performs the actual reading of the data from one area of memory to another.      ***/
+/***  The data is transfered from the address specified, to the address specified, and ***/
+/***  by the amount specified. Allegedly.                                              ***/
+/***  If the read routine address is 0, then the default SRAM routines are used.       ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    PCMCIA_SupportCode_ErrorCode                                                   ***/
+/***      - NO_ERROR                    = All data transferred successfully            ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+/*###################### THIS FUNCTION IS DEFINED IN S.READ_S ###########################*/
+

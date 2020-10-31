@@ -1,0 +1,869 @@
+/*  Title: > c.drag
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.drag"
+#include "h.editchar"
+#include "h.loadsave"
+#include "h.menu"
+#include "h.redraw"
+#include "h.sprites"
+#include "h.scaffold"
+#include "h.suspend"
+#include "h.main"
+
+
+int my_inkey(int n)
+{
+  int x = n & 0xFF;
+  int y = (n & 0xFF00) >> 8;
+
+  os_byte(0x81, &x, &y);
+
+  if (y == 0xFF) return(-1);
+
+  return(x);   /* RISC OS lib version says 'return n' (this is a bug!) */
+}
+
+
+os_error * send_datasave(dragboxstr *drag, wimp_mousestr *mouse,
+                                          int size, int type, char *filename);
+os_error *drag_movechar(wimp_w handle, int mousex, int mousey);
+
+os_error *updatescaffoldcopies(Char_Block *charptr, int index);
+
+static void scafflink2(Pt_Block *pt, int i);
+
+
+/* ---- global variables --------------------------------------------------- */
+
+
+dragboxstr  dragbox;
+dragboxstr  dragcopy;
+
+wimp_box    handlebox;
+int         handlex;
+int         handley;
+
+int         showpointer;
+int         showcoords;
+int         showwidth;
+int         showbbox;
+int         showobox;
+int         showfbox;
+int         showsprites;
+int         showhandles;
+int         showendpoints;
+int         showcharnames;
+
+
+/* ---- Mouse click detection ---------------------------------------------- */
+
+
+os_error * event_mouse(wimp_mousestr mouse)
+{
+  unsigned int charno;
+  Wind_Link    *wlink;
+
+/*
+    mytracef("Mouse click: x=%d, y=%d, b=%d, w=%d, i=%d\n",
+                       mouse.x,mouse.y,mouse.bbits,mouse.w,mouse.i);
+*/
+
+  if ((wlink=findwindlink(mouse.w)) == NULL) {
+    if (mouse.w > 0) er(getwindowstate(mouse.w));
+    if (mouse.w == origin_window) return(origin_mouse(&mouse));
+  } else {
+    er(getwlinkstate(wlink));
+  }
+
+  switch (mouse.bbits)
+  {
+    case wimp_BMID:
+         if (wlink == NULL) {
+           if (mouse.w == -2) {
+             er(wimp_create_menu(Menu_IconBar,mouse.x-(MENUWIDTH(4)>>1)-24,96+2*40));
+             menuhandle = NULL;
+             break;
+           }
+         } else {
+           er(create_menu(wlink,&mouse));
+         }
+         break;
+
+    case wimp_BLEFT:
+    case wimp_BRIGHT:
+         if (mouse.w == -2) {
+           er(newfont(&thisfont));
+           er(newfontwindow(thisfont));
+           break;
+         }
+
+         if (mouse.w == save_window) {
+           if (mouse.i == 2) {                    /* OK box */
+             er(savefilechk(menuhandle->info, wricon_filename, 0));
+           }
+           break;
+         }
+
+         if (mouse.w == save_window2) {
+           if (mouse.i == 2) {                    /* OK box */
+             er(savefilechk2(menuhandle->info, wricon_filename2, 0));
+           }
+           break;
+         }
+
+         if (mouse.w == magnifier_window) {
+           Char_Block *thischar = menuhandle->info;
+           int m1 = thischar ->magnifierup;
+           int m2 = thischar ->magnifierdown;
+
+           switch(mouse.i) {
+             case 2: m1 += (m1 <= 999 ? 1 : 0); break;
+             case 3: m1 -= (m1 > 1 ? 1 : 0); break;
+             case 4: m2 += (m2 <= 999 ? 1 : 0); break;
+             case 5: m2 -= (m2 > 1 ? 1 : 0);
+           }
+           if (m1 != thischar->magnifierup || m2 != thischar->magnifierdown)
+             er(zoom(menuhandle,m1,m2,0));
+
+           if (mouse.i == 7) er(zoom(menuhandle,m1,m2,1-thischar->variable));
+           break;
+         }
+
+         if (wlink != NULL)
+         switch(wlink->type)
+         {
+           case W_FONTINDEX:
+           case W_TREE:
+                thisfont = (Font_Block *) wlink->info;
+                if ((charno = getindex(wlink,mouse.x,mouse.y,NULL)) < thisfont->nchars) {
+#if FALSE
+                  if (inbasefile(thisfont,charno)) {
+                    returnerr("This character is inherited and cannot be edited");
+                  } else
+#endif
+                  { if (thisfont->chars[charno] == NULL) er(newchar(thisfont,charno));
+                    er(open_char((thisfont->filedata->bpp == 1) ? W_BITMAP   :
+                                 ((mouse.bbits==wimp_BLEFT)     ? W_SKELETON : W_FULL), thisfont->chars[charno])
+                      );
+                  }
+                }
+                break;
+
+           case W_FULL:
+                {
+                  Char_Block *charptr = wlink->info;
+                  if (!inbasefile(charptr->parent,charptr->charno)) {
+                    er(open_char(W_SKELETON, charptr));
+                  }
+                }
+                break;
+
+           case W_SKELETON:
+                er(editskel(wlink,&mouse));
+                break;
+
+           case W_BITMAP:
+                er(editbitmap(wlink,&mouse));
+                break;
+
+           default:
+                finish("Unrecognised window type");
+         }
+         break;
+
+    case wimp_BDRAGLEFT:
+         if (mouse.w == save_window)               /* save font file */
+         {
+           if (mouse.i == 0)      /* file icon */
+           {
+             wimp_icon f;
+             erx(wimp_get_icon_info(mouse.w,mouse.i,&f));
+             erx(dragfixedbox(bx + f.box.x0,
+                              by + f.box.y0,
+                              bx + f.box.x1,
+                              by + f.box.y1));
+             dragbox.type = DR_FILE;      /* menuhandle->info = font block */
+             dragbox.wlink = menuhandle;
+           }
+           break;
+         }
+
+         if (mouse.w == save_window2)              /* save metrics file */
+         {
+           if (mouse.i == 0)      /* file icon */
+           {
+             wimp_icon f;
+             erx(wimp_get_icon_info(mouse.w,mouse.i,&f));
+             erx(dragfixedbox(bx + f.box.x0,
+                              by + f.box.y0,
+                              bx + f.box.x1,
+                              by + f.box.y1));
+             dragbox.type = DR_FILE2;      /* menuhandle->info = font block */
+             dragbox.wlink = menuhandle;
+           }
+           break;
+         }
+
+         if (wlink != NULL)
+         switch(wlink->type)
+         {
+           case W_FONTINDEX:    /* copy char defn into another */
+           case W_TREE:
+                thisfont = (Font_Block *) wlink->info;
+                if ((thisfont->filedata->bpp) == 0) {
+                  wimp_box b;
+                  if ((charno = getindex(wlink,mouse.x,mouse.y,&b)) < thisfont->nchars) {
+                    erx(dragfixedbox(b.x0+dx,b.y0+dy,b.x1,b.y1));
+                    dragbox.type = bbc_inkey(-1) ? DR_FONTMOVE
+                                                 : DR_FONT;
+                    dragbox.wlink = wlink;
+                    dragbox.d.font.fromchar = thisfont->chars[charno];
+                  }
+                }
+                break;
+
+           case W_SKELETON:  /* drag Bezier control point */
+                er(editskel(wlink,&mouse));
+                break;
+
+           case W_FULL:
+                break;
+         }
+         break;
+
+    case wimp_BDRAGRIGHT:
+         if (wlink != NULL)
+         switch(wlink->type)
+         {
+           case W_FONTINDEX:    /* copy char's scaffold into another */
+           case W_TREE:
+                thisfont = (Font_Block *) wlink->info;
+                if ((thisfont->filedata->bpp) == 0) {      /* only outline fonts have scaffolding */
+                  wimp_box b;
+                  if ((charno = getindex(wlink,mouse.x,mouse.y,&b)) < thisfont->nchars) {
+                    erx(dragfixedbox(b.x0+dx,b.y0+dy,b.x1,b.y1));
+                    dragbox.type = bbc_inkey(-1) ? DR_COMPOSITE :
+                                   bbc_inkey(-2) ? DR_DECOMPOSITE
+                                                 : DR_BASECHAR;
+                    dragbox.wlink = wlink;
+                    dragbox.d.font.fromchar = thisfont->chars[charno];
+                  }
+                }
+                break;
+
+           case W_SKELETON:  /* drag Bezier control point */
+                er(editskel(wlink,&mouse));
+                break;
+         }
+         break;
+
+    case wimp_BCLICKLEFT:
+    case wimp_BCLICKRIGHT:
+         break;
+  }
+  return(NULL);
+}
+
+
+os_error * editbitmap(Wind_Link * wlink, wimp_mousestr * mouse)
+{
+  Char_Block * charptr = wlink->info;
+  Font_Block * font = charptr->parent;
+  int h, dx,dy;
+
+  getscaledchardata(charptr);
+
+  h = (charptr->yupperc-charptr->ylowc)*pixelmag;
+
+  dx = (mouse->x - bx) * font->xres / font->yres / pixelmag;
+  dy = (mouse->y - (by-h)) / pixelmag;
+
+  if (dx >= 0 && dx < xsize && dy >= 0 && dy < ysize)
+  {
+    static sprite_id sprid = { NULL, sprite_id_name };
+    sprite_colour spcol, spcol2;
+    sprid.s.name = charptr->sprname;
+
+    if (mouse->bbits & wimp_BRIGHT)
+         spcol.colour = 0;
+    else spcol.colour = 1;
+    spcol.tint = 0;
+
+    er(sprite_readpixel(font->spritedata,&sprid,dx,dy,&spcol2));
+
+    if (spcol.colour != spcol2.colour || spcol.tint != spcol2.tint) {
+      er(sprite_writepixel(font->spritedata,&sprid,dx,dy,&spcol));
+      dx = dx * pixelmag * font->yres / font->xres;
+      dy = dy * pixelmag - h;
+      invalidate(wlink->wind_handle,dx,dy,dx+pixelmag,dy+pixelmag);
+      er(savechar(charptr));
+      displaychar(findwindinfo(W_FONTINDEX,font)->wind_handle,font,charptr->charno);
+    }
+  }
+  return(NULL);
+}
+
+
+os_error * event_dragbox(void)
+{
+  Wind_Link     *wlink;
+  unsigned int  ch;
+  wimp_mousestr mouse;
+  os_error *err = NULL;
+
+  err = erm("dragbox.wlink", getwlinkstate(dragbox.wlink));
+  if (err == NULL) err = wimp_get_point_info(&mouse);
+
+  mousex = mouse.x;     /* for matchpoint() */
+  mousey = mouse.y;
+
+  if (err == NULL)
+  switch(dragbox.type)
+  {
+    case DR_FILE:
+         { Font_Block *font = menuhandle->info;
+           er(send_datasave(&dragbox, &mouse, flex_size((flex_ptr)&font->filedata), 0xFF6, wricon_filename));
+         }
+         break;
+
+    case DR_FILE2:
+         er(send_datasave(&dragbox, &mouse, 0, 0xFF6, wricon_filename2));
+         break;
+
+    case DR_FONT:
+         er(send_datasave(&dragbox, &mouse, -1, 0xAFF, "DrawFile"));
+         break;
+
+    case DR_FONTMOVE:
+         dragcopy = dragbox;               /* bodge - side effect of send_datasave() */
+         er(drag_movechar(mouse.w,mouse.x,mouse.y));
+         break;
+
+    case DR_COMPOSITE:    /* construct composite character */
+    case DR_DECOMPOSITE:    /* deconstruct composite character */
+
+         if ((wlink = findwindlink(mouse.w)) == NULL) break;
+
+         switch(wlink->type)
+         {
+           case W_FONTINDEX:
+           case W_TREE:
+                thisfont = (Font_Block *) wlink->info;
+                erx(getwindowstate(mouse.w));
+                if (dragbox.d.font.fromchar &&
+                     thisfont == dragbox.d.font.fromchar->parent)  /* both chars must be in same font */
+                if ((ch = getindex(wlink,mouse.x,mouse.y,NULL)) < thisfont->nchars)
+                if (thisfont->chars[ch]!=dragbox.d.font.fromchar) {
+                  int c = dragbox.d.font.fromchar->charno;
+                  if (thisfont->chars[ch]==NULL) {
+                    e(break, err=newchar(thisfont, ch));
+                    thisfont->chars[ch]->xwidth = thisfont->chars[c]->xwidth;
+                    thisfont->chars[ch]->ywidth = thisfont->chars[c]->ywidth;
+                  }
+                  if (dragbox.type == DR_COMPOSITE) {
+                    e(break,err=makecomposite(thisfont->chars[ch], c, 0, 0));
+                  } else {
+                    e(break,err=unmakecomposite(thisfont->chars[ch], c));
+                  }
+                }
+                break;
+
+           case W_SKELETON:
+                e(break, err=getwlinkstate(wlink));
+                thischar = wlink->info;
+                if (dragbox.d.font.fromchar)
+                if (thischar->parent==dragbox.d.font.fromchar->parent)  /* within a font only */
+                if (thischar!=dragbox.d.font.fromchar) {
+                  int c = dragbox.d.font.fromchar->charno;
+                  if (dragbox.type == DR_COMPOSITE) {
+                    e(break, err=makecomposite(thischar, c, unscalex(mouse.x), unscaley(mouse.y)));
+                  } else {
+                    e(break, err=unmakecomposite(thischar, c));
+                  }
+                }
+         }
+         break;
+
+    case DR_BASECHAR:    /* copy char's scaffold */
+
+         if ((wlink = findwindlink(mouse.w)) == NULL) break;
+
+         switch(wlink->type)
+         {
+           case W_FONTINDEX:
+           case W_TREE:
+                thisfont = (Font_Block *) wlink->info;
+                erx(getwindowstate(mouse.w));
+                if (dragbox.d.font.fromchar == NULL ||
+                    thisfont == dragbox.d.font.fromchar->parent)  /* can only use scaffold within a font */
+                if ((ch = getindex(wlink,mouse.x,mouse.y,NULL)) < thisfont->nchars)
+                if (thisfont->chars[ch]!=NULL)
+                if (thisfont->chars[ch]!=dragbox.d.font.fromchar)
+                  e(break,err=copyscaffold(dragbox.d.font.fromchar,thisfont->chars[ch]));
+                break;
+
+           case W_SKELETON:
+                thischar = (Char_Block *) wlink->info;
+                if (thischar->parent==dragbox.d.font.fromchar->parent)  /* scaffold within a font only */
+                if (thischar!=dragbox.d.font.fromchar)
+                  e(break,err=copyscaffold(dragbox.d.font.fromchar,thischar));
+         }
+         break;
+
+    case DR_POINT:
+         {
+           Pt_Block *pt2, *pt = dragbox.d.point.pt;
+           int link1, link2;
+
+           e(break,err=eorbits(pt,EO_DRAG));
+
+           if ((link1=nullindex(pt))>=0)
+           {
+             pt->x += 200;  /* avoid matching this one */
+
+             if ((pt2 = scancharendpt(thischar,matchpoint))!=NULL)
+             if ((link2=nullindex(pt2))>=0)
+             {
+               pt->x = pt2->x;
+               pt->y = pt2->y;
+               e(break,err=eorbits(pt,EO_RESTORE));
+               bbc_vdu(7);
+               if (pt->path!=pt2->path) mergepaths(pt2,pt);
+               join(pt->nextpt[1-link1],1,pt2,link2);
+               if (thischar->sline.p[0]==pt) thischar->sline.p[0]=pt2;
+               if (thischar->sline.p[3]==pt) thischar->sline.p[3]=pt2;
+               if (pt2->path->firstpoint==pt)
+                   pt2->path->firstpoint=pt2;
+               heap_free(pt);
+               if ((pt=pt2->nextpt[0])!=NULL) {
+                 pt->scaffoldx = pt2->scaffoldx;
+                 pt->scaffoldy = pt2->scaffoldy;
+               }
+               if ((pt=pt2->nextpt[1])!=NULL) {
+                 pt->scaffoldx = pt2->scaffoldx;
+                 pt->scaffoldy = pt2->scaffoldy;
+               }
+               dragbox.type = DR_NONE;
+               if (!showpointer) pointer(1);
+               e(break,err=updatecopies(thischar,TRUE));
+               e(break,err=updatebbox(thischar, handle));    /* handle set up by getwlinkstate */
+               validate(thischar,"decodedrag (glued)");
+               break;
+             }
+             pt->x -= 200;
+           }
+           e(break,err=eorbits(pt,EO_RESTORE));
+           dragbox.type = DR_NONE;
+           if (!showpointer) pointer(1);
+           validate(thischar,"decodedrag");
+           e(break,err=updatecopies(thischar,TRUE));
+           e(break,err=updatebbox(thischar, handle));    /* handle set up by getwlinkstate */
+         }
+         break;
+
+    case DR_RECTSCAFFOLD:
+         {
+           wimp_redrawstr rblk;
+           BOOL more;
+
+           e(break,err=eo_rectangle());
+           dragbox.type = DR_NONE;
+           if (!showpointer) pointer(1);
+           minx = unscalex(bx+dragbox.d.rectangle.x0);
+           miny = unscaley(by+dragbox.d.rectangle.y0);
+           maxx = unscalex(bx+dragbox.d.rectangle.x1);
+           maxy = unscaley(by+dragbox.d.rectangle.y1);
+           if (minx>maxx) { int temp=minx; minx=maxx; maxx=temp; }
+           if (miny>maxy) { int temp=miny; miny=maxy; maxy=temp; }
+           scancharpt(thischar,scaffoldpoint);
+           rblk.w = handle;
+           for (more=updminmax(&rblk);more;more=nextrect(&rblk)) {
+              pointcol=GCOL(0,13); scanchar(thischar,drawpoints);
+           }
+           e(break,err=updatecopies(thischar,TRUE));
+           e(break,err=setextent(dragbox.wlink));          /* extent may have been altered */
+         }
+         break;
+
+    case DR_SCAFFOLDX:
+         {
+           mousex += dragbox.xoff;
+           mousex = unscalex(mousex);
+           if (mousex != dragbox.d.scaffold.x) {
+             e(break,err=eo_scaffold(dragbox.d.scaffold.x,EO_DRAG));
+           }
+           e(break,err=changescaffoldcoord(dragbox.wlink->info,
+                                          dragbox.d.scaffold.index,
+                                          dragbox.d.scaffold.x,
+                                          &mousex)
+           );
+           e(break,err=eo_scaffold(mousex,EO_RESTORE));
+           if (!showpointer) pointer(1);
+           e(break,err=updatescaffoldcopies(dragbox.wlink->info,dragbox.d.scaffold.index));
+           e(break,err=setextent(dragbox.wlink));          /* extent may have been altered */
+         }
+         break;
+
+    case DR_SCAFFOLDY:
+         {
+           mousey += dragbox.yoff;
+           mousey = unscaley(mousey);
+           if (mousey != dragbox.d.scaffold.y) {
+             e(break,err=eo_scaffold(dragbox.d.scaffold.y,EO_DRAG));
+           }
+           e(break,err=changescaffoldcoord(dragbox.wlink->info,
+                                          dragbox.d.scaffold.index + 8,   /* point to following array */
+                                          dragbox.d.scaffold.y,
+                                          &mousey)
+           );
+           e(break,err=eo_scaffold(mousey,EO_RESTORE));
+           if (!showpointer) pointer(1);
+           e(break,err=updatescaffoldcopies(dragbox.wlink->info,dragbox.d.scaffold.index+8));
+           e(break,err=setextent(dragbox.wlink));          /* extent may have been altered */
+         }
+         break;
+
+    case DR_SPRITEBOX:
+         if (!showpointer) pointer(1);
+         invalidate(handle,-big,-big,big,big);         /* redraw sprite now */
+         e(break,err=setextent(dragbox.wlink));        /* extent may have been altered */
+
+  }
+  dragbox.type = DR_NONE;   /* must have finished now! */
+
+  return(err);
+}
+
+
+/* Routine to find which character the mouse is over
+ * Looks for font index, skeleton/bitmap window
+ */
+
+os_error *findchar(Char_Block **charpp, Wind_Link *wlink, int mousex, int mousey)
+{
+  er(getwindowstate(wlink->wind_handle));    /* sets up bx, by etc. */
+
+  *charpp = NULL;
+
+  switch(wlink->type) {
+
+    case W_FONTINDEX:
+    case W_TREE:
+         {
+           Font_Block *font = wlink->info;
+           int ch = getindex(wlink,mousex,mousey,NULL);
+           if (ch < font->nchars) *charpp = font->chars[ch];
+         }
+         break;
+
+    case W_SKELETON:
+    case W_BITMAP:
+         *charpp = wlink->info;
+  }
+  return(NULL);
+}
+
+
+os_error * send_datasave(dragboxstr *drag, wimp_mousestr *mouse,
+                                          int size, int type, char *filename)
+{
+  char *i, *j;
+  wimp_msgstr mess;
+
+  dragcopy = *drag;               /* used when the message passing has finished */
+
+  mess.hdr.your_ref = 0;
+  mess.hdr.action = wimp_MDATASAVE;
+  mess.data.datasave.w = mouse->w;
+  mess.data.datasave.i = mouse->i;
+  mess.data.datasave.x = mouse->x;
+  mess.data.datasave.y = mouse->y;
+  mess.data.datasave.estsize = size;
+  mess.data.datasave.type = type;
+  j=filename;
+  for (i=filename;*i>=32;i++) if (*i=='.') j=i+1;
+  i=mess.data.datasave.leaf;
+  for (;*j>=32;) *i++ = *j++;
+  *i = 0;  /* ensure correct terminator */
+  mess.hdr.size = (i - ((char *)&mess) + 4) & ~3;
+  return(wimp_sendwmessage(wimp_ESEND,&mess,mouse->w,mouse->i));
+}
+
+
+/* SHIFT-SELECT-dragging a character within a font moves a character to a new position.
+ * All references to the character (scaffold inheritance and composite inclusion) are relocated.
+ */
+
+os_error *drag_movechar(wimp_w handle, int mousex, int mousey)
+{
+  Wind_Link *wlink;
+  int ch;
+
+  if ((wlink = findwindlink(handle)) == NULL) return(NULL);
+
+  if (wlink->info != dragbox.wlink->info) returnerr("Can only move characters within a font");
+
+  switch(wlink->type)
+  {
+    case W_FONTINDEX:
+    case W_TREE:
+         thisfont = (Font_Block *) wlink->info;
+         er(getwindowstate(handle));
+         if (thisfont->filedata->bpp == 0) {
+           wimp_box b;
+           if ((ch = getindex(wlink,mousex,mousey,&b)) < thisfont->nchars)
+           if (thisfont->chars[ch]!=dragcopy.d.font.fromchar) {
+             er(movechardata(dragcopy.d.font.fromchar,thisfont,ch));
+             invalidate(handle, -big,-big,big,big);
+           }
+         }
+  }
+
+  return(NULL);
+}
+
+
+os_error *updatescaffoldcopies(Char_Block *charptr, int index)
+{
+  Font_Block *font = charptr->parent;
+  Char_Block **charray = font->chars;
+  int ownerchar = charptr->scaffold.xchar[index];
+  int i;
+
+  for (i=0;i<font->nchars;i++) {
+    if ((charptr=charray[i]) != NULL)
+    if (charptr->scaffold.xchar[index] == ownerchar) {
+      er(updatecopies(charptr,FALSE));   /* redo 1-bpp copies */
+    }
+  }
+  return(NULL);
+}
+
+
+/* mousex, mousey = coordinates to match with ('unscaled' coordinates) */
+
+int scaffoldpoint(pt)
+Pt_Block *pt;
+{
+  int i;
+
+  if (pt->type == PT_HINGED || pt->type == PT_PARALLEL)
+  if (pt->x >= minx)
+  if (pt->x <= maxx)
+  if (pt->y >= miny)
+  if (pt->y <= maxy) {
+    i = thischar->parent->scaffold.index;
+    if (thischar->parent->scaffold.selchar == thischar->scaffold.xchar[i]) {
+      scafflink(pt, i);
+    }
+  }
+  return(false);
+}
+
+
+void scafflink(Pt_Block *pt, int i)
+{
+  scafflink2(pt, i);
+  scafflink2(pt->nextpt[0], i);             /* control points must have the same linkages */
+  scafflink2(pt->nextpt[1], i);
+}
+
+
+static void scafflink2(Pt_Block *pt, int i)
+{
+  if (pt) { if (i<8) pt->scaffoldx = i; else pt->scaffoldy = i-8; }
+}
+
+
+os_error * draggingpoint(void)
+{
+  int mx,my,addx,addy;
+  Pt_Block *pt2, *pt = dragbox.d.point.pt;
+  wimp_mousestr m;
+
+  er(wimp_get_point_info(&m));
+  {
+    int scrollx = 0;
+    int scrolly = 0;
+
+    if ((mx = m.x)<dragbox.limit.minx) scrollx=-16;
+    if (mx>dragbox.limit.maxx) scrollx=16;
+    if ((my = m.y)<dragbox.limit.miny) scrolly=-16;
+    if (my>dragbox.limit.maxy) scrolly=16;
+    if (scrollx || scrolly)
+    {
+      union { wimp_winfo info; wimp_openstr open; } wblk;         /* NB: no icons in this window */
+      wblk.info.w = dragbox.wlink->wind_handle;
+      erx(wimp_get_wind_info(&wblk.info));
+      wblk.open.x += scrollx;
+      wblk.open.y += scrolly;
+      { register int minx = wblk.open.x;
+        register int maxy = wblk.open.y;
+        register int maxx = minx + wblk.open.box.x1 - wblk.open.box.x0;
+        register int miny = maxy + wblk.open.box.y0 - wblk.open.box.y1;
+        register BOOL flag = 0;
+        wimp_redrawstr rblk;
+        rblk.box = wblk.info.info.ex;             /* current extent of window */
+        if (minx < rblk.box.x0) { rblk.box.x0 = minx; flag=1; }
+        if (miny < rblk.box.y0) { rblk.box.y0 = miny; flag=1; }
+        if (maxx > rblk.box.x1) { rblk.box.x1 = maxx; flag=1; }
+        if (maxy > rblk.box.y1) { rblk.box.y1 = maxy; flag=1; }
+        if (flag) {
+          rblk.w = wblk.info.w;
+          erx(wimp_set_extent(&rblk));            /* ensure extent is sufficient */
+        }
+      }
+      erx(wimp_open_wind(&wblk.open));       /* this shouldn't be restricted by extent */
+    }
+  }
+  er(getwlinkstate(dragbox.wlink));
+
+  switch(dragbox.type)
+  {
+    case DR_POINT:
+    case DR_SCAFFOLDX:
+    case DR_SCAFFOLDY:
+    case DR_SPRITEBOX:
+         mx += dragbox.xoff;             /* compensate for initial pointer offset */
+         my += dragbox.yoff;
+         mx = unscalex(mx);
+         my = unscaley(my);              /* mx,my = coordinates in char coord space */
+  }
+
+  switch(dragbox.type)
+  {
+    case DR_POINT:
+         switch(pt->type)
+         {
+           case PT_CONTROL  + PT_INVISIBLE:
+           case PT_STRAIGHT + PT_INVISIBLE:
+                if (mx!=pt->x || my!=pt->y)
+                {
+                  er(eorbits(pt,EO_DRAG));
+                  pt->x = mx;
+                  pt->y = my;
+                  er(eorbits(pt,EO_DRAG));
+                }
+                break;
+       
+           case PT_HINGED:
+           case PT_PARALLEL:
+                if ((addx=mx-pt->x) | (addy=my-pt->y))
+                {
+                  er(eorbits(pt,EO_DRAG));
+                  pt->x = mx;
+                  pt->y = my;
+                  if ((pt2=pt->nextpt[0])!=NULL) { pt2->x+=addx; pt2->y+=addy; }
+                  if ((pt2=pt->nextpt[1])!=NULL) { pt2->x+=addx; pt2->y+=addy; }
+                  er(eorbits(pt,EO_DRAG));
+                }
+         }
+         break;
+
+    case DR_RECTSCAFFOLD:
+         if (mx-bx != dragbox.d.rectangle.x1 ||
+             my-by != dragbox.d.rectangle.y1) {
+           er(eo_rectangle());
+           dragbox.d.rectangle.x1 = mx-bx;
+           dragbox.d.rectangle.y1 = my-by;
+           er(eo_rectangle());
+         }
+         break;
+
+    case DR_SCAFFOLDX:
+         if (mx != dragbox.d.scaffold.x) {
+           er(eo_scaffold(dragbox.d.scaffold.x,EO_DRAG));
+           er(changescaffoldcoord(dragbox.wlink->info,
+                                          dragbox.d.scaffold.index,
+                                          dragbox.d.scaffold.x,
+                                          &mx));
+           dragbox.d.scaffold.x = mx;
+           er(eo_scaffold(mx,EO_DRAG));
+         }
+         break;
+
+    case DR_SCAFFOLDY:
+         if (my != dragbox.d.scaffold.y) {
+           er(eo_scaffold(dragbox.d.scaffold.y,EO_DRAG));
+           er(changescaffoldcoord(dragbox.wlink->info,
+                                          dragbox.d.scaffold.index + 8,   /* point into following array */
+                                          dragbox.d.scaffold.y,
+                                          &my));
+           dragbox.d.scaffold.y = my;
+           er(eo_scaffold(my,EO_DRAG));
+         }
+         break;
+
+    case DR_SPRITEBOX:
+         {
+           Char_Block *chr = dragbox.wlink->info;
+           sprite_pgm newbox = chr->backsprbox;
+           BOOL bigenough = 1;
+
+           /* apply constraints to mx,my depending on type of drag */
+
+           switch(dragbox.d.spritebox.subtype) {
+             case SPB_x0y0: newbox.p0[0] = newbox.p3[0] = mx; newbox.p0[1] = newbox.p1[1] = my; break;
+             case SPB_x1y0: newbox.p1[0] = newbox.p2[0] = mx; newbox.p1[1] = newbox.p0[1] = my; break;
+             case SPB_x1y1: newbox.p2[0] = newbox.p1[0] = mx; newbox.p2[1] = newbox.p3[1] = my; break;
+             case SPB_x0y1: newbox.p3[0] = newbox.p0[0] = mx; newbox.p3[1] = newbox.p2[1] = my; break;
+             case SPB_x0: newbox.p0[0] = newbox.p3[0] = mx; my = dragbox.d.spritebox.oldhandley; break;
+             case SPB_y0: newbox.p0[1] = newbox.p1[1] = my; mx = dragbox.d.spritebox.oldhandlex; break;
+             case SPB_x1: newbox.p1[0] = newbox.p2[0] = mx; my = dragbox.d.spritebox.oldhandley; break;
+             case SPB_y1: newbox.p3[1] = newbox.p2[1] = my; mx = dragbox.d.spritebox.oldhandlex; break;
+             case SPB_MAIN:
+                  { int ox = mx - dragbox.d.spritebox.oldhandlex;
+                    int oy = my - dragbox.d.spritebox.oldhandley;
+                    newbox.p0[0] += ox; newbox.p0[1] += oy;
+                    newbox.p1[0] += ox; newbox.p1[1] += oy;
+                    newbox.p2[0] += ox; newbox.p2[1] += oy;
+                    newbox.p3[0] += ox; newbox.p3[1] += oy;
+                  } break;
+             default:
+               { static os_error err = { 1, "" };
+                 sprintf(err.errmess,"Not yet implemented - %d\n",dragbox.d.spritebox.subtype);
+                 return(&err);
+               }
+           }
+
+           if (abs(newbox.p2[0]-newbox.p0[0]) < 32 ||
+               abs(newbox.p2[1]-newbox.p0[1]) < 32) bigenough = 0;
+
+           if (bigenough && (mx != dragbox.d.spritebox.oldhandlex || my != dragbox.d.spritebox.oldhandley)) {
+             er(eo_spritebox(EO_DRAG,dragbox.wlink));
+             chr->backsprbox = newbox;
+             dragbox.d.spritebox.oldhandlex = mx;
+             dragbox.d.spritebox.oldhandley = my;
+             er(eo_spritebox(EO_DRAG,dragbox.wlink));
+           }
+         }
+         break;
+
+    default: returnerr("Unknown drag type");
+  }
+  return(NULL);
+}
+
+
+os_error *dragfixedbox(int cx0,int cy0,int cx1,int cy1)
+{
+  wimp_dragstr d;
+
+  d.window = NULL;
+  d.type = wimp_USER_FIXED;
+  d.box.x0 = cx0;
+  d.box.y0 = cy0;
+  d.box.x1 = cx1;
+  d.box.y1 = cy1;
+  d.parent.x0 = 0;
+  d.parent.y0 = 0;
+  d.parent.x1 = xwindlimit;
+  d.parent.y1 = ywindlimit;
+  return(wimp_drag_box(&d));
+}
+

@@ -1,0 +1,811 @@
+/*
+  Merlyn Kline, 1995
+
+:NOTES
+
+  Veneer for URL module SWIs
+
+  The url_*() routines provide a one-on-one veneer for the URL module SWIs.
+  A collection of #define statements provides easy reference for constants.
+
+  The html_*() routines provide a layer above the basic veneer, for use
+  with !Browser.
+
+:END
+
+:MESSAGES
+auth1:Please enter username and password for %s at %s
+HdAUTH:You must enter a username and password in this dialogue box to see the page you have requested.
+HdAUTH0:Click SELECT to use the username and password with the page you have requested.
+HdAUTH1:Click SELECT to cancel fetching the password protected page.
+HdAUTH2:Enter your username for the page you have requested, in this field.
+HdAUTH3:Enter your password for the page you have requested, in this field.
+:END
+
+:HISTORY
+28/09/95 MK  Created
+:END
+
+*/
+
+#define NOUTRACE
+#define NOFORGE_TERMINATOR
+
+#ifdef UTRACE
+#define utrace(x) trace_printf(x);
+#else
+#define utrace(x)
+#endif
+
+/*----------------------------------------------------------------------*/
+#include "string.h"
+
+#include "kernel.h"
+#include "win.h"
+#include "errorgen.h"
+
+#include "URLv.h"
+
+
+#define URL_swibase    0x83e00
+#define URL_Register   (URL_swibase+0)
+#define URL_GetURL     (URL_swibase+1)
+#define URL_Status     (URL_swibase+2)
+#define URL_ReadData   (URL_swibase+3)
+#define URL_SetProxy   (URL_swibase+4)
+#define URL_Stop       (URL_swibase+5)
+#define URL_Deregister (URL_swibase+6)
+
+#ifndef URL_Method_http_GET
+
+/*----------------------------------------------------------------------*/
+#define URL_Method_http_GET   1
+/*----------------------------------------------------------------------*/
+#define URL_Method_http_HEAD  2
+/*----------------------------------------------------------------------*/
+#define URL_Method_http_POST  4
+/*----------------------------------------------------------------------*/
+#define URL_Method_http_PUT   8
+
+
+/*----------------------------------------------------------------------*/
+#define URL_Status_Connected  1
+/*----------------------------------------------------------------------*/
+#define URL_Status_SentReq    2
+/*----------------------------------------------------------------------*/
+#define URL_Status_SentData   4
+/*----------------------------------------------------------------------*/
+#define URL_Status_Responded  8
+/*----------------------------------------------------------------------*/
+#define URL_Status_Transfer  16
+/*----------------------------------------------------------------------*/
+#define URL_Status_Done      32
+/*----------------------------------------------------------------------*/
+#define URL_Status_Aborted   64
+
+#endif
+
+static BOOL authorising=FALSE; /* an authorisation request is in progress */
+
+/*----------------------------------------------------------------------*/
+_kernel_oserror *url_register(int flags,unsigned int *session)
+{ /* register a requirement to fetch a URL with the module.
+       flags        must be 0
+       session      pointer to store for session id (or NULL)
+  */
+  _kernel_swi_regs r;
+  _kernel_oserror *e;
+
+  if(session) *session=0;
+  r.r[0]=flags;
+  e=_kernel_swi(URL_Register,&r,&r);
+  if(session && !e) *session=r.r[1];
+  return(e);
+}
+
+/*----------------------------------------------------------------------*/
+_kernel_oserror *url_get_url(int flags, unsigned int session,int method,
+                             char *url,char *extradata,unsigned int *status,int mode)
+{ /* Start fetching data from a URL
+       flags      must be 0
+       session    as returned by url_register()
+       method     a URL_Method_* (see #defines above)
+       url        pointer to the complete URL including a method
+       extradata  pointer to extra data to send in PUT/POST etc
+       status     pointer to store for returned status (or NULL)
+       mode       0=data only,1=header only,2=both
+   */
+  _kernel_swi_regs r;
+  _kernel_oserror *e;
+
+  /* Restrict user to file: accesses only */
+
+  #ifdef FILES_ONLY
+    /* Done this way to avoid potential problems */
+    /* with people doing binary level hacks;     */
+    /* e.g. replacing 'file:' with 'http:' in    */
+    /* the binary!                               */
+
+    {
+      char test[5], xor[5], lookup[6];
+      int  ok = 0;
+
+      lookup[5] = 0;
+      lookup[1] = 'A';
+      memset(xor, 0x80, sizeof(xor));
+      test[1] = url[0] ^ xor[3];
+      if (test[1] != 0xE6) ok = 1;
+      test[3] = url[1] ^ xor[4];
+      lookup[4] = 'N';
+      lookup[3] = 'O';
+      test[0] = url[3] ^ xor[0];
+      test[2] = url[2] ^ xor[1];
+      if (test[2] != 0xEC) ok = 10;
+      if (test[0] != 0xE5) ok = -1;
+      lookup[0] = 'F';
+      test[4] = url[4] ^ xor[2];
+      if (test[4] != 0xBA) ok = ~0;
+      lookup[2] = 'L';
+      if (test[3] != 0xE9) ok = 5;
+
+      if (ok)
+      {
+        e = errorgen_tag(lookup);
+        return e;
+      }
+    }
+  #endif
+
+  if(status) *status=0;
+  r.r[0]=flags;
+  r.r[1]=session;
+  r.r[2]=method;
+  r.r[3]=(int)url;
+  r.r[4]=(int)extradata;
+  r.r[5]=mode;
+#ifdef UTRACE
+trace_printf("   **geturl:%d,%d,%d,%d,%d",r.r[0],r.r[1],r.r[2],r.r[3],r.r[4]);
+#endif
+  e=_kernel_swi(URL_GetURL,&r,&r);
+#ifdef UTRACE
+trace_printf("   **geturl:done");
+#endif
+  if(status && !e) *status=r.r[0];
+  return(e);
+}
+
+
+/*----------------------------------------------------------------------*/
+_kernel_oserror *url_status(int flags,unsigned int session,
+                            int *status,int *response,int *bytes)
+{ /* Get the status of a fetch
+       flags      must be 0
+       session    as returned by url_register()
+       status     pointer to store for returned status (or NULL)
+       response   pointer to store for server response code (or NULL)
+       bytes      pointer to store for bytes transferred so far (or NULL)
+  */
+  _kernel_swi_regs r;
+  _kernel_oserror *e;
+
+  if(status) *status=0;
+  if(response) *response=0;
+  if(bytes) *bytes=0;
+  r.r[0]=flags;
+  r.r[1]=session;
+#ifdef UTRACE
+trace_printf("   **status:%d,%d",r.r[0],r.r[1]);
+#endif
+  e=_kernel_swi(URL_Status,&r,&r);
+#ifdef UTRACE
+trace_printf("   **status:done");
+#endif
+  if(!e)
+  {
+    if(status) *status=r.r[0];
+    if(response) *response=r.r[1];
+    if(bytes) *bytes=r.r[2];
+  }
+  return(e);
+}
+
+
+/*----------------------------------------------------------------------*/
+_kernel_oserror *url_read_data(int flags,unsigned int session,
+                               void *buffer,int size,
+                               int *status,int *read,int *pending)
+{ /* Get a chunk of data from a URL.
+       flags      must be 0
+       session    as returned by url_register()
+       buffer     pointer to buffer for data (or NULL to just get pending)
+       size       size of buffer
+       status     pointer to store for returned protocol status (or NULL)
+       read       pointer to store for number of bytes read (or NULL)
+       pending    pointer to store for number of bytes left to get (or NULL)
+  */
+  _kernel_swi_regs r;
+  _kernel_oserror *e;
+
+  if(status) *status=0;
+  if(read) *read=0;
+  if(pending) *pending=0;
+  r.r[0]=flags;
+  r.r[1]=session;
+  r.r[2]=(int)buffer;
+  r.r[3]=size;
+#ifdef UTRACE
+trace_printf("   **read:%d,%d,%d,%d",r.r[0],r.r[1],r.r[2],r.r[3]);
+#endif
+  e=_kernel_swi(URL_ReadData,&r,&r);
+#ifdef UTRACE
+trace_printf("   **read:done");
+#endif
+  if(!e)
+  {
+    if(status) *status=r.r[0];
+    if(read) *read=r.r[4];
+    if(pending) *pending=r.r[5];
+  }
+  return(e);
+}
+
+
+/*----------------------------------------------------------------------*/
+_kernel_oserror *url_set_proxy(int flags,unsigned int session,
+                               char *baseurl,char *protocol,int noproxy)
+{
+  _kernel_swi_regs r;
+
+  r.r[0]=flags;
+  r.r[1]=session;
+  r.r[2]=(int)baseurl;
+  r.r[3]=(int)protocol;
+  r.r[4]=noproxy;
+  return(_kernel_swi(URL_SetProxy,&r,&r));
+}
+
+
+/*----------------------------------------------------------------------*/
+_kernel_oserror *url_stop(int flags,unsigned int session)
+{ /* interrupt a fetch if one is going on */
+  _kernel_swi_regs r;
+
+  r.r[0]=flags;
+  r.r[1]=session;
+  return(_kernel_swi(URL_Stop,&r,&r));
+}
+
+
+/*----------------------------------------------------------------------*/
+_kernel_oserror *url_deregister(int flags,unsigned int session)
+{ /* deregister a session */
+  _kernel_swi_regs r;
+
+  r.r[0]=flags;
+  r.r[1]=session;
+  return(_kernel_swi(URL_Stop,&r,&r));
+}
+
+
+
+
+
+
+
+
+#include "string.h"
+#include "stdio.h"
+
+/*----------------------------------------------------------------------*/
+#include "os.h"
+#include "flex.h"
+#include "dbox.h"
+#include "msgs.h"
+#include "help.h"
+
+#include "mflex.h"
+/*----------------------------------------------------------------------*/
+#include "HTMLLib.h"
+#include "Browser.h"
+#include "ErrorGen.h"
+
+const static char *base64_table="ABCDEFGHIJKLMNOP"
+                                "QRSTUVWXYZabcdef"
+                                "ghijklmnopqrstuv"
+                                "wxyz0123456789+/";
+/*
+ * encode_base64
+ *
+ * Passed a pointer to data, and its length, this will fill the output
+ * buffer with Base64-encoded data, returning the length of the
+ * output data (this is not terminated).
+ *
+ * The length of the output will be:
+ *     (length of input, rounded up to next multiple of 3) times 4
+ * so make sure you have a big enough output buffer.
+ */
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static int encode_base64(const char *in, int len, char *out)
+{
+    char *out_ptr=out;
+    int i;
+    unsigned long chunk;
+    int p=0;
+
+    while (p < len)
+    {
+        chunk=0;
+        for (i=0; i<3; i++, p++)
+        {
+            if (p < len)
+                chunk = (chunk << 8) | in[p];
+            else
+                chunk = (chunk << 8);
+        }
+
+        *out++=base64_table[chunk >> 18];
+        *out++=base64_table[(chunk >> 12) & 0x3f];
+        if (p <= len+1)
+        {
+            *out++=base64_table[(chunk >> 6) & 0x3f];
+            if (p <= len)
+                *out++=base64_table[chunk & 0x3f];
+            else
+                *out++='=';
+        }
+        else
+        {
+            *out++='=';
+            *out++='=';
+        }
+    }
+
+    return out-out_ptr;
+}
+
+
+#if 0
+/* this define is just here to get it into the automatically generated
+   header. It should be changed to:
+     #define RANSCODE
+   or
+     #define NOT_RANSCODE
+   depending on which library is used.
+*/
+/*----------------------------------------------------------------------*/
+#define NOT_RANSCODE
+#endif
+
+typedef struct urlstat
+{
+  int            session;   /* the fetch session handle */
+  int            fetching;  /* flag indicates we are still fetching */
+  int            fetched;   /* flag indicates we have got at least one byte so far */
+  void           *context;  /* parser context pointer */
+  HStreamRef     stream;    /* pointer to the token stream */
+  HStreamRef     lasttoken; /* pointer to the last token returned */
+  BOOL           identified;/* the stream has been identified */
+  BOOL           authorised;/* authorise: 0=not done, 1=doing, 2=done */
+  BOOL           allowparse;/* whether to allow HTMLLib to parse this URL */
+  int            method;    /* the method used to fetch */
+  char           *extradata;/* the extra data associated with this url */
+  int            type;      /* type from HtmlIdentify */
+  struct urlstat *next;
+} urlstat;
+
+static urlstat *fetch_list=NULL;
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static os_error *html_insert_header(char *header,void **data)
+{
+  BOOL ok;
+  int  s,l;
+
+  l=strlen(header)+2;
+  if(*data) s=mflex_size(data); else s=0;
+  if(s) ok=mflex_extend(data,s+l); else ok=mflex_alloc(data,l+1);
+  if(!ok) return(errorgen(2));
+  if(s) memmove((void*)(((int)*data)+l),*data,s);
+  strncpy(*data,header,l-2);
+  ((char*)(*data))[l-2]='\r';
+  ((char*)(*data))[l-1]='\n';
+  if(!s) ((char*)(*data))[l]=0;
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *html_get(char *url,char *extradata,int *handle,int method,char *user,BOOL allowparse,BOOL proxy)
+{ /* start fetching a URL
+       url        The URL to fetch
+       extradata  Extra bits to append for POST etc
+       handle     Place to store the generated handle to refer to this fetch
+       method     POST etc (see above)
+       store      flex anchor to store the fetched url
+       allowparse flag to allow HTML parsing; set to false for data/image fetches
+  */
+  os_error     *e=NULL;
+  unsigned int h;
+
+#ifdef UTRACE
+trace_printf("html_get...");
+#endif
+  *handle=0;
+  e=(os_error*)url_register(0,&h);
+  if(!e)
+  {
+    urlstat *up=NULL;
+
+    up=malloc(sizeof(urlstat));
+    if(!up) e=errorgen(2);
+    if(e)
+    {
+      if(up) free(up);
+      url_deregister(0,h);
+    }
+    else
+    {
+      memset(up,0,sizeof(urlstat));
+      up->session=*handle=(int)h;
+      up->type=1;
+      up->fetching=1;
+      up->next=fetch_list;
+      up->method=method;
+      up->extradata=NULL;
+      up->allowparse=allowparse;
+      fetch_list=up;
+      if(extradata)
+      {
+        int l;
+
+        l=strlen(extradata);
+        if(!mflex_alloc((flex_ptr)&up->extradata,l+3)) e=errorgen(2);
+        else
+        {
+          char head[50];
+
+          up->extradata[0]='\r';
+          up->extradata[1]='\n';
+          strcpy(up->extradata+2,extradata);
+          sprintf(head,"Content-Length: %d",l);
+          e=html_insert_header(head,(void*)&up->extradata);
+          if(!e)
+          {
+            strcpy(head,"Content-Type: application/x-www-form-urlencoded");
+            e=html_insert_header(head,(void*)&up->extradata);
+          }
+        }
+      }
+      if(!e && user)
+      {
+        char head[50];
+
+        sprintf(head,"Mailserv-User: %s",user);
+        e=html_insert_header(head,(void*)&up->extradata);
+      }
+      if(!e && !proxy) e=html_insert_header("X-NoProxy:",(void*)&up->extradata);
+/*
+if (up->extradata)
+{char j[100]; sprintf(j,"Save :4.tracepost %p +%x",up->extradata,mflex_size((flex_ptr)&up->extradata));
+os_cli(j);}
+*/
+    }
+    if(!e)
+    {
+      char c=0,*p;
+
+      p=fetch_find_name_tag(url);
+      if(p) {c=*p; *p=0;}
+      e=(os_error*)url_get_url(0,h,method,url,up->extradata,NULL,2);
+      if(p) *p=c;
+    }
+  }
+#ifdef UTRACE
+trace_printf("html_got");
+#endif
+  return(e);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *html_close(int handle)
+{ /* close the specified fetch handle, aborting any fetch */
+#ifdef RANSCODE
+  HTML_close(handle)
+#else
+  urlstat *up,**pup;
+
+#ifdef UTRACE
+trace_printf("html close...");
+#endif
+  url_stop(0,handle);
+  url_deregister(0,handle);
+  pup=&fetch_list;
+  up=(*pup);
+  while(up && up->session!=handle) {pup=&up->next; up=up->next;}
+  if(up->session!=handle) return(errorgen(2));
+  *pup=up->next;
+  if(up->stream) HtmlStreamFree(up->stream);
+  if(up->context) free(up->context);
+  if(up->extradata) mflex_free((flex_ptr)&up->extradata);
+  free(up);
+#ifdef UTRACE
+trace_printf("html closed");
+#endif
+#endif
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *html_get_next_token(int handle,int *remaining,int *size,
+                              HStreamRef *token,int *waiting,void **store,char *url)
+{ /* get the next token from a handle. This is a little odd:
+       handle     The handle to fetch from
+       remaining  Number of bytes still to fetch
+       size       size of the fetched data so far
+       token      store for a pointer to the fetched token, NULL=not ready
+       waiting    place to put a reason to say we are still awaiting delivery
+                     reason=0: we are NOT awaiting delivery - stuff has come
+                     reason=1: we are waiting for something to happen
+                     reason=2: a re-direct has been detected: *remaining points at a new url
+                     reason=3: this data not parseable: *remaining is filetype
+       store      flex anchor to store the fetched url
+  */
+  os_error *e=NULL;
+  int      r=0;
+  char     buffer[2048],refurl[1024];
+  urlstat  *up;
+
+  strncpy(refurl,url,sizeof(refurl));
+  refurl[sizeof(refurl)-1]=0;
+  {char *p=fetch_find_name_tag(refurl); if(p) *p=0;}
+  *waiting=1;
+  up=fetch_list;
+  while(up && up->session!=handle) up=up->next;
+  if(!up) return(errorgen(2));
+  if(token) *token=NULL;
+  if(!authorising && up->fetching && up->authorised!=1)
+    e=(os_error*)url_read_data(0,handle,buffer,sizeof(buffer),NULL,&r,remaining);
+  if(r && !e)
+  {
+    int  ok,oldsize;
+
+    if(!up->fetched && *store)
+    {
+      mflex_free((flex_ptr)store);
+      *store=NULL;
+    }
+    up->fetched=1;
+    if(*store)
+    {
+      oldsize=mflex_size((flex_ptr)store);
+      ok=mflex_extend((flex_ptr)store,oldsize+r);
+    }
+    else
+    {
+      oldsize=0;
+      ok=mflex_alloc((flex_ptr)store,r);
+    }
+    if(size) *size=oldsize+r;
+    if(!ok) return(errorgen(2));
+    memcpy(((char*)(*store))+oldsize,buffer,r);
+  }
+  if(!authorising && up->fetched)
+  {
+    if(up->identified)
+    {
+      if(up->context==NULL)
+      {
+        up->context=HtmlParse(refurl,0,up->type);
+        r=mflex_size((flex_ptr)store);
+      }
+      if(r && !e)
+      {
+        _kernel_register_slotextend(flex_budge);
+        up->stream=HtmlGetStream(up->context,(char**)store,r);
+        _kernel_register_slotextend(flex_dont_budge);
+      }
+      if(!up->lasttoken)
+      {
+        *token=up->lasttoken=up->stream;
+        *waiting=(!up->stream && up->fetching)?1:0;
+      }
+      else
+      {
+        if(up->lasttoken->next)
+        {
+          *token=up->lasttoken=up->lasttoken->next;
+          *waiting=0;
+        }
+        else
+        {
+          *waiting=(up->fetching)?1:0;
+          *token=NULL;
+        }
+      }
+    }
+    else if(up->authorised!=1)
+    {
+      int  s,o;
+      char *redirect;
+      int  code;
+      int  type;
+      int  parseable;
+
+      e=(os_error*)url_status(0,handle,&s,NULL,NULL);
+      if(e) return(e);
+      redirect=NULL;
+      type=parseable=0;
+      o=HttpStripHeaders((char*)*store,mflex_size((flex_ptr)store));
+      if(o>0)
+      { /* if we've got the headers */
+        code=HtmlIdentify((char*)*store,mflex_size((flex_ptr)store),(s&URL_Status_Done)!=0,
+                          &redirect,&type,&parseable);
+        memmove(*store,(char*)(((int)*store)+o),mflex_size((flex_ptr)store)-o); /* discard headers */
+        o=mflex_size((flex_ptr)store)-o;
+        if(o<0) {mflex_free((flex_ptr)store); *store=NULL;}
+        else mflex_extend((flex_ptr)store,o);
+        switch(code)
+        {
+          case 302: /* redirect */
+          {
+            url_stop(0,handle);
+            mflex_free((flex_ptr)store);
+            *store=NULL;
+            up->fetched=FALSE;
+            ERROUT((os_error*)url_get_url(0,handle,up->method,redirect,up->extradata,NULL,2));
+            *waiting=2;
+            *remaining=(int)redirect;
+          } break;
+          case 401: /* authorise */
+          {
+            char *p,*q;
+            char host[64],realm[64],username[32],password[32];
+            char base64[(sizeof(username)+sizeof(password)+2)*4/3];
+            char authcode[sizeof(username)+sizeof(password)+2];
+            BOOL ok;
+            int  l;
+
+            host[0]=0;
+            p=strstr(refurl,"//");
+            if(p)
+            {
+              p+=2;
+              STRFILL(host,p);
+              q=strchr(host,'/');
+              if(q) *q=0;
+            }
+            p=redirect;
+            while(*p && *p!='"') p++;
+            if(*p) p++;
+            STRFILL(realm,p);
+            p=realm;
+            while(*p && *p!='"') p++;
+            *p=0;
+            if(up->authorised>=2)
+            {
+              browser_authorise_forget(host,realm);
+              return(errorgen(6));
+            }
+            url_stop(0,handle);
+            up->authorised=1;
+            username[0]=password[0]=0;
+            p=browser_authorise_username(host,realm);
+            if(p)
+            {
+              STRFILL(username,p);
+              p=browser_authorise_password(host,realm);
+              if(p) STRFILL(password,p);
+            }
+            else
+            {
+              char prompt[160];
+              dbox d;
+              int  f;
+
+              sprintf(prompt,msgs_lookup("auth1:Please enter username and password for %s at %s"),
+                             realm,host);
+
+              d=dbox_new("authorise");
+              if(!d) return(errorgen(2));
+              authorising=TRUE;
+              dbox_raw_eventhandler(d,help_dboxrawevents,"HdAUTH");
+              dbox_setfield(d,6,prompt);
+              dbox_show(d);
+              do
+              {
+                dbox_setfield(d,2,username);
+                dbox_setfield(d,3,"");
+                f=dbox_fillin(d);
+                if(f==0)
+                {
+                  dbox_getfield(d,2,username,sizeof(username));
+                  dbox_getfield(d,3,password,sizeof(password));
+                }
+              } while(f!=dbox_CLOSE && ((f!=0 && f!=1) || (dbox_persist())));
+              dbox_dispose(&d);
+              authorising=FALSE;
+              if(f!=0) return(errorgen(6));
+              browser_authorise_remember(host,realm,username,password);
+            }
+            up->authorised=2;
+            if(up->extradata) s=mflex_size((flex_ptr)&up->extradata); else s=0;
+            strcpy(authcode,username);
+            strcat(authcode,":");
+            strcat(authcode,password);
+            l=encode_base64(authcode,strlen(authcode),base64);
+            base64[l]=0;
+            l+=23;
+            if(s) ok=mflex_extend((flex_ptr)&up->extradata,s+l);
+            else ok=mflex_alloc((flex_ptr)&up->extradata,l+1);
+            if(!ok) return(errorgen(2));
+            if(s) memmove(up->extradata+l,up->extradata,s);
+            strcpy(up->extradata,"Authorization: Basic ");
+            strncpy(up->extradata+21,base64,l-23);
+            up->extradata[l-2]='\r';
+            up->extradata[l-1]='\n';
+            if(!s) up->extradata[l]=0;
+            mflex_free((flex_ptr)store);
+            *store=NULL;
+            up->fetched=FALSE;
+            ERROUT((os_error*)url_get_url(0,handle,up->method,refurl,up->extradata,NULL,2));
+          } break;
+          default: parseable=1; /* catchall just in case */
+          case 200: /* ordinary URL */
+          {
+            if(!up->allowparse) parseable=0;
+            *waiting=parseable?1:3;
+            *remaining=type;
+            up->type=parseable;
+            up->identified=TRUE;
+          } break;
+          case 0: break; /* couldn't id yet */
+        }
+      }
+    }
+  }
+  if(!r && !e && up->authorised!=1 && !authorising)
+  {
+    int  s;
+
+    e=(os_error*)url_status(0,handle,&s,NULL,NULL);
+    if(e) return(e);
+    if(s&URL_Status_Done)
+    {
+      up->fetching=0;
+#ifdef FORGE_TERMINATOR
+      if(*store)
+      {
+        int oldsize;
+
+        oldsize=mflex_size((flex_ptr)store);
+        if(mflex_extend((flex_ptr)store,oldsize+1))
+        {
+          char *p;
+
+          p=(char*)*store;
+          p+=oldsize;
+          *p=0;
+        }
+      }
+#endif
+    }
+  }
+  if(size) *size=(*store)?mflex_size((flex_ptr)store):0;
+  return(e);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *html_get_next_chunk(int handle,char *buffer,int size,int *done,int *bytes)
+{ /* get a chunk of data from an html stream because it turned out not
+     to be html after all */
+  urlstat  *up;
+  int      s,t;
+
+  up=fetch_list;
+  while(up && up->session!=handle) up=up->next;
+  if(!up) return(errorgen(2));
+  ERROUT((os_error*)url_read_data(0,handle,buffer,size,NULL,bytes,&t));
+  ERROUT((os_error*)url_status(0,handle,&s,NULL,NULL));
+  *done=(s&URL_Status_Done)?1:0;
+  return(NULL);
+}

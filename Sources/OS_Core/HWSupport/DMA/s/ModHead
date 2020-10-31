@@ -1,0 +1,379 @@
+; > Sources.ModHead
+        LEADR   Module_LoadAddr
+
+        ASSERT  (.=Module_BaseAddr)
+
+        DCD     0                               ; Start
+        DCD     Init           - Module_BaseAddr
+        DCD     Die            - Module_BaseAddr
+        DCD     Service        - Module_BaseAddr
+        DCD     Title          - Module_BaseAddr
+        DCD     Helpstr        - Module_BaseAddr
+        DCD     0                               ; Helptable
+        DCD     Module_SWISystemBase + DMAManagerSWI * Module_SWIChunkSize
+        DCD     SWIhandler     - Module_BaseAddr
+        DCD     SWInames       - Module_BaseAddr
+        DCD     0                               ; SWIdecode
+        DCD     0
+        DCD     0
+
+;---------------------------------------------------------------------------
+Title   DCB     "DMAManager",0
+Helpstr DCB     "DMAManager",9,"$VString ($Date)",0
+                ALIGN
+
+;---------------------------------------------------------------------------
+;       Module initialisation point.
+;
+Init
+        ENTRY
+
+        Debug   mod,"Init"
+
+        LDR     r2, [r12]                       ; Have we already got a workspace ?
+        TEQ     r2, #0
+        BNE     %FT01
+
+        MOV     r0, #6
+        LDR     r3, =max_running_work
+        SWI     XOS_Module                      ; Claim workspace.
+        EXIT    VS
+
+        STR     r2, [r12]                       ; Store workspace pointer.
+01
+        MOV     r12, r2
+
+ [ standalone
+        ADR     r0, resourcefsfiles
+        SWI     XResourceFS_RegisterFiles
+ ]
+        BLVC    InitWS
+        BLVC    InitHardware
+
+        BLVS    ShutDown
+        EXIT
+
+;---------------------------------------------------------------------------
+; InitWS
+;
+;       Out:    r0 corrupted
+;
+;       Initialise our workspace.
+;
+InitWS
+        ENTRY   "r1,r2"
+
+        Debug   mod,"InitWS"
+
+        MOV     r0, #0                          ; Initialise workspace.
+ [ international
+        STR     r0, message_file_open
+ ]
+        STR     r0, DMABlockHead
+        STR     r0, FreeBlock
+        STR     r0, TagIndex
+        STR     r0, UnsafePageTable
+        STR     r0, UnsafePageCount
+
+        ADR     r1, ChannelBlock + lcb_Flags    ; Initialise logical channel table.
+        MOV     r2, #NoLogicalChannels
+10
+        SUBS    r2, r2, #1
+        STRCS   r0, [r1], #LCBSize              ; Initialise all lcb_Flags to 0.
+        BCS     %BT10
+
+        ADR     r1, DMAQueues                   ; Initialise DMA queues.
+        MOV     r2, #NoPhysicalChannels * DMAQSize / 4
+20
+        SUBS    r2, r2, #1
+        STRCS   r0, [r1], #4                    ; Zero all pointers.
+        BCS     %BT20
+
+ [ debugtab
+        MOV     r0, #0
+        DebugTabInit r0,r1,lr
+        Debug   tab,"Debug table at",r1
+ ]
+
+        EXIT
+
+;---------------------------------------------------------------------------
+; InitHardware
+;
+;       Out:    r0 corrupted
+;
+;       Initialise DMA hardware.
+;
+InitHardware
+        ENTRY   "r1,r2"
+
+        MOV     r0, #2                          ; Read system information.
+        SWI     XOS_ReadSysInfo
+        EXIT    VS
+        AND     r0, r0, #&0000FF00
+        TEQ     r0, #&00000100                  ; If no IOMD
+        ANDEQS  r2, r2, #&0000FF00              ;   or IOMD variant does not support DMA
+        ADRNE   r0, ErrorBlock_DMA_BadHard      ; then return error.
+        PullEnv NE
+        DoError NE
+
+        IOMDBase r1
+
+        IRQOff  lr
+        LDRB    r0, [r1, #IOMD_DMAMSK]          ; Disable all but sound channels.
+        BIC     r0, r0, #IOMD_DMA_IO0 :OR: IOMD_DMA_IO1 :OR: IOMD_DMA_IO2 :OR: IOMD_DMA_IO3
+        STRB    r0, [r1, #IOMD_DMAMSK]
+        SetPSR  lr
+
+ [ :LNOT: IOMD
+        STRB    r0, [r1, #IOMD_DMASTA]
+        STRB    r0, [r1, #IOMD_DMAREQ]
+ ]
+
+        MOV     r0, #&0C                        ; Channels 2 and 3 are external peripherals.
+        STRB    r0, [r1, #IOMD_DMAEXT]
+
+ [ IOMD
+        BL      ClaimVectors
+ ]
+
+        EXIT
+
+        MakeErrorBlock  DMA_BadHard
+
+
+ [ IOMD
+
+;---------------------------------------------------------------------------
+; ClaimVectors
+;
+;       Out:    r0 corrupted
+;
+;       Claim device vectors for DMA interrupts.
+;
+ClaimVectors
+        ENTRY   "r1,r2"
+
+        MOV     r0, #IOMD_DMAChannel0_DevNo
+        ADRL    r1, DMAInterruptChannel0
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector
+
+        MOVVC   r0, #IOMD_DMAChannel1_DevNo
+        ADRVCL  r1, DMAInterruptChannel1
+        SWIVC   XOS_ClaimDeviceVector
+
+        MOVVC   r0, #IOMD_DMAChannel2_DevNo
+        ADRVCL  r1, DMAInterruptChannel2
+        SWIVC   XOS_ClaimDeviceVector
+
+        MOVVC   r0, #IOMD_DMAChannel3_DevNo
+        ADRVCL  r1, DMAInterruptChannel3
+        SWIVC   XOS_ClaimDeviceVector
+
+        EXIT
+
+;---------------------------------------------------------------------------
+; ReleaseVectors
+;
+;       Out:    all registers and flags preserved
+;
+;       Release device vectors for DMA interrupts.
+;
+ReleaseVectors
+        ENTRY   "r0-r2"
+
+        MOV     r0, #IOMD_DMAChannel0_DevNo
+        ADRL    r1, DMAInterruptChannel0
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+
+        MOV     r0, #IOMD_DMAChannel1_DevNo
+        ADRL    r1, DMAInterruptChannel1
+        SWI     XOS_ReleaseDeviceVector
+
+        MOV     r0, #IOMD_DMAChannel2_DevNo
+        ADRL    r1, DMAInterruptChannel2
+        SWI     XOS_ReleaseDeviceVector
+
+        MOV     r0, #IOMD_DMAChannel3_DevNo
+        ADRL    r1, DMAInterruptChannel3
+        SWI     XOS_ReleaseDeviceVector
+
+        EXITS
+
+ ]
+
+;---------------------------------------------------------------------------
+;       Service handler.
+;
+Service
+        TEQ     r1, #Service_Reset
+ [ standalone
+        TEQNE   r1, #Service_ResourceFSStarting
+ ]
+ [ MemManager
+        TEQNE   r1, #Service_PagesUnsafe
+        TEQNE   r1, #Service_PagesSafe
+ ]
+        MOVNES  pc, lr
+
+        LDR     r12, [r12]
+
+ [ standalone
+        TEQ     r1, #Service_ResourceFSStarting
+        BNE     %FT10
+        ENTRY   "r0-r3"
+        ADR     r0, resourcefsfiles
+        MOV     lr, pc
+        MOV     pc, r2
+        EXITS
+10
+ ]
+ [ MemManager
+        TEQ     r1, #Service_PagesUnsafe
+        BEQ     DMAPagesUnsafe
+        TEQ     r1, #Service_PagesSafe
+        BEQ     DMAPagesSafe
+ ]
+
+        Debug   mod,"Service_Reset"
+
+        ENTRY   "r0-r2"
+        MOV     r0, #&FD                        ; Read last reset type.
+        MOV     r1, #0
+        MOV     r2, #&FF
+        SWI     XOS_Byte
+        TEQ     r1, #0
+        EXITS   NE                              ; Do nothing if hard reset.
+
+        Debug   mod," soft"
+
+        BL      FreePageTables
+        BL      FreeBuffers
+        BL      InitWS
+        EXITS
+
+;---------------------------------------------------------------------------
+;       Killing the module.
+;
+Die
+        ENTRY
+
+        Debug   mod,"Die"
+
+        LDR     r12, [r12]
+        TEQ     r12, #0
+        EXITS   EQ
+
+        BL      ShutDown
+
+        EXITS
+
+;---------------------------------------------------------------------------
+; ShutDown
+;
+;       Out:    preserves all registers and flags
+;
+;       Tidy up before dying.
+;
+ShutDown
+        ENTRY   "r0,r2"
+
+        Debug   mod,"Shutdown"
+
+ [ DeregisterOnFinalise
+        BL      DeregisterChannels
+ |
+        BL      FreePageTables
+ ]
+        BL      FreeBuffers
+
+ [ IOMD
+        BL      ReleaseVectors
+ ]
+
+ [ international
+        LDR     r0, message_file_open           ; Close the message file if it's open.
+        TEQ     r0, #0
+        ADRNE   r0, message_file_block
+        SWINE   XMessageTrans_CloseFile
+ ]
+
+ [ standalone
+        ADR     r0, resourcefsfiles
+        SWI     XResourceFS_DeregisterFiles
+ ]
+
+        EXITS                                   ; Ignore errors, preserve flags.
+
+ [ DeregisterOnFinalise
+
+;---------------------------------------------------------------------------
+;       Deregister all registered logical DMA channels, purge their queues
+;       and free any page tables.
+;
+DeregisterChannels
+        ENTRY   "r6-r8"
+
+        MOV     r6, #NoLogicalChannels
+        MOV     r7, #-1                         ; On DMAPurge calls do not start new transfers.
+        ADR     r8, ChannelBlock-LCBSize
+10
+        SUBS    r6, r6, #1                      ; If no more channels to do then
+        EXITS   CC                              ;   exit.
+
+        ADD     r8, r8, #LCBSize
+        LDR     lr, [r8, #lcb_Flags]
+        TST     lr, #lcbf_Registered            ; If this channel has not been registered then
+        BEQ     %BT10                           ;   try next.
+        MOV     lr, #0                          ; Mark channel as no longer registered.
+        STR     lr, [r8, #lcb_Flags]
+        BL      DMAPurge                        ; Purge the queue of requests for this channel.
+        B       %BT10
+
+ ]
+
+;---------------------------------------------------------------------------
+;       Free any page tables attached to DMA requests.
+;
+FreePageTables
+        ENTRY   "r0-r2,r9,r10"
+
+        MOV     r1, #NoPhysicalChannels
+        ADR     r9, DMAQueues-DMAQSize
+10
+        SUBS    r1, r1, #1
+        EXITS   CC
+
+        ADD     r9, r9, #DMAQSize
+        LDR     r10, [r9, #dmaq_Head]
+        TEQ     r10, #0
+        BEQ     %BT10
+20
+        LDR     r2, [r10, #dmar_PageTable]
+        TEQ     r2, #0
+        MOVNE   r0, #ModHandReason_Free
+        SWINE   XOS_Module
+        LDR     r10, [r10, #dmar_Next]
+        TEQ     r10, #0
+        BNE     %BT20
+        B       %BT10
+
+;---------------------------------------------------------------------------
+;       Free DMA request block buffers.
+;
+FreeBuffers
+        ENTRY   "r0-r2"
+        LDR     r2, DMABlockHead                ; Free all DMA request block buffers.
+10
+        TEQ     r2, #0
+        EXITS   EQ
+        LDR     r1, [r2, #block_Next]
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+        MOV     r2, r1
+        B       %BT10
+        EXITS
+
+        END

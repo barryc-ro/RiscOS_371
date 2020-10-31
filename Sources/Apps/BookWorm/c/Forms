@@ -1,0 +1,1707 @@
+/*
+  Merlyn Kline, 1996
+
+:NOTES
+
+  Form data manager for Browser.
+  This manages the *editable* data on forms plus lists of the fields
+  on each form.
+
+  Forms are stored in a flex block.
+
+  The first word of the flex block is the amount of space actually used.
+  This is followed by that much form data plus a chunk of free space.
+  Space is allocated in chunks of F_BLOCKSIZE and the free space can
+  be up to this size.
+
+  Forms and fields are identified by the token numbers
+  which create them.
+
+  Each form is stored as a form_header structure followed by a list of
+  form_field structures (each of the latter is of variable size)
+
+:END
+
+:MESSAGES
+submit:Submit
+reset:Reset
+selNONE:<None>
+selMANY:<Many>
+selTITL:Select
+:END
+
+:HISTORY
+:END
+
+
+*/
+
+#define NOFORMTRACE
+
+#include "stdio.h"
+#include "string.h"
+
+#include "msgs.h"
+/*----------------------------------------------------------------------*/
+#include "wimp.h"
+#include "font.h"
+#include "akbd.h"
+#include "coords.h"
+#include "wimpt.h"
+#include "bbc.h"
+
+/*----------------------------------------------------------------------*/
+#include "Defs.h"
+/*----------------------------------------------------------------------*/
+#include "Browser.h"
+#include "ErrorGen.h"
+#include "MFlex.h"
+#include "Forms.h"
+#include "Defs.h"
+#include "tags.h"
+#include "Redraw.h"
+#include "Reformat.h"
+
+#include "Utils.h"
+#include "Printing.h"
+
+#define F_BLOCKSIZE 1024
+
+/* characters used in temporary local encoding of form data */
+#define ENCODE_DATASEP   1 /* usually becomes '?' */
+#define ENCODE_FIELDSEP  2 /* usually becomes '&' */
+#define ENCODE_VALUESEP  3 /* usually becomes '=' */
+
+#define MAXSELECTIONS 500 /* max entries in a SELECT field */
+#define FORM_SELECTED(p) (!!((*(p))&1))
+
+#define FORM_SELCHAR 'Y'
+#define FORM_UNSELCHAR 'N'
+
+#if 0
+/* this chunk #if'd out - just here for GenH2 to see */
+/*----------------------------------------------------------------------*/
+typedef enum form_fieldtype
+{
+  form_text,
+  form_password,
+  form_checkbox,
+  form_radio,
+  form_select,
+  form_textarea,
+  form_image,
+  form_submit,
+  form_reset,
+  form_hidden
+} form_fieldtype;
+
+/*----------------------------------------------------------------------*/
+typedef struct fv_select
+{
+  int  scroll; /* scroll offset for select field */
+  char selection[4]; /* expandable list of true/false bytes */
+} fv_select;
+
+/*----------------------------------------------------------------------*/
+typedef union
+{
+  char              text[4]; /* expandable text value */
+  int               checked; /* for checkboxes and radio buttons */
+  fv_select         select;
+} form_field_value;
+
+#endif
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+typedef struct form_header
+{
+  int  token; /* token number defining this form */
+  int  fields; /* number of fields on this form */
+} form_header;
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+typedef struct form_field_header
+{
+  form_fieldtype type;
+  int            token; /* defining token */
+  int            size;  /* number of words occupied */
+} form_field_header;
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+typedef struct form_field
+{
+  form_field_header header;
+  form_field_value  value;
+} form_field;
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static browser *fe_browser=0; /* browser containing current edit, 0=no edits */
+static int     fe_token=0;    /* currently edited token, 0=none */
+static int     fe_index=0;    /* index of caret into text area when editing */
+static int     fe_xscroll=0;  /* scroll offset of edited field (OS coords) */
+static int     fe_yscroll=0;  /* scroll offset of edited field (lines) */
+static BOOL    fe_single=TRUE;/* edited field is single line field */
+static BOOL    fe_password=0; /* edited field is a password field */
+static char    fe_passcode[]="****************************************";
+static wimp_menustr *fe_menu=NULL; /* the current form menu for SELECTs */
+static browser      *fe_mbrowser;  /* browser we clicked menu on for SELECTs */
+static int          fe_mtoken;     /* token we clicked menu on for SELECTs */
+
+extern void event_cancel_menu(void);
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_ensure_free(browser *b,int free)
+{ /* ensure there is the indicated amount of free space in the form store */
+  int  oldsize,alloc;
+
+  if(b->fdata)
+  {
+    int used;
+
+    alloc=0;
+    used=*(int*)b->fdata;
+    oldsize=mflex_size(&b->fdata);
+    if(oldsize-used<free) alloc=free-(oldsize-used);
+  }
+  else
+  {
+    oldsize=0;
+    alloc=free;
+  }
+  if(alloc)
+  {
+    alloc=alloc/F_BLOCKSIZE;
+    alloc=(alloc+1)*F_BLOCKSIZE;
+    if(!oldsize)
+    {
+      if(!mflex_alloc(&b->fdata,alloc)) return(errorgen(2));
+    }
+    else
+    {
+      if(!mflex_extend(&b->fdata,alloc+oldsize)) return(errorgen(2));
+    }
+#ifdef FORMTRACE
+trace_printf("form alloc size=%d",alloc+oldsize);
+#endif
+    if(!oldsize) *(int*)b->fdata=4;
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_trim_space(browser *b)
+{ /* ensure the free space in the form store is not too large */
+  if(b->fdata)
+  {
+    int used,size;
+
+    used=*(int*)b->fdata;
+    if(used>4)
+    {
+      size=mflex_size(&b->fdata);
+      if(size-used>F_BLOCKSIZE)
+      {
+        size=used/F_BLOCKSIZE;
+        size=(size+1)*F_BLOCKSIZE;
+        mflex_extend(&b->fdata,size);
+#ifdef FORMTRACE
+trace_printf("form space trim=%d",size);
+#endif
+      }
+    }
+    else mflex_free(&b->fdata);
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_new_form(browser *b,int token)
+{
+  /*
+     Create a new form associated with the given token
+  */
+  form_header *p;
+
+  ERROUT(form_ensure_free(b,sizeof(form_header)));
+  p=(form_header*)(((int)b->fdata)+*(int*)b->fdata);
+  *(int*)b->fdata+=sizeof(form_header);
+  p->token=token;
+  p->fields=0;
+  b->nforms++;
+#ifdef FORMTRACE
+trace_printf("new form #%d",b->nforms);
+#endif
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_discard(browser *b)
+{
+  /* Discard all the forms in this view, free the memory */
+  form_cancel_edit(b);
+  b->nforms=0;
+  if(b->fdata) mflex_free(&b->fdata);
+  b->fdata=NULL;
+#ifdef FORMTRACE
+trace_printf("forms discarded");
+#endif
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void *form_find_record(browser *b,int token,BOOL header)
+{ /* locate the form form record governing the
+     indicated token or return NULL. If header is TRUE
+     then the header record for the form is located, otherwise
+     the field record for the token */
+  form_header *hp;
+  form_field  *fp;
+  int         i,j,o,used;
+
+  if(!b->fdata) return(NULL);
+  i=4;
+  used=*(int*)b->fdata;
+  while(i<used)
+  {
+    hp=(form_header*)(((int)b->fdata)+i);
+    if(hp->token==token) return(header?hp:NULL);
+    o=sizeof(form_header);
+    for(j=0;j<hp->fields;j++)
+    {
+      fp=(form_field*)(((int)b->fdata)+i+o);
+      if(fp->header.token==token) return(header?(void*)hp:(void*)fp);
+      o+=fp->header.size*4;
+    }
+    i+=o;
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_validate_select(browser *b,int token,int deflt)
+{
+  BOOL changed;
+  form_field  *fp;
+  int         n;
+  HStream     *tp;
+  char        *p;
+
+  fp=form_find_record(b,token,FALSE);
+  if(fp->header.type!=form_select) return(NULL);
+  tp=fetch_token_address(b,token);
+  if(tp->type&TYPE_MULTIPLE) return(NULL);
+  changed=FALSE;
+  p=fp->value.select.selection;
+  n=0;
+  while(*p)
+  {
+    if(*p==FORM_SELCHAR && n) {changed=TRUE; *p=FORM_UNSELCHAR;}
+    if(*p==FORM_SELCHAR) n++;
+    p++;
+  }
+  if(!n) {changed=TRUE; fp->value.select.selection[deflt]=FORM_SELCHAR;}
+  if(changed) browser_update_token(b,token,FALSE);
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_validate_radio(browser *b,int token)
+{
+  /* validate radio icons including the indicated token (ie ensure that
+     only one is selected).
+     If more than one is selected, all but the last are deselected (unless
+     the passed token is selected). If none are selected, the passed token
+     is selected. This behaviour is important when loading forms as it
+     ensures that the correct default selection is applied (if the fourth
+     button is selected by default, when the first is added it will be
+     alone and deselected so it will get selected - this must be over-
+     ridden when the fourth button is added to the page). It also ensures
+     sensible behaviour when the user clicks on the selected button.
+     If the token passed in is selected, it will stay selected. This ensures
+     that clicking on a button works!
+     Appropriate redraws will be executed.*/
+  form_field  *fp;
+  form_header *hp;
+  BOOL        selectthis,foundone;
+  int         i;
+  char        *name;
+  HStream     *tp;
+
+  fp=form_find_record(b,token,FALSE);
+  if(fp->header.type!=form_radio) return(NULL);
+  selectthis=fp->value.checked;
+  tp=fetch_token_address(b,token);
+  name=tp->name;
+  hp=form_find_record(b,token,TRUE);
+  fp=(form_field*)(((int)hp)+sizeof(form_header));
+  foundone=FALSE;
+  for(i=0;i<hp->fields;i++)
+  {
+    if(fp->header.type==form_radio)
+    {
+      tp=fetch_token_address(b,fp->header.token);
+      if(name && tp->name && !strcmp(name,tp->name))
+      {
+        if(fp->value.checked &&
+           (foundone || (selectthis && fp->header.token!=token)))
+        {
+          fp->value.checked=FALSE;
+          browser_update_token(b,fp->header.token,FALSE);
+        }
+        if(fp->value.checked) foundone=TRUE;
+      }
+    }
+    fp=(form_field*)(((int)fp)+fp->header.size*4);
+  }
+  if(!foundone)
+  {
+    fp=form_find_record(b,token,FALSE);
+    fp->value.checked=TRUE;
+    browser_update_token(b,fp->header.token,FALSE);
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_set_field_space(browser *b,int token,int space)
+{ /* set the space in bytes occupied by a field, NOT including the header */
+  form_field *fp;
+  int        oldspace,offset;
+
+  fp=form_find_record(b,token,FALSE);
+  offset=((int)fp)-((int)b->fdata);
+  oldspace=fp->header.size*4;
+  space+=sizeof(form_field_header);
+  if(space%4) space+=4-(space%4);
+  if(space>oldspace) ERROUT(form_ensure_free(b,space-oldspace));
+  if(space!=oldspace)
+  {
+    memmove((char*)(((int)b->fdata)+offset+space),
+            (char*)(((int)b->fdata)+offset+oldspace),
+            *((int*)b->fdata)-offset-oldspace);
+    *(int*)b->fdata+=space-oldspace;
+    fp=form_find_record(b,token,FALSE);
+    fp->header.size=space/4;
+    if(space<oldspace) return(form_trim_space(b));
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_put_field(browser *b,int token,char *value,BOOL update)
+{ /* set the value in a field. value interpreted as for form_new_field() except for SELECT
+     fields where it is a pointer to a zero terminated list of bytes where
+       FORM_UNSELCHAR=not selected, FORM_SELCHAR=selected */
+  form_field *fp;
+  BOOL       changed;
+
+  changed=FALSE;
+  fp=form_find_record(b,token,FALSE);
+  if(fp)
+  {
+    switch(fp->header.type)
+    {
+      case form_textarea: /* same as form_password: no break */
+      case form_text: /* same as form_password: no break */
+      case form_password:
+        value=value?value:"";
+        if(strcmp(value,fp->value.text))
+        {
+          ERROUT(form_set_field_space(b,token,strlen(value)+1));
+          fp=form_find_record(b,token,FALSE);
+          strcpy(fp->value.text,value);
+          changed=TRUE;
+        }
+      break;
+      case form_checkbox:
+        changed=(!value)!=(!fp->value.checked);
+        fp->value.checked=!!value;
+      break;
+      case form_radio:
+        changed=(!value)!=(!fp->value.checked);
+        fp->value.checked=!!value;
+        form_validate_radio(b,token);
+      break;
+      case form_select:
+      {
+        char *o;
+
+        value=value?value:"";
+        o=strchr(fp->value.select.selection,FORM_SELCHAR);
+        if(!o) o=fp->value.select.selection;
+        if(strcmp(value,fp->value.select.selection))
+        {
+          strcpy(fp->value.select.selection,value);
+          changed=TRUE;
+        }
+        form_validate_select(b,token,o-fp->value.select.selection);
+      } break;
+    }
+  }
+  if(changed && update) browser_update_token(b,token,FALSE);
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void form_build_selection(char *value,char *selection)
+{
+  int  i,n;
+  char *p;
+
+  p=value;
+  n=*(int*)p;
+  p+=8;
+  if(n>MAXSELECTIONS) n=MAXSELECTIONS;
+  for(i=0;i<n;i++)
+  {
+    selection[i]=FORM_SELECTED(p)?FORM_SELCHAR:FORM_UNSELCHAR;
+    p++;
+    p+=strlen(p)+1;
+    p+=strlen(p)+1;
+  }
+  selection[i]=0;
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_new_field(browser *b,int token,form_fieldtype type,char *value)
+{ /* Add a new field to the last form in the list (always the right one
+     due to the sequential nature of HTML). The value is initialised as
+     passed in; for radio and checkbox this is taken to be NULL=not
+     selected, otherwise selected. For SELECT fields, this is taken as
+     a pointer to the value part of the token which will be converted
+     to a zero terminated list of bytes where
+       FORM_UNSELCHAR=not selected, FORM_SELCHAR=selected */
+  int         space,c;
+  form_field  *p;
+  form_header *head;
+  char        select[MAXSELECTIONS+1];
+
+#ifdef FORMTRACE
+trace_printf("new field");
+#endif
+  space=sizeof(form_field_header);
+  switch(type)
+  {
+    case form_textarea: value=value?value:""; space+=strlen(value)+1; break;
+    case form_text:     value=value?value:""; space+=strlen(value)+1; break;
+    case form_password: value=value?value:""; space+=strlen(value)+1; break;
+    case form_checkbox: space+=4; break;
+    case form_radio:    space+=4; break;
+    case form_select:
+    {
+      HStream    *tp;
+
+      tp=fetch_token_address(b,token);
+      form_build_selection(value,select);
+      value=select;
+      space+=strlen(value)+1+sizeof(fv_select)-4; break;
+    } break;
+    /* other types have no data storage and the value part of the
+       structure is overwritten by the next field entry */
+  }
+  if(space%4) space+=4-(space%4);
+  ERROUT(form_ensure_free(b,space));
+  p=(form_field*)(((int)b->fdata)+*(int*)b->fdata);
+  *(int*)b->fdata+=space;
+  p->header.type=type;
+  p->header.token=token;
+  p->header.size=space/4;
+  switch(type)
+  {
+    case form_textarea: /* same as password: no break */
+    case form_text:     /* same as password: no break */
+    case form_password: strcpy(p->value.text,value); break;
+    case form_checkbox: /* same as radio: no break */
+    case form_radio:    p->value.checked=!!value; break;
+    case form_select:   p->value.select.scroll=0; strcpy(p->value.select.selection,value); break;
+    /* other types have no data storage and the value part of the
+       structure is overwritten by the next field entry */
+  }
+  head=(form_header*)(((int)b->fdata)+4);
+  c=b->nforms;
+  while(--c>0)
+  { /* find the header record for this form */
+    int        n=head->fields;
+    form_field *fp=(form_field*)(((int)head)+sizeof(form_header));
+
+    while(n-->0)
+    {
+      fp=(form_field*)(((int)fp)+fp->header.size*4);
+    }
+    head=(form_header*)fp;
+  }
+  head->fields++;
+  if(type==form_radio) form_validate_radio(b,token);
+  if(type==form_select) form_validate_select(b,token,0);
+#ifdef FORMTRACE
+trace_printf("nf: field #%d",head->fields);
+#endif
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+form_field_value *form_get_field(browser *b,int token)
+{
+  form_field *fp;
+
+  fp=form_find_record(b,token,FALSE);
+  return(fp?&fp->value:NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static char *form_select_text(browser *b,int token,char *selection)
+{
+  int     i,n,s;
+  HStream *tp;
+  char    *p,*f;
+
+  tp=fetch_token_address(b,token);
+  s=0;
+  p=tp->value;
+  n=*(int*)p;
+  if(n>MAXSELECTIONS) n=MAXSELECTIONS;
+  p+=8;
+  f=p;
+  for(i=0;i<n;i++)
+  {
+    if(selection[i]==FORM_SELCHAR)
+    {
+      s++;
+      f=p;
+    }
+    p++;
+    p+=strlen(p)+1;
+    p+=strlen(p)+1;
+  }
+  if(!s) return(msgs_lookup("selNONE:<None>"));
+  if(s>1) return(msgs_lookup("selMANY:<Many>"));
+  return(f+1);
+}
+
+/*----------------------------------------------------------------------*/
+char *form_get_field_text(browser *b,int token)
+{
+  form_field *fp;
+
+  fp=form_find_record(b,token,FALSE);
+  if(!fp) return(NULL);
+  switch(fp->header.type)
+  {
+    case form_text:     return(fp->value.text); break;
+    case form_password: return(fp->value.text); break;
+    case form_checkbox: return(NULL); break;
+    case form_radio:    return(NULL); break;
+    case form_select:   return(form_select_text(b,token,fp->value.select.selection)); break;
+    case form_textarea: return(fp->value.text); break;
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_reset_form(browser *b,int token)
+{
+  form_header *hp;
+
+  hp=form_find_record(b,token,TRUE);
+  if(hp)
+  {
+    form_field *fp;
+    int        i,j,nt;
+    char       *v;
+    HStream    *tp;
+    char       select[MAXSELECTIONS+1];
+
+    for(i=0;i<hp->fields;i++)
+    {
+      /* find the address again - flex may have moved */
+      hp=form_find_record(b,token,TRUE);
+      fp=(form_field*)(((int)hp)+sizeof(form_header));
+      for(j=0;j<i;j++) fp=(form_field*)(((int)fp)+fp->header.size*4);
+      nt=fp->header.token;
+      tp=fetch_token_address(b,nt);
+      v=NULL;
+      switch(fp->header.type)
+      {
+        case form_text:     v=tp->text; break;
+        case form_password: v=tp->text; break;
+        case form_checkbox: v=(char*)(tp->type&TYPE_CHECKED); break;
+        case form_radio:    v=(char*)(tp->type&TYPE_CHECKED); break;
+        case form_select:   form_build_selection(tp->value,select); v=select; break;
+        case form_textarea: v=tp->text; break;
+      }
+      ERROUT(form_put_field(b,nt,v,TRUE));
+    }
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+void form_get_linesize(wimp_box *fontbox,int *lh,int *lb)
+{
+  *lb=4-fontbox->y0; if(*lb<0) *lb=0;
+  if((*lb)%4) *lb+=4-((*lb)%4); /* lb=font baseline offset from line bottom */
+  *lh=*lb+fontbox->y1;
+  if((*lh)%4) *lh+=4-((*lh)%4); /* lh=line height */
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void form_textarea_find_caret(char *p,int fh,int *index,int x,int y)
+{ /* find the caret index in the string from the x (OS units) and y (lines) relative to top left */
+  int  i,l,w;
+  char c,*t;
+
+  i=0;
+  while(y>0 && p[i])
+  {
+    if(p[i]=='\n') y--;
+    i++;
+  }
+  p+=i;
+  t=strchr(p,'\n'); if(!t) t=strchr(p,0); c=*t; *t=0;
+  fm_get_string_width(fh,fe_password?fe_passcode:p,x*400+6*400,strlen(p),-1,&l,&w);
+  *t=c;
+  *index=l+i;
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void form_textarea_caretpos(char *p,int fh,int index,int *x,int *y)
+{ /* locate the caret in the string, return *x=offset in OS units, *y in lines */
+  int  ox,oy,i,li;
+  char *t,*l;
+
+  i=li=oy=ox=0;
+  l=t=p;
+  while(i<index && *t)
+  {
+    if(*t=='\n') {li=i+1; l=t+1; oy++;}
+    t++;
+    i++;
+  }
+  fm_get_string_width(fh,fe_password?fe_passcode:l,1000000000,index-li,-1,&i,&ox);
+  ox=(ox+200)/400;
+  *x=ox;
+  *y=oy;
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL form_input_box(browser *b,int token,wimp_box *box,int *lh,int *lb,int *fhand)
+{ /* fond input box, return success flag */
+  int                 fh,t=0;
+  int                 l,x,y,i;
+  reformat_line       *lp;
+  reformat_line_chunk *cp;
+  HStream             *tp;
+
+  l=browser_token_to_line(b,token);
+  if(l<1) return(FALSE);
+  lp=reformat_line_address(b,l);
+  cp=reformat_line_chunk_address(lp,0);
+  tp=fetch_token_address(b,cp->t);
+  y=lp->y+lp->b;
+  x=redraw_start_x(b,tp,lp,cp);
+  convert_pair_to_points(x,y,&x,&y);
+  for(i=0;i<lp->n && cp->t!=token;x+=cp->w,i++,cp++);
+  convert_pair_to_os(x,y,&x,&y);
+  tp=fetch_token_address(b,token);
+  fh=redraw_find_token_font(tp);
+  *fhand=fh;
+  fm_font_box(fh,box);
+  form_get_linesize(box,lh,lb);
+  if(tp->style&TEXTAREA)
+  {
+    int r;
+
+    r=tp->rows;
+    if(r<3) r=3;
+    box->y1=(box->y1-box->y0+4)*r+box->y0;
+  }
+  box->y0=box->y0+y-8;
+  box->y1=box->y1+y+8;
+  box->x0=x+4;
+  convert_pair_to_os(cp->w,t,&x,&t);
+  box->x1=box->x0+x-4-4;
+  return(TRUE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL form_token_visible(browser *b,int token)
+{
+  wimp_wstate state;
+  int         y0,y1,t,lh,lb,fh;
+  wimp_box    box;
+
+  if(wimp_get_wind_state(b->w,&state)) return(FALSE);
+  y1=coords_y_toworkarea(state.o.box.y1-browser_bar_height(b)-4,(coords_cvtstr*)&state.o.box);
+  t=(b->status.flags&PANE_ISOPEN)?STATUS_HEIGHT:0;
+  y0=coords_y_toworkarea(state.o.box.y0+t+4,(coords_cvtstr*)&state.o.box);
+  if(!form_input_box(b,token,&box,&lh,&lb,&fh)) return(FALSE);
+  if(box.y0>y0 && box.y1<y1) return(TRUE);
+  if(box.y1<y0 || box.y0>y0) return(FALSE);
+  if(box.y1-box.y0>y1-y0) return(TRUE);
+  return(FALSE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void form_show_edit_token(void)
+{
+  if(fe_browser && fe_token && !form_token_visible(fe_browser,fe_token))
+    browser_show_token(fe_browser,fe_token,0);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void form_abandon_menu(void)
+{
+  if(fe_menu)
+  {
+    wimp_create_menu((wimp_menustr*)-1,0,0);
+    free(fe_menu);
+    fe_menu=NULL;
+    fe_mbrowser=NULL;
+    fe_mtoken=0;
+  }
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_end_edit(browser *b,BOOL keepchanges,BOOL movefocus)
+{
+  os_error *e=NULL;
+
+  if((!b || b==fe_browser) && fe_browser && fe_token)
+  {
+    BOOL u;
+
+    if(e) e=errorgen((int)e);
+    u=fe_xscroll || fe_yscroll;
+    fe_xscroll=fe_yscroll=fe_index=0;
+    if(u) browser_update_token(fe_browser,fe_token,TRUE);
+    fe_browser=NULL;
+    fe_token=0;
+    if(movefocus) browser_give_focus_general(b);
+  }
+  form_abandon_menu();
+  return(e);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_create_menu(browser *b,int token)
+{
+  form_field    *fp;
+  HStream       *tp;
+  char          *p,*o;
+  int           w,i,n,size;
+  wimp_mousestr m;
+  wimp_menuhdr  *mhp;
+  wimp_menuitem *mip;
+
+  if(b!=fe_mbrowser || token!=fe_mtoken) form_abandon_menu();
+  fp=form_find_record(b,token,FALSE);
+  if(fp->header.type!=form_select) return(NULL);
+  tp=fetch_token_address(b,token);
+  p=tp->value+8;
+  size=sizeof(wimp_menuhdr);
+  p=tp->value;
+  n=*(int*)p;
+  if(n<1) {bbc_vdu(7); return(NULL);}
+  if(n>MAXSELECTIONS) n=MAXSELECTIONS;
+  p+=8;
+  w=8;
+  for(i=0;i<n;i++)
+  {
+    p++;
+    size+=strlen(p)+1+sizeof(wimp_menuitem);
+    if(strlen(p)>w) w=strlen(p);
+    p+=strlen(p)+1;
+    p+=strlen(p)+1;
+  }
+  if(!fe_menu) fe_menu=malloc(size+4);
+  if(!fe_menu) return(errorgen(2));
+  memset(fe_menu,0,size+4);
+  mhp=(wimp_menuhdr*)fe_menu;
+  mip=(wimp_menuitem*)(((int)mhp)+sizeof(wimp_menuhdr));
+  strncpy(mhp->title,tp->name,12);
+  if(!mhp->title[0] || mhp->title[11]) strcpy(mhp->title,msgs_lookup("selTITL:Select"));
+  mhp->tit_fcol=7;
+  mhp->tit_bcol=2;
+  mhp->work_fcol=7;
+  mhp->work_bcol=0;
+  mhp->width=w*16;
+  mhp->height=44;
+  mhp->gap=0;
+  p=tp->value+8;
+  o=(char*)(mip+n);
+  for(i=0;i<n;i++)
+  {
+    mip->flags=((i==n-1)?wimp_MLAST:0)|((fp->value.select.selection[i]==FORM_SELCHAR)?wimp_MTICK:0);
+    mip->submenu=(wimp_menuptr)-1;
+    mip->iconflags=wimp_ITEXT|wimp_IFILLED|wimp_INDIRECT|(wimp_BSELNOTIFY<<12)|(7<<24);
+    mip->data.indirecttext.buffer=o;
+    mip->data.indirecttext.validstring=NULL;
+    mip->data.indirecttext.bufflen=0;
+    mip++;
+    p++;
+    strcpy(o,p);
+    p+=strlen(p)+1;
+    p+=strlen(p)+1;
+    o+=strlen(o)+1;
+  }
+  event_cancel_menu();
+  wimp_get_point_info(&m);
+  return(wimp_create_menu(fe_menu,m.x-48,m.y));
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_start_select_edit(browser *b,int token)
+{
+  ERROUT(form_create_menu(b,token));
+  fe_mbrowser=b;
+  fe_mtoken=token;
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_autoscroll(browser *b)
+{
+  wimp_caretstr c;
+
+  wimp_get_caret_pos(&c);
+  if(c.w==b->w && c.x>0 && c.height>0)
+  {
+    wimp_wstate   state;
+    wimp_box      box;
+    int           gap,width,height,sc;
+
+    wimp_get_wind_state(b->w,&state);
+    box=state.o.box;
+    coords_box_toworkarea(&box,(coords_cvtstr*)&state.o.box);
+    box.y1-=browser_bar_height(b);
+    if(b->status.flags&PANE_ISOPEN) box.y0+=STATUS_HEIGHT;
+    width=box.x1-box.x0;
+    height=box.y1-box.y0;
+    if (height>width) gap=(width/5);
+    else gap=(height/5);
+    if (gap>100) gap=100;
+    sc=0;
+    if (c.y>(box.y1-gap)) {state.o.y+=(c.y-(box.y1-(gap*3)))+10; sc=1;}
+    if (c.y<(box.y0+gap)) {state.o.y+=(c.y-(box.y0+(gap*3)))-10; sc=1;}
+    if (c.x>(box.x1-gap)) {state.o.x+=(c.x-(box.x1-(gap*3)))-10; sc=1;}
+    if (c.x<(box.x0+gap)) {state.o.x+=(c.x-(box.x0+(gap*3)))-10; sc=1;}
+    if(sc) wimp_open_wind(&state.o);
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_start_textarea_edit(browser *b,int token,int mode)
+{  /* mode =0:caret near mouse, 1:caret at start (textarea), or end (single line), 2:caret at end */
+  HStream       *tp;
+  wimp_box      box;
+  int           lh,lb,fh,x,y;
+  wimp_mousestr m;
+  wimp_wstate   state;
+
+  ERROUT(form_end_edit(b,TRUE,FALSE));
+  tp=fetch_token_address(b,token);
+  fe_single=!(tp->style&TEXTAREA);
+  fe_password=(tp->type&TYPE_RESET)==TYPE_PASSWORD;
+  fe_browser=b;
+  fe_token=token;
+  switch(mode)
+  {
+    case 0:
+      form_input_box(b,fe_token,&box,&lh,&lb,&fh);
+      box.x0+=8; box.y0+=8; box.x1-=8; box.y1-=8;
+      wimp_get_point_info(&m);
+      wimp_get_wind_state(b->w,&state);
+      x=coords_x_toworkarea(m.x,(coords_cvtstr*)&state.o.box);
+      y=coords_y_toworkarea(m.y,(coords_cvtstr*)&state.o.box);
+      x-=box.x0;
+      y=(box.y1-y)/lh;
+      form_textarea_find_caret(form_get_field_text(b,fe_token),fh,&fe_index,x,y);
+      break;
+    case 1: if(fe_single) fe_index=strlen(form_get_field_text(b,fe_token)); else fe_index=0; break;
+    case 2: fe_index=strlen(form_get_field_text(b,fe_token)); break;
+    default: fe_index=0; break;
+  }
+  form_give_focus(b);
+  form_show_edit_token();
+  form_autoscroll(b);
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void form_check_scroll_field(browser *b,wimp_box *box,int x,int y,int lh)
+{ /* check that the box is showing the caret at x,y when lineheight is lh, scroll if necessary */
+  int            dx,dy,t;
+
+  dx=dy=0;
+  t=box->x1-box->x0-32;
+  if(x-fe_xscroll<0)
+  {
+    dx=(x-32)-fe_xscroll;
+    if(x<t) dx=-fe_xscroll; /* tend to be fully scrolled right */
+  }
+  if(x-fe_xscroll>t) dx=(x-t)-fe_xscroll;
+  t=(box->y1-box->y0)/lh-1;
+  if(y-fe_yscroll<0)
+  {
+    dy=(y-1)-fe_yscroll;
+    if(y<t) dy=-fe_yscroll; /* tend to be fully scrolled down */
+  }
+  if(y-fe_yscroll>t) dy=(y-t)-fe_yscroll;
+  if(fe_single) dy=0; /* don't vscroll single line fields */
+  if(dx || dy)
+  {
+    wimp_box       obox;
+    wimp_caretstr  c;
+
+    if(dx<0) {if((-dx)%4) dx-=(4-((-dx)%4));} else if(dx%4) dx+=4-(dx%4);
+    wimp_get_caret_pos(&c);
+    if(c.i<0 && c.w==b->w)
+    {
+      wimp_caretstr c1;
+
+      c1=c; c1.x=-1; c1.y=1; c1.height=0;
+      wimp_set_caret_pos(&c1);
+    }
+    fe_xscroll+=dx;
+    fe_yscroll+=dy;
+    obox=*box;
+    if(dx<0) obox.x1+=dx; else obox.x0+=dx;
+    if(dy<0) obox.y0-=dy*lh; else obox.y1-=dy*lh;
+    wimp_blockcopy(b->w,&obox,obox.x0-dx,obox.y0+dy*lh);
+    if(dx)
+    {
+      wimp_redrawstr r;
+
+      r.w=b->w;
+      r.box=*box;
+      if(dx<0) r.box.x1=r.box.x0-dx; else r.box.x0=r.box.x1-dx;
+      browser_update(b,&r,TRUE);
+    }
+    if(dy)
+    {
+      wimp_redrawstr r;
+
+      r.w=b->w;
+      r.box=*box;
+      if(dy<0) r.box.y0=r.box.y1+dy*lh; else r.box.y1=r.box.y0+dy*lh;
+      browser_update(b,&r,TRUE);
+    }
+    if(c.i<0 && c.w==b->w) wimp_set_caret_pos(&c);
+  }
+}
+
+/*----------------------------------------------------------------------*/
+BOOL form_give_focus(browser *b)
+{ /* take the focus if editing; return a flag saying if you did */
+  wimp_caretstr c;
+  wimp_box      box;
+  int           lh,lb,fh,ox,oy;
+
+  if(!b || b!=fe_browser || !fe_token) return(FALSE);
+  if(!form_input_box(b,fe_token,&box,&lh,&lb,&fh)) return(FALSE);
+  box.x0+=8; box.y0+=8; box.x1-=8; box.y1-=8;
+  form_textarea_caretpos(form_get_field_text(b,fe_token),fh,fe_index,&ox,&oy);
+  form_check_scroll_field(b,&box,ox,oy,lh);
+  c.w=fe_browser->w;
+  c.i=-1;
+  c.x=box.x0+ox-fe_xscroll;
+  c.y=box.y1-lh*(oy-fe_yscroll+1);
+  c.height=lh;
+  c.index=0;
+  wimp_set_caret_pos(&c);
+  return(TRUE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int form_extend_flex(void **data,int size)
+{ /* extend the flex block by the indicated amount, return the
+     offset into the block of the new bit or -1 for failure */
+  int o;
+
+  if(*data)
+  {
+    o=mflex_size(data);
+    if(!mflex_extend(data,o+size)) return(-1);
+  }
+  else
+  {
+    o=0;
+    if(!mflex_alloc(data,size)) return(-1);
+  }
+  return(o);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL form_encode_flex_data(void **data,char *enctype)
+{ /* encode the flex block, return success flag */
+  int  i,o;
+  char *p;
+
+  enctype=enctype; /* avoid compiler warning */
+  o=0;
+  while(*(((char*)*data)+o))
+  {
+    p=((char*)*data)+o;
+    if((*p<' ' || *p>126 || *p=='%' || *p=='&' || *p=='=' || *p=='?') &&
+       *p!=ENCODE_DATASEP && *p!=ENCODE_FIELDSEP && *p!=ENCODE_VALUESEP)
+    {
+      char code[10];
+
+      if(*p=='\n') strcpy(code,"%0D%0A"); else sprintf(code,"%%%02X",*p);
+      if(!form_extend_flex(data,strlen(code)-1)) return(FALSE);
+      memmove(((char*)*data)+o+strlen(code),((char*)*data)+o+1,
+              mflex_size(data)-o-strlen(code));
+      strncpy(((char*)*data)+o,code,strlen(code));
+      o+=strlen(code)-1;
+    }
+    o++;
+  }
+  /* now do simple encodings */
+  p=(char*)*data;
+  o=mflex_size(data);
+  for(i=0;i<o;i++,p++)
+  {
+    switch(*p)
+    {
+      case ' ':              *p='+'; break;
+      case ENCODE_DATASEP:   *p='?'; break;
+      case ENCODE_FIELDSEP:  *p='&'; break;
+      case ENCODE_VALUESEP:  *p='='; break;
+    }
+  }
+  return(TRUE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int form_field_data_size(browser *b,form_field *fp,HStream *tp)
+{ /* total size requirement for a field including name and value */
+  int     size;
+
+  size=0;
+  if(tp->name)
+  {
+    size=strlen(tp->name)+1; /* add one for the '=' sign */
+    switch(fp->header.type)
+    {
+      case form_textarea: /* form_textarea same as form_password: no break */
+      case form_text:     /* form_text same as form_password: no break */
+      case form_password: size+=strlen(fp->value.text); break;
+      case form_checkbox: /* form_checkbox same as form_radio: no break */
+      case form_radio:
+        if(fp->value.checked)
+        {
+          if(tp->value) size+=strlen(tp->value);
+          else size+=2;
+        }
+        else size=0;
+      break;
+      case form_select:
+      {
+        int  i,n,s;
+        char *p,*q;
+
+        s=0;
+        n=*(int*)tp->value;
+        p=tp->value+8;
+        for(i=0;i<n;i++)
+        {
+          p++;
+          q=p+strlen(p)+1;
+          if(fp->value.select.selection[i]==FORM_SELCHAR)
+            s+=size+strlen(*q?q:p)+1; /* plus one for & separator */
+          p=q+strlen(q)+1;
+        }
+        if(s) s--; /* one of the & separators need not be included */
+        size=s;
+      } break;
+      case form_image:    size=0; break; /*;{{*/
+      case form_submit:   size+=strlen(form_button_text(tp)); break;
+      case form_hidden:   if(tp->value) size+=strlen(tp->value); else size=0; break;
+    }
+  }
+  return(size);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_build_data(browser *b,int token,int x,int y,void **data)
+{ /* Build the data structure for a form in the indicated mflex block.
+     The token identifies the form and if it is a submit token it is included
+     in the data structure; other submit tokens are not.
+     The mflex block does not exist before calling this routine.
+     The form data are encoded according to the specification.
+     If the form METHOD is GET, the URL is included as part of this
+     data.
+     x and y are coords for forms submitted by INPUT TYPE=IMAGE
+  */
+  int         i,o,ho,fields;
+  form_header *hp;
+  form_field  *fp;
+  HStream     *tp;
+  BOOL        first;
+
+  x=x; y=y; /* avoid compiler warning */
+  *data=NULL;
+  if(form_extend_flex(data,1)<0) return(errorgen(2));
+  *(char*)*data=0;
+  hp=form_find_record(b,token,TRUE);
+  ho=((int)hp)-(int)b->fdata;
+  tp=fetch_token_address(b,hp->token);
+  if((tp->type&TYPE_GET) && tp->anchor)
+  { /* its a GET form - put the URL in */
+    int  i;
+    char *p;
+
+    i=form_extend_flex(data,strlen(tp->anchor)+1);
+    if(i<0) return(errorgen(2));
+    p=((char*)*data)+i-1;
+    strcpy(p,tp->anchor);
+    p=strchr(p,0);
+    *p++=ENCODE_DATASEP;
+    *p=0;
+  }
+  fields=hp->fields;
+  first=TRUE;
+  o=sizeof(form_header);
+  for(i=0;i<fields;i++)
+  {
+    fp=(form_field*)(((int)b->fdata)+ho+o);
+    tp=fetch_token_address(b,fp->header.token);
+    if(tp->name && fp->header.type!=form_reset &&
+       (fp->header.type!=form_submit || fp->header.token==token) &&
+       (fp->header.type!=form_image || fp->header.token==token))
+      {
+        int size;
+
+        size=form_field_data_size(b,fp,tp);
+        if(size)
+        {
+          int  offset;
+          char *p;
+
+          offset=form_extend_flex(data,size+(first?0:1));
+          if(offset<0) return(errorgen(2));
+          fp=(form_field*)(((int)b->fdata)+ho+o); /* recalculate because flex may have moved */
+          hp=(form_header*)(((int)b->fdata)+ho);
+          tp=fetch_token_address(b,fp->header.token);
+          p=((char*)*data)+offset-1;
+          if(!first) *p++=ENCODE_FIELDSEP;
+          *p=0;
+          strcpy(p,tp->name);
+          p=strchr(p,0);
+          *p++=ENCODE_VALUESEP;
+          *p=0;
+          switch(fp->header.type)
+          {
+            case form_textarea: /* form_textarea same as form_password: no break */
+            case form_text:     /* form_text same as form_password: no break */
+            case form_password: strcpy(p,fp->value.text); break;
+            case form_checkbox: /* form_checkbox same as form_radio: no break */
+            case form_radio:    if(tp->value) strcpy(p,tp->value); else strcpy(p,"on"); break;
+            case form_select:
+            {
+              int  i,n,first;
+              char *f,*q;
+
+              first=TRUE;
+              n=*(int*)tp->value;
+              f=tp->value+8;
+              for(i=0;i<n;i++)
+              {
+                f++;
+                q=f+strlen(f)+1;
+                if(fp->value.select.selection[i]==FORM_SELCHAR)
+                {
+                  if(!first)
+                  {
+                    *p++=ENCODE_FIELDSEP;
+                    strcpy(p,tp->name);
+                    p=strchr(p,0);
+                    *p++=ENCODE_VALUESEP;
+                    *p=0;
+                  }
+                  strcpy(p,*q?q:f);
+                  p=strchr(p,0);
+                  first=FALSE;
+                }
+                f=q+strlen(q)+1;
+              }
+            } break;
+            case form_image:    break; /*;{{*/
+            case form_submit:   strcpy(p,form_button_text(tp)); break;
+            case form_hidden:   if(tp->value) strcat(p,tp->value); break;
+          }
+          first=FALSE;
+        }
+      }
+    o+=fp->header.size*4;
+  }
+  hp=form_find_record(b,token,TRUE);
+  tp=fetch_token_address(b,hp->token);
+  if(!form_encode_flex_data(data,tp->enctype)) return(errorgen(2));
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_submit_form(browser *b,int token)
+{
+  void        *data;
+  os_error    *e;
+  form_header *hp;
+  HStream     *tp;
+
+  e=NULL;
+  ERROUT(form_finish_edit(b));
+  if(!e)
+  {
+    hp=form_find_record(b,token,TRUE);
+    tp=fetch_token_address(b,hp->token);
+    if((tp->type&TYPE_GET) && tp->anchor)
+    {
+      e=form_build_data(b,token,0,0,&data); /* ;{{ 0,0 need filling in for INPUT TYPE=IMAGE */
+      if(e) e=errorgen((int)e);
+      else e=browser_show_url_f(b,data,TRUE);
+      if(e) e=errorgen((int)e);
+      if(data) mflex_free(&data);
+    }
+    else if((tp->type&TYPE_POST) && tp->anchor)
+    {
+      e=form_build_data(b,token,0,0,&b->extradata); /* ;{{ 0,0 need filling in for INPUT TYPE=IMAGE */
+      tp=fetch_token_address(b,hp->token);
+      if(e)
+      {
+        e=errorgen((int)e);
+        if(b->extradata) mflex_free(&b->extradata);
+        b->extradata=NULL;
+      }
+      else e=browser_show_url_f(b,tp->anchor,TRUE);
+    }
+    else bbc_vdu(7);
+  }
+  return(e);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_click_field(browser *b,int token,int mode)
+{ /* process a click on a field */
+  /* mode =0:caret near mouse, 1:caret at start (textarea), or end (single line), 2:caret at end */
+  form_field *fp;
+  os_error   *e=NULL;
+
+  fp=form_find_record(b,token,FALSE);
+  if(fp) /* if it has a record in this module, edit it */
+  {
+    switch(fp->header.type)
+    {
+      case form_text:  /* same as form_password: no break */
+      case form_password:  e=form_start_textarea_edit(b,token,mode); break;
+      case form_checkbox:  /* same as form_radio: no break */
+      case form_radio:
+        ERROUT(form_put_field(b,token,(char*)!fp->value.checked,TRUE));
+      break;
+      case form_select:    e=form_start_select_edit(b,token); break;
+      case form_textarea:  e=form_start_textarea_edit(b,token,mode); break;
+      break;
+      case form_image:     /*;{{*/ break;
+      case form_submit:
+        browser_flash_token(b,token);
+        e=form_submit_form(b,token);
+      break;
+      case form_reset:
+        browser_highlight_token(b,token);
+        form_cancel_edit(b);
+        e=form_reset_form(b,token);
+        if(e) e=errorgen((int)e);
+        browser_clear_highlight(b,TRUE);
+      break;
+    }
+  }
+  return(e);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_cancel_edit(browser *b)
+{ /* terminate edit in the specified browser (NULL=any), discarding updates */
+  return(form_end_edit(b,FALSE,TRUE));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_finish_edit(browser *b)
+{ /* terminate edit in the specified browser (NULL=any), keeping updates */
+  return(form_end_edit(b,TRUE,TRUE));
+}
+
+/*----------------------------------------------------------------------*/
+char *form_button_text(HStream *tp)
+{
+  char *p;
+
+  p=tp->value;
+  if(!p && ((tp->type & TYPE_RESET)==TYPE_SUBMIT))
+    p=msgs_lookup("submit:Submit");
+  if(!p && ((tp->type & TYPE_RESET)==TYPE_RESET))
+    p=msgs_lookup("reset:Reset");
+  if(!p) p="?";
+  return(p);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL form_cursor_editable(form_fieldtype type)
+{
+  return(type==form_password || type==form_text || type==form_textarea);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_next_field(BOOL auto_submit)
+{
+  form_header *hp;
+  form_field  *fp;
+  int         i,first,next,found;
+
+  found=first=next=0;
+  hp=form_find_record(fe_browser,fe_token,TRUE);
+  fp=(form_field*)(((int)hp)+sizeof(form_header));
+  for(i=0;i<hp->fields;i++)
+  {
+    if(form_cursor_editable(fp->header.type))
+    {
+      if(!first) first=fp->header.token;
+      if(!next && found) next=fp->header.token;
+    }
+    if(fp->header.token==fe_token) found=TRUE;
+    fp=(form_field*)(((int)fp)+fp->header.size*4);
+  }
+  if(!next)
+  {
+    if(auto_submit) return(form_submit_form(fe_browser,fe_token));
+    else next=first;
+  }
+  if(next && next!=fe_token) return(form_click_field(fe_browser,next,1));
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_previous_field(void)
+{
+  form_header *hp;
+  form_field  *fp;
+  int         i,last,previous,found;
+
+  found=previous=last=0;
+  hp=form_find_record(fe_browser,fe_token,TRUE);
+  fp=(form_field*)(((int)hp)+sizeof(form_header));
+  for(i=0;i<hp->fields;i++)
+  {
+    if(fp->header.token==fe_token) found=TRUE;
+    if(form_cursor_editable(fp->header.type))
+    {
+      last=fp->header.token;
+      if(!found) previous=fp->header.token;
+    }
+    fp=(form_field*)(((int)fp)+fp->header.size*4);
+  }
+  if(!previous) previous=last;
+  if(previous && previous!=fe_token) return(form_click_field(fe_browser,previous,2));
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_cursor_right(void)
+{
+  if(fe_token && fe_browser)
+  {
+    char *p;
+
+    p=form_get_field_text(fe_browser,fe_token);
+    if(p[fe_index])
+    {
+      fe_index++;
+      form_give_focus(fe_browser);
+      form_autoscroll(fe_browser);
+    }
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_cursor_bot(void)
+{
+  if(fe_token && fe_browser)
+  {
+    char *p;
+
+    p=form_get_field_text(fe_browser,fe_token);
+    if(p[fe_index])
+    {
+      fe_index=strlen(p);
+      form_give_focus(fe_browser);
+      form_autoscroll(fe_browser);
+    }
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_cursor_eol(void)
+{
+  if(fe_token && fe_browser)
+  {
+    char *p;
+    int  o;
+
+    p=form_get_field_text(fe_browser,fe_token);
+    o=fe_index;
+    while(p[fe_index] && p[fe_index]!='\n') fe_index++;
+    if(o!=fe_index) {form_give_focus(fe_browser); form_autoscroll(fe_browser);}
+
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_cursor_bol(void)
+{
+  if(fe_token && fe_browser && fe_index)
+  {
+    char *p;
+    int  o;
+
+    p=form_get_field_text(fe_browser,fe_token);
+    o=fe_index;
+    do
+    {
+      fe_index--;
+    } while(fe_index>=0 && p[fe_index]!='\n');
+    fe_index++;
+    if(o!=fe_index) {form_give_focus(fe_browser); form_autoscroll(fe_browser);}
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_cursor_left(void)
+{
+  if(fe_token && fe_browser && fe_index)
+  {
+    fe_index--;
+    form_give_focus(fe_browser);
+    form_autoscroll(fe_browser);
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_cursor_tot(void)
+{
+  if(fe_token && fe_browser && fe_index)
+  {
+    fe_index=0;
+    form_give_focus(fe_browser);
+    form_autoscroll(fe_browser);
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_cursor_y(int dir)
+{
+  if(fe_token && fe_browser && dir)
+  {
+    char      *p;
+    int       o,x,y,fh;
+    HStream   *tp;
+
+    if(fe_single && dir<0) return(form_previous_field());
+    if(fe_single && dir>0) return(form_next_field(FALSE));
+    p=form_get_field_text(fe_browser,fe_token);
+    tp=fetch_token_address(fe_browser,fe_token);
+    fh=redraw_find_token_font(tp);
+    form_textarea_caretpos(p,fh,fe_index,&x,&y);
+    o=fe_index;
+    y+=dir;
+    if(y<0) return(form_previous_field());
+    if(tp->style&TEXTAREA) form_textarea_find_caret(p,fh,&fe_index,x,y);
+    if(o==fe_index) return(form_next_field(FALSE));
+    form_give_focus(fe_browser);
+    form_autoscroll(fe_browser);
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_insert_character(int key,BOOL *used)
+{
+  char           *p;
+  HStream        *tp;
+  int            x,y,fh,lh,lb;
+  wimp_redrawstr r;
+
+  if((key<32 && key!=13) || key>255 || key==127 || !fe_token || !fe_browser) {*used=FALSE; return(NULL);}
+  *used=TRUE;
+  p=form_get_field_text(fe_browser,fe_token);
+  tp=fetch_token_address(fe_browser,fe_token);
+  if(fe_single && key==13) return(form_next_field(TRUE));
+  ERROUT(form_set_field_space(fe_browser,fe_token,strlen(p)+2));
+  p=form_get_field_text(fe_browser,fe_token);
+  tp=fetch_token_address(fe_browser,fe_token);
+  form_input_box(fe_browser,fe_token,&r.box,&lh,&lb,&fh);
+  form_textarea_caretpos(p,fh,fe_index,&x,&y);
+  memmove(p+fe_index+1,p+fe_index,strlen(p)-fe_index+1);
+  r.box.y1-=(y-fe_yscroll)*lh+4;
+  if(key==13)
+    p[fe_index]=10;
+  else
+  {
+    p[fe_index]=key;
+    r.box.y0=r.box.y1-lh;
+    r.box.x0+=x-fe_xscroll;
+  }
+  browser_update(fe_browser,&r,TRUE);
+  return(form_cursor_right());
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *form_delete_character(BOOL right)
+{
+  char           *p,c;
+  int            x,y,fh,lh,lb;
+  wimp_redrawstr r;
+
+  if(!right && !fe_index) return(NULL);
+  if(!right) form_cursor_left();
+  p=form_get_field_text(fe_browser,fe_token);
+  if(!p[fe_index]) return(NULL);
+  c=p[fe_index];
+  form_input_box(fe_browser,fe_token,&r.box,&lh,&lb,&fh);
+  form_textarea_caretpos(p,fh,fe_index,&x,&y);
+  memmove(p+fe_index,p+fe_index+1,strlen(p)-fe_index);
+  ERROUT(form_set_field_space(fe_browser,fe_token,strlen(p)+1));
+  r.box.y1-=(y-fe_yscroll)*lh+4;
+  if(c!='\n')
+  {
+    r.box.y0=r.box.y1-lh;
+    r.box.x0+=x-fe_xscroll;
+  }
+  browser_update(fe_browser,&r,TRUE);
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *form_process_key(browser *b,int *key)
+{ /* process key stroke, set *key=0 if processed */
+  os_error *e;
+  BOOL     used;
+  e=NULL;
+
+  used=FALSE;
+  if(b==fe_browser && fe_browser && fe_token)
+  {
+    used=TRUE;
+    switch(*key)
+    {
+      case 8:                      e=form_delete_character(FALSE); break;
+      case 27:                     e=form_cancel_edit(b); break;
+      case 30:                     e=form_cursor_tot(); break;
+      case 127:                    e=form_delete_character(FALSE); break;
+      case akbd_RightK:            e=form_cursor_right(); break;
+      case akbd_RightK+akbd_Ctl:   e=form_cursor_eol(); break;
+      case akbd_LeftK:             e=form_cursor_left(); break;
+      case akbd_LeftK+akbd_Ctl:    e=form_cursor_bol(); break;
+      case akbd_TabK:              e=form_next_field(FALSE); break;
+      case akbd_DownK:             e=form_cursor_y(1); break;
+      case akbd_TabK+akbd_Sh:      e=form_previous_field(); break;
+      case akbd_UpK:               e=form_cursor_y(-1); break;
+      case akbd_CopyK:             e=form_delete_character(TRUE); break;
+      case akbd_UpK+akbd_Ctl:      e=form_cursor_tot(); break;
+      case akbd_UpK+akbd_Sh:       e=form_cursor_tot(); break;
+      case akbd_DownK+akbd_Ctl:    e=form_cursor_bot(); break;
+      case akbd_DownK+akbd_Sh:     e=form_cursor_bot(); break;
+      default:                     e=form_insert_character(*key,&used); break;
+    }
+  }
+  if(used) *key=0;
+  return(e);
+}
+
+/*----------------------------------------------------------------------*/
+void form_textarea_redraw(browser *b,int token,wimp_box *box,wimp_box *gw,int fh,
+                          BOOL multiline,BOOL password)
+{
+  int              nx0,ny0,nx1,ny1;
+  wimp_box         area,fontbox;
+  int              lh,lb,l;
+  char             c,*p,*t;
+  int              y,xs,ys;
+
+  area=*box; area.x0+=8; area.y0+=8; area.x1-=8; area.y1-=8;
+  nx0=area.x0>gw->x0?area.x0:gw->x0;
+  nx1=area.x1<gw->x1?area.x1:gw->x1;
+  ny0=area.y0>gw->y0?area.y0:gw->y0;
+  ny1=area.y1<gw->y1?area.y1:gw->y1;
+  nx0&=~(Wimpt_dx-1); ny0&=~(Wimpt_dy-1); nx1&=~(Wimpt_dx-1); ny1&=~(Wimpt_dy-1);
+  if(nx0>=nx1 || ny0>=ny1) return;
+  bbc_gwindow(nx0,ny0,nx1-1,ny1-1);
+  fm_font_box(fh,&fontbox);
+  form_get_linesize(&fontbox,&lh,&lb);
+  p=form_get_field_text(b,token);
+  if(p)
+  {
+    xs=ys=0;
+    if(b==fe_browser && token==fe_token) {xs=fe_xscroll; ys=fe_yscroll*lh;}
+    y=area.y1+ys;
+    do
+    {
+      t=strchr(p,'\n'); if(!t) t=strchr(p,0); c=*t; *t=0;
+      l=strlen(p);
+      if(y-lh<area.y1) fm_putsl(fh,area.x0-xs,y-lh+lb,password?fe_passcode:p,l,TRUE,FALSE);
+      y-=lh;
+      *t=c;
+      p+=l; if(*p=='\n') p++;
+    } while(y>area.y0 && multiline && *p);
+  }
+  bbc_gwindow(gw->x0,gw->y0,gw->x1-1,gw->y1-1);
+}
+
+/*----------------------------------------------------------------------*/
+void form_select_menu_event(wimp_eventstr *e)
+{
+  if(fe_menu && fe_mbrowser && fe_mtoken)
+  {
+    form_field    *fp;
+    int           n,o;
+    HStream       *tp;
+    char          select[MAXSELECTIONS+1];
+    wimp_mousestr m;
+
+    fp=form_find_record(fe_mbrowser,fe_mtoken,FALSE);
+    if(fp->header.type!=form_select) return;
+    tp=fetch_token_address(fe_mbrowser,fe_mtoken);
+    n=*(int*)tp->value;
+    o=e->data.menu[0];
+    if(o>=n) return;
+    strcpy(select,fp->value.select.selection);
+    if(tp->type&TYPE_MULTIPLE) select[o]=(select[o]==FORM_SELCHAR)?FORM_UNSELCHAR:FORM_SELCHAR;
+    else
+    {
+      int i,c;
+
+      for(i=0;i<n;i++) if(i==o) select[i]=(select[i]==FORM_SELCHAR)?FORM_UNSELCHAR:FORM_SELCHAR;
+                       else select[i]=FORM_UNSELCHAR;
+      c=0;
+      for(i=0;i<n;i++) if(select[i]==FORM_SELCHAR) c++;
+      if(!c) select[o]=FORM_SELCHAR;
+    }
+    form_put_field(fe_mbrowser,fe_mtoken,select,TRUE);
+    wimp_get_point_info(&m);
+    if(m.bbits&1) form_create_menu(fe_mbrowser,fe_mtoken);
+  }
+}
+
+/*----------------------------------------------------------------------*/
+void form_check_caret(browser *b)
+{ /* ensure the caret is correctly located in the window */
+  if((!b || b==fe_browser) && fe_browser && fe_token)
+  {
+    if(!form_give_focus(fe_browser)) form_finish_edit(fe_browser);
+  }
+}

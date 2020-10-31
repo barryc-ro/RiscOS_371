@@ -1,0 +1,291 @@
+; > Macros
+
+;..............................................................................
+;
+; Prep the routines as required
+
+        MACRO
+        PDumper_InitialiseMacros
+        MEND
+
+strip_type_mono  * StripType_Monochrome
+strip_type_greys * StripType_GreyLevel
+strip_type_256   * StripType_256Colour
+strip_type_24bm  * StripType_Multi
+        [ Medusa
+strip_type_16bs  * StripType_16Bit
+strip_type_24bs  * StripType_24Bit
+        ]
+
+;..............................................................................
+
+; Reset the buffer pointer, purging the contents.  Should only be called at
+; the start of a strip.
+
+        MACRO
+$l      PDumper_Reset $cc
+$l      MOV$cc  ofs,#buffer_length      ;Reset the free space in the buffer
+        ADR$cc  ptr,buffer_posn         ;..and its position
+        MEND
+
+;..............................................................................
+
+; Store a byte into the buffer, flushing if it is full or fills up
+
+        MACRO
+$l      PDumper_OutputReg $reg
+$l      STRB    $reg,[ptr,ofs,LSR #16]  ;Store the character
+        ADD     ofs,ofs,#&10000         ;And then advance the pointer
+        CMP     ofs,ofs,LSL #16         ;Has the buffer filled up yet?
+        PDumper_EmptyBuffer GT
+        MEND
+            
+;..............................................................................
+
+; Empty the buffer.
+
+        MACRO
+$l      PDumper_EmptyBuffer $cc
+$l      BL$cc   PDumper_EmptyBuffer     ;Empty the buffer
+        PDumper_Reset $cc
+        MEND
+
+;..............................................................................
+
+; Print a full word, ie. all four bytes.
+                                        
+        MACRO
+$l      PDumper_PrintBinaryWord $reg,$temp
+$l      MOV     $temp,$reg              ;bits 0..7
+        PDumper_OutputReg $temp
+        MOV     $temp,$reg,LSR #8       ;bits 8..15
+        PDumper_OutputReg $temp
+        MOV     $temp,$reg,LSR #16      ;bits 16..23
+        PDumper_OutputReg $temp
+        MOV     $temp,$reg,LSR #24      ;bits 24..31
+        PDumper_OutputReg $temp
+        MEND                           
+
+;..............................................................................
+
+; Print a half word, ie. two bytes.
+                                        
+        MACRO
+$l      PDumper_PrintBinaryPair $reg,$temp
+$l      MOV     $temp,$reg              ;bits 0..7
+        PDumper_OutputReg $temp
+        MOV     $temp,$reg,LSR #8       ;bits 8..15
+        PDumper_OutputReg $temp
+        MEND                           
+
+; As PrintBinaryPair, but high byte first
+                                        
+        MACRO
+$l      PDumper_PrintBinaryPair_HighFirst $reg,$temp
+$l      MOV     $temp,$reg ,LSR #8      ;bits 8..15   
+        PDumper_OutputReg $temp
+        MOV     $temp,$reg              ;bits 0..7
+        PDumper_OutputReg $temp
+        MEND                           
+
+;..............................................................................
+
+; Print a counted string, data stored as the first byte is its length
+; and then data follows on.
+                           
+; Pointer register is advanced beyond the end of the string.
+
+        MACRO
+$l      PDumper_PrintCountedString $reg,$temp1,$temp2
+$l      
+        LDRB    $temp1,[$reg],#1        ;Get the length of the string to print
+50
+        SUBS    $temp1,$temp1,#1        ;Decrease the counter
+        BLT     %FT51                   ;..and when <=0 then we must exit!
+                                                                          
+        LDRB    $temp2,[$reg],#1        ;Get the byte to send
+        PDumper_OutputReg $temp2
+        B       %BT50                   ;Then loop back until the counter is zero
+51
+        MEND
+
+;..............................................................................
+
+; Print a string given its length.  The pointer is advance beyond the last character
+; in the text and then length string is reset to zero.
+                                                      
+        MACRO
+$l      PDumper_PrintLengthString $reg,$length,$temp
+                   
+        CMP     $length,#buffer_length  ;Is the string longer than the current buffer
+        BLT     %FT50                   ;If so just insert
+
+        PDumper_EmptyBuffer             ;Ensure that the buffer is correctly flushed
+                      
+        Push    "$reg"                  ;Preserve the pointer to the text
+        Push    "R0-R3,R4"
+                          
+      [ "$length"<>"R3"
+        MOV     R3,$length
+      ]
+        LDR     R2,[SP,#16]             ;Get the pointer
+        LDR     R1,FileHandle
+        MOV     R0,#OSGBPB_WriteAtPTR   ;Get the handle and reeason code
+
+        CMP     R3,#0                   ;Is there any data to write (clears V)
+        SWINE   XOS_GBPB                ;..yup so send it now
+        PDumper_Error                   ;..and then trap any errors that occur
+
+        Pull    "R0-R3,R4"
+        Pull    "$reg"                  ;Balance the stack and restore the pointers
+
+        ADD     $reg,$reg,$length       ;Advance the pointer beyond the data sent
+        B       %FT51
+50
+        SUBS    $length,$length,#1      ;Decrease the counter
+        BLT     %FT51                   ;..and when <=0 then we must exit!
+                                                                          
+        LDRB    $temp,[$reg],#1         ;Get the byte to send
+        PDumper_OutputReg $temp
+        B       %BT50                   ;Then loop back until the counter is zero
+51
+
+        MEND
+
+;..............................................................................
+
+        GBLS    PDumper_EntryRegList
+
+; Entry to a PDumper routine
+
+        MACRO
+$l      PDumper_Entry $reglist
+      [ "$reglist"=""
+PDumper_EntryRegList SETS "ofs,ptr"     ;Always push the important ones
+      |
+PDumper_EntryRegList SETS "$reglist,ofs,ptr"
+      ]
+$l      
+        STR     SP,FramePointer         ;->Return frame ready to exit
+        Push    "$PDumper_EntryRegList ,lr"
+        MEND
+
+; Exit from a PDumper routine
+
+        MACRO
+$l      PDumper_Exit
+        Pull    "$PDumper_EntryRegList ,LR"
+        BICS    PC,LR,#V_bit
+        MEND
+
+; Trap an error from a PDumper SWI.  Returning as required. Note that you
+; cannot easily preserve all the registers here. It might look as if you
+; can by simply restoring the register set as in PDumper_Exit, but
+; PDumper_Error calls are not always matched with the right PDumper_Entry.
+; Specifically, the PDumper_Error call in the PDumper_EmptyBuffer
+; subroutine (see below) gets the register set used in the very last
+; PDumper_Entry call before it, yet PDumper_EmptyBuffer is called from
+; all over the place with various different sets of pushed registers.
+; Any attempt to restore all the registers has to get clever eg. a common
+; (and enforced) set of pushed regsiters, or a flag word saying what
+; registers were pushed etc. The easiest option (used below) is to not
+; restore the registers - PDriverDP doesn't seem to mind on errors.
+
+        MACRO
+$l      PDumper_Error
+$l
+        DebugE  Error, "Error taken "
+
+        LDRVS   R14,FramePointer        ; Points ABOVE lr that we need
+        SUBVS   sp, r14, #4             ; Ensure stack never too high
+        Pull    "pc", VS                ; Error - stuff the flags
+        MEND
+
+;..............................................................................
+          
+; Insert routines required for the above code.
+
+        MACRO
+$l      PDumper_InsertRoutines
+
+PDumper_GetLeftMargin ROUT
+
+        Push    "R0,LR"                                    
+
+        LDR     R14,[R7,#pd_leftmargin -pd_data]
+
+        LDRB    R0,[R7,#pd_data_version -pd_data]      
+        CMP     R0,#3                   ; is it a version file
+        Pull    "R0,PC",LT,^
+
+        LDR     R0,[R7,#pd_data_left_offset]
+        SUBS    R14,R14,R0
+        MOVMI   R14,#0                  ; adjust by margin, account for -ve
+
+        Pull    "R0,PC",,^
+                          
+
+PDumper_EmptyBuffer
+
+        Push    "R0-R4,LR"
+
+        MOV     R0,#OSGBPB_WriteAtPTR
+        LDR     R1,FileHandle           ;Get the file handle + reason code
+        MOV     R2,ptr
+        MOV     R3,ofs,LSR #16          ;Get the pointer and the length
+
+        CMP     R3,#0                   ;Is there any data to write (will clear V)
+        SWIGT   XOS_GBPB                ;..yup so write it now
+        BVC     %FT25
+
+        ; do we need to ignore any errors because we are tidying up
+
+        Push    "R0-R1"
+        ADR     R1, pd_error_flag_set
+        LDR     R0, [R1]
+        TEQ     R0, #1
+        Pull    "R0-R1"
+        BEQ     %FT25                   ; yes - so don't trap the error!
+        PDumper_Error                   ;..and then trap any errors
+25
+        MOV     ofs,#buffer_length      ;Reset the pointer
+        Pull    "R0-R4,PC"              ;And then exit 
+        MEND
+
+;..............................................................................
+
+; Adjust feed length based on version of the printer description file being
+;   used.
+
+        MACRO
+$l      PDumper_AdjustFeed $x,$y,$r,$temp
+$l
+        LDRB    $temp,[$r,#pd_data_version -pd_data]
+        CMP     $temp,#3                ; does it have support for the modified feed values
+        BLT     %FT10                   ;   no, so ignore it
+           
+        Debug   ,"Before offset",$x,$y
+
+        LDR     $temp,[$r,#pd_data_left_offset]
+        SUBS    $x,$x,$temp             ; allow for -ve value
+        MOVMI   $x,#0                  
+        LDR     $temp,[$r,#pd_data_top_offset]
+        SUBS    $y,$y,$temp
+        MOVMI   $y,#0                   ; subtract the y offset, account for -ve
+
+        Debug   ,"After offset",$x,$y
+10
+        MEND
+
+        MACRO
+$l      PDumper_GetLeftMargin $r,$cc
+$l
+        BL$cc   PDumper_GetLeftMargin
+      [ ("$r"="lr") :LOR: ("$r"="LR")
+      |
+        ! 0,"Compiling to return in $r"
+        MOV     $r,R14
+      ]
+        MEND
+
+        END

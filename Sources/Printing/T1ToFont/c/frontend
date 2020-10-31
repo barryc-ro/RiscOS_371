@@ -1,0 +1,1385 @@
+/* Title:   frontend.c -*-C-*-
+ *
+ * Wimp program to convert Adobe Type 1 fonts to Acorn Outline
+ * format.
+ */
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "res.h"
+#include "resspr.h"
+#include "menu.h"
+#include "template.h"
+#include "dbox.h"
+#include "werr.h"
+#include "font.h"
+#include "xferrecv.h"
+#include "visdelay.h"
+#include "kernel.h"
+#include "swis.h"
+#include "msgs.h"
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "main.h"
+#include "encoding.h"
+#include "metrics.h"
+#include "type1.h"
+#include "frontend.h"
+
+extern char *encoding_dir;
+extern int preprocess_mac (char *, char *);
+extern int preprocess_pc (char *, char *);
+extern int guesstype (char *);
+BOOL getfontname(char *filename, char *result, int resultsize);
+
+/********************************* CONSTANTS ********************************/
+
+/*
+ * Define POPUP for individual pop-up menus over the encoding and
+ * save-in icons.  Otherwise use a cascaded menu.
+ */
+#define POPUP
+
+/*
+ * Length of string buffers from dbox
+ */
+#define BUFLEN 256
+
+/*
+ * Environment variables
+ */
+
+#define FONTPATH   "Font$Path"
+#define FONTMERGE  "FontMerge"
+
+/*
+ * Scrap files
+ */
+
+#define SCRAP_TYPE1 msgs_lookup("Scrap1")
+#define SCRAP_AFM   msgs_lookup("Scrap2")
+#define SCRAP_TEMP  msgs_lookup("Scrap3")
+#define SCRAP_GENAFM msgs_lookup("Scrap4")
+
+/*
+ * Iconbar menu items
+ */
+
+#define FRONTEND_MENU_INFO     1
+#define FRONTEND_MENU_QUIT     2
+
+#define MAINBOX_MENU_FONTDIR 1
+#define MAINBOX_MENU_ENC 2
+
+/* Info box field for the version string; this is the icon number */
+
+#define FRONTEND_INFO_FIELD    4
+
+/* Main dbox icon numbers */
+
+#define MAINBOX_TYPE1    2
+#define MAINBOX_AFM      4
+#define MAINBOX_ENCNAME  6
+#define MAINBOX_SAVEIN   8
+#define MAINBOX_FONTNAME 10
+#define MAINBOX_KEEPPS   11
+#define MAINBOX_ENCMENU  12
+#define MAINBOX_SAVEMENU 13
+#define MAINBOX_OK       0
+
+/******************************** GLOBAL DATA *******************************/
+
+/*
+ * Application version
+ */
+#define VERSION_STRING msgs_lookup("Version:MESSAGES FILE NOT PRESENT")
+
+/*
+ * The menus
+ */
+
+static menu frontend_menu;
+static menu fontdir_menu;
+static menu enc_menu;
+#ifdef POPUP
+static menu current_menu;
+#else
+static menu mainbox_menu;
+#endif
+
+static char *fontdir_menu_string = NULL;
+static char *enc_menu_string = NULL;
+
+static int fontdir_number = 0;
+static int enc_number = 0;
+
+static encstr static_encstr;
+static metricsstr static_metrics;
+
+/*
+ * Handle for the frontend window
+ */
+static dbox mainbox;
+
+/*
+ * Flag - is the dbox open
+ */
+static BOOL mainbox_open = FALSE;
+
+/*
+ * To hold dbox values
+ */
+static char val_type1[BUFLEN] = "";
+static char val_afm[BUFLEN] = "";
+static char val_encname[BUFLEN] = "";
+static char val_savein[BUFLEN] = "";
+static char val_fontname[BUFLEN] = "";
+static BOOL val_keepps = FALSE;
+
+/*
+ * For the fontmerge stuff
+ */
+
+static BOOL use_fontmerge = FALSE;
+static char val_mergefrom[BUFLEN] = "";
+
+
+/*
+ * Cleanup routines
+ */
+
+void wipe_scrap ()
+{
+    if (use_fontmerge)
+    {
+        char buf[256];
+        sprintf(buf, "wipe %s.T1Font FR~C~V", getenv("Wimp$ScrapDir"));
+        system(buf);
+    }
+}
+
+
+void cleanup ()
+{
+    (void) remove(SCRAP_TYPE1);
+    (void) remove(SCRAP_AFM);
+    (void) remove(SCRAP_TEMP);
+#if GENAFM
+    (void) remove(SCRAP_GENAFM);
+#endif
+    wipe_scrap();
+}
+
+#define TOP12 (0xFFF00000)
+#define TYPEMSK (0x000FFF00)
+#define TYPESHFT (8)
+
+int filetype (char *buf)
+{
+    _kernel_swi_regs regs;
+    int load;
+    regs.r[0] = 17;
+    regs.r[1] = (int) buf;
+    if (_kernel_swi(XOS_Bit | OS_File, &regs, &regs))
+        return -1;
+    if (regs.r[0] != 1)
+        return -1;
+    load = (unsigned int) regs.r[2];
+    if ((load & TOP12) != TOP12)
+        return -1;
+    return (load & TYPEMSK) >> TYPESHFT;
+}    
+
+int object_type (char *buf)
+{
+    _kernel_swi_regs regs;
+    regs.r[0] = 17;                       /* don't do a path lookup */
+    regs.r[1] = (int) buf;
+    if (_kernel_swi(XOS_Bit | OS_File, &regs, &regs))
+        return 0;
+    return regs.r[0];
+}
+
+static BOOL isfile (char *name)
+{
+    return name && *name && object_type(name) == 1;
+}
+
+BOOL create_dir (char *dir)
+{
+    _kernel_swi_regs regs;
+    regs.r[0] = 8;
+    regs.r[1] = (int) dir;
+    regs.r[4] = 0;
+    return NULL == _kernel_swi(XOS_Bit | OS_File, &regs, &regs);
+}
+
+/*
+ * Create a directory hierarchy.  Takes the 'base' directory (which must
+ * exist) and a dot-separated list of subdirectories which need not.  The
+ * routine returns NULL for success, else an os_error.
+ */
+
+os_error *ensure_hier (char *base, char *dirs)
+{
+    char buf[256];
+    strcpy(buf, base);
+    base = buf + strlen(buf);
+    if (base > buf && *(base - 1) == '.')
+        *--base = 0;
+    if (object_type(buf) != 2)
+        return make_oserror(214, msgs_lookup("DirErr1"), base ? base : "");
+
+    while (dirs && *dirs)
+    {
+        int type;
+        *base++ = '.';                    /* Add a dot */
+        while (*dirs && *dirs != '.')     /* Copy up to (excluding) next dot */
+            *base++ = *dirs++;
+        *base = 0;
+        if (*dirs == '.')
+            dirs++;
+        type = object_type(buf);
+        switch (type)
+        {
+        case 0:
+            if (create_dir(buf) == FALSE || object_type(buf) != 2)
+                return make_oserror(214, msgs_lookup("DirErr2"), buf);
+            break;
+        case 1:
+            return make_oserror(214, msgs_lookup("DirErr3"),
+                                buf);
+        case 2:
+            break;                        /* directory */
+        default:
+            return make_oserror(214, msgs_lookup("DirErr4"), buf, type);
+        }
+    }
+    return NULL;
+}
+            
+
+/*
+ * Given a fairly standard type-1 /FontName string, try to guess a suitable
+ * Acorn-style name.  This should be more intelligent (looking at directory names
+ * in font$path etc) but it actually just does this:
+ *
+ *   Convert each group of punctuation to a dot
+ *   Put a dot before each embedded cap (but not leading all-caps sections)
+ *   Ensure no part is more than 10 chars
+ */
+
+#define LEAFMAX 10
+
+void guess_acorn_fontname (char *name, char *buf, int buflen)
+{
+    int bufind = 0;
+
+    while (*name && bufind < buflen - 1)
+    {
+        int start = bufind;
+        BOOL seenlc = FALSE;
+        while (*name && bufind < buflen - 2)
+        {
+            if (isalpha(*name) || isdigit(*name))
+            {
+                if (seenlc && isupper(*name))
+                    break;
+                if (!isupper(*name))
+                    seenlc = TRUE;
+                buf[bufind++] = *name++;
+            }
+            else
+                break;          /* punct */
+        }
+        /* Now *name is the terminator, either a cap or punct or NUL, or perhaps
+         * we filled the output buffer.
+         */
+
+        if (bufind - start > LEAFMAX)
+            bufind = start + LEAFMAX;
+
+        /* Could insert well-known transformations here, e.g. Times->Trinity */
+
+        buf[bufind++] = '.';
+        
+        while (*name && !(isalpha(*name) || isdigit(*name)))
+            name++;
+    }
+    if (buf[bufind - 1] == '.')
+        bufind--;
+    buf[bufind] = 0;
+}
+
+#undef LEAFMAX
+
+
+/*
+ * Processing encoding names.  The contents of the Encodings menu
+ * is sought in the Messages file.  The entry is a comma-separated list
+ * of items of the form tag=filename.  A further lookup is done on
+ * the tag to get to the I18Ned encoding name.  This technique lets us
+ * internationalise the encoding names on the menu without actually
+ * changing the names.
+ *
+ * The encoding names are processed directly into a menu string.  The
+ * filenames are stored by menu item number in the array "enc_filenames".
+ */
+
+#define MAX_ENCS 30
+#define ENC_PREFIX "T1ToFont:Encodings."
+
+char *enc_filenames[MAX_ENCS];
+int n_enc_filenames = 0;
+
+char *strsave (char *s)
+{
+    char *ret = malloc(strlen(s) + 1);
+    if (!ret)
+        werr(TRUE, msgs_lookup("OutOfMem"));
+    strcpy(ret, s);
+
+    return ret;
+}
+
+
+/* If you call this more than once you will leak memory */
+
+void process_encoding_names ()
+{
+    char *encs = strsave(msgs_lookup("Encodings:X"));
+    char *s = encs;
+    int i, size;
+    n_enc_filenames = 0;
+
+    if (strcmp(encs, "X") == 0)
+    {
+        enc_filenames[0] = "/Base0";   /* fallback */
+        enc_filenames[1] = NULL;       /* internal */
+        n_enc_filenames = 2;
+        enc_menu_string = " Acorn Extended Latin, Font specific";
+        return;
+    }
+    
+    /* Store each tag and calculate the size of the menu string */
+
+    size = 0;
+    while (*s && n_enc_filenames < MAX_ENCS)
+    {
+        char *start = s;
+        while (*s && *s != ',')
+        s++;
+        if (*s == ',')
+            *s++ = 0;
+
+        start = strsave(msgs_lookup(start));
+        {
+            char *t = strchr(start, '=');
+            if (t)
+                *t = 0;
+            else
+                continue;              /* incomplete, so ignore it */
+        }
+
+        enc_filenames[n_enc_filenames++] = start;
+        size += strlen(start) + 2;
+    }
+
+    if ((enc_menu_string = malloc(size)) == NULL)
+        werr(1, msgs_lookup("OutOfMem"));
+    *enc_menu_string = 0;
+
+    for (i = 0; i < n_enc_filenames; i++)
+    {
+        strcat(enc_menu_string, " ");  /* no-op menu option */
+        strcat(enc_menu_string, enc_filenames[i]);
+        if (i < n_enc_filenames - 1)
+            strcat(enc_menu_string, ",");
+        enc_filenames[i] += strlen(enc_filenames[i]) + 1;
+        if (strcmp(enc_filenames[i], "fontspecific") == 0)
+            enc_filenames[i] = NULL;
+    }
+}
+
+
+/****************************** EVENT HANDLERS ******************************/
+
+/*--- Event handler called on a left click on the icon. ---*/
+
+static void frontend_iconclick(wimp_i icon)
+{
+     icon = icon;
+
+    /* Open the dbox - only one allowed */
+    if (mainbox_open)
+    {
+#if 1
+        wimp_wstate s;
+        if (wimp_get_wind_state(dbox_syshandle(mainbox), &s) == NULL)
+        {
+            s.o.behind = -1;    /* top of window stack */
+            wimp_open_wind(&s.o);
+        }
+#else
+        werr(FALSE, msgs_lookup("OnlyOne"));
+#endif
+    }
+    else
+    {
+        dbox_showstatic(mainbox);
+        mainbox_open = TRUE;
+    }
+}
+
+/*--- Display the program info box - called from the menu processor. ---*/
+
+static void frontend_info_about_program(void)
+{
+    dbox d;                            /* Dialogue box handle */
+
+    /* Create the dialogue box */
+    if (d = dbox_new("ProgInfo"), d != NULL)
+    {
+        /* Fill in the version number */
+        dbox_setfield(d, FRONTEND_INFO_FIELD, VERSION_STRING);
+
+        /* Show the dialogue box */
+        dbox_show(d);
+
+        /* Keep it on the screen as long as needed */
+        dbox_fillin(d);
+
+        /* Dispose of the dialogue box */
+        dbox_dispose(&d);
+    }
+}
+
+/*--- Event handler for the icon menu. ---*/
+
+static void frontend_menuproc(void *handle, char *hit)
+{
+     handle = handle;
+
+    /* Find which menu item was hit and take action as appropriate */
+    switch (hit[0])
+    {
+    case FRONTEND_MENU_INFO:
+        frontend_info_about_program();
+        break;
+
+    case FRONTEND_MENU_QUIT:
+        /* Exit from the program. The wimp gets rid of the window and icon */
+        cleanup();
+        exit(0);
+    }
+}
+
+
+/*
+ * Set a choice from the fontdir or encoding menu according to
+ * parameters.  The choice number starts at 1.  Tick the
+ * appropriate entry in the menu, and put the string value
+ * into the given field of the given dbox.
+ * Return TRUE if OK, FALSE if the value was out of range,
+ */
+
+BOOL set_choice (menu menup,
+                 char *menustr,             /* comma-sep string */
+                 char *outbuf,              /* where to put string value */
+                 int choice,                /* number chosen from menu */
+                 int *choiceret,            /* where to store choice */
+                 dbox box,                  /* dbox containing icon */
+                 int field)                 /* field number to set */
+{
+    char *wp = outbuf;
+    if (choice < 1 || menustr == NULL)
+        return FALSE;
+    else
+    {
+        int n = choice;
+        while (--n > 0)
+        {
+            menustr = strchr(menustr, ',');
+            if (menustr == NULL)
+                return FALSE;
+            menustr++;
+        }
+    }
+
+    if (*menustr == ' ' || *menustr == '!' || *menustr == '>' || *menustr == '~')
+        menustr++;
+    while (*menustr && *menustr != ',')
+        *wp++ = *menustr++;
+    *wp = 0;
+
+    dbox_setfield(box, field, outbuf);
+    if (*choiceret != 0)
+        menu_setflags(menup, *choiceret, 0, 0);
+        
+    *choiceret = choice;
+    menu_setflags(menup, *choiceret, 1, 0);
+    
+    return TRUE;
+}
+
+
+/*--- Event handler for the mainbox menus. ---*/
+
+static void mainbox_menu_handler(void *handle, char *hit)
+{
+#ifdef POPUP
+    if (current_menu == fontdir_menu)
+#else
+    int whichmenu = (int) *hit++;
+    if (whichmenu == MAINBOX_MENU_FONTDIR)
+#endif
+    {
+        int choice = (int) *hit;
+        if (choice != 0)
+            set_choice(fontdir_menu, fontdir_menu_string, val_savein, choice,
+                       &fontdir_number, mainbox, MAINBOX_SAVEIN);
+    }
+    else
+#ifdef POPUP
+    if (current_menu == enc_menu)
+#else
+    if (whichmenu == MAINBOX_MENU_ENC)
+#endif
+    {
+        int choice = (int) *hit;
+        if (choice != 0)
+            set_choice(enc_menu, enc_menu_string, val_encname, choice,
+                       &enc_number, mainbox, MAINBOX_ENCNAME);
+    }
+#ifdef POPUP
+    else if (current_menu == frontend_menu)
+        frontend_menuproc(handle, hit);
+#endif  
+}
+
+/*
+ * Caret control.  These are needed because the caret
+ * paints incorrectly if you do a dbox_setfield when the
+ * caret is in the window.  The "pos" parameter of
+ * set_caret is useful for ensuring that the end of
+ * the string is visible after the dbox_setfield.
+ */
+
+void unset_caret (dbox box, int icon)
+{
+    wimp_caretstr caret;
+    caret.w = dbox_syshandle(box);
+    caret.i = icon;
+    caret.x = caret.y = 0;
+    caret.height = 1 << 25;
+    caret.index = 0;
+    wimp_set_caret_pos(&caret);
+}
+
+void set_caret (dbox box, int icon, int pos)
+{
+    wimp_caretstr caret;
+    caret.w = dbox_syshandle(box);
+    caret.i = icon;
+    caret.x = caret.y = 0;
+    caret.height = -1;
+    caret.index = pos;
+    wimp_set_caret_pos(&caret);
+}
+
+
+/*
+ * Support for dragging icons in.  First load of actual files
+ * (from filer windows, etc.)  These are easy.
+ */
+
+void import_file (char *name, int type, wimp_eventstr *ev)
+{
+    char *dest;
+    int icon = -1;
+
+    if (ev->data.msg.hdr.action == wimp_MDATALOAD)
+        icon = ev->data.msg.data.dataload.i;
+
+    /* If dragged to a specific icon, fill that in.  Else try and guess */
+
+    if (icon != MAINBOX_TYPE1 && icon != MAINBOX_AFM)
+        icon = type == FILETYPE_TYPE1 ? MAINBOX_TYPE1 : MAINBOX_AFM;
+
+    if (icon == MAINBOX_TYPE1)
+        dest = val_type1;
+    else
+        dest = val_afm;
+
+    strcpy(dest, name);
+
+    unset_caret(mainbox, icon);
+    dbox_setfield(mainbox, icon, dest);
+    set_caret(mainbox, icon, strlen(dest));
+
+    xferrecv_insertfileok();
+
+    if (dest == val_type1)
+    {
+        char name[256];
+        if (getfontname(val_type1, name, sizeof(name)))
+        {
+            guess_acorn_fontname(name, val_fontname, sizeof(val_fontname));
+            dbox_setfield(mainbox, MAINBOX_FONTNAME, val_fontname);
+        }
+    }
+}
+
+
+/*
+ * Dragging "files" from other applications is harder; we have to
+ * get it in little pieces by a callback interface.  Note that the
+ * callback is not called automatically on the final partial piece.
+ */
+
+static FILE *scrapfile;
+static int total_imported;
+
+BOOL import_piece (char **buffer, int *size)
+{
+    if (fwrite((void *) *buffer, (size_t) sizeof(char),
+               (size_t) *size, scrapfile)
+        != *size)
+        return FALSE;
+    total_imported += *size;
+    return TRUE;
+}
+
+
+void import_data (int type, wimp_eventstr *ev)
+{
+    int icon = -1;
+    char *scrap;
+    char *dest;
+    char importbuf[1024];
+    int size;
+
+    if (ev->data.msg.hdr.action == wimp_MDATASAVE)
+        icon = ev->data.msg.data.datasave.i;
+
+    /* If dragged to a specific icon, fill that in.  Else try and guess */
+
+    if (icon != MAINBOX_TYPE1 && icon != MAINBOX_AFM)
+        icon = type == FILETYPE_TYPE1 ? MAINBOX_TYPE1 : MAINBOX_AFM;
+
+    if (icon == MAINBOX_TYPE1)
+    {
+        dest = val_type1;
+        scrap = SCRAP_TYPE1;
+    }
+    else
+    {
+        dest = val_afm;
+        scrap = SCRAP_AFM;
+    }
+
+    (void) remove(scrap);
+
+    *dest = 0;
+    unset_caret(mainbox, icon);
+    dbox_setfield(mainbox, icon, dest);
+
+    scrapfile = fopen(scrap, "w");
+    if (scrapfile == NULL)
+    {
+        set_caret(mainbox, icon, 0);
+        werr(0, msgs_lookup("NoWrite"), scrap);
+        return;
+    }
+
+    total_imported = 0;
+    size = xferrecv_doimport(importbuf, sizeof(importbuf), import_piece);
+    if (size != 0)
+    {
+        char *buf = importbuf;
+        import_piece(&buf, &size);
+    }
+
+    (void) fclose(scrapfile);
+
+    if (total_imported > 0)
+    {
+        settype(scrap, type);
+        strcpy(dest, scrap);
+        dbox_setfield(mainbox, icon, dest);
+        set_caret(mainbox, icon, strlen(dest));
+        if (dest == val_type1)
+        {
+            char name[256];
+            if (getfontname(val_type1, name, sizeof(name)))
+            {
+                guess_acorn_fontname(name, val_fontname, sizeof(val_fontname));
+                dbox_setfield(mainbox, MAINBOX_FONTNAME, val_fontname);
+            }
+        }
+    }
+    else
+    {
+        set_caret(mainbox, icon, 0);
+        (void) remove(scrap);
+        werr(0, msgs_lookup("ImportErr"));
+    }
+}
+
+
+/*
+ * Raw event handler for dbox
+ */
+
+BOOL mainbox_raw_event_handler (dbox box, void *event, void *handle)
+{
+    wimp_eventstr *ev = (wimp_eventstr *) event;
+    char *name;
+    int type, estsize;
+
+    if ((type = xferrecv_checkinsert(&name)) != -1)
+    {
+        import_file(name, type, ev);
+        return TRUE;
+    }   
+    else if ((type = xferrecv_checkimport(&estsize)) != -1)
+    {
+        import_data(type, ev);
+        return TRUE;
+    } else
+        return FALSE;
+}
+
+/*--- Event handler for dbox. ---*/
+
+static void mainbox_event_handler(dbox db, void *handle)
+{
+    dbox_field field = dbox_get(db);
+    os_error *e;
+    BOOL bboxesOK = TRUE;
+    BOOL doType1 = TRUE;
+    char *from;
+    encstr *encoding;
+    BOOL decrypt_file, decrypt_only;
+#if GENAFM
+    extern FILE *exportmets;
+    exportmets = NULL;
+#endif
+
+    /* The getenv() calls below are a sneaky way for me to get a decrypted
+     * copy of the Type 1 file.
+     */
+
+    decrypt_file = getenv("T1ToFont$Decrypt")     != NULL;
+    decrypt_only = getenv("T1ToFont$DecryptOnly") != NULL;
+    if (decrypt_only) decrypt_file = TRUE;
+
+    handle = handle;
+
+    /* Deal with event */
+    switch (field)
+    {
+    case MAINBOX_KEEPPS:
+        val_keepps = !val_keepps;
+        dbox_setnumeric(mainbox, MAINBOX_KEEPPS, val_keepps);
+        break;
+
+#if 0
+
+/*
+ * This code does not get called.  I want it to be called when the user
+ * edits the strings and then leaves the field, either with RETURN or
+ * by moving the caret with the mouse.  Is this possible?  As it stands,
+ * the guessed Acorn-style name is not done when you type the filename
+ * in by hand (big deal; who will?)
+ */
+
+    case MAINBOX_TYPE1:
+    {
+        char name[256];
+        dbox_getfield(mainbox, MAINBOX_TYPE1, val_type1, sizeof(val_type1));
+        if (getfontname(val_type1, name, sizeof(name)))
+        {
+            guess_acorn_fontname(name, val_fontname, sizeof(val_fontname));
+            dbox_setfield(mainbox, MAINBOX_FONTNAME, val_fontname);
+        }
+        break;
+    }
+
+#endif
+
+    case MAINBOX_OK:
+        encoding = NULL;
+        {
+            int len = strlen(val_savein);
+            if (len == 0)
+            {
+                werr(0, msgs_lookup("NoSaveDir"));
+                break;
+            }
+            else if (!use_fontmerge && val_savein[len - 1] != '.')
+            {
+                val_savein[len++] = '.';
+                val_savein[len] = 0;
+            }
+            else if (use_fontmerge && val_savein[len - 1] == '.')
+            {
+                val_savein[--len] = 0;
+            }
+        }
+
+        /* Get latest versions of user-editable fields */
+        dbox_getfield(mainbox, MAINBOX_TYPE1, val_type1, sizeof(val_type1));
+        dbox_getfield(mainbox, MAINBOX_AFM, val_afm, sizeof(val_afm));
+        dbox_getfield(mainbox, MAINBOX_FONTNAME, val_fontname, sizeof(val_fontname));
+
+        /*
+         * T1 field empty: just do metrics
+         * AFM field empty: generate our own AFM
+         * Both empty: error.
+         * Fields that are not empty must contain a valid filename.
+         */
+
+        if (!*val_type1 && !*val_afm)
+        {
+            werr(0, msgs_lookup("NoFiles"));
+            break;
+        }
+
+        if (*val_type1 && !isfile(val_type1))
+        {
+            werr(0, msgs_lookup("BadType1"), val_type1);
+            break;
+        }
+
+        if (*val_afm)
+        {
+            BOOL ok;
+            e = validatemetrics(val_afm, &ok);
+            if (e)
+            {
+                werr(0, e->errmess);
+                break;
+            }
+            if (!ok)
+            {
+                werr(0, msgs_lookup("NotAFM"), val_afm);
+                *val_afm = 0;
+                dbox_setfield(mainbox, MAINBOX_AFM, val_afm);
+            }
+        }
+
+        if (!*val_fontname)
+        {
+            werr(0, msgs_lookup("NoName"));
+            break;
+        }
+
+        if (use_fontmerge)
+        {
+            sprintf(val_mergefrom, "T1Font.%s", val_fontname);
+            e = ensure_hier(getenv("Wimp$ScrapDir"), val_mergefrom);
+            sprintf(val_mergefrom, "%s.T1Font.", getenv("Wimp$ScrapDir"));
+        }
+        else
+            e = ensure_hier(val_savein, val_fontname);
+
+        if (e)
+        {
+            wimpt_complain(e);
+            break;              /* leave box dbox up */
+        }
+
+        visdelay_begin();
+
+/*
+ * Check to see whether we need to preprocess the file to give
+ * plain Type 1 text.  This is based solely on the filetype.
+ */
+
+        e = NULL;
+        doType1 = TRUE;
+
+        if (!*val_type1)
+        {
+            doType1 = FALSE;
+            goto dometrics;
+        }
+        
+        switch (guesstype(val_type1))
+        {
+        case FILETYPE_MAC:
+            if (!preprocess_mac(val_type1, SCRAP_TEMP))
+                e = make_oserror(214, msgs_lookup("PreProc1"));
+            from = SCRAP_TEMP;
+            break;
+        case FILETYPE_PC:
+            if (!preprocess_pc(val_type1, SCRAP_TEMP))
+                e = make_oserror(214, msgs_lookup("PreProc2"));
+            from = SCRAP_TEMP;
+            break;
+        case FILETYPE_TYPE1:
+        default:
+            from = val_type1;
+            break;
+        }
+
+        if (e == NULL)
+        {
+#if GENAFM
+            if (!*val_afm)
+            {
+                /* Attempt to generate crude metrics file ourselves */
+                /* If this open fails, we fall back on generating no IntMetrics */
+                exportmets = fopen(SCRAP_GENAFM, "w");
+            }
+#endif
+            e = converttype1(use_fontmerge ? val_mergefrom : val_savein,
+                             val_fontname, from, "10", DO_FLATTEN,
+                             enc_filenames[enc_number - 1],
+                             decrypt_file,
+                             decrypt_only,
+                             &bboxesOK,
+                             &encoding);
+#if GENAFM
+            if (exportmets) fclose(exportmets);
+#endif
+        }
+
+dometrics:
+
+        if (decrypt_only)
+            goto keepps;
+
+        /* Don't create an IntMetrics file if we've no AFM */
+#if GENAFM
+        if (!*val_afm && !exportmets)
+            goto keepps;
+#else
+        if (!*val_afm)
+            goto keepps;
+#endif
+
+        if (e == NULL)
+        {
+            if (encoding == NULL)
+            {
+                if (enc_filenames[enc_number - 1] == NULL)
+                    e = make_oserror(214, msgs_lookup("EncError"));
+                else
+                {
+                    memset((void *)&static_encstr, 0, sizeof(static_encstr));
+                    e = readencoding(&static_encstr, &static_metrics,
+                                     enc_filenames[enc_number - 1], DontCheck, TRUE);
+                    if (e == NULL) encoding = &static_encstr;
+                }
+            }
+        }
+        if (e == NULL)
+        {
+            freeMetrics(&static_metrics);
+            memset((void *)&static_metrics, 0, sizeof(static_metrics));
+            e = checkmetrics(use_fontmerge ? val_mergefrom : val_savein,
+                             val_fontname,
+#if GENAFM
+                             exportmets ? SCRAP_GENAFM : val_afm,
+#else
+                             val_afm,
+#endif
+                             DO_MAKE | DO_KERNS, encoding, &static_metrics);
+        }
+
+#if GENAFM
+        if (exportmets)
+            (void) remove(SCRAP_GENAFM);
+#endif
+
+keepps:
+
+        if (e == NULL && encoding != NULL)
+        {
+            /* If this is not a Base encoding font, save the Encoding too */
+            if (encoding->alphabet == -1)
+            {
+                char fullname[256];
+                sprintf(fullname, "%s%s.Encoding", use_fontmerge ? val_mergefrom : val_savein,
+                        val_fontname);
+                writeencoding(encoding, fullname);
+            }
+            freeEncoding(encoding); encoding = NULL;
+        }
+
+        if (e == NULL && val_keepps)
+        {
+            char sysbuf[512];
+            char fullname[256];
+            if (*val_type1)
+            {
+                /* Copy the Type 1 file to a file called Type 1 in the Fonts directory */
+                sprintf(fullname, "%s%s.Type1", use_fontmerge ? val_mergefrom : val_savein,
+                        val_fontname);
+                sprintf(sysbuf, "copy %s %s A~C~DF~L~N~P~Q~R~S~T~V", from, fullname);
+                e = os_cli(sysbuf);
+                if (!e)
+                    e = settype(fullname, FILETYPE_TYPE1);
+            }
+            if (!e && *val_afm)
+            {
+                /* Keep the AFM file too */
+                sprintf(fullname, "%s%s.AFM", use_fontmerge ? val_mergefrom : val_savein,
+                        val_fontname);
+                sprintf(sysbuf, "copy %s %s A~C~DF~L~N~P~Q~R~S~T~V", val_afm, fullname);
+                e = os_cli(sysbuf);
+                if (!e)
+                    e = settype(fullname, FILETYPE_AFM);
+            }
+        }
+
+        visdelay_end();
+
+        if (doType1 && !bboxesOK)
+            werr(0, msgs_lookup("BadBBoxes"));
+
+        if (e)
+            wimpt_complain(e);
+
+        /*
+         * Now, if the fontmerge method is being used, attempt to summon said program
+         */
+
+        if (use_fontmerge)
+        {
+            char buf[256];
+            _kernel_swi_regs regs;
+            sprintf(buf, "%s %s.T1Font %s", FONTMERGE, getenv("Wimp$ScrapDir"), val_savein);
+
+            regs.r[0] = (int) buf;
+
+            e = _kernel_swi(XOS_Bit | Wimp_StartTask, &regs, &regs);
+
+            if (e)
+                wimpt_complain(e);
+
+            wipe_scrap();
+        }
+
+        break;                  /* Leave dialogue box open */
+
+    case dbox_CLOSE:
+        dbox_hide(db);
+        mainbox_open = FALSE;
+        break;
+
+/* Dubious code warning */
+
+    case MAINBOX_ENCMENU:
+    case MAINBOX_SAVEMENU:
+        {
+            wimp_eventstr *oldev = wimpt_last_event();
+            wimp_eventstr ev = *oldev;
+            if (ev.e == wimp_EBUT)
+            {
+                ev.data.but.m.bbits = wimp_BMID;
+                wimpt_fake_event(&ev);          /* XXX */
+            }
+        }
+        break;
+
+/* End of dubious code */
+
+    default:                           /* Ignore any other event */
+        break;
+    }
+}
+
+
+/*
+ * Get the next component of the path string supplied.
+ * Remove junk at the start and end, and put it in a
+ * supplied return buffer.  Update the supplied pointers.
+ * Otherwise return NULL.  The caller knows that the string
+ * is exhausted when *whence is 0.
+ */
+
+int getone (char **whence, char **buf)
+{
+    char *bufp = *buf;
+    char *start = *whence;
+    char *end;
+    
+    while (*start == ' ' || *start == ',')
+        start++;
+    end = start;
+    while (!(*end == 0 || *end == ' ' || *end == ','))
+        *bufp++ = *end++;
+
+    if (bufp > *buf && *(bufp - 1) == '.')
+        bufp--;
+    *bufp = 0;
+
+    *whence = end;
+    {
+        int ret = bufp - *buf;
+        *buf = bufp;
+        return ret;
+    }
+}
+    
+char *build_fontdir_string ()
+{
+    char *path;
+    char *str, *sp;
+    int len = 1;                /* for a 0 */
+
+    path = getenv(FONTPATH);
+    
+    if (path == NULL)
+    {
+/*      werr(0, msgs_lookup("NoPath"));*/
+        return NULL;
+    }
+
+    if (path) 
+        len += strlen(path);
+    else
+        path = "";
+    
+    if (!(str = sp = malloc(len)))
+    {
+        werr(0, msgs_lookup("OutOfMem"));
+        return NULL;
+    }
+
+    while (path && *path)
+    {
+        *sp++ = ' ';            /* no-op menu opt char */
+        if (getone(&path, &sp))
+            *sp++ = ',';
+        else
+            sp--;
+    }
+
+    if (sp > str)
+        *--sp = 0;              /* unwanted comma */
+
+    if (sp <= str)
+    {
+/*      werr(0, msgs_lookup("NoPath"));*/
+        return NULL;
+    }
+    return str;
+}
+
+
+void create_fontdir_menu ()
+{
+    if (fontdir_menu)
+        menu_dispose(&fontdir_menu, 0);
+    fontdir_menu_string = build_fontdir_string();
+    if (fontdir_menu_string != NULL)
+        fontdir_menu = menu_new(msgs_lookup("SaveTitle"), fontdir_menu_string);
+    else
+#if 0
+        fontdir_menu = NULL;
+#else
+        fontdir_menu = menu_new(msgs_lookup("SaveTitle"), msgs_lookup("SaveNoDirs"));
+#endif
+}
+
+#ifdef POPUP
+
+menu mainbox_menu_maker (void *handle)
+{
+    /* Which icon were we in? */
+    wimp_eventstr *ev = wimpt_last_event();
+    int icon;
+
+    if (event_is_menu_being_recreated())
+        return current_menu;
+
+    if (ev->e != wimp_EBUT)
+        return 0;
+    
+    icon = ev->data.but.m.i;
+    if (icon == MAINBOX_ENCNAME || icon == MAINBOX_ENCMENU)
+        current_menu = enc_menu;
+    else if (icon == MAINBOX_SAVEIN || icon == MAINBOX_SAVEMENU)
+    {
+        create_fontdir_menu();
+        current_menu = fontdir_menu;
+    }
+    else
+        current_menu = frontend_menu;
+
+    return current_menu;
+}
+
+#else
+
+menu mainbox_menu_maker (void *handle)
+{
+    menu_submenu(mainbox_menu, MAINBOX_MENU_FONTDIR, (menu) 0);
+    create_fontdir_menu();
+    menu_submenu(mainbox_menu, MAINBOX_MENU_FONTDIR, fontdir_menu);
+    return mainbox_menu;
+}
+
+#endif
+    
+
+/*
+ * Make menu for the main dbox
+ */
+
+void create_mainbox_menu ()
+{
+#ifndef POPUP
+    mainbox_menu = menu_new(msgs_lookup("MainTitle"), msgs_lookup("MainItems"));
+    if (mainbox_menu == NULL)
+        return;
+#endif
+
+    create_fontdir_menu();
+    enc_menu = menu_new(msgs_lookup("EncTitle"), enc_menu_string);
+#ifndef POPUP
+    menu_submenu(mainbox_menu, MAINBOX_MENU_ENC, enc_menu);
+#endif
+}
+
+/****************************** INITIALISATION ******************************/
+
+/*--- Initialise the program, returning TRUE if it was all OK. ---*/
+
+static BOOL frontend_initialise(void)
+{
+    /* RISC_OSlib initialisation */
+
+    res_init("T1ToFont");              /* Resources XXXX I18N */
+    msgs_init();                       /* MessageTrans */
+    wimpt_init(msgs_lookup("Title"));
+                                       /* Main Wimp initialisation */
+    visdelay_init();                   /* Hourglass */
+    resspr_init();                     /* Application sprites */
+    template_init();                   /* Templates */
+    dbox_init();                       /* Dialogue boxes */
+
+    /* Create the main window, and declare its event handler */
+
+    mainbox = dbox_new("ToAcorn");
+    dbox_raw_eventhandler(mainbox, mainbox_raw_event_handler, (void *) 0);
+    dbox_eventhandler(mainbox, mainbox_event_handler, (void *) 0);
+
+    /* Create the icon bar menu */
+
+    frontend_menu = menu_new(msgs_lookup("IconTitle"), msgs_lookup("IconItems"));
+    if (frontend_menu == NULL)
+        return FALSE;                  /* Menu create failed */
+
+    process_encoding_names();
+
+    /* Create the dbox menu */
+
+    create_mainbox_menu();
+#ifndef POPUP
+    if (mainbox_menu == NULL)
+        return FALSE;
+#endif
+
+    event_attachmenumaker(dbox_syshandle(mainbox), mainbox_menu_maker,
+                          mainbox_menu_handler, (void *) 0);
+
+    /* Initial values for "choice" items are first */
+
+    set_choice(fontdir_menu, fontdir_menu_string, val_savein, 1,
+               &fontdir_number, mainbox, MAINBOX_SAVEIN);
+    set_choice(enc_menu, enc_menu_string, val_encname, 1,
+               &enc_number, mainbox, MAINBOX_ENCNAME);
+
+    dbox_setnumeric(mainbox, MAINBOX_KEEPPS, val_keepps);
+
+    /* Set up the icon on the icon bar, and declare its event handlers */
+
+    baricon(msgs_lookup("TaskID"), (int) resspr_area(), frontend_iconclick);
+    if (!event_attachmenu(win_ICONBAR, frontend_menu, frontend_menuproc, 0))
+        return FALSE;                  /* Unable to attach menu */
+
+    /* Determine whether we should use fontmerge of not */
+
+    {
+        FILE *dummy = fopen("Run:" FONTMERGE, "r");
+        use_fontmerge = (dummy != NULL);
+        if (dummy)
+            fclose(dummy);
+    }
+
+    /* All went ok */
+    return TRUE;
+}
+
+            
+/*
+ * This should work on plain Type 1, Mac encoded Type 1 and PC
+ * encoded Type 1.
+ *
+ * Apart from being ugly, this code assumes that successive calls
+ * to fget() at the end of file return EOF repeatedly.  Is this
+ * the case?
+ */
+
+BOOL getfontname(char *filename, char *result, int resultsize)
+{
+    FILE *f = fopen(filename, "r");
+    int c;
+    while ((c = getc(f)) != EOF)
+    {
+        if (c == '/')
+            if (getc(f) == 'F' && /* ugh */
+                getc(f) == 'o' &&
+                getc(f) == 'n' &&
+                getc(f) == 't' &&
+                getc(f) == 'N' &&
+                getc(f) == 'a' &&
+                getc(f) == 'm' &&
+                getc(f) == 'e')
+            {
+                while ((c = getc(f)) != '/')
+                    ;
+                while ((c = getc(f)) > 32 && resultsize > 1)
+                {
+                    *result++ = c;
+                    resultsize--;
+                }
+                *result = 0;
+                fclose(f);
+                return TRUE;
+            }
+    }
+    fclose(f);
+    return FALSE;
+}
+    
+/******************************* MAIN PROGRAM ********************************/
+
+/*--- Main entry point. ---*/
+
+int main ()
+{
+    encoding_dir = ENC_PREFIX;
+    freopen("null:", "w", stdout);
+    freopen("null:", "w", stderr);
+    if (frontend_initialise())
+    {
+        /* The main event loop */
+        while (TRUE)
+             event_process();
+    }
+
+    return 0;
+}
+
+

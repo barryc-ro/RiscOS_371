@@ -1,0 +1,1208 @@
+/*-*-c-*- Title: > c.metrics
+ * Author: Neil Raine
+ * Purpose: Convert between and compare data from AFM files and IntMetrics file
+ */
+
+#include "h.main"
+#include "h.encoding"
+#include "h.metrics"
+#include <ctype.h>
+#include "msgs.h"
+
+
+#define EASY 0
+#define DEBUG_splitcomp 0
+
+
+#define FLG_FIXED (FLG_NOXOFFSETS | FLG_NOYOFFSETS)
+
+static os_error *addnamedkern(encstr * encoding, kernstr * kstr, char *name1, char *name2, int x, int y);
+static os_error *addkern(kernstr * kstr, int ch1, int ch2, int x0, int y0);
+
+static void checkfield(int value, int *addr, const char *field, BOOL checkflag, mod_flags * modified);
+
+static os_error *trycomposite(encstr * enc, encstr * accent_encstr, int ch, char *charname,
+	       cc_section * basechar, cc_section * accent, int *foundit, int upaccents);
+
+static int fgetcode(int cond, FILE * stream);
+static int fputcode(int cond, int code, FILE * stream);
+
+#define Fputcode(cc,code,stream) erf(fputcode(cc,code,stream))
+
+/*
+ * Hashing algorithm for storing kern pairs (reversible)
+ */
+
+#define hash(letter1,letter2) ((letter1 ^ (letter2 << 4) ^ (letter2 >> 4)) & 0xFF)
+
+
+/* Check that the metric file exists and is has the correct magic string at the start */
+
+os_error *validatemetrics(const char *filename, BOOL *ok)
+{
+    FILE *infile;
+    float flt;
+    char inbuffer[256];
+    char *ptr = inbuffer;
+    int charcode;
+
+    e(return (e), fopen_err(filename, "r", &infile));
+
+    do
+    {
+	charcode = fgetc(infile);
+	*ptr++ = charcode;
+    } while (charcode != 0x0A && charcode != 0x0D && charcode != EOF && ptr < inbuffer + sizeof(inbuffer));
+    ptr[-1] = 0;
+
+    if (sscanf(inbuffer, "StartFontMetrics %f", &flt) == 1)
+	*ok = TRUE;
+    else
+	*ok = FALSE;
+
+    fclose(infile);
+    return NULL;
+}
+    
+
+/*- Read AFM file into metrics arrays.  metrics should be zeroed
+ * first by caller.
+ */
+
+/* XXX only called with actions of DO_MAKE and (possibly) DO_KERN*/
+
+os_error *checkmetrics(const char *fontprefix,
+		       const char *fontname,
+		       const char *filename,
+		       keyid actions,
+		       encstr * encoding,
+		       metricsstr * metrics)
+{
+    FILE *infile;
+    int i, ch1, wid, x0, y0, x1, y1, charno, charcode;
+    char name[64], name2[64];
+    int designsize = 1000;	       /* design size in metrics */
+    os_error *lasterr = NULL;
+
+#if EASY
+    int fontdes;		       /* design size in outlines */
+
+#endif
+    float flt;
+    mod_flags modified = MOD_MAIN;                      /* write IntMetrics */
+    int fileversion = metrics->fileversion;
+    file_flags fileflags = metrics->fileflags;
+    int defaultxwidth, defaultywidth;
+    BOOL isfixedpitch = 0;
+
+    if (filename == NULL)
+	return make_oserror(214, msgs_lookup("NoAFM"));
+
+    metrics->ncodes = encoding->nchars;
+
+#define checkkerns 0
+
+/* Read the design size in the Outlines file.
+ * This allows us to suggest better values of designsize for rescaling characters.
+ */
+
+#if EASY
+    {
+	char filename[256];
+
+	e(return (e), getoutlinesfname(filename, fontprefix, fontname, encoding->alphabet));
+
+	if ((infile = fopen(filename, "r")) == NULL)
+	{
+	    fontdes = -1;	       /* unknown */
+	}
+	else
+	{
+	    fseek(infile, 6, SEEK_SET);
+	    fontdes = fgetc2little(infile);
+	    fclose(infile);
+	}
+    }
+#endif
+
+    e(return (e), fopen_err(filename, "r", &infile));
+
+    do
+    {
+	char inbuffer[256];
+	char *ptr = inbuffer;
+
+	do
+	{
+	    charcode = fgetc(infile);
+	    *ptr++ = charcode;
+	} while (charcode != 0x0A && charcode != 0x0D && charcode != EOF && ptr < inbuffer + sizeof(inbuffer));
+	ptr[-1] = 0;
+
+	if (sscanf(inbuffer, "DesignSize %d", &x0) == 1)
+	{
+	    designsize = x0;
+	}
+	else
+	if (sscanf(inbuffer, "ItalicAngle %f", &flt) == 1)
+	{
+	    int newshear = (int) ((double) (-1000 * tan(flt * 3.1415926 / 180)));
+	    metrics->italicshear = newshear;
+	}
+	else
+	if (sscanf(inbuffer, "IsFixedPitch %s", name) == 1)
+	{
+	    if (strcmp(name, "true") == 0)
+	    {
+		isfixedpitch = 1;
+	    }
+	    else
+	    {
+		/* invalid 'isfixedpitch' line defaults to false */
+		isfixedpitch = 0;
+	    }
+	}
+	else
+	if (sscanf(inbuffer, "UnderlinePosition %d", &x0) == 1)
+	{
+	    checkfield(x0 * 256 / designsize, &metrics->underlineposition, "UnderlinePosition %d", checkkerns, &modified);
+	}
+	else
+	if (sscanf(inbuffer, "UnderlineThickness %d", &x0) == 1)
+	{
+	    checkfield(x0 * 256 / designsize, &metrics->underlinethickness, "UnderlineThickness %d", checkkerns, &modified);
+	}
+	else
+	if (sscanf(inbuffer, "FontBBox %d %d %d %d", &x0, &y0, &x1, &y1) == 4)
+	{
+	    x0 = x0 * 1000 / designsize;
+	    y0 = y0 * 1000 / designsize;
+	    x1 = x1 * 1000 / designsize;
+	    y1 = y1 * 1000 / designsize;
+
+	    metrics->fontbbox_x0 = x0;
+	    metrics->fontbbox_y0 = y0;
+	    metrics->fontbbox_x1 = x1;
+	    metrics->fontbbox_y1 = y1;
+	}
+	else
+/* XXX all these calls to checkfield could be replaced with assignments */
+	if (sscanf(inbuffer, "CapHeight %d", &x0) == 1)
+	{
+	    checkfield(x0 * 1000 / designsize, &metrics->capheight, "CapHeight %d", checkkerns, &modified);
+	}
+	else
+	if (sscanf(inbuffer, "XHeight %d", &x0) == 1)
+	{
+	    checkfield(x0 * 1000 / designsize, &metrics->xheight, "XHeight %d", checkkerns, &modified);
+	}
+	else
+	if (sscanf(inbuffer, "Descender %d", &x0) == 1)
+	{
+	    checkfield(x0 * 1000 / designsize, &metrics->descender, "Descender %d", checkkerns, &modified);
+	}
+	else
+	if (sscanf(inbuffer, "Ascender %d", &x0) == 1)
+	{
+	    checkfield(x0 * 1000 / designsize, &metrics->ascender, "Ascender %d", checkkerns, &modified);
+	}
+	else
+	if (sscanf(inbuffer, "KPX %s %s %d", &name, &name2, &x0) == 3)
+	{
+	    EG(fail, addnamedkern(encoding, &metrics->newkerns, name, name2, x0 * 1000 / designsize, 0));
+	}
+	else
+	if (sscanf(inbuffer, "KPY %s %s %d", &name, &name2, &y0) == 3)
+	{
+	    EG(fail, addnamedkern(encoding, &metrics->newkerns, name, name2, 0, y0 * 1000 / designsize));
+	}
+	else
+	if (sscanf(inbuffer, "KP %s %s %d %d", &name, &name2, &x0, &y0) == 4)
+	{
+	    EG(fail, addnamedkern(encoding, &metrics->newkerns, name, name2, x0 * 1000 / designsize, y0 * 1000 / designsize));
+	}
+	else
+	{
+	    if (sscanf(inbuffer, "C %d ; WX %d ; N %s ; B %d %d %d %d ;",
+		       &ch1, &wid, name, &x0, &y0, &x1, &y1) == 7)
+	    {
+		nameblk *check;
+
+		x0 = x0 * 1000 / designsize;
+		y0 = y0 * 1000 / designsize;
+		x1 = x1 * 1000 / designsize;
+		y1 = y1 * 1000 / designsize;
+		wid = wid * 1000 / designsize;
+
+		/* must go explicitly down list of names so we catch all the duplicates */
+
+		for (check = encoding->hashtable[*name]; check; check = check->link)
+		    if (strcmp(check->name, name) == 0)
+		    {
+			charno = check->code;
+			encoding->matchtable[charno] = ENC_CHECKED;	/* we've checked this
+									 * one */
+			addmetric(metrics, charno, x0, y0, x1, y1, wid, 0);
+		    }
+	    }
+	}
+    } while (charcode != EOF);
+    fclose(infile); infile = NULL;
+
+    /* check for characters not present in AFM file */
+
+    for (i = 0; i < MAX_CHARS; i++)
+    {
+	if (encoding->matchtable[i] == ENC_EXIST)
+	{
+	    cc_section basechar, accent;
+
+	    splitcomposite(encoding, i, &basechar, &accent, actions);
+	    if (basechar.code >= 0)
+	    {
+		int ch_basechar = metrics->charmap[basechar.code];
+		int x0 = metrics->x0[ch_basechar] + basechar.xoffset;
+		int y0 = metrics->y0[ch_basechar] + basechar.yoffset;
+		int x1 = metrics->x1[ch_basechar] + basechar.xoffset;
+		int y1 = metrics->y1[ch_basechar] + basechar.yoffset;
+
+		if (accent.code >= 0)
+		{
+		    int ch_accent = metrics->charmap[accent.code];
+
+		    if (x0 > metrics->x0[ch_accent])
+			x0 = metrics->x0[ch_accent] + accent.xoffset;
+		    if (y0 > metrics->y0[ch_accent])
+			y0 = metrics->y0[ch_accent] + accent.yoffset;
+		    if (x1 < metrics->x1[ch_accent])
+			x1 = metrics->x1[ch_accent] + accent.xoffset;
+		    if (y1 < metrics->y1[ch_accent])
+			y1 = metrics->y1[ch_accent] + accent.yoffset;
+		}
+		addmetric(metrics, i, x0, y0, x1, y1, metrics->xwidth[ch_basechar], metrics->ywidth[ch_basechar]);
+/*
+        printf("%s assumed to have same width as %s\n", encoding->nameof[i]->name,
+                                                        encoding->nameof[basechar.code]->name);
+*/
+	    }
+	}
+    }
+
+    if (actions & DO_KERNS)
+    {
+        fileflags |= FLG_KERNS;
+    }
+
+    fileversion = (fileflags == 0) ? 0 : 2;
+
+    /*
+     * Work out correct fileflags, if we're allowed to do so 
+     */
+
+    if (fileversion)
+    {
+	int nchars = metrics->nchars;
+
+	/* check for mono-spaced fonts */
+
+	defaultxwidth = metrics->defaultxwidth = 0;
+	defaultywidth = metrics->defaultywidth = 0;
+
+	fileflags |= FLG_NOXOFFSETS | FLG_NOYOFFSETS;
+
+	for (i = 0; i < nchars; i++)
+	{
+	    if (isfixedpitch)
+	    {
+		if (defaultxwidth == 0)
+		{
+		    defaultxwidth = metrics->xwidth[i];
+		}
+		if (defaultywidth == 0)
+		{
+		    defaultywidth = metrics->ywidth[i];
+		}
+	    }
+	    if (metrics->xwidth[i] != defaultxwidth)
+		fileflags &= ~FLG_NOXOFFSETS;
+	    if (metrics->ywidth[i] != defaultywidth)
+		fileflags &= ~FLG_NOYOFFSETS;
+	}
+
+	metrics->defaultxwidth = defaultxwidth;
+	metrics->defaultywidth = defaultywidth;
+
+#if 0
+	if (isfixedpitch && (fileflags & FLG_FIXED) != FLG_FIXED)
+	{
+	    /* XXX werr version 
+	       printf("Warning: IsFixedPitch true, but not all widths equal\n"); */
+	}
+#endif
+
+	for (i = 0; i < MAX_CHARS; i++)
+	{
+	    kern_pair *kern;
+
+	    for (kern = metrics->newkerns.letter1[i]; kern; kern = kern->link)
+	    {
+		if (kern->xoffset)
+		    fileflags &= ~FLG_NOXOFFSETS;
+		if (kern->yoffset)
+		    fileflags &= ~FLG_NOYOFFSETS;
+	    }
+	}
+
+	if (metrics->newkerns.total)
+	{
+	    fileflags = (fileflags | FLG_KERNS) & ~FLG_16BITKERNS;
+	}
+	else
+	{
+	    fileflags &= ~(FLG_KERNS | FLG_16BITKERNS);
+	}
+	if (fileflags == 0)
+	    fileversion = 0;	       /* no need! */
+	else
+	    fileflags |= FLG_KERNS;    /* needed for defaultx/ywidth */
+
+    }
+    else
+    {
+	modified &= ~MOD_KERNS;	       /* irrelevant if no kerns */
+    }
+
+    metrics->fileversion = fileversion;
+    metrics->fileflags = fileflags;
+
+    /*
+     * Check metrics to ensure that they are efficiently mapped Must not move char number
+     * 0, as that is special (null char) 
+     */
+
+    if ((fileflags & FLG_FIXED) != FLG_FIXED)
+    {
+	int nchars = metrics->nchars;
+	int original_nchars = nchars;
+	int i, j, k, head = -1, *tail = &head;
+
+	for (i = nchars - 1; i >= 0; i--)
+	{
+	    for (j = i - 1; j >= 0; j--)
+	    {
+		if (((fileflags & FLG_NOXOFFSETS) || metrics->xwidth[i] == metrics->xwidth[j]) &&
+		    ((fileflags & FLG_NOYOFFSETS) || metrics->ywidth[i] == metrics->ywidth[j]) &&
+		    ((fileflags & FLG_NOBBOXES) || (metrics->x0[i] == metrics->x0[j] &&
+						    metrics->y0[i] == metrics->y0[j] &&
+						    metrics->x1[i] == metrics->x1[j] &&
+						    metrics->y1[i] == metrics->y1[j])))
+		{
+		    for (k = 0; k < metrics->ncodes; k++)
+			if (metrics->charmap[k] == i)
+			    metrics->charmap[k] = j;
+		    metrics->xwidth[i] = -1;
+		    *tail = i;	       /* as i descends, so we know that the chain must
+				        * descend */
+		    tail = &metrics->xwidth[i];
+		    /* printf("Remapped character %d to %d\n",i,j); */
+		    modified |= MOD_MAIN;
+		    break;	       /* next i */
+		}
+	    }
+	}
+
+	for (i = head; i >= 0; i = j)
+	{			       /* chain must go backwards, so we know
+				        * char[--nchars] is not in the chain */
+	    j = metrics->xwidth[i];
+	    if (i != --nchars)
+	    {
+		metrics->xwidth[i] = metrics->xwidth[nchars];
+		metrics->ywidth[i] = metrics->ywidth[nchars];
+		metrics->x0[i] = metrics->x0[nchars];
+		metrics->y0[i] = metrics->y0[nchars];
+		metrics->x1[i] = metrics->x1[nchars];
+		metrics->y1[i] = metrics->y1[nchars];
+		for (k = 0; k < metrics->ncodes; k++)
+		    if (metrics->charmap[k] == nchars)
+			metrics->charmap[k] = i;
+	    }
+	    /* printf("Relocated character %d to %d\n",nchars,i); */
+	}
+
+	metrics->nchars = nchars;
+    }
+
+    /*
+     * Now write the metrics file (if different from original) 
+     */
+
+    if (modified)
+    {
+	e(return (e), writemetrics(fontprefix, fontname, encoding, metrics));
+    }
+
+    return (NULL);
+
+fail:
+    if (infile) fclose(infile);
+    return lasterr;
+}
+
+static void checkfield(int value, int *addr, const char *field, BOOL chkkerns, mod_flags * modified)
+{
+    *addr = value;
+}
+
+
+/*
+ * Write metrics to <fontprefix><fontname>.IntMetrics
+ * Take note of original fileversion and -kerns keyword
+ */
+
+os_error *writemetrics(const char *fontprefix,
+		        const char *fontname,
+		        encstr * encoding,
+		        metricsstr * metrics)
+{
+    char metfname[256];
+    FILE *metfile;
+    int i, letter1;
+    kern_pair *kern;
+    int nchars = metrics->nchars;
+    int fileversion = metrics->fileversion;
+    file_flags fileflags = metrics->fileflags;
+    int chmap[MAX_CHARS];
+    int charmapsize;
+
+    /*
+     * try to output the earliest version of the file format we can get away with ncodes
+     * = number of external character codes nchars = number of distinct entries in the
+     * metrics file metrics->charmap[] is the map which is put into the metrics file
+     * chmap[] is the lookup used when outputting entries: only used if no map put into
+     * file 
+     */
+
+    if ((fileflags & FLG_FIXED) == FLG_FIXED)
+    {
+	fileflags |= FLG_CHARMAPSIZED;
+	charmapsize = 0;
+	nchars = 0;
+    }
+    else
+    {
+	if (metrics->ncodes > 256)
+	{
+	    fileflags |= FLG_CHARMAPSIZED;
+	    if (nchars > 256)
+	    {
+		charmapsize = 0;
+		nchars = metrics->ncodes;
+		for (i = 0; i < nchars; i++)
+		    chmap[i] = metrics->charmap[i];	/* chmap[] does the remapping */
+	    }
+	    else
+	    {
+		charmapsize = metrics->ncodes;
+		for (i = 0; i < nchars; i++)
+		    chmap[i] = i;      /* metrics->charmap[] does the remapping */
+	    }
+	}
+	else
+	{
+	    fileflags &= ~FLG_CHARMAPSIZED;
+	    charmapsize = 256;
+	    for (i = 0; i < nchars; i++)
+		chmap[i] = i;
+	}
+    }
+
+    fileversion = 0;
+    if (fileflags & FLG_ILLEGAL0)
+	fileversion = 1;
+    if (fileflags & FLG_ILLEGAL1)
+	fileversion = 2;
+    if (fileflags & FLG_ILLEGAL2)
+	return (make_oserror(1, msgs_lookup("MetFlags"), fileflags));
+
+    /* construct output filename and try to open file */
+
+    e(return (e), getmetricsfname(metfname, fontprefix, fontname, encoding->alphabet));
+
+    E(fopen_err(metfname, "w", &metfile));
+
+    /* write out metrics header, charmap, bboxes, xwidths, ywidths, kerns */
+
+    Fputs(fontname, metfile);
+    while (ftell(metfile) < 40)
+    {
+	Fputc(0x0D, metfile);
+    }
+
+    Fput4(16, metfile);
+    Fput4(16, metfile);
+    Fputc(nchars & 0xFF, metfile);
+    Fputc(fileversion, metfile);
+    Fputc(fileflags, metfile);
+    Fputc(nchars >> 8, metfile);
+
+    if (fileflags & FLG_CHARMAPSIZED)
+    {
+	Fputc(charmapsize, metfile);
+	Fputc(charmapsize >> 8, metfile);
+    }
+    for (i = 0; i < charmapsize; i++)
+	Fputc(metrics->charmap[i], metfile);
+
+    if ((fileflags & FLG_NOBBOXES) == 0)
+    {
+	for (i = 0; i < nchars; i++)
+	    Fput2(metrics->x0[chmap[i]], metfile);
+	for (i = 0; i < nchars; i++)
+	    Fput2(metrics->y0[chmap[i]], metfile);
+	for (i = 0; i < nchars; i++)
+	    Fput2(metrics->x1[chmap[i]], metfile);
+	for (i = 0; i < nchars; i++)
+	    Fput2(metrics->y1[chmap[i]], metfile);
+    }
+    if ((fileflags & FLG_NOXOFFSETS) == 0)
+    {
+	for (i = 0; i < nchars; i++)
+	    Fput2(metrics->xwidth[chmap[i]], metfile);
+    }
+    if ((fileflags & FLG_NOYOFFSETS) == 0)
+    {
+	for (i = 0; i < nchars; i++)
+	    Fput2(metrics->ywidth[chmap[i]], metfile);
+    }
+
+    if (fileflags & FLG_KERNS)
+    {
+	long int table_offset;
+	long int table[4];
+	int i;
+
+	table_offset = ftell(metfile);
+
+	fseek(metfile, 8, SEEK_CUR);   /* write table later */
+
+	table[0] = ftell(metfile) - table_offset;
+
+	Fput2(metrics->fontbbox_x0, metfile);
+	Fput2(metrics->fontbbox_y0, metfile);
+	Fput2(metrics->fontbbox_x1, metfile);
+	Fput2(metrics->fontbbox_y1, metfile);
+	Fput2(metrics->defaultxwidth, metfile);
+	Fput2(metrics->defaultywidth, metfile);
+	Fput2(metrics->italicshear, metfile);
+	Fputc(metrics->underlineposition, metfile);
+	Fputc(metrics->underlinethickness, metfile);
+	Fput2(metrics->capheight, metfile);
+	Fput2(metrics->xheight, metfile);
+	Fput2(metrics->descender, metfile);
+	Fput2(metrics->ascender, metfile);
+	Fput4(0, metfile);	       /* reserved field */
+
+	table[1] = ftell(metfile) - table_offset;
+
+	if (metrics->newkerns.total)
+	{
+	    fileflags &= ~FLG_16BITKERNS;
+	    for (letter1 = 0; letter1 < MAX_CHARS; letter1++)
+	    {
+		kern = metrics->newkerns.letter1[letter1];
+		if (kern)
+		{
+		    if (letter1 >= 256 || kern->letter >= 256)
+			fileflags |= FLG_16BITKERNS;
+		}
+	    }
+	    for (letter1 = 0; letter1 < MAX_CHARS; letter1++)
+	    {
+		kern = metrics->newkerns.letter1[letter1];
+		if (kern)
+		{
+		    Fputcode(fileflags & FLG_16BITKERNS, letter1, metfile);
+		    for (; kern; kern = kern->link)
+		    {
+			Fputcode(fileflags & FLG_16BITKERNS, kern->letter, metfile);
+			if ((fileflags & FLG_NOXOFFSETS) == 0)
+			    Fput2(kern->xoffset, metfile);
+			if ((fileflags & FLG_NOYOFFSETS) == 0)
+			    Fput2(kern->yoffset, metfile);
+		    }
+		    Fputcode(fileflags & FLG_16BITKERNS, 0, metfile);
+		}
+	    }
+	    Fputcode(fileflags & FLG_16BITKERNS, 0, metfile);
+	}
+
+	table[2] = ftell(metfile) - table_offset;	/* this area reserved (must be
+							 * null) */
+
+	table[3] = ftell(metfile) - table_offset;	/* this area reserved (must be
+							 * null) */
+
+	/* write table of offsets */
+
+	fseek(metfile, table_offset, SEEK_SET);
+	for (i = 0; i < 4; i++)
+	    Fput2((int) table[i], metfile);
+
+    }				       /* if (fileflags & FLG_KERNS) */
+
+    fclose(metfile);
+    e(return (e), settype(metfname, 0xff6));	/* metrics file */
+
+    return (NULL);
+}
+
+
+/* NB: Commoning-up of metrics is done later */
+
+void addmetric(metricsstr * metrics, int charno, int x0, int y0, int x1, int y1, int xw, int yw)
+{
+    int nchars = metrics->nchars++;
+
+    metrics->x0[nchars] = x0;
+    metrics->y0[nchars] = y0;
+    metrics->x1[nchars] = x1;
+    metrics->y1[nchars] = y1;
+    metrics->xwidth[nchars] = xw;
+    metrics->ywidth[nchars] = yw;
+
+    metrics->charmap[charno] = nchars;
+}
+
+
+/*
+ * Add kern pairs for all combinations of these names
+ * There will usually be only one pair - but more if the names are duplicated
+ */
+
+static os_error *addnamedkern(encstr * encoding, kernstr * kstr, char *name1, char *name2, int x, int y)
+{
+    nameblk *check1, *check2;
+
+    for (check1 = encoding->hashtable[*name1]; check1; check1 = check1->link)
+	if (strcmp(check1->name, name1) == 0)
+	{
+	    for (check2 = encoding->hashtable[*name2]; check2; check2 = check2->link)
+		if (strcmp(check2->name, name2) == 0)
+		{
+		    e(return (e), addkern(kstr, check1->code, check2->code, x, y));
+		}
+	}
+
+    return (NULL);		       /* does nothing if either name not recognised */
+}
+
+
+/*
+ * Add kern pair for a given pair of character codes
+ * Note that AFM kern pairs are specified by name,
+ * and this can map onto several kern pairs specified by character code
+ */
+
+static os_error *addkern(kernstr * kstr, int ch1, int ch2, int x0, int y0)
+{
+    kern_pair *kern;
+
+    kern = malloc_abort(sizeof(kern_pair));
+
+    kern->letter = ch2;
+    kern->xoffset = x0;
+    kern->yoffset = y0;
+
+    kern->link = kstr->letter1[ch1];
+    kstr->letter1[ch1] = kern;
+
+    kstr->total++;
+
+    return (NULL);
+}
+
+
+/* Read little-endian 16-bit word from file */
+
+int fgetc2little(FILE * f)
+{
+     return (((fgetc(f) << 16) + (fgetc(f) << 24)) >> 16);
+}
+
+
+/* Read little-endian 32-bit word from file */
+
+int fgetc4little(FILE * f)
+{
+     return (fgetc(f) + (fgetc(f) << 8) + (fgetc(f) << 16) + (fgetc(f) << 24));
+}
+
+
+#ifdef XXDELETED
+/*
+ * Output AFM-type file indicating contents of metrics arrays
+ */
+
+os_error *exportmetrics(const char *outfname, const char *fontname, encstr * encoding, metricsstr * metrics)
+{
+    FILE *outfile;
+    int i, j, numchars;
+    kern_pair *kern;
+    file_flags fileflags = metrics->fileflags;
+
+#if 0
+    if ((outfile = fopen(outfname, "w")) == NULL)
+    {
+	return (make_oserror(214, "Couldn't open export file '%s' for output", outfname));
+    }
+#endif
+    E(fopen_err(outfname, "w", &outfile));
+
+    fprintf(outfile, "StartFontMetrics 2.0\n");
+
+    fprintf(outfile, "FontName %s\n", fontname);
+    fprintf(outfile, "Encoding %s\n", encoding->name);
+    if (fileflags & FLG_KERNS)
+    {
+	fprintf(outfile, "ItalicAngle %f\n", 180 / 3.1415926 * atan(-((double) metrics->italicshear) / 1000));
+    }
+    fprintf(outfile, "IsFixedPitch %s\n", ((fileflags & FLG_FIXED) == FLG_FIXED) ? "true" : "false");
+    if (fileflags & FLG_KERNS)
+    {
+	fprintf(outfile, "UnderlinePosition %d\n", metrics->underlineposition * 1000 / 256);
+	fprintf(outfile, "UnderlineThickness %d\n", metrics->underlinethickness * 1000 / 256);
+	fprintf(outfile, "FontBBox %d %d %d %d\n", metrics->fontbbox_x0, metrics->fontbbox_y0, metrics->fontbbox_x1, metrics->fontbbox_y1);
+	fprintf(outfile, "CapHeight %d\n", metrics->capheight);
+	fprintf(outfile, "XHeight %d\n", metrics->xheight);
+	fprintf(outfile, "Descender %d\n", metrics->descender);
+	fprintf(outfile, "Ascender %d\n", metrics->ascender);
+    }
+
+    numchars = 0;
+    for (i = 0; i < MAX_CHARS; i++)
+	if (metrics->charmap[i])
+	    numchars++;
+
+    fprintf(outfile, "StartCharMetrics %d\n", numchars);
+
+    for (i = 0; i < metrics->ncodes; i++)
+    {
+	if ((j = metrics->charmap[i]) != 0)
+	{
+	    if (metrics->x0[j] || metrics->y0[j] || metrics->x1[j] || metrics->y1[j]
+		|| metrics->xwidth[j] || metrics->ywidth[j])
+	    {
+		fprintf(outfile, "C %d ; ", i);
+		if (metrics->xwidth[j] && metrics->ywidth[j] == 0)
+		{
+		    fprintf(outfile, "WX %d ; ", metrics->xwidth[j]);
+		}
+		else
+		if (metrics->xwidth[j] == 0 && metrics->ywidth[j])
+		{
+		    fprintf(outfile, "WY %d ; ", metrics->ywidth[j]);
+		}
+		else
+		{
+		    fprintf(outfile, "W %d %d ; ", metrics->xwidth[j], metrics->ywidth[j]);
+		}
+		fprintf(outfile, "N %s ; B %d %d %d %d ;\n", encoding->nameof[i]->name,
+			metrics->x0[j], metrics->y0[j], metrics->x1[j], metrics->y1[j]);
+	    }
+	}
+    }
+
+    fprintf(outfile, "EndCharMetrics\n");
+
+    if ((fileflags & FLG_KERNS) && metrics->newkerns.total)
+    {
+
+	fprintf(outfile, "StartKernData\n");
+	fprintf(outfile, "StartKernPairs %d", metrics->newkerns.total);
+
+	for (i = 0; i < metrics->ncodes; i++)
+	{
+	    if (metrics->newkerns.letter1[i])
+		fprintf(outfile, "\n");
+	    for (kern = metrics->newkerns.letter1[i]; kern; kern = kern->link)
+	    {
+		if (kern->xoffset && kern->yoffset == 0)
+		{
+		    fprintf(outfile, "KPX %s %s %d\n", encoding->nameof[i]->name,
+			    encoding->nameof[kern->letter]->name,
+			    kern->xoffset);
+		}
+		else
+		if (kern->xoffset == 0 && kern->yoffset)
+		{
+		    fprintf(outfile, "KPY %s %s %d\n", encoding->nameof[i]->name,
+			    encoding->nameof[kern->letter]->name,
+			    kern->yoffset);
+		}
+		else
+		{
+		    fprintf(outfile, "KP %s %s %d %d\n", encoding->nameof[i]->name,
+			    encoding->nameof[kern->letter]->name,
+			    kern->xoffset, kern->yoffset);
+		}
+	    }
+	}
+
+	fprintf(outfile, "EndKernPairs\n");
+	fprintf(outfile, "EndKernData\n");
+    }
+
+    fprintf(outfile, "EndFontMetrics\n");
+
+    fclose(outfile);
+
+#ifdef XXDELETED
+    printf("AFM file exported to '%s'\n", outfname);
+#endif
+
+    return (NULL);
+}
+#endif
+
+
+/* Routine to return the case of a character as one of three values.
+ * Should really use some sort of encoding vector (cf. accents).
+ */
+
+
+casetype caseof(char code)
+{
+     return (isupper(code) ? CASE_UPPER : islower(code) ? CASE_LOWER : CASE_NEITHER);
+}
+
+
+/* Given an encoding and a character code, try to split it into a base character and an accent.
+ * First tries to find the name in the encoding vector, to see if it has a basechar/accent defined.
+ * After that it does a textual lookup on the name, reading the list of accents in the encoding file "Accents".
+ * The final base and accent codes relate to the encoding vector supplied.
+ */
+
+static BOOL needupaccents = 1;
+static encstr upaccent_encstr;
+
+static BOOL needdownaccents = 1;
+static encstr downaccent_encstr;
+
+static BOOL needdummies = 1;
+static encstr dummy_encstr;
+
+os_error *splitcomposite(encstr * enc, int ch, cc_section * basechar, cc_section * accent, keyid actions)
+{
+    char buffer[MAXNAMELEN + 1];
+    char *charname;
+    int i, namelen, foundit;
+    nameblk *nmptr = enc->nameof[ch];
+
+    if (nmptr->base.code >= 0)
+    {
+	*basechar = nmptr->base;
+	*accent = nmptr->accent;
+	return (NULL);
+    }
+
+    if ((actions & DO_NOACCENTS) == 0)
+    {
+	if (needupaccents)
+	{
+	    e(return (e), readencoding(&upaccent_encstr, NULL, "Specials.Accents_Up", DontCheck, FALSE));
+	    needupaccents = 0;
+	}
+
+	if (needdownaccents)
+	{
+	    e(return (e), readencoding(&downaccent_encstr, NULL, "Specials.Accents_Dn", DontCheck, FALSE));
+	    needdownaccents = 0;
+	}
+    }
+
+    if (needdummies)
+    {
+	e(return (e), readencoding(&dummy_encstr, NULL, "Specials.Dummies", DontCheck, FALSE));
+	needdummies = 0;
+    }
+
+    charname = nmptr->name;
+    namelen = strlen(charname);
+
+    for (i = 0; i < dummy_encstr.nchars; i++)
+    {
+	if (dummy_encstr.matchtable[i] != ENC_NOEXIST)
+	{
+	    char *dummyname = dummy_encstr.nameof[i]->name;
+	    int basenamelen = namelen - strlen(dummyname);
+
+	    if (basenamelen > 0)
+	    {
+		if (strcmp(charname + basenamelen, dummyname) == 0)
+		{
+		    strncpy(buffer, charname, basenamelen);
+		    buffer[basenamelen] = 0;
+		    basechar->code = matchname(enc, buffer);
+		    if (basechar->code >= 0)
+		    {
+			basechar->xoffset =
+			    basechar->yoffset = 0;
+			accent->code = -1;
+			return (NULL);
+		    }
+		}
+	    }
+	}
+    }
+
+    basechar->code = accent->code = -1;
+
+    if ((actions & DO_NOACCENTS) == 0)
+    {
+	e(return (e), trycomposite(enc, &upaccent_encstr, ch, charname, basechar, accent, &foundit, 1));
+	if (!foundit)
+	    e(return (e), trycomposite(enc, &downaccent_encstr, ch, charname, basechar, accent, &foundit, 0));
+    }
+
+    return (NULL);
+}
+
+
+static os_error *trycomposite(encstr * enc, encstr * accent_encstr, int ch, char *charname,
+	        cc_section * basechar, cc_section * accent, int *foundit, int upaccents)
+{
+    char buffer[MAXNAMELEN + 1];
+    int i;
+    int namelen = strlen(charname);
+
+    *foundit = 1;		       /* let's be optimistic! */
+
+    for (i = 0; i < accent_encstr->nchars; i++)
+    {
+	if (accent_encstr->matchtable[i] != ENC_NOEXIST)
+	{
+	    char *accentname = accent_encstr->nameof[i]->name;
+	    int basenamelen = namelen - strlen(accentname);
+
+	    if (basenamelen > 0)
+	    {
+		if (strcmp(charname + basenamelen, accentname) == 0)
+		{
+		    strncpy(buffer, charname, basenamelen);
+		    buffer[basenamelen] = 0;
+		    if (upaccents)
+		    {
+			if (strcmp(buffer, "i") == 0)
+			    strcpy(buffer, "dotlessi");	/* i already has an accent! */
+			if (strcmp(buffer, "j") == 0)
+			    strcpy(buffer, "dotlessj");	/* j already has an accent! */
+		    }
+		    basechar->code = matchname(enc, buffer);
+		    basechar->xoffset =
+			basechar->yoffset = 0;
+		    accent->code = matchname(enc, accentname);
+		    {
+			nameblk *nm;
+			int basewidth, accentwidth;
+			casetype caseof_base;
+			BOOL gotyoffset = 0;
+
+			nm = basechar->code < 0 ? NULL : enc->nameof[basechar->code];
+			basewidth = nm ? nm->width : 0;
+			nm = accent->code < 0 ? NULL : enc->nameof[accent->code];
+			accentwidth = nm ? nm->width : 0;
+			accent->xoffset = (basewidth - accentwidth) / 2;
+			accent->yoffset = 0;
+#if DEBUG_splitcomp
+			printf("CC %s ; PCC %s %s ; basewidth = %d, accentwidth = %d\n",
+			       charname, buffer, accentname, basewidth, accentwidth);
+#endif
+
+			/*
+			 * for the vertical offset,                                            *
+			 * try to find a character with the same case that has the same
+			 * accent 
+			 */
+
+			caseof_base = caseof(*buffer);
+
+			for (i = 0; i < MAX_CHARS; i++)
+			{
+			    if (caseof(i) == caseof_base)
+			    {
+				for (nm = enc->hashtable[i]; nm && !gotyoffset; nm = nm->link)
+				{
+				    if (accent->code == nm->accent.code)
+				    {
+#if DEBUG_splitcomp
+					printf("Different base with same accent: %s (yoffset = %d)\n", nm->name, nm->accent.yoffset);
+#endif
+					accent->yoffset = nm->accent.yoffset;
+					gotyoffset = 1;
+				    }
+				}
+			    }
+			}
+
+			/*
+			 * if that didn't work, try
+			 * to find the same base char with a different accent (the
+			 * accent must exist in this accent encoding)        
+			 */
+
+			if (!gotyoffset)
+			{
+			    for (nm = enc->hashtable[*buffer]; nm && !gotyoffset; nm = nm->link)
+			    {
+				if (basechar->code == nm->base.code && nm->accent.code >= 0)
+				{
+				    if (matchnameblk(accent_encstr, enc->nameof[nm->accent.code]->name))
+				    {
+#if DEBUG_splitcomp
+					printf("Same base with different accent: %s (yoffset = %d)\n", nm->name, nm->accent.yoffset);
+#endif
+					accent->yoffset = nm->accent.yoffset;
+					gotyoffset = 1;
+				    }
+				}
+			    }
+			}
+
+			/*
+			 * and if that still didn't work                                *
+			 * try to find any character with the same case with any accent *
+			 * (the accent must exist in this accent encoding)              
+			 */
+
+			if (!gotyoffset)
+			{
+			    for (i = 0; i < MAX_CHARS && !gotyoffset; i++)
+			    {
+				if (caseof(i) == caseof_base)
+				{
+				    for (nm = enc->hashtable[i]; nm && !gotyoffset; nm = nm->link)
+				    {
+					if (nm->accent.code >= 0)
+					{
+					    if (matchnameblk(accent_encstr, enc->nameof[nm->accent.code]->name))
+					    {
+#if DEBUG_splitcomp
+						printf("Diff base with diff accent: %s (yoffset = %d)\n", nm->name, nm->accent.yoffset);
+#endif
+						accent->yoffset = nm->accent.yoffset;
+						gotyoffset = 1;
+					    }
+					}
+				    }
+				}
+			    }
+			}
+		    }
+		    if (basechar->code >= 0)
+			return (NULL); /* otherwise keep looking! */
+		}
+	    }
+	}
+    }
+
+    basechar->code = -1;
+    accent->code = -1;
+
+    *foundit = 0;
+
+    return (NULL);
+}
+
+
+/* return IntMetrics filename given prefix, fontname and alphabet */
+
+os_error *getmetricsfname(char *outbuff, const char *fontprefix, const char *fontname, int alphabet)
+{
+     return (getfontfilename(outbuff, fontprefix, fontname, "IntMetrics", 10, alphabet));
+}
+
+
+/* return Outlines filename given prefix, fontname and alphabet */
+
+os_error *getoutlinesfname(char *outbuff, const char *fontprefix, const char *fontname, int alphabet)
+{
+     return (getfontfilename(outbuff, fontprefix, fontname, "Outlines", 10, alphabet));
+}
+
+
+/* return full font filename given prefix, name, leafname and alphabet */
+
+os_error *getfontfilename(char *outbuff,
+			   const char *fontprefix, const char *fontname,
+			   const char *leafname, int maxleaflen, int alphabet)
+{
+    char numbuff[64], buffer2[64], *leaf;
+    int excess;
+
+    if (alphabet < 0)
+    {
+	leaf = (char *) leafname;
+    }
+    else
+    {
+	sprintf(numbuff, "%d", alphabet);
+	excess = strlen(leafname) + strlen(numbuff) - maxleaflen;
+	if (excess < 0)
+	    excess = 0;
+	strcpy(buffer2, leafname);
+	strcpy(buffer2 + strlen(leafname) - excess, numbuff);
+	leaf = buffer2;
+    }
+
+    sprintf(outbuff, "%s%s.%s", fontprefix, fontname, leaf);
+
+    return (NULL);
+}
+
+
+/* get character code (8 or 16 bit) depending on flag */
+
+int fgetcode(int cond, FILE * stream)
+{
+    if (cond)
+	 return (fgetc2little(stream));
+    else
+	return (fgetc(stream));
+}
+
+/* put character code (8 or 16 bit) depending on flag */
+
+int fputcode(int cond, int code, FILE * stream)
+{
+    if (cond)
+	 return (fput2(code, stream));
+    else
+	return (fputc(code, stream));
+}
+
+static void freeKerns (kern_pair *kp)
+{
+    while (kp)
+    {
+	kern_pair *link = kp->link;
+	free((char *) kp);
+	kp = link;
+    }
+}
+
+/* Safe to call this on a metricsstr that is all zeros */
+
+void freeMetrics (metricsstr *metrics)
+{
+    int i;
+    for (i = 0; i < MAX_CHARS; i++)
+    {
+	freeKerns(metrics->oldkerns.letter1[i]);
+	freeKerns(metrics->newkerns.letter1[i]);
+	metrics->oldkerns.letter1[i] =
+	    metrics->newkerns.letter1[i] = NULL;
+    }
+    metrics->oldkerns.total =
+	metrics->newkerns.total = 0;
+}

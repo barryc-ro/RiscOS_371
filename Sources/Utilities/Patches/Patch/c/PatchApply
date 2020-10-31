@@ -1,0 +1,1344 @@
+#include "Patch.h"
+
+
+static ERROR_BLOCK(BadFileType);
+static ERROR_BLOCK(FileExists);
+static ERROR_BLOCK(ReadFail);
+static ERROR_BLOCK(WriteFail);
+static ERROR_BLOCK(VerifyFail);
+static ERROR_BLOCK(OldFail);
+static ERROR_BLOCK(NewFail);
+static ERROR_BLOCK(NoFile);                     /* In Global.Messages */
+
+static char const wimp_scrap[] = "<Wimp$Scrap>";
+static char const copy_trans[] = "Copy";
+static char const prep_slot[] = "_PrepareSlot";
+static char const prepare[] = "_Prepare";
+static char const fin_slot[] = "_FinishSlot";
+static char const finish[] = "_Finish";
+
+
+
+/* Function to transform a file using the specified transform. If an error
+   is returned, it has already been reported and the user has already
+   clicked OK. */
+
+static _kernel_oserror * transform_file
+(
+    char const * const                  parm0,
+    char const * const                  parm1,
+    char const * const                  transform,
+    char const * const                  slot,
+    char const * const                  execute
+)
+{
+    _kernel_oserror *                   error;
+    _kernel_oserror *                   slot_error;
+    _kernel_swi_regs                    regs;
+
+
+    /* Read the current value of the next wimp slot, and save it. */
+
+    regs.r[0] = -1;
+    regs.r[1] = -1;
+
+    NOERR(_kernel_swi(XWimp_SlotSize, &regs, &regs));
+    orig_next_slot = regs.r[1];
+
+
+    /* Build the slot token in the main string. */
+
+    strcpy(msg_lookup_buff, transform);
+    strcat(msg_lookup_buff, slot);
+
+
+    /* Get the slot size into the auxilliary buffer. */
+
+    msgtrans_lookup_all(msg_lookup_aux_buff, msg_lookup_aux_buff_size,
+                        msg_lookup_buff, 0,0,0,0);
+
+
+    /* Convert the slot size to integer, and set it. */
+
+    regs.r[0] = -1;
+    regs.r[1] = 1024 * read_number(msg_lookup_aux_buff);
+
+    error = _kernel_swi(XWimp_SlotSize, &regs, &regs);
+
+    if (error != NULL)
+    {
+        goto restore_slot;
+    }
+     
+
+    /* Build the command token in the main string. */
+
+    strcpy(msg_lookup_buff, transform);
+    strcat(msg_lookup_buff, execute);
+
+
+    /* Get the *command into the auxilliary buffer. */
+
+    msgtrans_lookup_all(msg_lookup_aux_buff, msg_lookup_aux_buff_size,
+                        msg_lookup_buff, parm0, parm1, 0,0);
+
+
+    /* Execute the command, as a new Wimp task. */
+
+    DEBUG_PRINTF(("Wimp_StartTask '%s'\n", msg_lookup_aux_buff));
+    regs.r[0] = (int) msg_lookup_aux_buff;
+
+    error = _kernel_swi(XWimp_StartTask, &regs, &regs);
+
+
+    /* Jump here to report an error and restore the wimp slot. */
+
+restore_slot:
+
+    if (error != NULL)
+    {
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+    }
+
+
+    /* Restore the original wimp next slot size. Set the global back to -1
+       before checking the error. This way, if there was an error and
+       Cancel is clicked, the exit handler will not try to restore the
+       next slot again. There would be no point trying, since it has just
+       failed once. */
+
+    regs.r[0] = -1;
+    regs.r[1] = orig_next_slot;
+
+    slot_error = _kernel_swi(XWimp_SlotSize, &regs, &regs);
+    orig_next_slot = -1;
+
+    if (slot_error != NULL)
+    {
+        report_error(slot_error, (wimp_ECANCEL | wimp_EOK));
+    }
+
+
+    /* Return the earlier error if there was one. */
+
+    return error != NULL ? error : slot_error;
+}
+
+
+
+/* Function which checks if the data of the length qouted matches that
+   in the file channel given at the location in the file given.
+
+   Returns TRUE if matched, FALSE if doesn't match.
+
+   If eof_allowed is TRUE, then any bytes off the end of the file are
+   treated as being &FF in the file instead.
+
+   If eof_allowed is FALSE, then any reading off the end of the file is
+   regarded as a non match.
+
+   The first parameter is used for error reporting only. */
+
+static BOOL check_file_bytes
+(
+    char const * const                  target,
+
+    int const                           channel,
+    int const                           location,
+    char const * const                  data,
+    int const                           length,
+    BOOL const                          eof_allowed,
+    int const                           extent
+)
+{
+    char *                              buffer;
+    int                                 result;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+
+    DEBUG_PRINTF(("Check &%02X bytes at &%08X, extent &%08X %s eof\n",
+                  length, location, extent, eof_allowed ?
+                                                "allow" : "disallow"));
+
+    /* Have we been asked to read off the end? */
+
+    if (location + length > extent)
+    {
+        if (!eof_allowed || location >= extent)
+        {
+            /* We are not allowed to read off the end, even though
+               we have been asked to, or we can't read anything at all.
+               In either case it doesn't match. */
+
+            return FALSE;
+        }
+
+        /* If we are allowing off the end of the file, then ensure that
+           we actually only read up to the end of the file to avoid
+           any errors. */
+
+        regs.r[3] = extent - location;
+    }
+    else
+    {
+        /* Read all we were asked to. */
+
+        regs.r[3] = length;
+    }
+
+
+    /* Needs to be calloc() for zeros off end of file. */
+
+    buffer = calloc_noerr(length, 1);
+
+
+    /* Read the bytes from the location. */
+
+    regs.r[0] = OSGBPB_ReadFromGiven;
+    regs.r[1] = channel;
+    regs.r[2] = (int) buffer;
+    regs.r[4] = location;
+
+    error = _kernel_swi(XOS_GBPB, &regs, &regs);
+
+
+    if (error == NULL && regs.r[3] != 0)
+    {
+        /* Rats - failed to read everything. Oh well - convert to
+           an error. */
+
+        error = msgtrans_error_lookup(ErrorBlock_ReadFail, target, 0,0,0);
+    }
+
+    if (error != NULL)
+    {
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+        /* Got an error, so deem as not matching. */
+
+        result = FALSE;
+    }
+    else
+    {
+        /* Check the data. */
+
+        result = (memcmp(buffer, data, length) == 0);
+    }
+
+    free(buffer);
+    return result;
+}
+
+
+
+/* Function which writes out the data specified to the given channel
+   at the given file offset.
+
+   The first parameter is for error reporting only. */
+
+static _kernel_oserror * write_file_bytes
+(
+    char const * const                  target,
+
+    int const                           channel,
+    int const                           location,
+    char const * const                  data,
+    int const                           length
+)
+{
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+
+    DEBUG_PRINTF(("Write &%02X bytes at &%08X\n", length, location));
+
+    /* Writes the bytes to the location. */
+
+    regs.r[0] = OSGBPB_WriteAtGiven;
+    regs.r[1] = channel;
+    regs.r[2] = (int) data;
+    regs.r[3] = length;
+    regs.r[4] = location;
+
+    error = _kernel_swi(XOS_GBPB, &regs, &regs);
+
+    if (error == NULL && regs.r[3] != 0)
+    {
+        /* Rats - failed to write everything. Oh well - convert to
+           an error. */
+
+        error = msgtrans_error_lookup(ErrorBlock_WriteFail, target, 0,0,0);
+    }
+
+    if (error != NULL)
+    {
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+    }
+
+    return error;
+}
+
+
+
+/* Function to delete an existing file, providing the file there
+   has the file type it is supposed to have. */
+
+static _kernel_oserror * delete_file
+(
+    char const * const                  target,
+    int const                           object_type,
+    int const                           file_type,
+    int const                           supposed_file_type
+)
+{
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+    DEBUG_PRINTF(("Delete '%s', obj_type %d, file_type %d, supposed %d\n",
+                  target, object_type, file_type,
+                  supposed_file_type));
+
+    if (object_type == object_nothing)
+    {
+        /* Doesn't exist, so can't patch. */
+
+        error = msgtrans_error_lookup(ErrorBlock_NoFile, target, 0,0,0);
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+        return error;
+    }
+
+    if (file_type != supposed_file_type &&
+        supposed_file_type != FileType_DontCare)
+    {
+        /* Wrong file type, so can't patch. */
+
+        error = msgtrans_error_lookup(ErrorBlock_BadFileType, target, 0,0,0);
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+        return error;
+    }
+
+
+    /* It is present and of the correct file type, so delete it. */
+
+    regs.r[0] = OSFile_Delete;
+    regs.r[1] = (int) target;
+
+    error = _kernel_swi(XOS_File, &regs, &regs);
+
+    if (error != NULL)
+    {
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+    }
+
+    return error;
+}
+
+
+
+/* Function to create a file, providing that it doesn't already exist. */
+
+static _kernel_oserror * create_file
+(
+    char const * const                  target,
+    int const                           object_type,
+    char const * const                  contents
+)
+{
+    _kernel_oserror *                   error;
+
+    DEBUG_PRINTF(("Create '%s', obj_type %d, contents '%s'\n",
+                  target, object_type, contents));
+
+    if (object_type != object_nothing)
+    {
+        /* It exists when it shouldn't, so can't patch. */
+
+        error = msgtrans_error_lookup(ErrorBlock_FileExists, target, 0,0,0);
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+        return error;
+    }
+
+
+    /* It is absent, so use the copy finish transformation to move it in. */
+
+    return transform_file(contents, target, copy_trans, fin_slot, finish);
+}
+
+
+
+/* Function to replace an existing file with another file, providing
+   that the existing file has the file type it is supposed to have. */
+
+static _kernel_oserror * replace_file
+(
+    char const * const                  target,
+    int const                           object_type,
+    int const                           file_type,
+    int const                           supposed_file_type,
+    char const * const                  contents
+)
+{
+    _kernel_oserror *                   error;
+
+    DEBUG_PRINTF(("Replace '%s', obj_type %d, file_type %d, supposed %d,"
+                  " contents '%s'\n",
+                  target, object_type, file_type,
+                  supposed_file_type, contents));
+
+    if (object_type == object_nothing)
+    {
+        /* Doesn't exist, so can't patch. */
+
+        error = msgtrans_error_lookup(ErrorBlock_NoFile, target, 0,0,0);
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+        return error;
+    }
+
+    if (file_type != supposed_file_type &&
+        supposed_file_type != FileType_DontCare)
+    {
+        /* Wrong file type, so can't patch. */
+
+        error = msgtrans_error_lookup(ErrorBlock_BadFileType, target, 0,0,0);
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+        return error;
+    }
+
+
+    /* All correct, so use the copy finish transformation to move it in. */
+
+    return transform_file(contents, target, copy_trans, fin_slot, finish);
+}
+
+
+
+/* Function to delete the global file. */
+
+static void delete_global
+(
+    void
+)
+{
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+    if (glob_delete != NULL)
+    {
+        regs.r[0] = OSFile_Delete;
+        regs.r[1] = (int) glob_delete;
+
+        error = _kernel_swi(XOS_File, &regs, &regs);
+        glob_delete = NULL;
+
+        if (error != NULL)
+        {
+            report_error(error, (wimp_ECANCEL | wimp_EOK));
+        }
+    }
+}
+
+
+
+/* Function to close the global channel. */
+
+static void close_global
+(
+    void
+)
+{
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+    if (glob_channel != 0)
+    {
+        regs.r[0] = OS_FIND_CLOSE;
+        regs.r[1] = glob_channel;
+
+        error = _kernel_swi(XOS_Find, &regs, &regs);
+        glob_channel = 0;
+
+        if (error != NULL)
+        {
+            report_error(error, (wimp_ECANCEL | wimp_EOK));
+        }
+    }
+}
+
+
+
+/* Function to apply (or remove as appropriate) the patch specified.
+   There are lots of consistency checks in here for files existing,
+   having the correct file types and contents etc. even though they
+   are supposed to be correct, in case someone has gone in and started
+   modifying files by hand.
+
+   Note that we NEVER call delete_global() in this function. This is
+   because if we did it we incurr an extra floppy disk swap to delete
+   it, and deleting it is unecessary as the next file to get patched
+   will delete it when it is transformed. After the last file has been
+   patched, check_patch() is always called and that does delete the
+   global file, so we never end up with anything lying around after we
+   have finished yet we keep the floppy disk swaps to a minimum. */ 
+
+extern void perform_patch
+(
+    TARGET_APP const * const            targ_app,
+    TARGET_PATCH const * const          targ_patch
+)
+{
+    PATCH_ACTION                        action;
+    FILE_DATA const *                   file;
+    VERIFY_CHUNK *                      verify;
+    MODIFY_CHUNK *                      modify;
+    char const *                        transform;
+    char const *                        local_object;
+    int                                 object_type;
+    int                                 file_type;
+    int                                 extent;
+    char *                              target;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+    action = targ_patch->select_action;
+
+    for (file = targ_patch->patch->files;
+         file != NULL;
+         file = file->next)
+    {
+        /* I did use OSFile_ReadWithTypePath, with r1 set to file->name
+           and r4 set to outer_dir. However, if outer_dir has a comma
+           in it anywhere, fileswitch interprets that as the seperator
+           between multiple directories in a path string. Argh! */
+
+        target = malloc_noerr(targ_app->outer_dir_len + file->name_len + 1);
+        strcpy(target, targ_app->outer_dir);
+        strcpy(target + targ_app->outer_dir_len, file->name);
+
+        /* Get the info for this file. */
+
+        regs.r[0] = OSFile_ReadWithTypeNoPath;
+        regs.r[1] = (int) target;
+
+        error = _kernel_swi(XOS_File, &regs, &regs);
+
+        if (error != NULL)
+        {
+            report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+            /* He pressed OK. But we certainly can't apply this patch! */
+
+            free(target);
+            return;
+        }
+
+        object_type = regs.r[0];
+        file_type = regs.r[6];
+
+        switch (file->flavour)
+        {
+        case FLAVOUR_CREATE:
+            /* Create a new file. */
+
+            if (action == ACTION_APPLY)
+            {
+                if (create_file(target, object_type, file->u_new_contents))
+                {
+                    /* It failed, so give up on this patch. */
+
+                    free(target);
+                    return;
+                }
+            }
+            else
+            {
+                if (delete_file(target, object_type, file_type,
+                                file->u_new_file_type))
+                {
+                    /* It failed, so give up on this patch. */
+
+                    free(target);
+                    return;
+                }
+            }
+            break;
+
+
+        case FLAVOUR_DELETE:
+            /* Delete an existing file. */
+
+            if (action == ACTION_APPLY)
+            {
+                if (delete_file(target, object_type, file_type,
+                                file->u_old_file_type))
+                {
+                    /* It failed, so give up on this patch. */
+
+                    free(target);
+                    return;
+                }
+            }
+            else
+            {
+                if (create_file(target, object_type, file->u_old_contents))
+                {
+                    /* It failed, so give up on this patch. */
+
+                    free(target);
+                    return;
+                }
+            }
+            break;
+
+
+        case FLAVOUR_REPLACE:
+            /* Replace existing file with another one. */
+
+            if (action == ACTION_APPLY)
+            {
+                if (replace_file(target, object_type, file_type,
+                                 file->u_old_file_type,
+                                 file->u_new_contents))
+                {
+                    /* It failed, so give up on this patch. */
+
+                    free(target);
+                    return;
+                }
+            }
+            else
+            {
+                if (replace_file(target, object_type, file_type,
+                                 file->u_new_file_type,
+                                 file->u_old_contents))
+                {
+                    /* It failed, so give up on this patch. */
+
+                    free(target);
+                    return;
+                }
+            }
+            break;
+
+
+        case FLAVOUR_MODIFY:
+            /* Check if the file exists with correct filetype. */
+
+            if (object_type == object_nothing)
+            {
+                /* Doesn't exist, so can't patch. */
+
+                error = msgtrans_error_lookup(ErrorBlock_NoFile,
+                                              target, 0,0,0);
+                report_error(error, (wimp_ECANCEL | wimp_EOK));
+                free(target);
+                return;
+            }
+
+            if (file_type != file->u_file_type &&
+                file->u_file_type != FileType_DontCare)
+            {
+                /* Wrong file type, so can't patch. */
+
+                error = msgtrans_error_lookup(ErrorBlock_BadFileType,
+                                              target, 0,0,0);
+                report_error(error, (wimp_ECANCEL | wimp_EOK));
+                free(target);
+                return;
+            }
+
+
+            /* Get the file transformed into <Wimp$Scrap>, unless
+               there are no changes (just verifies) and no transform in
+               which case we will verify in situ. */
+
+            if (file->u_transform != NULL)
+            {
+                /* Use the real transform. */
+
+                transform = file->u_transform;
+            }
+            else
+            {
+                /* Use the Copy transform if there are changes. */
+
+                if (file->u_changes != NULL)
+                {
+                    transform = copy_trans;
+                }
+                else
+                {
+                    /* No transform and no changes. */
+
+                    transform = NULL;
+                }
+            }
+
+
+            /* Work out whether to operate on Wimp$Scrap or on the file
+               in situ. */
+
+            if (transform != NULL)
+            {
+                /* Transform the file, marking <Wimp$Scrap> as globally
+                   deletable up front. */
+
+                glob_delete = wimp_scrap;
+                error = transform_file(target, wimp_scrap, transform,
+                                       prep_slot, prepare);
+
+                if (error != NULL)
+                {
+                    /* Error has already been reported. We certainly
+                       can't patch this file though. */
+
+                    free(target);
+                    return;
+                }
+
+                local_object = wimp_scrap;
+            }
+            else
+            {
+                /* Verify original file in place. */
+
+                local_object = target;
+            }
+
+
+            /* Open the file. */
+
+            regs.r[0] = OS_FIND_OPEN_UPDATE_NOPATH;
+            regs.r[1] = (int) local_object;
+
+            error = _kernel_swi(XOS_Find, &regs, &regs);
+
+            if (error == NULL && (glob_channel = regs.r[0]) == 0)
+            {
+                /* Rats - the file doesn't exist (the transformation
+                   screwed up). Convert to an error to get trapped by
+                   the error handling. */
+
+                error = msgtrans_error_lookup(ErrorBlock_NoFile,
+                                              local_object, 0,0,0);
+            }
+
+            if (error != NULL)
+            {
+                report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+                /* He pressed OK, but we certainly can't patch this. */
+
+                free(target);
+                return;
+            }
+
+
+            /* Get the file's extent. */
+
+            regs.r[0] = OSArgs_ReadEXT;
+            regs.r[1] = glob_channel;
+
+            error = _kernel_swi(XOS_Args, &regs, &regs);
+
+            if (error != NULL)
+            {
+                report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+                /* He pressed OK, but we certainly can't patch this. */
+
+                close_global();
+                free(target);
+                return;
+            }
+            extent = regs.r[2];
+
+
+
+            /* Go down the verify chunks, checking that they are all
+               correct. */
+
+            for (verify = file->u_verifies;
+                 verify != NULL;
+                 verify = verify->next)
+            {
+                if (!check_file_bytes(local_object, glob_channel,
+                                     verify->location,
+                                     verify->data, verify->length,
+                                     FALSE, extent))
+                {
+                    /* Didn't match, so we can't patch this. */
+
+                    error = msgtrans_error_lookup(ErrorBlock_VerifyFail,
+                                                  target, 0,0,0);
+                    report_error(error, (wimp_ECANCEL | wimp_EOK));
+                    close_global();
+                    free(target);
+                    return;
+                }
+            }
+
+
+            /* Go down the changes chunks, checking that they are what
+               they should be (old for apply and new for remove) and
+               then changing them. */
+
+            for (modify = file->u_changes;
+                 modify != NULL;
+                 modify = modify->next)
+            {
+                if (action == ACTION_APPLY)
+                {
+                    /* Check for match with old data. Old data is
+                       allowed to be off the end of the file. */
+
+                    if (!check_file_bytes(local_object, glob_channel,
+                                          modify->location,
+                                          modify->old, modify->length,
+                                          TRUE, extent))
+                    {
+                        /* Didn't match the old data, and it should have. */
+
+                        error = msgtrans_error_lookup(ErrorBlock_OldFail,
+                                                      target, 0,0,0);
+                        report_error(error, (wimp_ECANCEL | wimp_EOK));
+                        close_global();
+                        free(target);
+                        return;
+                    }
+
+
+                    /* Write the new data out (this may extend the file). */
+
+                    error = write_file_bytes(local_object, glob_channel,
+                                             modify->location,
+                                             modify->new, modify->length);
+                    if (error != NULL)
+                    {
+                        /* Error has already been reported. */
+
+                        close_global();
+                        free(target);
+                        return;
+                    }
+                }
+                else /* if (action == ACTION_APPLY) */
+                {
+                    /* Remove.
+
+                       Check for match with new data, which is not allowed
+                       to be off the end of the file. */
+
+                    if (!check_file_bytes(local_object, glob_channel,
+                                          modify->location,
+                                          modify->new, modify->length,
+                                          FALSE, extent))
+                    {
+                        /* Didn't match the new data, and it should have. */
+
+                        error = msgtrans_error_lookup(ErrorBlock_NewFail,
+                                                      target, 0,0,0);
+                        report_error(error, (wimp_ECANCEL | wimp_EOK));
+                        close_global();
+                        free(target);
+                        return;
+                    }
+
+
+                    /* Write the old data out (this may put zeros on
+                       the end of the file that originally didn't
+                       exist ie. I don't shrink the file). */
+
+                    error = write_file_bytes(local_object, glob_channel,
+                                             modify->location,
+                                             modify->old, modify->length);
+                    if (error != NULL)
+                    {
+                        /* Error has already been reported. */
+
+                        close_global();
+                        free(target);
+                        return;
+                    }
+                } /* End if (action == ACTION_APPLY) else */
+
+            } /* End for all modify chunks */
+
+
+            /* We have finished modifying/checking the file, so close it. */
+
+            close_global();
+
+
+            /* If we did a transformation (including copy), then transform
+               it back. */
+
+            if (transform != NULL)
+            {
+                /* Transform from <Wimp$Scrap> back to the real file. */
+
+                error = transform_file(wimp_scrap, target, transform,
+                                       fin_slot, finish);
+
+                if (error != NULL)
+                {
+                    /* Error has already been reported. We certainly
+                       can't patch this file though. */
+
+                    free(target);
+                    return;
+                }
+            }
+
+            break; /* End case FLAVOUR_MODIFY */
+
+        } /* End switch (file->flavour) */
+
+        /* Without this, you get heap rot :-) */
+
+        free(target);
+
+    } /* End for all files for this patch. */
+}
+
+
+
+/* Function to check whether a patch can be applied, removed, or neither
+   to the target specified. */
+
+extern PATCH_ACTION check_patch
+(
+    TARGET_APP const * const            targ_app,
+    TARGET_PATCH const * const          targ_patch
+)
+{
+    PATCH_ACTION                        likely_action;
+    PATCH_ACTION                        this_action;
+    FILE_DATA const *                   file;
+    VERIFY_CHUNK *                      verify;
+    MODIFY_CHUNK *                      modify;
+    char const *                        local_object;
+    char *                              target;
+    int                                 object_type;
+    int                                 file_type;
+    int                                 extent;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+    likely_action = ACTION_NONE;
+
+    for (file = targ_patch->patch->files;
+         file != NULL;
+         file = file->next)
+    {
+        /* I did use OSFile_ReadWithTypePath, with r1 set to file->name
+           and r4 set to outer_dir. However, if outer_dir has a comma
+           in it anywhere, fileswitch interprets that as the seperator
+           between multiple directories in a path string. Argh! */
+
+        target = malloc_noerr(targ_app->outer_dir_len + file->name_len + 1);
+        strcpy(target, targ_app->outer_dir);
+        strcpy(target + targ_app->outer_dir_len, file->name);
+
+        DEBUG_PRINTF(("Checking '%s'\n", target));
+
+        /* Get the info for this file. */
+
+        regs.r[0] = OSFile_ReadWithTypeNoPath;
+        regs.r[1] = (int) target;
+
+        error = _kernel_swi(XOS_File, &regs, &regs);
+
+        if (error != NULL)
+        {
+            report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+            /* He pressed OK. But we certainly can't apply this patch! */
+
+            free(target);
+            return ACTION_NONE;
+        }
+
+        object_type = regs.r[0];
+        file_type = regs.r[6];
+        this_action = ACTION_UNKNOWN;
+
+        switch (file->flavour)
+        {
+        case FLAVOUR_CREATE:
+            /* Create a new file. */
+
+            if (object_type == object_nothing)
+            {
+                /* We may be able to apply this patch. */
+
+                this_action = ACTION_APPLY;
+            }
+            else
+            {
+                /* If the file type is right, we may be able to remove. */
+
+                if (file_type == file->u_new_file_type ||
+                    file->u_new_file_type == FileType_DontCare)
+                {
+                    this_action = ACTION_REMOVE;
+                }
+                else
+                {
+                    /* Inconsistent. Definitely can't do this patch. */
+
+                    free(target);
+                    return ACTION_NONE;
+                }
+            }
+            break;
+
+
+        case FLAVOUR_DELETE:
+            /* Delete an existing file. */
+
+            if (object_type == object_nothing)
+            {
+                /* We may be able to remove this patch. */
+
+                this_action = ACTION_REMOVE;
+            }
+            else
+            {
+                /* If the file type is right, we may be able to apply. */
+
+                if (file_type == file->u_old_file_type ||
+                    file->u_old_file_type == FileType_DontCare)
+                {
+                    this_action = ACTION_APPLY;
+                }
+                else
+                {
+                    /* Inconsistent. Definitely can't do this patch. */
+
+                    free(target);
+                    return ACTION_NONE;
+                }
+            }
+            break;
+
+
+        case FLAVOUR_REPLACE:
+            /* Replace existing file with another one. */
+
+            if (object_type == object_nothing)
+            {
+                /* Inconsistent. Can't do this patch. */
+
+                free(target);
+                return ACTION_NONE;
+            }
+
+
+            /* We know nothing if either file type is wildcarded. */
+
+            if (file->u_old_file_type == FileType_DontCare ||
+                file->u_new_file_type == FileType_DontCare)
+            {
+                /* Drop out of the case statement. */
+
+                break;
+            }
+
+
+            /* If both old and new should have the same type, then we
+               cannot extract any apply/remove information here. */
+
+            if (file->u_old_file_type == file->u_new_file_type) 
+            {
+                if (file_type != file->u_old_file_type)
+                {
+                    /* File is of wrong type, so can't do anything. */
+
+                    free(target);
+                    return ACTION_NONE;
+                }
+            }
+            else
+            {
+                /* Old and new file types are different, so we can extract
+                   more information. */ 
+
+                if (file_type == file->u_old_file_type)
+                {
+                    /* Old type present, so may be able to apply. */
+
+                    this_action = ACTION_APPLY;
+                }
+                else
+                {
+                    if (file_type == file->u_new_file_type)
+                    {
+                        /* New type present, so may be able to remove. */
+
+                        this_action = ACTION_REMOVE;
+                    }
+                    else
+                    {
+                        /* Neither type matches, so definitely can't
+                           do anything. */
+
+                        free(target);
+                        return ACTION_NONE;
+                    }
+                }
+            } /* End if old and new file types same */
+            break;
+
+
+        case FLAVOUR_MODIFY:
+            /* Check if the file exists with correct filetype. */
+
+            if (object_type == object_nothing ||
+                (file_type != file->u_file_type &&
+                 file->u_file_type != FileType_DontCare))
+            {
+                /* Doesn't exist or doesn't match, so can't patch. */
+
+                free(target);
+                return ACTION_NONE;
+            }
+
+
+            /* Get the file transformed if necessary into <Wimp$Scrap> */
+
+            if (file->u_transform != NULL)
+            {
+                glob_delete = wimp_scrap;
+                error = transform_file(target, wimp_scrap,
+                                       file->u_transform,
+                                       prep_slot, prepare);
+
+                if (error != NULL)
+                {
+                    /* Error has already been reported. We certainly
+                       can't patch this file though. */
+
+                    this_action = ACTION_NONE;
+                    goto delete_file;
+                }
+
+                local_object = wimp_scrap;
+            }
+            else
+            {
+                /* Verify original file in place. */
+
+                local_object = target;
+            }
+
+
+            /* Open the file. */
+
+            regs.r[0] = OS_FIND_OPEN_READ_NOPATH;
+            regs.r[1] = (int) local_object;
+
+            error = _kernel_swi(XOS_Find, &regs, &regs);
+
+            if (error == NULL && (glob_channel = regs.r[0]) == 0)
+            {
+                /* Rats - the file doesn't exist (the transformation
+                   screwed up). Convert to an error to get trapped by
+                   the error handling. */
+
+                error = msgtrans_error_lookup(ErrorBlock_NoFile,
+                                              local_object, 0,0,0);
+            }
+
+            if (error != NULL)
+            {
+                report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+                /* He pressed OK, but we certainly can't patch this. */
+
+                this_action = ACTION_NONE;
+                goto delete_file;
+            }
+
+
+            /* Get the file's extent. */
+
+            regs.r[0] = OSArgs_ReadEXT;
+            regs.r[1] = glob_channel;
+
+            error = _kernel_swi(XOS_Args, &regs, &regs);
+
+            if (error != NULL)
+            {
+                report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+                /* He pressed OK, but we certainly can't patch this. */
+
+                this_action = ACTION_NONE;
+                goto close_file;
+            }
+            extent = regs.r[2];
+
+
+
+            /* Go down the verify chunks, checking that they are all
+               correct. */
+
+            for (verify = file->u_verifies;
+                 verify != NULL;
+                 verify = verify->next)
+            {
+                if (!check_file_bytes(local_object, glob_channel,
+                                      verify->location,
+                                      verify->data, verify->length,
+                                      FALSE, extent))
+                {
+                    /* Didn't match, so can't apply or remove. */
+
+                    this_action = ACTION_NONE;
+                    goto close_file;
+                }
+            }
+
+
+            /* Go down the changes chunks, checking that they are all
+               either old or new. */
+
+            for (modify = file->u_changes;
+                 modify != NULL;
+                 modify = modify->next)
+            {
+                /* Check for match with old data first. Old data is allowed
+                   to be off the end of the file. */
+
+                if (check_file_bytes(local_object, glob_channel,
+                                     modify->location,
+                                     modify->old, modify->length,
+                                     TRUE, extent))
+                {
+                    /* Matched old. If we have had a previous new match,
+                       then this can't be applied or removed. */
+
+                    if (this_action == ACTION_REMOVE)
+                    {
+                        this_action = ACTION_NONE;
+                        goto close_file;
+                    }
+                    this_action = ACTION_APPLY;
+                }
+                else
+                {
+                    /* Didn't match old. If we have had a previous old
+                       match, then this can't be applied or removed. */
+
+                    if (this_action == ACTION_APPLY)
+                    {
+                        this_action = ACTION_NONE;
+                        goto close_file;
+                    }
+
+                    /* Check for match with new data. */
+
+                    if (check_file_bytes(local_object, glob_channel,
+                                         modify->location,
+                                         modify->new, modify->length,
+                                         FALSE, extent))
+                    {
+                        /* Matched new. If we have had a previous old match,
+                           then this can't be applied or removed. */
+
+                        if (this_action == ACTION_APPLY)
+                        {
+                            this_action = ACTION_NONE;
+                            goto close_file;
+                        }
+                        this_action = ACTION_REMOVE;
+                    }
+                    else
+                    {
+                        /* Didn't match new. If we have had a previous new
+                           match, then this can't be applied or removed. */
+
+                        if (this_action == ACTION_REMOVE)
+                        {
+                            this_action = ACTION_NONE;
+                            goto close_file;
+                        }
+
+                    } /* End if new bytes match else */
+
+                } /* End if old bytes match else */
+
+            } /* End for all modify chunks */
+
+
+close_file:
+           /* Close the file now we have finshed with it. */
+
+            close_global();
+
+delete_file:
+            /* Delete the file if we did a transformation. */
+
+            delete_global();
+
+            break; /* End case FLAVOUR_MODIFY */
+
+        } /* End switch (file->flavour) */
+
+
+        /* Don't need the target anymore. */
+
+        free(target);
+
+
+        /* Check what we think we could have done with this file, versus
+           what we though of all the previous files. */
+
+        switch (this_action)
+        {
+        case ACTION_APPLY:
+            if (likely_action == ACTION_REMOVE)
+            {
+                /* Clashes with a previous file decision, so we can't
+                   do either. */
+
+                return ACTION_NONE;
+            }
+            likely_action = this_action;
+            break;
+
+
+        case ACTION_REMOVE:
+            if (likely_action == ACTION_APPLY)
+            {
+                /* Clashes with previous file decision, so we can't
+                   do either. */
+
+                return ACTION_NONE;
+            }
+            likely_action = this_action;
+            break;
+
+
+        case ACTION_NONE:
+            /* Definitely can't apply or remove. */
+
+            return ACTION_NONE;
+
+
+        case ACTION_UNKNOWN:
+            /* This file can be either applied or removed
+               (eg. verification words only) */
+
+            break;
+        }
+
+    } /* End for all files for this patch. */
+
+
+    /* Either we have assigned the action and there were no later
+       contradictions, or it is still set to none. */
+
+    return likely_action;
+}

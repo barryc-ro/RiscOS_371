@@ -1,0 +1,968 @@
+; > Core.FontSWI
+
+;----------------------------------------------------------------------------
+;
+; SWI PDriver_FontSWI implementation
+;
+;----------------------------------------------------------------------------
+
+fontswi
+        Push    "LR"
+
+; do precisely nothing if it is a counting pass
+        LDR     LR, counting_pass
+; Debug   PageBox, "font counting_pass = ",LR
+        CMP     LR, #0
+        Pull    "PC",NE
+
+        CMP     R8,#Font_Paint - Font_CacheAddr
+        BEQ     fontswi_paint
+        CMP     R8,#Font_LoseFont - Font_CacheAddr
+        BEQ     fontswi_losefont
+        CMP     R8,#Font_SetPalette - Font_CacheAddr
+        BEQ     fontswi_setpalette
+        CMP     R8,#Font_SetFontColours - Font_CacheAddr
+        Pull    "PC",NE
+
+; This is a Font_SetFontColours call. We need to tell the printer-specific
+; code about it.
+
+fontswi_setfontcolours
+        Push    "R1,R2,R10,R11"
+
+; Pick up current job's workspace, check for persistent errors, enable
+; ESCAPEs and pass through recursive OS_WriteC's
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+
+        BL      checkpersistenterror
+        BVS     fontswi_setfontcolours_persistentreturn
+
+        BL      enableescapes
+
+; Flush any buffered VDU 5 characters
+
+        BLVC    vdu5_flush
+
+; Do the operation
+
+        [       FontColourFixes
+        ANDVC   R1,R1,#&F
+        ANDVC   R2,R2,#&F
+        ]
+        BLVC    fontswi_setcolours
+
+; And return
+
+fontswi_setfontcolours_return
+        BL      disableandcheckescapes
+        BLVS    makepersistenterror
+fontswi_setfontcolours_persistentreturn
+        Pull    "R1,R2,R10,R11,PC"
+
+; Subroutine to set GCOL-specified colours as well as we are reasonably able
+; to. Algorithm used:
+;   (A) If a 256-colour mode: if the foreground entry requested has been
+;       defined in 'fontpalette', use the components of that entry to set
+;       absolute colours. Otherwise use the parameters as GCOLs.
+;   (B) If a non-256-colour mode, use any of the full foreground and
+;       background entries implied by the call to set absolute colours,
+;       provided the entries concerned have been defined. Set any remaining
+;       values (including the offset) as GCOLs.
+
+        [ Medusa
+;   (C) In 8bpp full palette and 16/32bpp modes, behave exactly as
+;       for (A).  If the fontpalette has been set, use it (it contains
+;       24bit RGB values).  Otherwise, treat the numbers as GCOLs
+;       which will subsequently be looked up by gcol_lookup.
+        ]
+
+fontswi_setcolours
+        Push    "R1-R5,LR"
+        [       :LNOT:FontColourFixes
+        CMP     R1,#-1                          ;Beware of out of range
+        ANDNE   R1,R1,#&0F                      ;  parameters
+        CMP     R2,#-1
+        ANDNE   R2,R2,#&0F
+        ]
+        ADR     R4,fontpalette
+        LDR     LR,lgbpp
+        TEQ     LR,#3
+        [ Medusa
+        TEQNE   LR,#4                           ;Treat 16 and 32bpp exactly the same
+        TEQNE   LR,#5                           ;  as 8bpp
+        ]
+        BNE     fontswi_setcolours_normal
+
+        [       FontColourFixes
+
+; OSS 23 Jan 91 *** TEQ instead of CMP
+
+        TEQ     R2,#TopBit                      ;Setting foreground?
+        |
+        CMP     R2,#-1                          ;Setting foreground?
+        ]
+        BEQ     fontswi_setcolours_offset       ;Not much to do if not (Note
+                                                ;  V clear if branch taken)
+        LDR     LR,[R4,R2,LSL #2]!
+        CMP     LR,#-1                          ;Has entry been set?
+        BEQ     fontswi_setcolours_256col_gcol  ;Do what we can if not
+        MOV     R2,LR
+        BL      font_absfg
+        LDRVC   R1,[R4,#16*4]
+        BLVC    font_absbg
+        [       :LNOT:FontColourFixes
+        LDRVC   R3,[R4,#2*16*4]
+        ]
+        B       fontswi_setcolours_offset
+
+fontswi_setcolours_256col_gcol
+        [       FontColourFixes
+
+; OSS 23 Jan 91 *** TEQ instead of CMP
+
+        TEQ     R1,#TopBit
+        |
+        CMP     R1,#-1
+        ]
+        BLNE    font_bg                         ;Last, desperate, almost
+        BLVC    font_fg                         ;  certainly wrong attempt!
+        B       fontswi_setcolours_offset
+
+fontswi_setcolours_normal
+        [       FontColourFixes
+
+; OSS 23 Jan 91 *** TEQ instead of CMP
+
+        TEQ     R1,#TopBit                      ;Setting background?
+        |
+        CMP     R1,#-1                          ;Setting background?
+        ]
+        BEQ     fontswi_setcolours_normal_tryfg
+        LDR     LR,[R4,R1,LSL #2]
+        CMP     LR,#-1
+        BNE     fontswi_setcolours_normal_absbg
+        BL      font_bg
+        B       fontswi_setcolours_normal_tryfg
+fontswi_setcolours_normal_absbg
+        MOV     R1,LR
+        BL      font_absbg
+
+fontswi_setcolours_normal_tryfg
+        BVS     fontswi_setcolours_offset
+        [       FontColourFixes
+
+; OSS 23 Jan 91 *** TEQ instead of CMP
+
+        TEQ     R2,#TopBit                      ;Setting foreground?
+        |
+        CMP     R2,#-1                          ;Setting foreground?
+        ]
+        BEQ     fontswi_setcolours_offset
+        MOV     LR,R3
+        [       FontColourFixes
+
+; OSS 23 Jan 91 *** TEQ instead of CMP
+
+        TEQ     LR,#TopBit
+        |
+        CMP     LR,#-1
+        ]
+        LDREQ   LR,fontcoloffset
+        ADD     LR,R2,LR
+        AND     LR,LR,#&F
+        LDR     LR,[R4,LR,LSL #2]
+        CMP     LR,#-1
+        BNE     fontswi_setcolours_normal_absfg
+        BL      font_fg
+        B       fontswi_setcolours_offset
+fontswi_setcolours_normal_absfg
+        MOV     R2,LR
+        BL      font_absfg
+
+fontswi_setcolours_offset
+        Pull    "R1-R5,PC",VS
+        [       FontColourFixes
+
+; OSS 23 Jan 91 *** TEQ instead of CMP
+
+        TEQ     R3,#TopBit
+        |
+        CMP     R3,#-1
+        ]
+        STRNE   R3,fontcoloffset
+        BLNE    font_coloffset
+                Pull    "R1-R5,PC"
+
+; This is a Font_SetPalette call. Use it to update our 'fontpalette' table.
+
+        [ Medusa
+; 8bpp full palette and 16/32bpp modes are treated as for old 8bpp modes
+        ]
+
+fontswi_setpalette
+        Push    "R1-R11"
+
+; Pick up current job's workspace, check for persistent errors, enable
+; ESCAPEs and pass through recursive OS_WriteC's
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+
+        BL      checkpersistenterror
+        BVS     fontswi_setpalette_persistentreturn
+
+        BL      enableescapes
+
+; Flush any buffered VDU 5 characters
+
+        BLVC    vdu5_flush
+        BVS     fontswi_setpalette_return
+
+; Do the real work
+
+        AND     R1,R1,#&F               ;Don't trust the outside world!
+        AND     R2,R2,#&F               ;  (But can trust R3, as font manager
+        BIC     R4,R4,#&FF              ;  checks it.)
+        BIC     R5,R5,#&FF
+        ADR     R6,fontpalette          ;Address 'fontpalette' table
+        LDR     LR,lgbpp                ;256 colour mode or higher
+        CMP     LR,#3                   ;NB clears V if EQ
+        [       FontColourFixes
+        BLT     fontswi_setpalette_not256
+        STR     R5,[R6,R2,LSL #2]!      ;If so, store desired foreground
+        STR     R4,[R6,#16*4]           ;  and background,
+        STR     R3,fontcoloffset        ;  set the offset and return
+        BL      font_coloffset
+        B       fontswi_setpalette_return
+fontswi_setpalette_not256
+        |
+        STRGE   R5,[R6,R2,LSL #2]!      ;If so, store desired foreground,
+        STRGE   R4,[R6,#16*4]           ;  background and offset and return
+        STRGE   R3,[R6,#2*16*4]
+        BGE     fontswi_setpalette_return
+        ]
+
+        STR     R4,[R6,R1,LSL #2]       ;Store background colour
+
+        MOVS    R7,R3                   ;Get divisor and initial multipliers
+        RSBMI   R7,R7,#0                ;  for colour calculations. Initial
+        ADD     R1,R7,#1                ;  bg multiplier is ABS(R3), initial
+        MOV     R8,#1                   ;  fg multiplier is 1, divisor is
+                                        ;  ABS(R3)+1
+fontswi_setpalette_loop
+        AND     R2,R2,#&F               ;Reduce R2 MOD 16
+
+        MOV     R9,R4,LSR #24           ;Calculate blue component of result
+        MOV     R10,R5,LSR #24
+        BL      fontswi_setpalette_interpolate
+        MOV     R11,R10,LSL #24
+
+        MOV     R9,R4,LSR #16           ;Calculate green component of result
+        MOV     R10,R5,LSR #16
+        AND     R9,R9,#&FF
+        AND     R10,R10,#&FF
+        BL      fontswi_setpalette_interpolate
+        ORR     R11,R11,R10,LSL #16
+
+        MOV     R9,R4,LSR #8            ;Calculate red component of result
+        MOV     R10,R5,LSR #8
+        AND     R9,R9,#&FF
+        AND     R10,R10,#&FF
+        BL      fontswi_setpalette_interpolate
+        ORR     R11,R11,R10,LSL #8
+
+        STR     R11,[R6,R2,LSL #2]      ;And store interpolated colour
+
+        CMP     R3,#0                   ;Move R2 in correct direction
+        ADDGE   R2,R2,#1
+        SUBLT   R2,R2,#1
+        ADD     R8,R8,#1                ;Increment foreground multiplier
+        SUBS    R7,R7,#1                ;Decrement background multiplier
+        BGE     fontswi_setpalette_loop ;Loop till full foreground
+
+fontswi_setpalette_return
+        BL      disableandcheckescapes
+        BLVS    makepersistenterror
+fontswi_setpalette_persistentreturn
+        Pull    "R1-R11,PC"             ;Note V is clear
+
+; Subroutine to interpolate a colour component.
+; Entry: R1 = divisor
+;        R7 = bg multiplier
+;        R8 = fg multiplier
+;        R9 = bg component
+;        R10 = fg component
+; Exit:  R9 corrupt
+;        R10 = interpolated component
+
+fontswi_setpalette_interpolate
+        Push    "LR"
+        MUL     R9,R7,R9                ;bg multiplier * bg
+        MLA     R9,R8,R10,R9            ;+ fg multiplier * fg
+        ADD     R9,R9,R1,ASR #1         ;Adjust for rounding
+        DivRem  R10,R9,R1,LR            ;Divide by divisor
+        Pull    "PC"
+
+; This is a Font_LoseFont call. We need to tell all print jobs so that they
+; can forget about any slaved fonts.
+
+fontswi_losefont
+        Push    "R11"
+        ADR     R11,printjoblist - (:INDEX:joblink)
+        ASSERT  :BASE:joblink = R11
+fontswi_losefont_loop
+        LDR     R11,joblink
+        CMP     R11,#0
+        Pull    "R11,PC",EQ             ;Return with VC if end of list
+        BL      font_losefont
+        BVC     fontswi_losefont_loop
+        Pull    "R11,PC"
+
+
+;This routine handles the Font_Paint SWI, it replaces the one above
+;due to extensions within the RISC OS 3.00 Font Manager for transformed
+;fonts, kerning and backwards writing.
+
+        ASSERT :BASE:currenthandle =R12
+        ASSERT :INDEX:currenthandle =0
+        ASSERT currentws =currenthandle +4
+
+fontswi_paint
+        Push    "R0-R11"
+
+        Debug   CoreFont, "Font paint entered r1,r2,r7=",R1,R2,R7
+
+        LDMIA   R12,{R10,R11}           ;R10 =current handle, R11 =current workspace
+        BL      checkpersistenterror
+        BVS     fontswi_paint_persistentreturn
+
+        STR     R0,fontpaint_initfont   ;Initial font (this will be revised below in light
+                                        ; of R2 bit 8)
+        BL      enableescapes
+        BLVC    vdu5_flush              ;Flush any buffered VDU 5 characters
+        
+        Push    "R3"
+        MOVVC   R3,#intercept_all -intercept_font
+        BLVC    changeintercept
+        Pull    "R3"                    ;Stop intercepting PDriver_FontSWIs
+        BVS     fontswi_paint_return
+                                     
+;Setup has been started we must now attempt to setup the pre-paint coordinates
+;and ready ourselves for the painting extravanganzer.
+
+        TST     R2,#fontpaintflag_mpoint
+        BEQ     fontswi_paint_coordsinmpoint
+        
+        Push    "R1,R2"
+        MOV     R1,R3
+        MOV     R2,R4
+        SWI     XFont_Converttopoints   ;Ensure that start position in millipoints
+        MOVVC   R3,R1
+        MOVVC   R4,R2                   ;And copy the coordinates up correctly
+        Pull    "R1,R2"
+        BVS     fontswi_paint_return    ;Give an error back to the caller
+               
+;Coordinates are now in millipoints so we must now read the information
+;about the string and ready ourselfs for the reset of the deocding.  We now
+;perform a string width to get the maximum X and Y offsets, last character
+;and finally the number of split characters (" ").  This information is 
+;used for justification.
+
+fontswi_paint_coordsinmpoint
+        Push    "R0-R7"
+
+        TST     R2,#fontpaintflag_kern  ;Is kerning being performed?
+        LDR     R2,=&140120           
+        ORRNE   R2,R2,#1:SHL:9          ;Yup, so set the kerning bit
+
+        MOV     R3,#&2000000
+        MOV     R4,#&2000000            ;Big offsets to get the last character
+
+        SUB     SP,SP,#4*9            
+        MOV     R5,SP                   ;We need some scratch space
+
+        MOV     R0,#0                   ;Using the current font
+        STR     R0,[R5]            
+        STR     R0,[R5,#4]              ;No space add x/y
+        STR     R0,[R5,#8]            
+        STR     R0,[R5,#12]             ;No char add x/y
+
+        MOV     R7,#" "
+        STR     R7,[R5,#16]             ;Split character is a space
+        SWI     XFont_ScanString        ;Perform the scan of the string
+
+        [ {TRUE}
+
+; Use the 'string width' (offset after printing) rather than the bounding box
+; when calculating the justification.  This is because the bounding box returned
+; from Font_ScanString does NOT include any embedded movement sequences at the
+; start or end of the string (it *does* count ones in the middle).  The string
+; width includes ALL the movement caused by escape sequences.
+
+        ADRVC   R0,fontpaint_maxhoffset
+        STMVCIA R0,{R3,R4,R7}           ;Write the offset X,Y and the number of split characters
+
+        |
+
+        ADDVC   R0,R5,#20
+        LDMVCIA R0,{R0,R1,R2,R3}        ;Get the coordinates returned by the scan string call
+        SUBVC   R2,R2,R0           
+        SUBVC   R3,R3,R1                ;And then calculate the X,Y offsets
+        ADRVC   R0,fontpaint_maxhoffset
+        STMVCIA R0,{R2,R3,R7}           ;Write the offset X,Y and the number of split characters
+
+        ]
+
+        ADD     SP,SP,#4*9              ;Balance the stack out
+        STRVS   R0,[SP]                 ;..and then write any error pointers
+
+        Pull    "R0-R7"
+        BVS     fontswi_paint_return
+
+        TST     R2,#fontpaintflag_coordsblk
+        BEQ     fontswi_paint_nocoordsblock
+
+;A coordinate block has been specified, we must copy the relevant areas of
+;this away into our own workspace assuming that all values are in millipoints
+;as 1/256 of an OS unit sequences are not currently supported by the Font Manager.
+
+        Push    "R0-R1,R2-R3"
+
+        ADR     LR,fontpaint_spaceaddX  ;Copu justification information from the block
+        LDMIA   R5!,{R0-R1,R8-R9}
+        STMIA   LR!,{R0-R1,R8-R9}
+
+        TST     R2,#fontpaintflag_rubout  
+        ADRNE   LR,fontpaint_ruboutbox
+        LDMNEIA R5!,{R0-R1,R8-R9}
+        STMNEIA LR!,{R0-R1,R8-R9}       ;Copy rubout information from the block
+
+        Pull    "R0-R1,R2-R3"           ;Preserve starting font handle and string pointer
+        B       fontswi_paint_coordsblock
+        LTORG
+                   
+;Now we need to handle the case of their being no coordinate block.  This is
+;simply a case of converting the old style call to be a new style one, ie. 
+;getting and converting the justification region into coordinate offsets
+;and then reading the four points for the rubout box and then stashing them
+;in the block in 1/72000" format.
+
+fontswi_paint_nocoordsblock        
+        Push    "R1-R3"                 ;Needed for coordinate conversion
+
+        MOV     R8,R2                   ;Take a seperate copy of flags word
+        ADR     R9,oldpoint             ;Pointer to the OS unit coordinate store
+        
+        MOV     LR,#0
+        STR     LR,fontpaint_spaceaddY  ;No veritcal justification
+        STR     LR,fontpaint_charaddX
+        STR     LR,fontpaint_charaddY   ;No micro justification
+
+        TST     R8,#fontpaintflag_justify
+        STREQ   LR,fontpaint_spaceaddX  ;No justification to be performed
+        BEQ     fontswi_paint_nojustify 
+
+        LDMIA   R9!,{R1,R2}             ;Get the justification final point
+        SWI     XFont_Converttopoints
+        Pull    "R1-R3",VS
+        BVS     fontswi_paint_return    ;Return because the call failed
+   
+;We now calculate the justification offsets within the line, this is quite
+;simple as we already know the number of space characters and the maximum
+;offsets within the line.
+
+        SUB     R1,R1,R3                ;Calculate area to justify into
+        LDR     R2,fontpaint_maxhoffset
+        SUB     R1,R1,R2                ;Remaining space at the end of the line (signed)
+        LDR     R2,fontpaint_spacecount
+        TEQ     R2,#0                   ;Division by zero?
+        MOVEQ   R3,#0
+        BEQ     fontswi_paint_divzeroskip
+
+        Push    "R0"                    ;Calculate the inter-word spacing
+           
+        CMP     R1,#0
+        MVNLT   R1,R1
+        MOV     R0,PC
+        DivRem  R3,R1,R2,LR             ;Divide to work out extra spacing information needed 
+        TEQP    R0,#0
+        MVNLT   R3,R3                   ;Ensure sign correct as converted to +VE before the divide
+
+        Pull    "R0"                    ;Preserve this it is important
+
+fontswi_paint_divzeroskip
+        STR     R3,fontpaint_spaceaddX
+                   
+;Justification calculated now carry on and see if we need to worry
+;about the rubout region.
+
+fontswi_paint_nojustify
+        TST     R8,#fontpaintflag_rubout
+        BEQ     fontswi_paint_norubout  ;No rubout box so don't bother to unpick the coordinates
+
+;We now have to setup the rubout box, this is stored on the coordinate stack
+;as two X,Y coordinate pairs.  We must attempt to read them and then convert
+;them to millipoint values to then be used.
+                      
+        ADR     R3,fontpaint_ruboutbox +(4*4)
+               
+        LDMIA   R9!,{R1,R2}
+        SWI     XFont_Converttopoints   ;Get the top right of the rubout box in millipoints
+        STMVCDB R3!,{R1,R2}             ;Store the converted coordinates
+
+        LDMVCIA R9!,{R1,R2}
+        SWIVC   XFont_Converttopoints   ;Get the bottom left of the rubout box in millipoints
+        STMVCDB R3!,{R1,R2}             ;Store the converted coordinates
+
+        Pull    "R1-R3",VS
+        BVS     fontswi_paint_return   
+        
+;Rub-out area has now been setup, we must now attempt to tidy up.
+
+fontswi_paint_norubout
+        Pull    "R1-R3"
+
+;We have now setup the various registers and the coordinate block to contain meaningful
+;information, we must now attempt to setup the registers ready to contain the painting 
+;of the string.
+
+fontswi_paint_coordsblock
+        TST     R2,#fontpaintflag_matrix
+        ADREQ   R6,defaultmatrix        ;No matrix specified so use a default.
+
+        Push    "R0-R4"
+        LDMIA   R6,{R0-R3,R4,R5}
+        ADR     LR,fontpaint_initmatrix
+        STMIA   LR,{R0-R3,R4,R5}        ;Copy away the initial matrix to be used
+        Pull    "R0-R4"                 ;Preserve the important registers
+                          
+        TST     R2,#fontpaintflag_length   
+        ADDNE   R9,R1,R7                ;Calculate ending point of the line
+        
+        ;amg  9th May 1994
+        ;bignum is too low on a Medusa: it is &02000000, but rma is &02100000
+        ;as a result font_paint calls which weren't specifying the string
+        ;length, and were printing a string from rma, would fail and actually
+        ;print nothing.
+        ;Fix is to use the largest POSITIVE number possible. Can't use -1
+        ;cos the rest of the code uses signed comparisons
+        
+        ;MOVEQ   R9,#BigNum
+        MVNEQ   R9,#&80000000           ;gives &7FFFFFFF
+        
+        Debug   CoreFont, "End of string=",R9
+
+        Push    "R1,R2"
+        ADR     LR,usersoffset
+        LDMIA   LR,{R1,R2}              ;Read the user offset
+        SWI     XFont_Converttopoints   ;And convert to points
+        MOVVC   R5,R1
+        MOVVC   R6,R2                   ;Copy the values away
+        Pull    "R1,R2"                 ;Preserve the string pointer and flags
+        BVS     fontswi_paint_return    ;Return if it errors
+
+        Push    "R1-R3"
+        TST     R2,#fontpaintflag_usehandle
+        LDRNE   R0,fontpaint_initfont   ;Either get the font handle that was passed in R0
+        MOVEQ   R0,#0                   ;Or use current font
+        TEQ     R0,#0                   ;If font handle is zero
+        SWIEQ   XFont_CurrentFont       ;Read the current font being used
+        Pull    "R1-R3"
+
+        LDR     LR,bitclear
+        BIC     R2,R2,LR                ;Clear out the bonus flags from R2
+        SUB     R3,R3,R5
+        SUB     R4,R4,R6                ;Adjust the painting position via the user offset
+
+        ADR     LR,fontpaint_initfont
+        STMIA   LR,{R0,R1,R2,R3-R4}     ;Store handle, String pointer, Flags, Co-ordinates, Matrix ptr
+        
+        ADR     LR,fontpaint_ruboutbox
+        LDMIA   LR,{R0-R3}              ;Get the rubout region
+        SUB     R0,R0,R5
+        SUB     R1,R1,R6
+        SUB     R2,R2,R5
+        SUB     R3,R3,R6                ;Adjust the rubout region via the user offset
+        STMIA   LR,{R0-R3}              ;And then store them away
+
+;We have now setup all the correct data for painting the string and R5 now points
+;at the string terminator.  We no call 'font_stringstart' to prepare to
+;output the string and find out how many passes over the string are wanted
+;and the maximum string chunk length is.
+
+        BL      font_savecolours        ;Take a checkpoint on the colour state
+        BLVC    font_stringstart
+        BVS     fontswi_paint_return
+
+;Now start performing the passes over the string.  At the start of a pass
+;R7 holds the string length limit, R8 the number of passes (count down value),
+;R9 points to the string terminator and R10,R11 contain the usual gumpf.
+
+fontswi_paint_nextpass
+        Debuga  CoreFont, "Start of pass ",R8
+        Debug   CoreFont, " r7,r9 ", R7, R9
+
+        LDR     LR,fontpaint_initfont
+        STR     LR,fontpaint_font       ;Setup the starting font
+
+        ADR     LR,fontpaint_initmatrix
+        LDMIA   LR,{R0-R3,R4-R5}
+        ADR     LR,fontpaint_matrix
+        STMIA   LR,{R0-R3,R4-R5}        ;Setup the start matrix to be used
+
+        BL      font_passstart
+        BVS     fontswi_paint_return    ;Setup the font and colour information as required
+
+        MOV     R0,#0                   ;Underline thickness to zero
+        STR     R0,fontpaint_ulpos
+        STR     R0,fontpaint_ulthick
+
+        ADR     R0,fontpaint_startpos
+        LDMIA   R0,{R1,R2}
+        ADR     R0,fontpaint_paintxy
+        STMIA   R0,{R1,R2}              ;Setup a copy of the painting position
+
+        LDR     R0,fontpaint_ruboutbox  ;Reset the rubout area start point
+        STR     R0,fontpaint_ruboutstart
+
+        LDR     R6,fontpaint_stringaddr ;Setup a pointer to the start of the string
+
+fontswi_paint_interpretloop
+        CMP     R6,R9                   ;End of the line yet?
+        BGE     fontswi_paint_passdone
+
+        LDRB    LR,[R6],#1
+        Debuga  CoreFont, "  ", R6, LR
+        CMP     LR,#32                  ;Is the character printable?
+        BHS     fontswi_paint_printable        
+   
+        TEQ     LR,#0                   ;Finished a pass so exit the loop now
+        TEQNE   LR,#10
+        TEQNE   LR,#13  
+        BEQ     fontswi_paint_passdone
+
+        TEQ     LR,#9
+        TEQNE   LR,#11                  ;Horizontal or vertical offset?
+        BEQ     fontswi_paint_movement
+        TEQ     LR,#17
+        BEQ     fontswi_paint_onecol    ;Single colour change (fore/background)
+        TEQ     LR,#18
+        BEQ     fontswi_paint_allcols   ;Change both for and background
+        TEQ     LR,#19
+        BEQ     fontswi_paint_abscols   ;Change to absolute colours
+        TEQ     LR,#21
+        BEQ     fontswi_paint_comment   ;Skip the comment string
+        TEQ     LR,#25
+        BEQ     fontswi_paint_underline ;Handle the underlining changing
+        TEQ     LR,#26
+        BEQ     fontswi_paint_setfont   ;Handle the font changing
+        TEQ     LR,#27  
+        BEQ     fontswi_paint_matrix4   ;Four word matrix (change CTM)
+        TEQ     LR,#28
+        BEQ     fontswi_paint_matrix    ;Six word matrix (change CTM and offset)
+
+;We have encounted an unknown escape sequence so we must fault it.
+      
+        ADR     R0,ErrorBlock_PrintCantThisFontPaint
+        BL      LookupSingle            
+        B       fontswi_paint_return
+
+        MakeInternatErrorBlock PrintCantThisFontPaint,,NoFPnt
+
+fontswi_paint_passdone
+        BL      font_passend            ;Inform printer specific code we finished this pass
+        BVS     fontswi_paint_finished  
+
+        SUBS    R8,R8,#1                ;Decrease the pass counter
+        BNE     fontswi_paint_nextpass
+
+        BL      font_stringend          ;Allow the printer specific code to tidy up correctly
+
+fontswi_paint_finished
+        MOV     R5,R0
+        MOV     R6,PC                   ;Save error pointer and current flags
+
+        LDR     R0,fontpaint_font       ;Font handle at end of paint sequence one (for compatibility)
+        SWI     XFont_SetFont
+        MOVVC   R0,R5                   ;Restore error pointer if no error
+        TEQVCP  R6,#0                   ;And the original flags
+
+fontswi_paint_return
+        MOV     R3,#intercept_all
+        BL      changeintercept         ;Restore interception of font calls
+        BL      disableandcheckescapes  ;Restore escape state and report any that occured during handling
+        BLVS    makepersistenterror     ;If an error (or escape) occured then make it a persistent error
+
+fontswi_paint_persistentreturn
+        STRVS   R0,[SP]                 ;It errored so return with R0 ->Error block
+        Pull    "R0-R11,PC"
+
+;Data used to create the default matrix and also to clear out the unused bit fields.
+
+defaultmatrix   
+        & 65536, 0, 0, 65536, 0, 0
+        ALIGN
+
+bitclear
+        & fontpaintflag_coordsblk +fontpaintflag_matrix +fontpaintflag_length +fontpaintflag_usehandle +fontpaintflag_mpoint
+        ALIGN
+
+;We now have a printable character, we must attempt to build up a sequence
+;of printable characters to pass to the backend and we must attempt to
+;loop building this string until we either run out of characters, the chunk
+;is filled or a non-printable character is found.
+
+fontswi_paint_printable
+
+;Check to see if an identity matrix is being used, if so then we must
+;attempt to clear or set the matrix being accordingly.
+
+        ADR     LR,fontpaint_matrix
+        LDMIA   LR,{R0-R3,R4-R5}        ;Get the matrix being used
+
+        TEQ     R0,#65536
+        TEQEQ   R1,#0
+        TEQEQ   R2,#0
+        TEQEQ   R3,#65536
+        TEQEQ   R4,#0
+        TEQEQ   R5,#0                   ;Is it an identity matrix?
+
+        LDR     R0,fontpaint_initflags
+        ORRNE   R0,R0,#fontpaintflag_matrix
+        STR     R0,fontpaint_flags      ;Put together a new set of flags
+                                      
+;Now scan and build up a section of printable characters.
+
+        SUB     R1,R6,#1                ;Point at start of printable characters
+
+fontswi_paint_scanprintables   
+        LDRB    LR,[R6],#1              ;Get the next byte
+        CMP     LR,#32                  ;Printable?
+        CMPHS   R9,R6                   ;loop if printable & more wanted
+        BHS     fontswi_paint_scanprintables
+        SUB     R5, R6, R1              ;Get the length of this
+        SUB     R5, R5, #1              ;section
+
+;Now:   R1 contains the start of the current chunk
+;       R5 contains the length of the current chunk
+;       R8 contains the pass number.
+;       R9 points to the overall string terminator.
+;       R10-R12 usual gumf
+
+;Now attempt to paint the chunk, first we will handle the setting up of the
+;rubout region - to do this we must see if the end point is greater than 
+;then user specified end point, if so then we can clip it and then 
+;turn the rubout handling off as it is invalid.
+;
+;Then we must paint the chunk of printable characters
+                     
+        BL      fontswi_paint_nextposition
+        BVS     fontswi_paint_return    ;Calculate the point after painting the string (used for rubout aswell)
+
+        LDR     R6,fontpaint_initflags  ;Are we supposed to be handling the rubout?
+        TST     R6,#fontpaintflag_rubout
+        BEQ     fontswi_paintnorubout
+             
+        LDR     R3,fontpaint_ruboutbox+8
+        LDR     R4,fontpaint_paintendxy ;Get the rubout end and the string end points
+        CMP     R3,R4
+        MOVGT   R3,R4                   ;If rubout ends before end of this chunk then truncate end point and setup 
+                                        ;  flag to indicate that rubout has been finished.
+
+        BICGT   R6,R6,#fontpaintflag_rubout
+        STR     R3,fontpaint_ruboutend 
+
+fontswi_paintnorubout
+        ADR     R3,fontpaint_paintxy
+        LDMIA   R3,{R3,R4}              ;Get the new painting position
+        BL      font_paintchunk         ;Attempt to paint a suitable chunk
+        BVS     fontswi_paint_return    
+
+        STR     R6,fontpaint_initflags  ;Store the modified painting flags (minus rubout if being turned off!)
+                             
+        ADR     LR,fontpaint_paintendxy ;Setup the new painting coordinates
+        LDMIA   LR,{R3,R4}
+        ADR     LR,fontpaint_paintxy
+        STMIA   LR,{R3,R4}              
+                
+        LDR     R3,fontpaint_ruboutend  ;Swap the coordinates around correctly for the next chunk to be painted
+        STR     R3,fontpaint_ruboutstart
+
+        ADD     R6,R1,R5                ;Setup pointer to the next character
+        B       fontswi_paint_interpretloop
+                
+
+;This code is used to calculate the position after painting the string.  The routine
+;uses Font_ScanString with the same parameters as passed into the font_paintchunk
+;call to get the offset to add onto the painting coordinates after the chunk.
+;
+;The routine sets up 'fontpaint_paintendxy' to contain the correct values.
+
+        ASSERT  fontpaint_paintendxy =fontpaint_paintxy +8
+
+fontswi_paint_nextposition
+        Push    "R0-R7,LR"
+
+        MOV     R7,R5                   ;Length of the section to be scanned
+      
+        ADR     R2,fontpaint_spaceaddX
+        LDMIA   R2,{R3-R6}
+        MOV     LR,#-1                  ;Split character is -1 (none)
+        Push    "R3-R6,LR"              ;Push justification + split character
+
+        LDR     R0,fontpaint_font       ;Get the handle of the font to be used
+
+        LDR     R2,fontpaint_flags      ;Setup a valid flags word
+        AND     R2,R2,#fontpaintflag_reversed +fontpaintflag_kern +fontpaintflag_matrix
+        ORR     R2,R2,#fontpaintflag_coordsblk +fontpaintflag_usehandle +fontpaintflag_length
+                
+        MOV     R3,#BigNum 
+        MOV     R4,#BigNum              ;Maximum offsets to get the caret position
+        MOV     R5,SP                   ;Pointer to my coordinate block copy on the stack
+        ADR     R6,fontpaint_matrix
+        SWI     XFont_ScanString        ;Returns the nearest caret position to use as coordaintes
+        ADD     SP,SP,#4*5              ;Balance the stack correctly
+        BVS     fontswi_paint_nextpositionreturn
+
+        ADR     LR,fontpaint_paintxy
+        LDMIA   LR!,{R1,R2}
+        ADD     R1,R1,R3
+        ADD     R2,R2,R4
+        STMIA   LR,{R1,R2}              ;Adjust the painting position correctly
+                             
+fontswi_paint_nextpositionreturn
+        STRVS   R0,[SP]
+        Pull    "R0-R7,PC"
+        
+
+;Now we handle the various escape sequences within the line.  These routines
+;attempt to unpack and handle the bits as required.
+
+fontswi_paint_movement
+        TEQ     LR,#11                          ;9 (X move) or 11 (Y move).
+        ADR     R0,fontpaint_paintxy            ;  Address correct
+        ADDEQ   R0,R0,#4                        ;  co-ordinate, then get
+        LDRB    R1,[R6],#1                      ;  3 byte number
+        LDRB    LR,[R6],#1
+        ORR     R1,R1,LR,LSL #8
+        LDRB    LR,[R6],#1
+        MOV     LR,LR,LSL #24
+        ORR     R1,R1,LR,ASR #8
+        LDR     LR,[R0]                 ;Update offset co-ordinate and loop
+        ADD     LR,LR,R1
+        STR     LR,[R0]
+        B       fontswi_paint_interpretloop
+
+fontswi_paint_onecol                    ;Deal with 17 (single colour change)
+        LDRB    LR,[R6],#1              ;Get the new colour
+
+        [       FontColourFixes
+        MOV     R1,#TopBit
+        MOV     R2,#TopBit
+        MOV     R3,#TopBit
+        |
+        MOV     R1,#-1
+        MOV     R2,#-1
+        MOV     R3,#-1
+        ]
+        CMP     LR,#128
+        ANDLT   R2,LR,#&F
+        ANDGE   R1,LR,#&F
+        B       fontswi_paint_docolours
+
+fontswi_paint_allcols                   ;Deal with 18 (change all colours)
+        LDRB    R1,[R6],#1
+        LDRB    R2,[R6],#1
+        LDRB    R3,[R6],#1
+        AND     R1,R1,#&F
+        AND     R2,R2,#&F
+        [       FontColourFixes
+        MOV     R3,R3,LSL #24
+        MOV     R3,R3,ASR #24
+        |
+        AND     R3,R3,#&F
+        ]
+fontswi_paint_docolours
+        BL      fontswi_setcolours
+        BVC     fontswi_paint_interpretloop
+        B       fontswi_paint_return
+
+fontswi_paint_abscols                   ;Deal with 19 (set absolute colours)
+        LDRB    R1,[R6],#1
+        LDRB    R2,[R6],#1
+        LDRB    R3,[R6],#1
+        MOV     R1,R1,LSL #8
+        ORR     R1,R1,R2,LSL #16
+        ORR     R1,R1,R3,LSL #24
+        BL      font_absbg
+        LDRVCB  R1,[R6],#1
+        LDRVCB  R2,[R6],#1
+        LDRVCB  R3,[R6],#1
+        MOVVC   R2,R2,LSL #16
+        ORRVC   R2,R2,R1,LSL #8
+        ORRVC   R2,R2,R3,LSL #24
+        BLVC    font_absfg
+        LDRVCB  R3,[R6],#1
+        [       FontColourFixes
+        MOVVC   R3,R3,LSL #24
+        MOVVC   R3,R3,ASR #24
+        ]
+        STRVC   R3,fontcoloffset
+        BLVC    font_coloffset
+        BVC     fontswi_paint_interpretloop
+        B       fontswi_paint_return
+
+fontswi_paint_comment
+fontswi_paint_commentloop               ;Deal with 21 (comment)
+        LDRB    LR,[R6],#1
+        CMP     LR,#32
+        BHS     fontswi_paint_commentloop
+        B       fontswi_paint_interpretloop
+
+fontswi_paint_underline                 ;Deal with 25 (underline control)
+        LDRB    R0,[R6],#1
+        LDRB    R1,[R6],#1
+        ADR     LR,fontpaint_ulpos
+        STMIA   LR,{R0,R1}
+        ASSERT  fontpaint_ulthick = fontpaint_ulpos+4
+        B       fontswi_paint_interpretloop
+
+fontswi_paint_setfont                   ;Deal with 26 (change font)
+        LDRB    R0,[R6],#1
+        STR     R0,fontpaint_font
+        B       fontswi_paint_interpretloop
+                
+fontswi_paint_matrix4
+        Push    "R0-R3,R4-R5"
+        ADD     R6,R6,#3
+        BIC     R6,R6,#3                ;Align to nice word boundary
+
+        LDMIA   R6!,{R0-R3}
+        MOV     R4,#0
+        MOV     R5,#0                   ;Munge the translation point to zero
+        
+        ADR     LR,fontpaint_matrix
+        STMIA   LR,{R0-R3,R4-R5}
+
+        Pull    "R0-R3,R4-R5"
+        B       fontswi_paint_interpretloop
+
+fontswi_paint_matrix
+        Push    "R0-R3,R4-R5"
+        ADD     R6,R6,#3
+        BIC     R6,R6,#3                ;Align to nice word boundary
+
+        LDMIA   R6!,{R0-R3,R4,R5}       ;Read the matrix from the string
+        ADR     LR,fontpaint_matrix
+        STMIA   LR,{R0-R3,R4-R5}
+
+        Pull    "R0-R3,R4-R5"
+        B       fontswi_paint_interpretloop
+
+        END

@@ -1,0 +1,418 @@
+/*  Title: > c.wlink
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.drag"
+#include "h.loadsave"
+#include "h.main"
+#include "h.menu"
+#include "h.redraw"
+#include "h.scaffold"
+
+
+os_error *linkchar(Char_Block *charptr);
+os_error *create_named_window(wimp_wind *template, wimp_w *handle, char *name);
+
+
+/* ---- global variables -------------------------------------------------- */
+
+
+Wind_Link   Wind_Head,
+            *backlink;
+
+Wind_Link * menuhandle;
+
+int         fontxpos,fontypos;
+
+Font_Block  *thisfont;
+Char_Block  *thischar;
+Path_Block  *thispath;
+
+char_flags  charflags = CHAR_GRIDEDGES | CHAR_FLATTENED;
+
+
+/* ---- functions --------------------------------------------------------- */
+
+
+os_error * addwindlink(wimp_w handle, wtype type, void *info)
+{
+  Wind_Link *wlink;
+
+  er(getheap(Wind_Link,&wlink));
+
+  wlink->next = Wind_Head.next;
+  Wind_Head.next = wlink;
+  wlink->wind_handle = handle;
+  wlink->type = type;
+  wlink->info = info;
+  return(NULL);
+}
+
+
+/* Delete window, along with its link in the chain
+ * Frees title heap block if this is a character window
+ */
+
+void deletewindlink(Wind_Link *backlink, Wind_Link *wlink)
+{
+  switch(wlink->type) {
+    case W_SKELETON:
+    case W_FULL:
+    case W_BITMAP:
+      { wimp_winfo wblk;
+        wblk.w = wlink->wind_handle;
+        erx(wimp_get_wind_info(&wblk));
+        heap_free(wblk.info.title.indirecttext.buffer);    /* title includes character name */
+      }
+  }
+  backlink->next = wlink->next;
+  erx(wimp_delete_wind(wlink->wind_handle));
+  heap_free(wlink);
+}
+
+
+/* Return pointer to window link for the given window handle
+ * If window is not recognised, the program is aborted !!!
+ */
+
+Wind_Link *findwindlink(wimp_w handle)
+{
+  Wind_Link *wlink;
+
+  if (handle == -1
+   || handle == -2
+   || handle == info_window
+   || handle == save_window
+   || handle == save_window2
+   || handle == origin_window
+   || handle == magnifier_window
+   || handle == fontsize_window) return(NULL);
+
+  wlink = findwindlink2(handle);
+  if (wlink) {
+    return(wlink);
+  } else {
+    os_error error;
+    sprintf(error.errmess,"Window handle %d not recognised",handle);
+    errorexit(&error);
+    return(NULL);
+  }
+}
+
+
+/* As above, but just returns NULL if window handle not recognised */
+
+Wind_Link *findwindlink2(wimp_w handle)
+{
+  Wind_Link *wlink = &Wind_Head;
+
+  while (wlink->next != NULL)
+  {
+    backlink = wlink;
+    wlink = wlink->next;
+    if (wlink->wind_handle == handle) return(wlink);
+  }
+  return(NULL);
+}
+
+
+/* Find window link for a given type/info pair */
+
+Wind_Link *findwindinfo(wtype type, void *info)
+{
+  Wind_Link *wlk = &Wind_Head;
+  while (wlk->next != NULL)
+  {
+    backlink = wlk;
+    wlk = wlk->next;
+    if ((wlk->type == type) && (wlk->info == info)) return(wlk);
+  }
+  return(NULL);
+}
+
+
+/* ---- Window/font creation routines -------------------------------------- */
+
+
+os_error * newfont(Font_Block **fontpp)
+{
+  Font_Block * fontptr;
+  int i;
+
+  er(getheap(Font_Block,&fontptr));
+  fontptr->parent = NULL;
+  strcpy(fontptr->filename,"FontFile");
+  strcpy(fontptr->filename2,"IntMetrics");
+  fontptr->currchar = -1;
+  fontptr->scaffold.selchar = 0;
+  fontptr->scaffold.index = 0;
+  {
+    static FFile_FontHdr inithdr =
+    {
+      FONT_READY,              /* fontid               */
+      0,                       /* bpp                  */
+      6,                       /* version number       */
+      500,                     /* designsize (was 458) */
+      -25,-80,458,458,         /* x0, y0, xs, ys       */
+      0,0,0,0,0,0,0,0,0,       /* offsets to chunks    */
+    };
+
+    int size = (sizeof(inithdr) + 2 + 3) & ~ 3;  /* allow 2 chars for null title */
+    FFile_FontHdr *f;
+
+    e( { heap_free(fontptr); return(e); },
+         myflex_alloc((flex_ptr)&fontptr->filedata,size)
+     );
+
+    *(f=fontptr->filedata) = inithdr;        /* initialise */
+
+    for (i=0;i<=8;i++) f->chunk.offsets[i] = size;
+    f->table[0] = 2;  /* table length */
+    f->table[1] = 0;  /* 2 zero terminators - null title */
+    er(changetitle(fontptr,512,"<Untitled>","Outlines"));
+    for (i=1;i<=255;i++) f->table[i] = 0;
+  }
+
+  fontptr->basefiledata = NULL;
+
+  fontptr->spritedata = NULL;
+  fontptr->skeleton_threshold = 0;     /* always draw skeleton lines */
+
+  e( { heap_free(fontptr); return(e); }, heapalloc(256*sizeof(Char_Block *),(void **)&fontptr->chars));
+
+  mytracef("font->chars = &%p\n",fontptr->chars);
+
+  fontptr->nchars = 256;
+  for(i=0;i<fontptr->nchars;i++) { fontptr->chars[i]=NULL; }
+
+  fontptr->grid.skip = 32;     /* chunk 0 not displayed */
+  fontptr->grid.across = 16;   /* 16 chars per row */
+
+  fontptr->display.charnames = showcharnames;   /* display character names in font index */
+  fontptr->display.endpoints = FALSE;           /* don't display the end points */
+
+  *fontpp = fontptr;           /* fill in font pointer pointer */
+
+  return(NULL);
+}
+
+
+/* create a font window and associate it with the given font block */
+
+os_error *newfontwindow(Font_Block *fontptr)
+{
+  int marginx = t_fontindex.i[0].box.x0 - t_fontindex.w.ex.x0;
+  int marginy = t_fontindex.i[0].box.y0 - t_fontindex.w.ex.y0;
+
+  {
+    int oldskip = fontptr->grid.skip;
+    fontptr->grid.skip = 0;                        /* go for max possible height */
+    getfontbox(fontptr, &t_fontindex.i[0].box);    /* sets up width and height */
+    fontptr->grid.skip = oldskip;
+  }
+
+  t_fontindex.w.ex.x1 = t_fontindex.i[0].box.x1 + marginx;
+  t_fontindex.w.ex.y0 = t_fontindex.i[0].box.y0 - marginy;
+
+  er(wimp_create_wind(&t_fontindex.w,&handle));
+
+  er(addwindlink(handle,W_FONTINDEX,fontptr));
+
+  er(setextent(Wind_Head.next));      /* assume this is the one! */
+
+  return(openxy(handle,fontxpos,fontypos-=80));
+}
+
+
+os_error * newchar(Font_Block *parent, int charnumber)
+{
+  Char_Block * charptr;
+  FFile_FontHdr *ffile = parent->filedata;
+  int i;
+
+  if (charnumber==0) returnerr("Character 0 must always be null");
+
+  er(getheap(Char_Block,&charptr));
+
+  charptr->parent = parent;
+  charptr->charno = charnumber;
+  parent->chars[charnumber] = charptr;
+
+  charptr->sprname[0] = 0;              /* no sprite defined yet       */
+  charptr->backsprite[0] = 0;           /* no background sprite either */
+
+  charptr->composites = NULL;           /* list of character indices added to this one */
+  charptr->selcomp = NULL;              /* selected composite section */
+
+  charptr->flags = 0;
+  charptr->flatness = 100;              /* better than default value */
+  charptr->orgX = 0;
+  charptr->orgY = 0;
+
+  charptr->xwidth = charptr->ywidth = 0;   /* read in when a font is loaded */
+
+/*  No point in setting these - globalmag takes care of it.
+  charptr->magnifierup = 1;
+  charptr->magnifierdown = 1;
+  charptr->variable = 1;
+*/
+
+  charptr->xlowc =         /* used to be set to same as windowbox */
+  charptr->ylowc =
+  charptr->xupperc =
+  charptr->yupperc = 0;
+
+  charptr->windowbox.x0 = ffile->x0;
+  charptr->windowbox.y0 = ffile->y0;
+  charptr->windowbox.x1 = ffile->x0 + ffile->xs;
+  charptr->windowbox.y1 = ffile->y0 + ffile->ys;
+
+  charptr->nextpath = NULL;
+  charptr->sline.p[1] = NULL;
+  charptr->template = NULL;
+
+  charptr->scaffold.basechar = 0;
+  for (i=0;i<16;i++) {
+    charptr->scaffold.xchar[i] = charnumber;
+    charptr->scaffold.xlink[i] = 0;
+    charptr->scaffold.xcoord[i] = NULL_SCAFFOLD;
+  }
+  er(linkchar(charptr));   /* see if any bitmaps can be created */
+
+  return(redrawtree(parent));        /* the tree changes when a new char is created */
+}
+
+
+/* Set up outline/bitmap links for this character, and redraw bitmap windows if nec. */
+
+os_error *linkchar(Char_Block *charptr)
+{
+  Wind_Link *wlk;
+  Font_Block *fontptr = charptr->parent;
+  int bpp = fontptr->filedata->bpp;
+  int charno = charptr->charno;
+
+  /* look for potential links to this character */
+
+  wlk = Wind_Head.next;
+  while (wlk) {
+    if (wlk->type == W_FONTINDEX) {
+      Font_Block *font2 = wlk->info;
+      if (bpp==0) {
+        if (font2->parent == fontptr) {
+          register Char_Block *ch2 = font2->chars[charno];
+          if (ch2) ch2->template = charptr;      /* do this even if char not displayed */
+        }
+      } else {
+        if (fontptr->parent == font2)
+          charptr->template = font2->chars[charno];
+      }
+    }
+    wlk = wlk->next;
+  }
+
+  /* redraw any characters which just gained a parent! */
+
+  wlk = Wind_Head.next;
+  while(wlk) {
+    if (wlk->type == W_BITMAP) {
+      Char_Block *ch2 = wlk->info;
+      if (ch2)
+      if (ch2->template == charptr)
+        invalidate(wlk->wind_handle,-big,-big,big,big);
+    }
+    wlk = wlk->next;
+  }
+  return(NULL);
+}
+
+
+os_error * open_char(type, charptr)
+int type;
+Char_Block * charptr;
+{
+  wimp_w newhandle;
+  Wind_Link *wlk;
+  char name[10];
+
+  strcpy(name, charname(charptr->charno));    /* make a copy of the char name */
+  er(loadchar(charptr));                     /* ensure character is loaded */
+
+  if ((wlk = findwindinfo(type, charptr)) != NULL)
+  {
+    newhandle = wlk->wind_handle;
+  }
+  else
+  {
+    er(savechar(charptr));
+    er(loadchar(charptr));       /* construct (blank) sprite */
+
+    switch(type)
+    {
+      case W_SKELETON:
+           er(create_named_window(&t_skeleton.w, &newhandle, name));
+           charptr->magnifierup = globalmag_up;
+           charptr->magnifierdown = globalmag_down;
+           charptr->variable = globalmag_variable;
+           break;
+
+      case W_FULL:
+           er(create_named_window(&t_full.w, &newhandle, name));
+           break;
+
+      case W_BITMAP:
+           charptr->magnifierup = globalmag_up;             /* not actually used, */
+           charptr->magnifierdown = globalmag_down;    /* but needed for getchardata */
+           charptr->variable = globalmag_variable;          /* should really be a separate set */
+           charptr->flags = orrin(charptr->flags, charflags, CHAR_GRID);
+           er(create_named_window(&t_bitmap.w, &newhandle, name));
+           er(loadchar(charptr->template));
+    }
+    er(addwindlink(newhandle, type, charptr));
+    er(setextent(Wind_Head.next));       /* assume this is where it's put */
+  }
+
+  return(front(newhandle));
+}
+
+
+/* Create named window, combining the given name with the format string in the title
+ * NB: heap block used to hold string must be freed by deletewindlink()
+ */
+
+os_error *create_named_window(wimp_wind *template, wimp_w *handle, char *name)
+{
+  char buffer[256];
+  char *formatstr = template->title.indirecttext.buffer;
+  char *heapblock;
+  os_error *err;
+  char *ch;
+
+  for (ch=formatstr; *ch >= 32; ch++) { }; *ch = 0;   /* ensure zero-terminated */
+
+  sprintf(buffer, formatstr, name);
+  er(heapalloc(strlen(buffer)+1, (void **)&heapblock));
+  strcpy(heapblock, buffer);
+
+  template->title.indirecttext.buffer = heapblock;
+  err = wimp_create_wind(template, handle);
+  template->title.indirecttext.buffer = formatstr;
+
+  return(err);
+}
+
+
+/* Return the winding rule information about a specified font, this involves
+ * not only checking the scaffold flags but also checking the version 
+ */
+
+int nonzerowinding(Char_Block *charptr)
+  {
+    if (charptr->parent->filedata->version >=8) {
+      return (charptr->parent->filedata->chunk.new.scaffoldflags & SCF_NONZERO);
+    }
+    return FALSE;
+  }

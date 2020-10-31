@@ -1,0 +1,626 @@
+; > Core.ColTrans
+
+;----------------------------------------------------------------------------
+;
+; The ColourV interception routine
+;
+;----------------------------------------------------------------------------
+
+interceptcolour
+        Push    "R10,R11,LR"
+
+; Is this a ColourTrans call we're not interested in?
+        LDRB    LR,passthrough
+        TST     LR,#passthrough_col
+        Pull    "R10,R11,PC",NE
+
+; note that an application should not rely on colour trans stuff (eg. translation
+;   table) in counting pass being meaningful during real pass
+; pass on if it is a counting pass (printer code would return rubbish anyway)
+        LDR     LR, counting_pass
+        CMP     LR, #0
+        Pull    "R10,R11,PC",NE
+
+        CMP     R8,#(intcolour_tableend - intcolour_table):SHR:2
+        BHS     intcolour_wanted
+        ADR     LR,intcolour_table
+        LDR     LR,[LR,R8,LSL #2]
+        TEQ     LR,#0
+        Pull    "R10,R11,PC",EQ
+intcolour_wanted
+
+; Pick up current job's workspace, check for persistent errors, enable
+; ESCAPEs and pass through recursive OS_WriteC's
+
+        ASSERT  :BASE:currenthandle = R12
+        ASSERT  :INDEX:currenthandle = 0
+        ASSERT  currentws = currenthandle + 4
+        LDMIA   R12,{R10,R11}           ;R10:=currenthandle, R11:=currentws
+
+        BL      checkpersistenterror
+        BVS     intcolour_persistentreturn
+
+        BL      enableescapes
+        BVS     intcolour_return
+
+; Error if the reason code is out of range. Otherwise process the call.
+
+        CMP     R8,#(intcolour_tableend - intcolour_table):SHR:2
+      [ VectorErrors
+        BHS     intcolour_unknown       ;Give up because unknown reason
+      |
+        BHS     intcolour_return
+      ]
+        MOV     LR,PC
+        ADD     PC,PC,R8,LSL #2         ;Table driven subroutine call
+        B       intcolour_return
+
+; Zeroes in the following table indicate that the relevant call should be
+; passed on to the previous owner of the vector without entering the
+; printer driver's error-handling environment, and in particular without
+; having the chance to generate a persistent error.
+;   Note that the code above ensures that such a zero cannot be branched to.
+
+intcolour_table
+        B       intcolour_selecttable   ;SelectTable
+        B       intcolour_passon        ;SelectGCOLTable
+        B       intcolour_passon        ;ReturnGCOL
+        B       intcolour_setgcol       ;SetGCOL
+        B       intcolour_retcn         ;ReturnColourNumber
+        B       intcolour_passon        ;ReturnGCOLForMode
+        B       intcolour_retmodecn     ;ReturnColourNumberForMode
+        B       intcolour_passon        ;ReturnOppGCOL
+        B       intcolour_setopgcol     ;SetOppGCOL
+        B       intcolour_retoppcn      ;ReturnOppColourNumber
+        B       intcolour_passon        ;ReturnOppGCOLForMode
+        B       intcolour_retmodeoppcn  ;ReturnOppColourNumberForMode
+        DCD     0                       ;GCOLToColourNumber
+        DCD     0                       ;ColourNumberToGCOL
+        B       intcolour_passon        ;ReturnFontColours
+        B       intcolour_setfontcols   ;SetFontColours
+        DCD     0                       ;InvalidateCache
+        B       intcolour_passon        ;SetCalibration
+        B       intcolour_passon        ;ReadCalibration
+        B       intcolour_passon        ;ConvertDeviceColour
+        B       intcolour_passon        ;ConvertDevicePalette
+        B       intcolour_passon        ;ConvertRGBToCIE
+        B       intcolour_passon        ;ConvertCIEToRGB
+        B       intcolour_passon        ;WriteCalibrationToFile
+        B       intcolour_passon        ;ConvertRGBToHSV
+        B       intcolour_passon        ;ConvertHSVToRGB
+        B       intcolour_passon        ;ConvertRGBToCMYK
+        B       intcolour_passon        ;ConvertCMYKToHSV
+        B       intcolour_passon        ;ReadPalette
+        B       intcolour_passon        ;SetPalette
+        B       intcolour_passon        ;SetColour
+        DCD     0                       ;MiscOp
+        B       intcolour_passon        ;WriteLoadingsToFile
+        DCD     0                       ;SetTextColour
+        DCD     0                       ;SetOppTextColour
+        B       intcolour_generatetable ;GenerateTable
+       
+intcolour_tableend
+           
+       [ VectorErrors
+intcolour_unknown
+        ADR     r0, ErrorBlock_PrintCantUnkColV
+        BL      LookupSingle            ; Always sets the V flag
+      ]
+
+intcolour_return
+        BL      disableandcheckescapes
+        BLVS    makepersistenterror
+intcolour_persistentreturn
+        Pull    "R10,R11,LR,PC"         ;Return from this routine
+
+intcolour_passon
+        BL      disableandcheckescapes
+        BLVS    makepersistenterror
+        Pull    "R10,R11,PC",VC
+        Pull    "R10,R11,LR,PC"
+
+      [ VectorErrors
+        MakeInternatErrorBlock PrintCantUnkColV
+      ]
+       
+;------------------------------------------------------------------------------
+
+        [ Medusa
+
+; Determine the mode of a sprite.
+; In:  R0 -> sprite area
+;      R1 -> sprite name, or sprite
+;      R5: Bit 0 set if R1 -> sprite
+; Out: R0 = mode number or sprite type
+; Error: VSET
+
+intcolour_spritemode
+        Push    "R1-R6,LR"
+
+;        Debug   Medusa, "intcolour_spritemode ", R0, R1, R5
+
+        MOV     R2, R1
+        MOV     R1, R0
+        TST     R5, #1 :SHL: 0
+        MOVNE   R0, #SpriteReason_ReadSpriteSize :OR: (1 :SHL: 9)
+        MOVEQ   R0, #SpriteReason_ReadSpriteSize :OR: (1 :SHL: 8)
+
+; no need to change interception of SpriteOp as we pass this
+; reason straight on
+
+        Debug   Medusa, "OS_SpriteOp ", R0, R1, R2, R3, R4, R5, R6, R7
+        SWI     XOS_SpriteOp
+        Debug   Medusa, "OS_SpriteOp out ", R0, R1, R2, R3, R4, R5, R6, R7
+        MOVVC   R0, R6                  ; Return mode if no error
+
+;        Debug   Medusa, "intcolour_spritemode returns ", r0
+
+        Pull    "R1-R6,PC"
+
+
+; Determine the depth of a mode
+; In: R0: mode number or sprite type
+; Out: R2: log2bpp of that mode
+; Error: VSET
+
+intcolour_log2bpp
+        Push    "R1,LR"
+;        Debug   Medusa, "log2bpp called for mode ", R0
+        CLRV
+        MOV     R1, #9                  ; Log2BPP
+        SWI     XOS_ReadModeVariable
+        SETV    CS
+
+;        DebugE  Medusa, "XOS_ReadModeVariable error: "
+;        Debug   Medusa, "intcolour_log2bpp returns ", r2
+
+        Pull    "R1,PC"
+
+
+; Determine whether depth of a mode/sprite is 16/32.  On non-Medusa systems
+; the OS error caused by trying to investigate a Medusa mode/sprite will
+; be passed back to the caller.
+;
+; In:  R0 = mode number, OR
+;      R0 = sprite type, OR
+;      R0 -> mode selector, OR
+;      R0 -> sprite area
+;      R1 -> sprite name, or sprite
+;      R5: Bit 0: R1 -> sprite, else name (only significant when R0 - >sprite area)
+; Out: EQ if the sprite is defined in a 16/32bpp mode
+; Error: VSET
+
+intcolour_16or32
+        Push    "R0,R2,LR"
+        TEQ     R0, #256                ; Bodge for !Draw
+        TEQNE   R0, #&8000              ; Bodge for the Wimp
+        BEQ     %FT03
+        CMP     R0, #-1                 ; Is is -1 (current mode),
+        BICNES  R2, R0, #255            ; or is it an old-fashioned mode number?
+        BEQ     %FT01
+        TST     R0, #1                  ; Is it a sprite type?
+        BNE     %FT01                   ; handle like a mode number if so
+
+; It's not a mode number, so it could be a mode selector ptr or a sprite area ptr.
+; Determine which:-
+
+        LDR     R2, [R0]                ; Get first word of sprite area/mode selector
+        TST     R2, #1 :SHL: 0          ; is bit 0 set?
+        BNE     %FT01                   ; if so, it's a mode selector which OS_ReadModeVariable can handle
+
+03
+        BL      intcolour_spritemode    ; Must be a sprite.  Get sprite's mode number or selector into R0
+        STRVS   R0, [SP]                ; Return error if the
+        Pull    "R0,R2,PC",VS           ;   OS does not grok this sprite
+
+01
+        BL      intcolour_log2bpp       ; R0 = log2BPP
+        STRVS   R0, [SP]
+        Pull    "R0,R2,PC",VS           ; OS does not grok this mode
+
+        TEQ     R2, #4                  ; is is 16bpp?
+        TEQNE   R2, #5                  ; or 32bpp?
+
+;        DebugIf NE, Medusa, "intcolour_16or32 returns NE"
+;        DebugIf EQ, Medusa, "intcolour_16or32 returns EQ"
+
+        Pull    "R0,R2,PC"              ; if so, leave EQ set
+
+        ]       
+
+;------------------------------------------------------------------------------
+
+; Deal with ColourTrans_SelectTable / ColourTrans_GenerateTable, this is done
+; by calling down to ColourTrans_GenerateTable to give the physical palette
+; entries and then returning the appropriate pixtrans block.
+
+        [ Medusa
+;       If this is a 16/32bpp sprite, pass on to ColourTrans
+;       which will handle the request.  Any table that ColourTrans gives to
+;       the app will be ignored by the sprite plotting code when the
+;       sprite is 16/32bpp.
+;
+;       Otherwise, behave as before, filling our own lookup table with
+;       RGB values.   XXX - I assume that GenerateTable with 'return
+;       physical palette table' will correctly give me a 256-entry table
+;       if the mode is an 8bpp full palette mode?
+;
+;       Note: 8bpp full palette mode goes through this code as for old modes.
+;       However, when subsequently plotting the sprite, we will actually use
+;       its palette directly if it has one.
+        ]
+
+
+intcolour_selecttable
+        CMP     R2,#-1                  ;Pass through to ColourTrans if 
+        BNE     intcolour_passon        ;  destination mode <> -1
+
+        Debug   mjs, "select_table ", R0, R1, R2, R3, R4, R5, R6, R7
+
+        Push    "R0-R9,LR"              ;Preserve the important registers
+
+        ; The following code zeroes the flags unless R0 is
+        ; a sprite area pointer
+
+        CMP     R0, #-1                 ;Is source "current mode"
+        MOVEQ   R5, #0
+        BEQ     intcolour_selecttable_doneflags
+
+        BICS    LR, R0, #&FF            ;Is source an old mode number?
+        MOVEQ   R5, #0
+        BEQ     intcolour_selecttable_doneflags
+
+        [ Medusa
+        TST     R0, #&01                ;Is source a sprite type (bit 0 set)?
+        MOVNE   R5, #0
+        BNE     intcolour_selecttable_doneflags
+
+        ; Bodge for !Draw, which hopes to fool the system into thinking
+        ; it has passed a sprite area in by setting R0=256
+        TEQ     R0, #256                ;If it's !Draw, then leave the flags alone
+        TEQNE   R0, #&8000              ; and this bodge is for the Wimp (suggested by AMG)
+        BEQ     intcolour_selecttable_doneflags
+
+        LDR     LR, [R0]                ;Get the first word of the block
+        TST     LR, #&01                ;If bit 0 set, it's a mode descriptor
+        MOVNE   R5, #0
+        ]
+
+intcolour_selecttable_doneflags
+
+    Debug mjs,"select_table stored effective R5 = ",R5
+        STR     R5, ctrans_selgentab_R5 ;store the R5 flags value (zapped to 0 as appropriate)
+
+        [ Medusa
+        BL      intcolour_16or32        ;Is source mode 16 or 32bpp?
+        STRVS   R0,[sp,#CallerR0]       ;Poke error return address onto the stack
+        Pull    "R0-R9,PC",VS           ;  and return error if test failed
+        LDREQ   R8, jpeg_ctransflag     ;we cannot pass on jpeg request (relies on proper table)
+        CMPEQ   R8, #0                  ;R8 != 0 if jpeg
+        Pull    "R0-R9,LR",EQ           ;If it is 16/32bpp, not jpeg
+        BEQ     intcolour_passon        ;  Pass the call thru to ColourTrans
+        ]
+
+        B       intcolour_table_generate;  then process in the common routines
+
+intcolour_generatetable
+  Debug   mjs, "generate_table (before pass on check)", R0, R1, R2, R3, R4, R5, R6, R7
+        MOVS    R10,R5,LSR #24          ;Return if not generating the pixel translation table
+        CMPNE   R2,#-1                  ;Pass through to ColourTrans if
+        BNE     intcolour_passon        ;  destination mode <> -1
+
+        Debug   mjs, "generate_table ", R0, R1, R2, R3, R4, R5, R6, R7
+
+        Push    "R0-R9,LR"              ;Preserve the registers, return address already pushed
+
+        STR     R5, ctrans_selgentab_R5 ;store the entry R5 flags value
+
+        [ Medusa
+        BL      intcolour_16or32        ;Is source mode 16 or 32bpp?
+        STRVS   R0,[sp,#CallerR0]       ;Poke error return address onto the stack
+        Pull    "R0-R9,PC",VS           ;  and return error if test failed
+        LDREQ   R8, jpeg_ctransflag     ;we cannot pass on jpeg request (relies on proper table)
+        CMPEQ   R8, #0                  ;R8 != 0 if jpeg
+        Pull    "R0-R9,LR",EQ           ;If it is 16/32bpp
+        BEQ     intcolour_passon        ;  Pass the call thru to ColourTrans
+        ]
+
+intcolour_table_generate
+
+        Debug   mjs, "MJS: trapped coltrans table select/generate"
+
+        LDR     R8, jpeg_ctransflag     ;check for jpeg request 
+        CMP     R8, #0                  ;R8 != 0 if jpeg
+        BEQ     intcolour_not_jpeg
+        CMP     R4, #0                  ;is it asking for buffer size?
+        MOVEQ   R4, #12                 ;size of 32k table descriptor block
+        STREQ   R4, [sp,#CallerR4]
+        Pull    "R0-R9,PC", EQ
+
+; should only get here for jpeg request, deep pixels to non-deep strip type
+        BL      jpeg_ctrans_handle
+        Pull    "R0-R9,PC"
+
+intcolour_not_jpeg
+        LDRB    R8,passthrough
+        ORR     LR,R8,#passthrough_col
+        STRB    LR,passthrough          ;Allow ColourTrans calls
+        Push    "R8"                    ;  preserving the old state of the flags word
+
+        MOV     R8,R4                   ;Return buffer to be filled
+        MOV     R9,#0                   ;No temporary store allocated yet
+
+        Push    "R0-R3,R5-R7"
+                                          
+        MOV     R4,#0                   ;Return the size of the
+        ORR     R5,R5,#1:SHL:24         ;  table of palette entries generated
+        SWI     XColourTrans_GenerateTable
+        MOVVC   R0,#ModHandReason_Claim     
+        MOVVC   R3,R4                   ;Attempt to claim a buffer big enough to put
+        SWIVC   XOS_Module              ;  all the physical palette entries into
+        MOVVC   R9,R2
+        MOVVC   R10,R3                  ;End of the table to be scanned
+
+        STRVS   R0,[SP]
+        Pull    "R0-R3,R5-R7"           ;Restore the registers (returning an error pointer)
+
+        MOVVC   R4,R9                   ;Fill the buffer with the physical colours
+        ORRVC   R5,R5,#1:SHL:24         ;  for converting to pixel values
+        SWIVC   XColourTrans_GenerateTable
+        BVS     intcolour_table_errored
+
+        LDR     R5,ctrans_selgentab_R5  ; get effective caller R5 back (interested in bit4 'wide')
+  Debug mjs,"mjs: generate/select table  effective R5 = ",R5
+
+; R8 -> buffer to be filled with pixtrans values
+; R9 => start of the table to be processed
+; R10 -> end of the buffer to be processed
+                
+        MOV     R1,#0                   ;Index into the table being scanned
+        MOV     R3,#0                   ;count of bytes stored
+
+intcolour_table_mainloop
+        CMP     R1,R10,LSR #2           ;Have we finished scanning the table yet?
+  Debug mjs,"mjs: colour table, R1 R3 = ",R1,R3
+        MOVEQ   R1, R3
+        BEQ     intcolour_table_return  ;  yes, so tidy and then return
+
+        LDR     R0,[R9,R1,LSL #2]       ;Get the physical palette entry
+        BIC     R0,R0,#&FF              ;  nobble of the lower eight bits (not important)
+        TST     R5, #&10                ; check 'wide' bit
+        BEQ     intcolour_tmloop_notwide
+        Push    "R1"
+        BL      colour_rgbtopixvalwide
+        MOV     R2, R1                  ; R2 = bytes in pixel value (1,2 or 4)
+        Pull    "R1"
+        CMP     R8,#0                   ; Do we need to store back any values - reading the size?
+        BEQ     intcolour_tmloop_wcount
+        CMP     R2, #1
+        STREQB  R0,[R8,R1]
+        BEQ     intcolour_tmloop_wcount
+        CMP     R2, #2
+        BEQ     intcolour_tmloop_w2
+; R2 should be 4
+        STR     R0,[R8,R1,LSL #2]
+        B       intcolour_tmloop_wcount
+intcolour_tmloop_w2
+        STRB    R0,[R8,R1, LSL #1]
+        ADD     R8, R8, #1
+        MOV     R0, R0, LSR #8
+        STRB    R0,[R8,R1, LSL #1]
+        SUB     R8,R8, #1
+intcolour_tmloop_wcount
+        ADD     R1, R1, #1
+        ADD     R3, R3, R2
+        B       intcolour_table_mainloop
+
+intcolour_tmloop_notwide
+        BL    colour_rgbtopixval        ; and then convert to a pixtrans value
+        CMP     R8,#0                   ; Do we need to store back any values - reading the size?
+        STRNEB  R0,[R8,R1]              ; yes, so store back into the table
+        ADD     R1,R1,#1                ; increasing the index until finished scanning
+        ADD     R3,R3,#1
+        B       intcolour_table_mainloop
+       
+intcolour_table_return
+        Pull    "LR"
+        STRB    LR,passthrough          ;Restore old interception flags
+
+        MOV     R0,#ModHandReason_Free
+        MOV     R2,R9
+        SWI     XOS_Module              ;Release the temporary block of RMA
+
+  Debug mjs,"about to return table R1 R8 ",R1,R8
+        TEQ     R8,#0                   ;Were they just reading the size?
+        STREQ   R1,[sp,#CallerR4]       ;  yes, so modify the return frames entry giving the size
+
+        Pull    "R0-R9,PC"              ;Return assuming that the return address is stacked
+
+intcolour_table_errored
+        STR     R0,[sp,#CallerR0]       ;Poke error return address onto the stack
+
+        Pull    "LR"
+        STRB    LR,passthrough          ;Restore the old interception flags
+
+        MOVS    R2,R9                   ;Is there a temporary block to release?
+        MOVNE   R0,#ModHandReason_Free  ;  yes, its non-zero so there must be one!
+        SWINE   XOS_Module
+                          
+        SETV                            ;Ensure that oVerflow set 'cos R0 -> error block
+        Pull    "R0-R9,PC"              ;  and return assuming return address already pushed!
+                       
+
+; Deal with calling the PaletteV and then read palette.
+
+intcolour_readpalette
+        Push    "R4,R9,LR"
+
+        MOV     R4,#paletteV_Read
+        MOV     R9,#PaletteV            ;Setup reason code and vector to call
+        SWI     XOS_CallAVector         ;And then jump to the vector handler
+        Pull    "R4,R9,PC",VS
+            
+; On Medusa PaletteV is claimed and the value returned is
+; expected to be correct.  Therefore on Medusa the following
+; code will not be executed:-
+
+        CMP     R4,#paletteV_Complete   ;Will clear V if worked
+        SWINE   XOS_ReadPalette         ;Attempt to read the palette if that fails
+        LDRNE   LR,=&F0F0F000           ;Returns &B0G0R000
+        ANDNE   R2,R2,LR
+        ORRNE   R2,R2,R2,LSR #4         ;Return so that &B0G0R000 -> &BBGGRR00
+
+        Pull    "R4,R9,PC"
+        LTORG
+
+
+; Deal with ColourTrans_SetGCOL.
+
+intcolour_setgcol
+        Push    "LR"                    ;Avoid interference with a buffered
+        BL      vdu5_flush              ;  sequence of VDU 5 characters
+        Pull    "LR"
+        MOVVS   PC,LR
+        Push    "R0"
+        TST     R3,#&80                 ;Set the given colour
+        ADREQ   LR,fgmode
+        ADRNE   LR,bgmode
+        STR     R4,[LR]                 ;  with the requested GCOL action
+        BIC     R0,R0,#&FF
+        ASSERT  fgrgb-fgmode = bgrgb-bgmode
+        STR     R0,[LR,#fgrgb-fgmode]   ;  and the given rgb value
+        MOV     R0,#&80
+        ASSERT  fggcol-fgmode = bggcol-bgmode
+        STRB    R0,[LR,#fggcol-fgmode+3] ; & note this is an absolute colour
+
+        MOV     R8,#ColourTrans_ReturnGCOL - ColourTrans_SelectTable
+        Pull    "R0"                    ;Convert into ColourTrans_ReturnGCOL
+        B       intcolour_passon        ;  to get the returned GCOL
+
+; Deal with ColourTrans_ReturnColourNumber(ForMode).
+
+        [ Medusa
+; What should ColourTrans_Return{Opp}ColourNumber{ForMode} return
+; when printing (mode == -1)?
+;
+; The existing code always returns a byte value representing
+; an index into our private colour table.  It's not clear how
+; to improve on this, since we have absolutely no way of telling
+; what the application is going to do with the number when
+; it gets it back.  Presumably it will write it into sprite memory.
+;
+; Could (clutching at straws) test the current *screen* mode and
+; return a 16/32bpp colour number if appropriate - but does this
+; help?
+;
+; XXX For now I propose to leave the existing behaviour and see what happens.
+        ]
+
+intcolour_retmodecn
+        CMP     R1,#-1                  ;Convert to ReturnColourNumber if
+        BNE     intcolour_passon        ;  "current mode" requested; pass
+                                        ;  through otherwise.
+intcolour_retcn
+        Push    "LR"
+        BL      colour_rgbtopixval      ;Pass on to printer-dependent code
+        Pull    "PC"
+
+; Deal with ColourTrans_SetOppGCOL.
+
+intcolour_setopgcol
+        Push    "LR"                    ;Avoid interference with a buffered
+        BL      vdu5_flush              ;  sequence of VDU 5 characters
+        Pull    "LR"
+        MOVVS   PC,LR
+        Push    "R0,R9"
+        TST     R3,#&80                 ;Set the opposite to the given colour
+        ADREQ   R9,fgmode
+        ADRNE   R9,bgmode
+        STR     R4,[R9]                 ;  with the requested GCOL action
+        BIC     R0,R0,#&FF
+        BL      intcolour_opposite
+        ASSERT  fgrgb-fgmode = bgrgb-bgmode
+        STR     R0,[R9,#fgrgb-fgmode]   ;  and the given rgb value
+        MOV     R0,#&80
+        ASSERT  fggcol-fgmode = bggcol-bgmode
+        STRB    R0,[R9,#fggcol-fgmode+3] ; & note this is an absolute colour
+
+        MOV     R8,#ColourTrans_ReturnOppGCOL - ColourTrans_SelectTable
+        Pull    "R0,R9"                 ;Convert to ColourTrans_ReturnOppGCOL
+        B       intcolour_passon        ;  to get the returned GCOL
+
+
+; Deal with ColourTrans_ReturnOppColourNumber(ForMode).
+
+intcolour_retmodeoppcn
+        CMP     R1,#-1                  ;Convert to ReturnOppColourNumber if
+        BNE     intcolour_passon        ;  "current mode" requested; pass
+                                        ;  through otherwise.
+intcolour_retoppcn
+        Push    "LR"
+        BL      intcolour_opposite      ;Produce target colour
+        BL      colour_rgbtopixval      ;Pass on to printer-dependent code
+        Pull    "PC"
+
+; Subroutine to produce a contrasting RGB value.
+; Entry: R0 = &BBGGRR00
+; Exit:  R0 = modified &BBGGRR00
+
+intcolour_opposite
+        TST     R0,#&80000000
+        ORREQ   R0,R0,#&FF000000
+        BICNE   R0,R0,#&FF000000
+        TST     R0,#&800000
+        ORREQ   R0,R0,#&FF0000
+        BICNE   R0,R0,#&FF0000
+        TST     R0,#&8000
+        ORREQ   R0,R0,#&FF00
+        BICNE   R0,R0,#&FF00
+        Return
+
+; Deal with ColourTrans_SetFontColours.
+
+intcolour_setfontcols
+        Push    "LR"                    ;Avoid interference with a buffered
+        BL      vdu5_flush              ;  sequence of VDU 5 characters
+        Pull    "PC",VS
+        Push    "R1-R6,R9"
+
+      [ FontHandleEnsure
+
+; This now checks for handles <=0 so that the RISCOS_Lib no longer fails,
+;   it used to only check for handles of zero - just like the manuals document.
+
+        CMP     R0,#0
+        SWILE   XFont_CurrentFont     
+        LDMIA   SP,{R1-R3}
+        SWI     XFont_SetFont           ;Set new font and rest of code leaves unchanged
+        Pull    "R1-R6,R9,PC",VS
+
+        MOV     R0,#0                   ;Further calls should not change the handle
+      ]
+
+        ADR     R9,intcolour_setfontcols_continue + SVC_mode
+        Push    "R9-R12"
+        ADD     LR,R13,#48              ;Stack holds R9-R12, R1-R6, R9, LR,
+        LDMIA   LR,{R10,R11,PC}         ;  R10, R11, cont.addr., ret.addr.
+intcolour_setfontcols_continue
+        Pull    "R10-R12"
+        Pull    "R4-R6"                 ;Original r1-r3
+        Pull    "R4-R6,R9,PC",VS
+        Push    "R1-R3"
+        MOV     R1,R4
+        MOV     R2,R5
+        MOV     R3,R6
+        BL      font_absbg
+        BLVC    font_absfg
+        STRVC   R3,fontcoloffset
+        BLVC    font_coloffset
+
+      [ FontHandleEnsure
+        SWIVC   XFont_CurrentFont       ;Read back the new font (handle in r0)
+      ]
+
+        Pull    "R1-R6,R9,PC"
+
+        END

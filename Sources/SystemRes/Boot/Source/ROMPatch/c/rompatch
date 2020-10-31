@@ -1,0 +1,552 @@
+
+/* rompatch.c */
+
+/*
+  17-Oct-96 2.00 MJS originated (version 1 is different mapping
+                     strategy, in BASIC)
+  25-Oct-96 2.01 MJS no longer relies on growing screen memory in order to
+                     avoid taking future screen pages; instead does
+                     something much more like BASIC version (ahem, thanks Tim)
+  24-Feb-97 2.02 MJS Enhanced to allow patches for more than one ROM version.
+                     Added some patches for 3.70:
+                       - Wimp_TransferBlock (fixes as for RISC OS 3.71)
+                       - RTCAdjust (remove duplicate request to CallEvery)
+                     Created patches for 3.60:
+                       - Wimp_TransferBlock (fixes to equivalent of RISC OS 3.71)
+                       - RTCAdjust (remove duplicate request to CallEvery)
+                       - FSLock (SP's patch - allow floppy format when hard drive locked)
+                     (see patches directory for details)
+*/
+
+/* version string is maintained in s.module */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "defs.h"
+#include "debug.h"
+#include "UK/messages.h"
+
+/* implemented in assembler */
+extern uint32 module,moduleend;
+extern uint32 modDAhandler,moddata;
+extern uint32 svcarmid(void);
+extern void   svccopy(uint32 *src, uint32 *dest, int bytes);
+extern uint32 svcpeek(uint32 *addr);
+extern void   svcpoke(uint32 *addr, uint32 val);
+extern void   svcsetROML1PT(uint32 *L1PTaddr, uint32 *L1PTvals, int count);
+
+/* ROMs and their patches */
+#include "patches/patch.h"
+
+/* ------------------------------------------------------------------------ */
+
+static int match_romcrc(uint32 *romcrc)
+{
+  int    i, match;
+  uint32 *this_romcrc = (uint32 *)(ROMstart+ROMsize-12);
+
+  for (match=1,i=0; i<3; i++) match &= (this_romcrc[i] == romcrc[i]);
+
+  return match;
+}
+
+/* ------------------------------------------------------------------------ */
+
+uint32 logtophys(uint32 log)
+{
+  osmemoryblock_t block;
+
+  block.logaddr = log;
+  _swix(OS_Memory,_INR(0,2),0x2200,&block,1); /* log provided, fill in phys */
+  return block.physaddr; 
+}
+
+uint32 logtopagenum(uint32 log)
+{
+  osmemoryblock_t block;
+
+  block.logaddr = log;
+  _swix(OS_Memory,_INR(0,2),0xa00,&block,1); /* log provided, fill in pnum */
+  return block.pagenumber; 
+}
+
+static uint32 phystopagenum(uint32 phys)
+{
+  osmemoryblock_t block;
+
+  block.physaddr = phys;
+  _swix(OS_Memory,_INR(0,2),0xc00,&block,1); /* phys provided, fill in pnum */
+  return block.pagenumber; 
+}
+
+
+/* ------------------------------------------------------------------------ */
+
+static int scan_patches(patchlist_proc patchlist[],
+                        int *romsection,int *romlpage,int *rompage)
+{
+  /* checks patch status, updates romsection,romlpage,rompage,
+     returns no. of patch pages */
+
+  int          i, j, Npatchpages;
+  uint32       *la, ila;
+  patchentry_t *pl;
+
+  /* initialise hit tables */
+  for (i=0; i<ROMsections; i++) romsection[i] = 0;
+  for (i=0; i<ROMlpages; i++)   romlpage[i]   = 0;
+  for (i=0; i<ROMpages; i++)    rompage[i]    = 0;
+
+  for (Npatchpages=i=0; patchlist[i] != NULL; i++)
+  {
+    pl = (patchlist[i])(NULL);
+    if (pl)
+    {
+      for (j=0; pl[j].newval != pl[j].oldval; j++)
+      {
+        la = pl[j].logaddr;
+        ila = (uint32)la;
+        if (*la == pl[j].newval)
+        {
+          fprintf(stderr,E_ROMpatched);
+          exit(ErrorReturnCode);
+        }
+        if (*la != pl[j].oldval)
+        {
+          fprintf(stderr,E_badROMpatch);
+          fprintf(stderr,"  at %8.8x: wanted=%8.8x found=%8.8x\n",ila,pl[j].oldval,*la);
+          exit(ErrorReturnCode);
+        }
+        /* mark section and large page hits with 1 */
+        romsection[(ila - ROMstart) >> 20] = 1;
+        romlpage[(ila - ROMstart) >> 16]   = 1;;
+        if (rompage[(ila - ROMstart) >> 12] == 0)
+        {
+          /* count newly hit pages, and mark with 1 for now */
+          Npatchpages++;
+          rompage[(ila - ROMstart) >> 12] = 1;
+        }
+      }
+    }
+  }
+
+  /* now rescan page hit table, and mark with ascending sequence of
+     hit number */
+  for (i=j=0; i<ROMpages; i++) if (rompage[i]) rompage[i] = ++j;
+
+  return Npatchpages;
+}
+
+/* ------------------------------------------------------------------------ */
+
+#define pagetype(pap,table) ((pap)&1) ? (table[(pap)>>1] >> 4) : (table[(pap)>>1] & 15)
+
+#define pt_availableDRAM 1
+
+static int find_DA_first_pagenum(int pagesneeded, uint32 *first_pagenum)
+{
+  /* find a suitable block of sequential page numbers for dynamic area; ie.
+     not pages currently unavailable and not pages that may later be
+     needed for screen
+     - return 1 for success 0 for failure (if success, first_pagenum is
+       first page number in found block) */
+
+  _kernel_oserror *e;
+  uint8           *table;
+  uint32          L1PTphys,firstpagepap;
+  int             tablesize, L1PTpap,pap,pt,pagestofind,foundfirstpage;
+
+  /* find size of memory physical arrangement table (bytes) */
+  e = _swix(OS_Memory,_IN(0)|_OUT(1),6,&tablesize);
+  if (e) return 0;
+
+# if Debug
+    fprintf(stderr,"physical arrangement tablesize=%1d\n",tablesize);
+#  endif
+  table = malloc(tablesize);
+  if (table == NULL) return 0;
+
+  /* read memory physical arrangement table (two entries per byte) */ 
+  e = _swix(OS_Memory,_INR(0,1),7,table);
+  if (e) return 0;
+
+  /* RAM used for start of L1PT is good start point for scan of table;
+     mainly, avoids DRAM that could be used for screen in no-VRAM
+     system  */
+  L1PTphys = logtophys(L1PT);
+  L1PTpap  = L1PTphys >> 12; /* physical arrangement (4k) page index, into table */
+
+# if Debug
+    fprintf(stderr,"L1PTpap=%1d end=%1d\n",L1PTpap,tablesize*2);
+# endif
+
+  foundfirstpage = 0;
+  firstpagepap   = 0;
+  pagestofind    = pagesneeded - 1;
+  for (pap=L1PTpap; (pap<tablesize*2) && pagestofind; pap++)
+  {
+    pt = pagetype(pap,table);
+#   if Debug
+      fprintf(stderr,"pap=0x%5.5x pt=0x%2.2x\n",pap,pt);
+#   endif
+    if (foundfirstpage)
+    {
+      /* we must collect subsequent pages that are DRAM and not marked Unavailable */
+      if (pt == pt_availableDRAM) pagestofind--; else foundfirstpage = 0;
+#     if Debug
+        fprintf(stderr,"  - %1d %5d\n",foundfirstpage,pagestofind);
+#     endif
+    }
+    else
+    {
+      if (pt == pt_availableDRAM)
+      {
+        /* found a possible first page, (DRAM that is not marked Unavailable) */
+        pagestofind  = pagesneeded - 1;
+        firstpagepap = pap;
+        foundfirstpage = 1;
+#       if Debug
+          fprintf(stderr,"  > %1d %5d\n",foundfirstpage,pagestofind);
+#       endif
+      }      
+    }
+  }
+
+  *first_pagenum = phystopagenum(firstpagepap << 12);
+  return foundfirstpage && (pagestofind == 0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void create_patchDA(uint32 RMAaddr, int DAsize, uint32 DAhandler_addr,
+                           char *patchname,
+                           int *patchDAN, uint32 *patchDAbase)
+{
+  /* create dynamic area for patches (plus 1 page - the first - for
+     MMU L2PT), return DA number and base */
+ 
+  _kernel_oserror *e;
+  moduledata_t    *md;
+  int             ok;
+  uint32          first_pagenum;
+
+  /* non-draggable area, user read only, bufferable,cacheable,
+     has handler, specific pages required, initial size 0 */
+
+  e = _swix(OS_DynamicArea,_INR(0,8)|_OUT(1)|_OUT(3),
+            0,-1,0,-1,0x181,DAsize,DAhandler_addr,0,
+            patchname,patchDAN,patchDAbase);
+
+  if (!e)
+  {
+    /* find block of pages to use (starting at first_pagenum) */
+    ok = find_DA_first_pagenum(DAsize>>12,&first_pagenum);
+    if (ok)
+    {
+      /* set values reguired by pregrow handler, in module in RMA */
+      md = (moduledata_t *)((uint32)(&moddata)-(uint32)(&module)+RMAaddr);
+      md->nextpageneeded     = first_pagenum;
+      md->firstpagenotneeded = first_pagenum + (DAsize >> 12);
+#     if Debug
+      fprintf(stderr,"DA page numbers 0x%1.1x..0x%1.1x\n",
+              md->nextpageneeded,md->firstpagenotneeded-1);
+#     endif
+      /* grow the area to DAsize */
+      e = _swix(OS_ChangeDynamicArea,_INR(0,1),*patchDAN,DAsize);
+    }
+  }
+
+  if (e || !ok)
+  {
+    fprintf(stderr,E_patchmem);
+    exit(ErrorReturnCode);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void fill_patchpages(patchlist_proc patchlist[],uint32 patchDAbase,
+                            int *romsection,int *romlpage,int *rompage)
+{
+  /* fill in code (with patches) for patch pages in dynamic area (0'th
+     page of dynamic area reserved for L2PT stuff */
+
+  int          i,j, ppage;
+  patchentry_t *pl;
+  uint32       addr, *waddr, ppaddr;
+
+  /* negate rompage entries to flag 'not copied yet' */
+  for (i=0; i<ROMpages; i++) if (rompage[i]) rompage[i] = -rompage[i];
+
+  for (i=0; patchlist[i] != NULL; i++)
+  {
+    pl = (patchlist[i])(NULL);
+    if (pl)
+    {
+      for (j=0; pl[j].newval != pl[j].oldval; j++)
+      {
+        addr  = (uint32)pl[j].logaddr;
+        ppage = (addr - ROMstart) >> 12;
+        if (rompage[ppage] < 0)
+        {
+          /* first time this page hit - copy from ROM to dynamic area */
+          rompage[ppage] = -rompage[ppage]; /* mark as now copied (unnegate) */
+          ppaddr = addr & 0xfffff000;
+          svccopy((uint32 *)ppaddr,
+                  (uint32 *)(patchDAbase + (rompage[ppage] << 12)),0x1000);
+        }
+        waddr = (uint32 *)(patchDAbase + (rompage[ppage]<<12) + (addr&0xfff));
+#       if Debug
+          fprintf(stderr,"  %8.8x %8.8x --> %8.8x %8.8x\n",
+                  addr,pl[j].oldval,(int)waddr,pl[j].newval);
+#       endif
+        svcpoke(waddr,pl[j].newval);
+      }
+    }
+  }
+
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void fill_patchL2PTpage(int writeprotect, uint32 armid, uint32 patchDAbase,
+                               int *romsection,int *romlpage,int *rompage)
+{
+  /* fill in 1st page of dynamic area with MMU level2 page table info for
+     patches  */
+
+  int    i,s,p,lp, ppage;            
+  uint32 *patchL2PT,ppage_physaddr,lpage_physaddr, mmu_lp,mmu_sp;
+
+  if (writeprotect && ((armid & 0xf000) >= 0x7000))
+  {
+    /* ROM supports write protection, and processor supports ROM bit (ie.
+       ROM is presumed to have set ROM bit for this processor)
+       => mark patched areas as read only, bufferable,cacheable */
+    mmu_lp = 0x00d;
+    mmu_sp = 0x00e;
+  }
+  else
+  {
+    /* ROM does not support write protection, or processor (ARM6) has no ROM bit
+       (ie. there will not be a ROM bit set)
+        => mark patched areas as read only (user), bufferable,cacheable */
+    mmu_lp = 0xaad;
+    mmu_sp = 0xaae;
+  }
+
+  patchL2PT = (uint32 *)patchDAbase; /* 0'th page is used for L2PT stuff */
+
+  for (p=lp=s=0; s<ROMsections; s++)
+  {    
+    if (romsection[s])
+    {
+      /* must break down this section, and L2PT map it */
+      for (lp=s*16; lp<(s+1)*16; lp++)
+      {
+        if (romlpage[lp])
+        {
+          /* must break down this large page into (small) pages */
+          for (p=lp*16; p<(lp+1)*16; p++)
+          {
+            if (rompage[p])
+            {
+              /* patched page, in dynamic area */
+              ppage = rompage[p];
+              ppage_physaddr = logtophys(patchDAbase + (ppage << 12));
+            }
+            else
+            {
+              /* unpatched page, in ROM */
+              ppage_physaddr = ROMphysstart + (p << 12);
+            }
+            svcpoke(patchL2PT+p,ppage_physaddr | mmu_sp); 
+#           if Debug
+              fprintf(stderr,"SPG %8.8x %8.8x\n",
+                      (int)patchL2PT+p,ppage_physaddr | mmu_sp);
+#           endif
+          }
+        }
+        else
+        {
+          /* map as large page (MMU requires 16 entries repeated) */
+          lpage_physaddr = ROMphysstart + (lp << 16);
+          for (i=lp*16; i<(lp+1)*16; i++)
+            svcpoke(patchL2PT+i,lpage_physaddr | mmu_lp);
+#         if Debug
+              fprintf(stderr,"LPG %8.8x %8.8x\n",
+                      (int)patchL2PT+i,lpage_physaddr | mmu_lp);
+#         endif
+        }
+      }
+    }
+    else
+    {
+      /* section map can remain, set unused L2PT to Fault */
+      for (i=s*256; i<(s+1)*256; i++) svcpoke(patchL2PT+i,0);
+#     if Debug
+        fprintf(stderr,"SEC %8.8x %8.8x\n",(int)patchL2PT+i,0);
+#     endif
+    }
+  }
+
+}
+
+/* ------------------------------------------------------------------------ */
+
+static uint32 insert_ROMPatches_module(void)
+{
+  /* returns address of (start of) module in RMA as a uint32 */
+
+  uint32 RMAaddr;
+
+  _kernel_oserror *e;
+
+  /* insert module into RMA */
+  e = _swix(OS_Module,_INR(0,2),11,&module,(int)(&moduleend)-(int)(&module));
+  if (!e)
+  {
+    /* find start of module in RMA */
+    e = _swix(OS_Module,_INR(0,1)|_OUT(3),18,"ROMPatches",&RMAaddr);
+  }
+
+  if (e)
+  {
+    fprintf(stderr,"%s\n",e->errmess);
+    fprintf(stderr,E_nomodule);
+    exit(ErrorReturnCode);
+  }
+
+  return RMAaddr;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void set_ROM_L1PT(uint32 RMAaddr, int patchDAN, uint32 patchDAbase,
+                         int *romsection)
+{
+  /* - set required data values in ROMPatches module, in RMA
+     - set ROM L1PT entries to apply patches; do this via assembler call
+       so that it happens cleanly, while ROM code is not executing
+  */
+
+  int             i;
+  uint32          ROM_L1PTvalues[ROMsections];
+  moduledata_t    *md;
+
+# define MMU_L1PR 0x11  /* flag L1 descriptor as page reference */
+
+  /* current L1PT settings */
+  for (i=0; i<ROMsections; i++) 
+    ROM_L1PTvalues[i] = svcpeek((uint32 *)(L1PT + (ROMstart >> 18) + (i<<2)));
+
+  /* now poke all required values into module data space, in RMA */
+  md = (moduledata_t *)((uint32)(&moddata)-(uint32)(&module)+RMAaddr);
+  md->DAN  = patchDAN;
+  md->kernL1PT = L1PT + (ROMstart >> 18);
+  for (i=0; i<ROMsections; i++) md->L1PTentries[i] = ROM_L1PTvalues[i];
+
+  /* new settings, for any sections hit by patches */
+  for (i=0; i<ROMsections; i++)
+  {
+    if (romsection[i])
+      ROM_L1PTvalues[i] = logtophys(patchDAbase + (i << 10)) | MMU_L1PR;
+  }
+
+# if Debug
+   for (i=0; i<ROMsections; i++)
+     printf("  romsection %1d %8.8x\n",i,ROM_L1PTvalues[i]);
+
+# endif
+
+# if ReallyDoRemap
+    svcsetROML1PT((uint32 *)(L1PT + (ROMstart >> 18)),ROM_L1PTvalues,ROMsections);
+# else
+    fprintf(stderr,"** svcsetROML1PT skipped **\n");
+# endif
+
+}
+
+/* ------------------------------------------------------------------------ */
+
+static ROMentry_t *identify_ROM(void)
+{
+  int        r;
+  ROMentry_t *rom;
+
+  for (rom=knownROMs[r=0]; rom != NULL; rom=knownROMs[++r])
+  {
+#   if Debug
+    fprintf(stderr,"check %s\n",rom->patchname);
+#   endif
+    if (match_romcrc(rom->romcrc)) break;
+  }
+
+# if Debug
+    if (rom == NULL) fprintf(stderr,E_ROMunknown);
+#endif
+
+  return rom;
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+  int        Npatchpages, patchDAN, patchDAsize;
+  uint32     armid, patchDAbase, RMAaddr, DAhandler_addr;
+  ROMentry_t *rom;
+
+  /* marked in order to construct best mapping granularity
+     allowed by patches (to minimise stress on processor TLB(s)) */
+  static int romsection[ROMsections];
+  static int romlpage[ROMlpages];
+  static int rompage[ROMpages];
+
+  rom = identify_ROM();
+  if (!rom) exit(0); /* not classed as error */
+
+  armid = svcarmid();
+# if Debug
+  fprintf(stderr,"ARM ID = %8.8x\n",armid);
+# endif
+
+  /* sets hit tables, calculates number of pages required for patches */
+  Npatchpages = scan_patches(rom->patchlist,romsection,romlpage,rompage);
+
+  if (Npatchpages == 0) exit(0); /* not classed as error */
+
+# if Debug
+  dbtrace_patchhits(romsection,romlpage,rompage);
+# endif
+
+  /* insert module first, since DAhandler code there */
+  RMAaddr = insert_ROMPatches_module();
+  DAhandler_addr = (uint32)(&modDAhandler) - (uint32)(&module) + RMAaddr;
+
+  /* 1 extra page required for L2PT entries */
+  patchDAsize = (Npatchpages + 1) << 12;
+  create_patchDA(RMAaddr,patchDAsize,DAhandler_addr,rom->patchname,
+                 &patchDAN,&patchDAbase);
+
+# if Debug
+  dbtrace_DApages(patchDAN,patchDAbase,patchDAsize);
+# endif
+
+  /* rescans patches, and sets patch pages in DA */
+  fill_patchpages(rom->patchlist,patchDAbase,romsection,romlpage,rompage);
+
+  /* sets MMU level 2 mapping page in DA */
+  fill_patchL2PTpage(rom->writeprotect,armid,patchDAbase,
+                     romsection,romlpage,rompage);
+
+  /* also sets required data values in ROMpatches module, in RMA */
+  set_ROM_L1PT(RMAaddr,patchDAN,patchDAbase,romsection);
+
+  /* ROM is now patched! */
+  return 0;
+}

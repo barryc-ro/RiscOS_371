@@ -1,0 +1,1478 @@
+/* Title: > c.redraw
+ * 
+ * A note from our sponsers:
+ * 
+ * Currently there is no support for showing the elements within the draw 
+ * path with suitable end points, although there is a character based flag
+ * controlling it.
+ * 
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.main"
+#include "h.drag"
+#include "h.editchar"
+#include "h.loadsave"
+#include "h.menu"
+#include "h.redraw"
+#include "h.scaffold"
+#include "h.sprites"
+#include "h.suspend"
+
+
+os_error *minmaxpath(int *ptr, wimp_box *m);      /* used by updatebbox() */
+
+
+/* ---- Redraw routines ---------------------------------------------------- */
+
+
+int *buildoutptr;
+
+os_error * event_redraw(rptr)
+wimp_redrawstr *rptr;
+{
+  Wind_Link *wlink;
+  BOOL more;
+
+  handle = rptr->w;    /* used by eo_scaffold */
+  if ((wlink = findwindlink(handle)) == NULL) finish("Bad redraw request");
+  er(wimp_redraw_wind(rptr,&more));
+
+  bx = rptr->box.x0 - rptr->scx;
+  by = rptr->box.y1 - rptr->scy;
+  xsize = rptr->box.x1 - rptr->box.x0;
+  ysize = rptr->box.y1 - rptr->box.y0;
+
+/*
+  bbc_vdu(4); bbc_tab(0,1);
+  printf("Redrawing: type = %d, info = &%5x\n",wlink->type,(int) wlink->info);
+*/
+
+  switch(wlink->type)
+  {
+    case W_FONTINDEX:
+         return(redraw_font(more,rptr,wlink->info));
+
+    case W_TREE:
+         return(redraw_tree(more,rptr,wlink->info));
+
+    case W_FULL:
+         return(redraw_full(more,rptr,getchardata(wlink)));
+
+    case W_SKELETON:
+         return(redraw_skel(more,rptr,getchardata(wlink)));
+
+    case W_BITMAP:
+         return(redraw_bitmap(more,rptr,getchardata(wlink)));
+
+    default:
+         finish("Unrecognised window type");
+  }
+  return(NULL);
+}
+
+
+os_error *getwlinkstate(Wind_Link *wlink)
+{
+  if (wlink==NULL) return(NULL);
+  er(getwindowstate(wlink->wind_handle));
+  switch(wlink->type)
+  {
+    case W_SKELETON:
+    case W_FULL:
+         getchardata(wlink);
+  }
+  return(NULL);
+}
+
+
+/* Set up global variables:  x0, y0, x1, y1, xscale, yscale, thischar
+ */
+
+Char_Block *getchardata(Wind_Link *wlink)
+{
+  Char_Block *charptr = wlink->info;
+  FFile_FontHdr *f = charptr->parent->filedata;
+                                          
+  thischar = charptr;
+
+  x0 = f->x0;                      /* global parameters for buildpath() */
+  y0 = f->y0;
+  x1 = f->xs + x0;
+  y1 = f->ys + y0;
+
+  if (charptr->variable || wlink->type == W_FULL) {
+    register int ymul = ysize - (YBORDER << 1);
+    register int ydiv = (f->designsize > y1) ? f->designsize : y1;   /* always include baseline */
+    xscale = yscale = ((ymul<<16)/((ydiv<1)?1:ydiv));
+  } else {
+    xscale = yscale = (charptr->magnifierup<<16)/charptr->magnifierdown;
+  }
+
+  return(charptr);
+}
+
+
+os_error * redraw_font(BOOL more, wimp_redrawstr *rptr, Font_Block *font)
+{
+  int i;
+
+  thisfont = font;              /* for drawcharindex() */
+
+  while (more)
+  {
+    gx0 = rptr->g.x0 - bx; 
+    gy0 = rptr->g.y0 - by;
+    gx1 = rptr->g.x1 - bx;
+    gy1 = rptr->g.y1 - by;
+
+    if (gy1 > 0)
+    {
+      wimp_gcol(0,7);
+      bbc_move(bx+FontIndexOrgX,by+FontIndexOrgY+44);
+      {
+        register FFile_FontHdr *f = font->filedata;
+        register char *i;
+        for (i=((char *)f->table) + f->table[0];*i;) bbc_vdu(*i++);
+        bbc_vdu(' ');
+        for (;i[1];) bbc_vdu(*(++i));
+      }
+    }
+
+    wimp_gcol(0,2);
+    drawgrid(FontIndexOrgX,FontIndexOrgY,
+             font->grid.across,
+             ((font->nchars-1-font->grid.skip)/font->grid.across)+1,
+             FONT_BOXX,FONT_BOXY);
+    gridpattern(FontIndexOrgX,FontIndexOrgY,
+                font->grid.across-1,
+                (font->nchars-1-font->grid.skip)/font->grid.across,
+                FONT_BOXX,FONT_BOXY,
+                drawcharindex);
+
+    for (i = font->grid.skip >> 5; i < 8; i++) {
+      if (inbasefile(font, i << 5)) {
+        wimp_box b1, b2;
+        getcharbox(font,(i<<5),bx,by,&b1);
+        getcharbox(font,(i<<5)+31,bx,by,&b2);
+        if (rptr->g.y0 < b1.y1 && rptr->g.y1 > b2.y0) {
+          wimp_gcol(0,7);
+          bbc_rectanglefill(b1.x0-16,b2.y0,7,b1.y1-b2.y0);
+          bbc_rectanglefill(b2.x1+10,b2.y0,7,b1.y1-b2.y0);
+        }
+      }
+    }
+
+    er(wimp_get_rectangle(rptr,&more));
+  }
+  return(NULL);
+}
+
+
+void drawgrid(orgx,orgy,numx,numy,widx,widy)
+int orgx,orgy,numx,numy,widx,widy;
+{
+  int xx0 = (gx0-orgx)/widx;
+  int yy0 = (orgy-gy0)/widy;
+  int xx1 = (gx1-orgx)/widx;
+  int yy1 = (orgy-gy1)/widy;
+  int x,y,endx,endy;
+
+  if (xx0<0) xx0=0;
+  if (yy1<0) yy1=0;
+  if (xx1>numx) xx1=numx;
+  if (yy0>numy) yy0=numy;
+
+  orgx += bx;
+  orgy += by;
+
+  xx0 = orgx + xx0*widx;
+  yy0 = orgy - yy0*widy;
+  xx1 = orgx + xx1*widx;
+  yy1 = orgy - yy1*widy;
+
+  endx = orgx+numx*widx;
+  endy = orgy-numy*widy;
+
+  for (y=yy1;y>=yy0;y-=widy)
+  {
+    bbc_move(orgx,y); bbc_draw(endx,y);
+  }
+  for (x=xx0;x<=xx1;x+=widx)
+  {
+    bbc_move(x,orgy); bbc_draw(x,endy);
+  }
+}
+
+
+void gridpattern(orgx,orgy,numx,numy,widx,widy,subr)
+int orgx,orgy,numx,numy,widx,widy;
+void (*subr)(int,int,int,int);
+{
+  int cx,cy;
+  int xx0 = (gx0-orgx)/widx;
+  int yy0 = (orgy-gy0)/widy;
+  int xx1 = (gx1-orgx)/widx;
+  int yy1 = (orgy-gy1)/widy;
+  int x,y;
+
+  if (xx0<0) xx0=0;
+  if (yy1<0) yy1=0;
+  if (xx1>numx) xx1=numx;
+  if (yy0>numy) yy0=numy;
+
+  cy = by+orgy-yy1*widy;
+  for (y=yy1;y<=yy0;y++)
+  {
+    cx = bx+orgx+xx0*widx;
+    for (x=xx0;x<=xx1;x++)
+    {
+      subr(x,y,cx,cy);
+      cx += widx;
+    }
+    cy -= widy;
+  }
+}
+
+static sprite_pixtrans ttr[] = { 0,1 };
+
+void drawcharindex(x,y,cx,cy)
+int x,y,cx,cy;
+{
+  int ch = x + thisfont->grid.across*y + thisfont->grid.skip;
+  Char_Block *charptr;
+  sprite_factors factors;
+  sprite_info sprinfo;
+
+  if (ch >= thisfont->nchars) return;
+
+  if ((charptr=thisfont->chars[ch])!=NULL)
+  {
+    if (charptr->sprname[0]!=0)
+    {
+      sprite_pixtrans *ttrp;
+      static sprite_id sprid = { NULL, sprite_id_name };
+      sprid.s.name = charptr->sprname;
+
+      mytracef("charptr=&%p, sprite name = '%s'\n",charptr,charptr->sprname);
+         
+      if ((thisfont->filedata->bpp)==1)
+      {
+        factors.xmag = dx;
+        factors.ymag = dy;
+        factors.xdiv = 2;
+        factors.ydiv = 2;
+        sprinfo.mode = 18;
+      }
+      else
+      {
+        erx(sprite_readsize(thisfont->spritedata,&sprid,&sprinfo));
+        factors.xmag = 1 << bbc_modevar(sprinfo.mode,bbc_XEigFactor);
+        factors.ymag = 1 << bbc_modevar(sprinfo.mode,bbc_YEigFactor);
+        factors.xdiv = dx;
+        factors.ydiv = dy;
+      }
+
+      if (bbc_modevar(sprinfo.mode,bbc_Log2BPP) == 0)
+      {
+        ttr[0] = pixtrans[0];
+        ttr[1] = pixtrans[15];
+        ttrp = ttr;
+      } else ttrp = pixtrans;
+
+      if (heaptrace) mytracef("sprite_put_scaled(%p,""%s"",0,%d,%d,%p,%p\n",
+                thisfont->spritedata,sprid.s.name,cx+dx,cy-FONT_BOXY+dy,&factors,ttrp);
+
+      if (thisfont->spritedata == NULL) mytracef("font->spritedata == NULL !!!\n");
+
+      erx(sprite_put_scaled(thisfont->spritedata,&sprid,0,
+                            cx+dx,cy-FONT_BOXY+dy,&factors,ttrp));
+    }
+
+    /* if char contains the selected font line, paint index in red, else black */
+
+    wimp_gcol(0, charcolour(charptr));
+  }
+  else wimp_gcol(0,2);
+
+  if (thisfont->display.charnames) {
+    bbc_move(cx,cy-4);
+    puts(charname(ch));       /* some chars have funny names */
+  }
+}
+
+
+/* Return index of char under the mouse pointer
+ * Deals with Font Index window and Scaffold Tree window
+ * Assumes that getwindowstate() has been called already
+ */
+
+int getindex(Wind_Link *wlink, int mousex, int mousey, wimp_box *b)
+{
+  int mx, my;
+
+  switch(wlink->type)
+  {
+    case W_FONTINDEX:
+         {
+           Font_Block *font = wlink->info;
+
+           mx = mousex - bx - FontIndexOrgX;
+           my = by + FontIndexOrgY - mousey;
+           if (mx >= 0 && mx < font->grid.across*FONT_BOXX && my >= 0) {
+             int ch = (mx/FONT_BOXX) + font->grid.across*(my/FONT_BOXY) + font->grid.skip;
+             if ((ch < font->nchars) && (b != NULL)) getcharbox(font,ch,bx,by,b);
+             return(ch);
+           }
+         }
+         break;
+
+    case W_TREE:
+         return(findintree(wlink,mousex,mousey,b));
+  }
+
+  return(big);
+}
+
+
+/* Return bounding box of given character in Font Index window */
+
+void getcharbox(Font_Block *font, int charno, int bx, int by, wimp_box *b)
+{
+  b->x0 = bx + FontIndexOrgX + FONT_BOXX*((charno-font->grid.skip) % font->grid.across);
+  b->y1 = by + FontIndexOrgY - FONT_BOXY*((charno-font->grid.skip) / font->grid.across);
+  b->x1 = b->x0 + FONT_BOXX;
+  b->y0 = b->y1 - FONT_BOXY;
+}
+
+
+/* Returns box of all characters in the Font Index window */
+
+void getfontbox(Font_Block *font, wimp_box *b)
+{
+  b->x0 = FontIndexOrgX;
+  b->y1 = FontIndexOrgY;
+  b->x1 = FontIndexOrgX + (FONT_BOXX * font->grid.across);
+  b->y0 = FontIndexOrgY - (FONT_BOXY * (((font->nchars-1-font->grid.skip)/font->grid.across)+1));
+}
+
+
+/* Redraw full info window (ie. filled in shape of character) */
+
+os_error * redraw_full(BOOL more, wimp_redrawstr *rptr, Char_Block *charptr)
+{
+  int fillpath[MAXPATH], strokepath[MAXPATH];
+  int matrix[6];
+
+  matrix[0] = dx << 15; matrix[1] = 0;
+  matrix[2] = 0; matrix[3] = dy << 15;
+  matrix[4] = (bx & ~(dx-1)) << 8;
+  matrix[5] = (by & ~(dy-1)) << 8;
+
+  xscale = xscale * 2 / dx;      /* convert so 1 pixel = 2x2 OS units */
+  yscale = yscale * 2 / dy;
+  bx = - (dx >> 1);                   /* half-pixel adjustment in buildpath */
+  by = - (dy >> 1);
+
+  initsize(fillpath);
+  initsize(strokepath);
+  er(buildpath(charptr, fillpath, strokepath, TRUE));     /* use scaffolding */
+
+  while (more) {
+    wimp_gcol(0,11); drawstroke(strokepath, matrix, charptr->flatness);
+
+    if (nonzerowinding(charptr)) {
+      wimp_gcol(0,7); drawfill_winding(fillpath, matrix, charptr->flatness); }
+    else {
+      wimp_gcol(0,7); drawfill(fillpath, matrix, charptr->flatness); }
+
+    er(wimp_get_rectangle(rptr,&more));
+  }
+
+  return(NULL);
+}
+
+
+/* Redraw contents of skeleton window.
+ * Wimp_RedrawWindow or Wimp_UpdateWindow have already been called (more = flag returned)
+ * Possible contents are (from back to front):
+ *          background sprite
+ *          template
+ *          composite sections
+ *          scaffold lines                    ;
+ *               metrics bounding box         ;
+ *               current bounding box         ; all done in drawscaffold()
+ *               font bounding box            ;
+ *               width                        ;
+ *          character outline
+ *          control points
+ *
+ * This routine also checks the end points flag which is used to indicate in
+ * what direction the path runs.
+ *
+ */
+
+os_error * redraw_skel(BOOL more, wimp_redrawstr *rptr, Char_Block *charptr)
+{
+  int fillpath[MAXPATH];
+  int * backfill = NULL;
+
+  if (charptr->template != NULL)
+  {
+    int d1 = charptr->parent->filedata->designsize;
+    int d2 = charptr->template->parent->filedata->designsize;
+    int oldx0 = x0, oldy1 = y1, oldxscale = xscale, oldyscale = yscale;
+    xscale = (((xscale >> 6) * d1) / d2) << 6;    /* watch out for overflow */
+    yscale = (((yscale >> 6) * d1) / d2) << 6;
+    x0 = (x0 * d2) / d1;                          /* ensure char origins coincide */
+    y1 = (y1 * d2) / d1;
+    initsize(fillpath);
+    er(buildpath(charptr->template, fillpath, NULL, FALSE));
+    backfill = fillpath;
+    x0 = oldx0; y1 = oldy1; xscale = oldxscale; yscale = oldyscale;
+  }
+
+  while (more)
+  {
+    gx0 = unscalex(rptr->g.x0); 
+    gy0 = unscaley(rptr->g.y0);
+    gx1 = unscalex(rptr->g.x1);
+    gy1 = unscaley(rptr->g.y1);
+
+    er(drawbacksprite(charptr, rptr));
+
+    if (backfill!=NULL)
+    {
+      wimp_gcol(0, 3);
+      drawstroke(backfill, NULL, 0);
+    }
+
+    er(eo_drawcomposites(charptr));
+
+    er(drawscaffold(charptr, rptr));
+
+    scanchar(charptr,drawline);
+
+    pointcol=GCOL(0,13);
+    scanchar(charptr,drawpoints);
+
+    if (dragbox.type != DR_NONE)
+    if (handle==dragbox.wlink->wind_handle)
+    switch(dragbox.type) {
+      case DR_POINT:
+        er(eorbits(dragbox.d.point.pt,EO_JUSTDRAG));
+        break;
+      case DR_SCAFFOLDX:
+        er(eo_scaffold(dragbox.d.scaffold.x,EO_JUSTDRAG));
+        break;
+      case DR_SCAFFOLDY:
+        er(eo_scaffold(dragbox.d.scaffold.y,EO_JUSTDRAG));
+        break;
+      case DR_RECTSCAFFOLD:
+        wimp_gcol(3,7);
+        bbc_move(bx+dragbox.d.rectangle.x0,by+dragbox.d.rectangle.y0);
+        bbc_plot(bbc_SolidExFinal+5,bx+dragbox.d.rectangle.x1,by+dragbox.d.rectangle.y0);
+        bbc_plot(bbc_SolidExFinal+5,bx+dragbox.d.rectangle.x1,by+dragbox.d.rectangle.y1);
+        bbc_plot(bbc_SolidExFinal+5,bx+dragbox.d.rectangle.x0,by+dragbox.d.rectangle.y1);
+        bbc_plot(bbc_SolidExFinal+5,bx+dragbox.d.rectangle.x0,by+dragbox.d.rectangle.y0);
+    }
+    erx(wimp_get_rectangle(rptr,&more));
+  }
+  return(NULL);
+}
+
+
+/* Draw background sprite for this char
+ */
+
+os_error * drawbacksprite(Char_Block *charptr, wimp_redrawstr *rptr)
+{
+  static sprite_id spriteid = { NULL, sprite_id_name };
+  sprite_pixtrans ttr[2];
+  sprite_pgm sprbox;
+
+  rptr = rptr;   /* keep C quiet */
+
+  if (charptr->backsprite[0] == 0) return(NULL);
+
+  spriteid.s.name = charptr->backsprite;
+
+  ttr[0] = pixtrans[4];             /* bodge for scanner output */
+  ttr[1] = pixtrans[0];
+
+  er(scalebox(&sprbox,&charptr->backsprbox,8));
+/*
+  mytracef("Sprite pgm: %d,%d, %d,%d, %d,%d, %d,%d\n",
+        sprbox.p0[0] >> 8, sprbox.p0[1] >> 8,
+        sprbox.p1[0] >> 8, sprbox.p1[1] >> 8,
+        sprbox.p2[0] >> 8, sprbox.p2[1] >> 8,
+        sprbox.p3[0] >> 8, sprbox.p3[1] >> 8);
+*/
+  if (showsprites) {
+    sprite_area *sparea = charptr->parent->spritedata;
+
+    if ((sprbox.p0[0] == sprbox.p3[0]) &&
+        (sprbox.p1[0] == sprbox.p2[0]) &&
+        (sprbox.p0[1] == sprbox.p1[1]) &&
+        (sprbox.p2[1] == sprbox.p3[1]) &&
+        (sprbox.p1[0] > sprbox.p0[0]) &&
+        (sprbox.p2[1] > sprbox.p1[1])) {
+      sprite_factors f;
+      sprite_info sprinfo;
+
+      er(sprite_readsize(sparea, &spriteid, &sprinfo));
+
+      f.xmag = (sprbox.p1[0] - sprbox.p0[0]) >> 8;
+      f.ymag = (sprbox.p2[1] - sprbox.p1[1]) >> 8;
+      f.xdiv = sprinfo.width  * dx;             /* divide by screen pixel size */
+      f.ydiv = sprinfo.height * dy;             /* (factors refer to pixels!) */
+
+      er(sprite_put_scaled(sparea,&spriteid,0,sprbox.p0[0] >> 8,sprbox.p0[1] >> 8,&f,ttr));
+
+    } else {
+
+      er(sprite_put_pgm(sparea,&spriteid,0,NULL,&sprbox,ttr));
+    }
+  }
+
+  if (dragbox.type == DR_SPRITEBOX) {
+    er(drawspritebox(3,11,charptr));
+  } else if (showhandles) {
+    er(drawspritebox(0,11,charptr));
+  }
+
+  return(NULL);
+}
+
+
+/* Scale a sprite box by the current scale factors */
+
+os_error * scalebox(sprite_pgm *dst, sprite_pgm *src, int bitposn)
+{
+  dst->p0[0] = scalex(src->p0[0]) << bitposn;
+  dst->p0[1] = scaley(src->p0[1]) << bitposn;
+  dst->p1[0] = scalex(src->p1[0]) << bitposn;
+  dst->p1[1] = scaley(src->p1[1]) << bitposn;
+  dst->p3[0] = scalex(src->p3[0]) << bitposn;
+  dst->p3[1] = scaley(src->p3[1]) << bitposn;
+  dst->p2[0] = scalex(src->p2[0]) << bitposn;
+  dst->p2[1] = scaley(src->p2[1]) << bitposn;
+
+  return(NULL);
+}
+
+
+/* draw sprite box, using the supplied gcol action / colour */
+
+os_error * drawspritebox(int gcol1, int gcol2, Char_Block *charptr)
+{
+  sprite_pgm b;
+
+  er(scalebox(&b, &charptr->backsprbox, 0));
+
+  wimp_gcol(gcol1,gcol2);
+
+  bbc_move(b.p0[0], b.p0[1]);
+  bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, b.p1[0], b.p1[1]);
+  bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, b.p2[0], b.p2[1]);
+  bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, b.p3[0], b.p3[1]);
+  bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, b.p0[0], b.p0[1]);
+
+  scanhandles(&b,drawhandle);       /* draw each handle in turn */
+
+  return(NULL);
+}
+
+
+/* scan all the sprite box handles, returning the handle of the one that returns TRUE
+ * also leaves handlebox with the values for the handle returned
+ */
+
+spb_type scanhandles(sprite_pgm *b, BOOL (*subr)(spb_type t,wimp_box *box))
+{
+  int i, x, y;
+
+  for (i=SPB_MIN; i<=SPB_MAX; i++) {
+    switch(i) {
+      case SPB_x0y0: x = b->p0[0]; y = b->p0[1]; break;
+      case SPB_x1y0: x = b->p1[0]; y = b->p1[1]; break;
+      case SPB_x1y1: x = b->p2[0]; y = b->p2[1]; break;
+      case SPB_x0y1: x = b->p3[0]; y = b->p3[1]; break;
+      case SPB_x0: x = (b->p0[0]+b->p3[0]) >> 1;
+                   y = (b->p0[1]+b->p3[1]) >> 1; break;
+      case SPB_y0: x = (b->p0[0]+b->p1[0]) >> 1;
+                   y = (b->p0[1]+b->p1[1]) >> 1; break;
+      case SPB_x1: x = (b->p1[0]+b->p2[0]) >> 1;
+                   y = (b->p1[1]+b->p2[1]) >> 1; break;
+      case SPB_y1: x = (b->p2[0]+b->p3[0]) >> 1;
+                   y = (b->p2[1]+b->p3[1]) >> 1;
+    }
+    handlebox.x0 = x-6; handlebox.y0 = y-6; handlebox.x1 = x+6; handlebox.y1 = y+6;
+    handlex = x;
+    handley = y;
+
+    if (subr(i,&handlebox)) return(i);   /* return handle if routine returns TRUE */
+  }
+
+  return(SPB_NONE);
+}
+
+
+/* draw a sprite box handle - called from scanhandles */
+
+BOOL drawhandle(spb_type t, wimp_box * box)
+{
+  t=t;   /* shut C up */
+
+  bbc_move(box->x0,box->y0);
+  bbc_draw(box->x1,box->y0);
+  bbc_draw(box->x1,box->y1);
+  bbc_draw(box->x0,box->y1);
+  bbc_draw(box->x0,box->y0);
+
+  return(0);            /* don't stop scanning */
+}
+
+
+/* check for mouse being within a given box
+ * mousex, mousey contain the mouse coordinates (absolute)
+ * box coordinates are also absolute
+ */
+
+BOOL matchhandle(spb_type t, wimp_box * box)
+{
+  t=t;   /* shut C up */
+
+  if (mousex >= box->x0 &&
+      mousey >= box->y0 &&
+      mousex <= box->x1 &&
+      mousey <= box->y1) return(1); else return(0);
+}
+
+
+/* update bbox according to position of handles
+ * in this case the coords are unscaled (ie. design units)
+ */
+
+BOOL minmaxhandle(spb_type t, wimp_box *box)
+{
+  int x = (box->x0 + box->x1) >> 1;      /* get centre coordinate */
+  int y = (box->y0 + box->y1) >> 1;
+
+  t=t;   /* shut C up */
+
+  if (x < minx) minx = x;
+  if (x > maxx) maxx = x;
+  if (y < miny) miny = y;
+  if (y > maxy) maxy = y;
+
+  return(0);
+}
+
+
+/* Draw scaffold lines, metric bbox, char bbox, font bbox, width
+ * Called from redraw_skel and various editchar routines
+ */
+
+os_error * drawscaffold(Char_Block *charptr, wimp_redrawstr *rptr)
+{
+  register int i,x,xx,x2;
+  register int dragline = -100;   /* index of line being dragged (+8 if y-scaffold) */
+  int *coord;
+  int *width;
+  Char_Block *dragchar;
+
+  i = dragbox.d.scaffold.index;
+  switch(dragbox.type) {
+    case DR_SCAFFOLDX:
+      if (charptr->parent == (dragchar=dragbox.wlink->info)->parent)
+      if (charptr->scaffold.xchar[i] == dragchar->scaffold.xchar[i])
+        dragline = i;
+      break;
+    case DR_SCAFFOLDY:
+      if (charptr->parent == (dragchar=dragbox.wlink->info)->parent);
+      if (charptr->scaffold.ychar[i] == dragchar->scaffold.ychar[i])
+        dragline = i+8;
+  }
+
+  coord = charptr->scaffold.xcoord;
+  width = charptr->scaffold.xwidth;
+  for (i=0;i<8;i++) {
+    x = coord[i];
+    if (x != NULL_SCAFFOLD) {
+      if ((x2=width[i]) >= WID_LTANGENT) {
+        xx = x2 = scalex(x);
+      } else {
+        x2 = x+x2;
+        xx = scalex(x);
+        x2 = scalex(x2);
+      }
+      if (x2+tt+dx+32 >= rptr->g.x0 && xx-tt < rptr->g.x1) {
+        int colour = scaffoldcolour(charptr,i);
+        wimp_gcol(0, colour & 0xFF);
+        if (i == dragline) {
+          if (width[i] < WID_LTANGENT) {             /* just draw line which isn't being dragged */
+            if (dragbox.d.scaffold.x != x) {
+              bbc_move(xx,rptr->g.y0); bbc_draw(xx,rptr->g.y1);
+              wimp_gcol(0, colour>>8); bbc_circlefill(xx,by,tt);
+            } else {
+              bbc_move(x2,rptr->g.y0); bbc_draw(x2,rptr->g.y1);
+              wimp_gcol(0, colour>>8); bbc_circlefill(x2,by,tt);
+            }
+          }
+        } else {
+          bbc_move(xx,rptr->g.y0); bbc_draw(xx,rptr->g.y1);
+          switch(width[i]) {
+            case WID_LTANGENT:
+              wimp_gcol(0, colour>>8);
+              bbc_move(xx,by); bbc_move(xx,by+tt); bbc_plot(bbc_Sector+5, xx,by-tt);
+              x2 -= tt+dx;    /* correct for index printing */
+              break;
+            case WID_RTANGENT:
+              wimp_gcol(0, colour>>8);
+              bbc_move(xx,by); bbc_move(xx,by-tt); bbc_plot(bbc_Sector+5, xx,by+tt);
+              x2 -= tt+dx;    /* correct for index printing */
+              break;
+            default:
+              bbc_move(x2,rptr->g.y0); bbc_draw(x2,rptr->g.y1);
+              wimp_gcol(0, colour>>8); bbc_circlefill(xx,by,tt); bbc_circlefill(x2,by,tt);
+              xx += tt+dx; x2 -= tt+dx;
+              if (xx<=x2) { bbc_move(xx,by); bbc_draw(x2,by); }
+          } /* switch */
+          if ((colour & 0xFF) == GCOL_SELECTED) {
+            er(printscaffoldindex(DR_SCAFFOLDX, x2, i, 0, 11));
+          }
+        } /* if (dragged scaffold line) */
+      } /* if (within clip rectangle) */
+    } /* if (not null scaffold) */
+  }/* for (scaffold lines = 0..7) */
+
+  coord = charptr->scaffold.ycoord;
+  width = charptr->scaffold.ywidth;
+  for (i=0;i<8;i++) {
+    x = coord[i];
+    if (x != NULL_SCAFFOLD) {
+      if ((x2=width[i]) >= WID_LTANGENT) {
+        xx = x2 = scaley(x);
+      } else {
+        x2 = x+x2;
+        xx = scaley(x);
+        x2 = scaley(x2);
+      }
+      if (x2+tt+dy+48 >= rptr->g.y0 && xx-tt < rptr->g.y1) {
+        int colour = scaffoldcolour(charptr,i+8);
+        wimp_gcol(0, colour & 0xFF);  /* index into following array */
+        if (i+8 == dragline) {
+          if (width[i] < WID_LTANGENT) {              /* only draw line which isn't being dragged */
+            if (dragbox.d.scaffold.y != x) {
+              bbc_move(rptr->g.x0,xx); bbc_draw(rptr->g.x1,xx);
+              wimp_gcol(0, colour>>8); bbc_circlefill(bx,xx,tt);
+            } else {
+              bbc_move(rptr->g.x0,x2); bbc_draw(rptr->g.x1,x2);
+              wimp_gcol(0, colour>>8); bbc_circlefill(bx,x2,tt);
+            }
+          }
+        } else {
+          bbc_move(rptr->g.x0,xx); bbc_draw(rptr->g.x1,xx);
+          switch(width[i]) {
+            case WID_LTANGENT:
+              wimp_gcol(0, colour>>8);
+              bbc_move(bx,xx); bbc_move(bx-tt,xx); bbc_plot(bbc_Sector+5, bx+tt, xx);
+              x2 -= tt+dy;    /* correct for index printing */
+              break;
+            case WID_RTANGENT:
+              wimp_gcol(0, colour>>8);
+              bbc_move(bx,xx); bbc_move(bx+tt,xx); bbc_plot(bbc_Sector+5, bx-tt, xx);
+              x2 -= tt+dy;    /* correct for index printing */
+              break;
+            default:
+              bbc_move(rptr->g.x0,x2); bbc_draw(rptr->g.x1,x2);
+              wimp_gcol(0, colour>>8); bbc_circlefill(bx,xx,tt); bbc_circlefill(bx,x2,tt);
+              xx += tt+dy; x2 -= tt+dy;
+              if (xx<=x2) { bbc_move(bx,xx); bbc_draw(bx,x2); }
+          } /* switch */
+          if ((colour & 0xFF) == GCOL_SELECTED) {
+            er(printscaffoldindex(DR_SCAFFOLDY, x2, i, 0, 11));
+          }
+        } /* if (dragged scaffold line) */
+      } /* if (within clip rectangle) */
+    } /* if (not null scaffold) */
+  }/* for (scaffold lines = 0..7) */
+
+  /* draw width, char bbox, font bbox (if relevant option enabled) */
+
+  if (showobox) {
+    int x0 = charptr->origbox.x0;
+    int y0 = charptr->origbox.y0;
+    int x1 = charptr->origbox.x1;
+    int y1 = charptr->origbox.y1;
+    if (x0 || y0 || x1 || y1) {
+      wimp_gcol(0,10);
+      bbc_move(scalex(x0),scaley(y0));
+      bbc_draw(scalex(x1),scaley(y0));
+      bbc_draw(scalex(x1),scaley(y1));
+      bbc_draw(scalex(x0),scaley(y1));
+      bbc_draw(scalex(x0),scaley(y0));
+    }
+  }
+
+  wimp_gcol(0,11);
+
+  if (showbbox) {
+    bbc_move(scalex(charptr->xlowc),scaley(charptr->ylowc));
+    bbc_draw(scalex(charptr->xupperc),scaley(charptr->ylowc));
+    bbc_draw(scalex(charptr->xupperc),scaley(charptr->yupperc));
+    bbc_draw(scalex(charptr->xlowc),scaley(charptr->yupperc));
+    bbc_draw(scalex(charptr->xlowc),scaley(charptr->ylowc));
+  }
+
+  if (showfbox) {
+    register FFile_FontHdr *f = charptr->parent->filedata;
+    register int x0 = scalex(f->x0);
+    register int y0 = scaley(f->y0) & ~(dy-1);
+    register int x1 = scalex(f->x0 + f->xs);
+    register int y1 = scaley(f->y0 + f->ys);
+    register int yy = scaley(f->y0 + f->ys - f->designsize) & ~(dy-1);
+    bbc_move(x0, y1); bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, x0, y0);
+    if (y0 != yy) bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, x1, y0);
+    else bbc_move(x1, y0);
+    bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, x1, y1);
+    bbc_move(bx-xwindlimit, y1);
+    bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, bx+xwindlimit, y1);
+    bbc_move(bx-xwindlimit, yy);
+    bbc_plot(bbc_DottedExFinal + bbc_DrawAbsFore, bx+xwindlimit, yy);
+  }
+
+  if (showwidth) {
+    register int designsize = charptr->parent->filedata->designsize;
+    register int x = charptr->xwidth * designsize / 1000;
+    register int y = charptr->ywidth * designsize / 1000;
+    register int xx = (x) ? 0 : tt;                     /* if zero-width, display a cross */
+
+    bbc_move(scalex(0),scaley(-tt)); bbc_draw(scalex(0),scaley(tt));
+    bbc_move(scalex(0-xx),scaley(0));
+    bbc_draw(scalex(x+xx),scaley(y));
+    bbc_move(scalex(x),scaley(y-tt)); bbc_draw(scalex(x),scaley(y+tt));
+  }
+
+  return(NULL);
+}
+
+
+os_error *redraw_bitmap(BOOL more, wimp_redrawstr *rptr, Char_Block *charptr)
+{
+  Font_Block * font = charptr->parent;
+  sprite_factors factors;
+  static sprite_id sprid = { NULL, sprite_id_name };
+  int strokepath[MAXPATH], *strokep;
+  int flattenedpath[MAXPATH2];
+  int matrix[6], *matrixp;
+  os_regset r;
+
+  sprid.s.name = charptr->sprname;
+
+  ttr[0] = pixtrans[0];
+  ttr[1] = pixtrans[15];
+  factors.ymag = pixelmag << 8;
+  factors.ydiv = dy << 8;
+  factors.xmag = factors.ymag * font->yres / font->xres;
+  factors.xdiv = dx << 8;
+
+  getscaledchardata(charptr);
+
+  if (charptr->template != NULL)
+   if (charptr->flags & CHAR_FLATTENED)
+    {
+    int oldbx=bx,
+        oldby=by;
+
+    xsize = xsize << 1;   /* correct for mode 18 */
+    ysize = ysize << 1;
+    xscale = xscale << 1;
+    yscale = yscale << 1;
+
+    bx = -(dx>>1);              /* bx,by = top-left coordinate of box */
+    by = ysize-(dy>>1);         /* correct for half-pixel adjustment in buildpath */
+
+    initsize(strokepath);
+    er(buildpath(charptr->template, strokepath, NULL, TRUE));
+
+    bx=oldbx;
+    by=oldby;
+
+    xsize = xsize >> 1;   /* restore these */
+    ysize = ysize >> 1;
+    xscale = xscale >> 1;
+    yscale = yscale >> 1;
+
+    flattenedpath[0] = 0;
+    flattenedpath[1] = sizeof(flattenedpath)-2*sizeof(int);
+    r.r[0] = (int) strokepath;
+    r.r[1] = (int) flattenedpath;
+    r.r[2] = charptr->flatness;         /* user can alter this */
+    er(os_swix(Draw_FlattenPath,&r));
+    strokep=flattenedpath;
+
+    matrix[0] = factors.xmag << 7;
+    matrix[1] = 0;
+    matrix[2] = 0;
+    matrix[3] = factors.ymag << 7;
+    matrix[4] = bx << 8;
+    matrix[5] = (by-(charptr->yupperc-charptr->ylowc)*pixelmag) << 8;
+    matrixp = matrix;
+   }
+
+  xsize =  (xsize * factors.xmag) >> 8;
+  ysize =  (ysize * factors.ymag) >> 8;
+  xscale= (xscale * factors.xmag) >> 8;
+  yscale= (yscale * factors.ymag) >> 8;
+
+  if (charptr->template !=NULL)
+  if ((charptr->flags & CHAR_FLATTENED) == 0)
+  {
+    initsize(strokepath);
+    er(buildpath(charptr->template, strokepath, NULL, FALSE));
+    strokep = strokepath;
+    matrixp = NULL;
+  }
+
+  while (more)
+  {
+    gx0 = unscalex(rptr->g.x0); 
+    gy0 = unscaley(rptr->g.y0);
+    gx1 = unscalex(rptr->g.x1);
+    gy1 = unscaley(rptr->g.y1);
+
+    erx(sprite_put_scaled(font->spritedata,&sprid,0,
+                      bx,by-(charptr->yupperc-charptr->ylowc)*pixelmag,
+                      &factors,ttr));
+
+    if (charptr->flags & (CHAR_GRIDCENTRES | CHAR_GRIDEDGES))
+    {
+      int xx0,xx1,yy0,yy1,i,j,k;
+
+      xx0 = bx << 8;
+      yy0 = by - (charptr->yupperc-charptr->ylowc) * pixelmag;
+      xx1 = xx0+ (charptr->xupperc-charptr->xlowc) * factors.xmag;
+      yy1 = by;
+
+      wimp_gcol(0,8);
+             
+      /* Plot the grid below the bit image copy of the image and then
+       * a suitable set of diamonds if required.
+       */ 
+
+      i = xx0;
+      for (j=0;j<=charptr->xupperc-charptr->xlowc;j++)
+      {
+        if (i>>8 < rptr->g.x1 && (i + factors.xmag)>>8 >= rptr->g.x0)
+          {
+            /* first plot the grid line */
+            if (charptr->flags & CHAR_GRIDEDGES)
+              { bbc_move(i>>8,yy0); bbc_draw(i>>8,yy1); }
+
+            /* then the diamonds - grid centres */
+            if (charptr->flags & CHAR_GRIDCENTRES)
+            for (k = yy0;k<yy1;k+=pixelmag)
+            {
+              if (k < rptr->g.y1 && (k + pixelmag) >= rptr->g.y0)
+              {    
+                bbc_move((i+(factors.xmag>>1))>>8,k);
+                bbc_draw((i+factors.xmag)>>8,k+(pixelmag>>1));
+                bbc_draw((i+(factors.xmag>>1))>>8,k+pixelmag);
+                bbc_draw(i>>8,k+(pixelmag>>1));
+                bbc_draw((i+(factors.xmag>>1))>>8,k);
+              }  
+            }
+          }
+        i += factors.xmag;
+      }
+
+      i = yy0;
+      if (charptr->flags & CHAR_GRIDEDGES)
+      for (j=0;j<=charptr->yupperc-charptr->ylowc;j++)
+      {
+        if (i >= rptr->g.y0 && i <= rptr->g.y1) 
+          { bbc_move(xx0>>8,i); bbc_draw(xx1>>8,i); }
+        i += pixelmag;
+      }
+    }
+
+    wimp_gcol(0,11);
+    {
+      int x = scalex(0);
+      int y = scaley(0);
+      bbc_move(x-tt,y);
+      bbc_draw(x+tt,y);
+      bbc_move(x,y-tt);
+      bbc_draw(x,y+tt);
+      x += (charptr->xwidth*charptr->parent->xres << 8) / 72000 * factors.xmag >> 16;
+      y += (charptr->ywidth*charptr->parent->yres << 8) / 72000 * factors.ymag >> 16;
+      bbc_move(x-tt,y);
+      bbc_draw(x+tt,y);
+      bbc_move(x,y-tt);
+      bbc_draw(x,y+tt);
+    }
+
+    if (charptr->template != NULL)
+
+    {
+      wimp_gcol(0,11);
+      r.r[0] = (int) strokep;
+      r.r[1] = 0x18;                     /* 0x18  = fill boundary only */
+      r.r[2] = (int) matrixp;
+      r.r[3] = charptr->flatness;   /* can be altered by user */
+      r.r[4] = 0;
+      r.r[5] = 0;
+      r.r[6] = 0;
+      erx(os_swix(Draw_Stroke,&r));
+    }
+
+    erx(wimp_get_rectangle(rptr,&more));
+  }
+  return(NULL);
+}
+
+
+int pointcol;    /* global parameter */
+
+int drawpoints(line)
+Line_Block *line;
+{
+  if (line->p[1]->type < PT_INVISIBLE)
+  {
+    drawpoint(line->p[0],pointcol);
+    if (selected(thischar, line->p[1]))
+    {
+      drawpoint(line->p[1],pointcol);
+      drawpoint(line->p[2],pointcol);
+    }
+    drawpoint(line->p[3],pointcol);
+  }
+  return(0);
+}
+
+
+void drawpoint(pt,col)
+Pt_Block *pt;
+int col;
+{
+  int x = scalex(pt->x), y = scaley(pt->y);
+
+  switch(pt->type)
+  {
+    case PT_CONTROL:
+         if (col!=0) wimp_gcol(col>>8,11); else wimp_gcol(0,0);
+         {
+           int x2 = scalex(pt->nextpt[1]->x),
+               y2 = scaley(pt->nextpt[1]->y);
+           bbc_move(x,y);
+           bbc_draw(x2+(x2-x),y2+(y2-y));  /* bbc_draw(x2,y2); >>> draw tangent line <<< */
+         }
+         break;
+    case PT_STRAIGHT:
+         if (col!=0) wimp_gcol(col>>8,11); else wimp_gcol(0,0);
+         break;
+    case PT_HINGED:
+    case PT_PARALLEL:
+         wimp_gcol(col >> 8,col & 0xFF);
+  }
+
+  switch(scafftype(thischar)) {
+    case SEL_SCAFFOLDX:
+      if (pt->scaffoldx == thischar->parent->scaffold.index) wimp_gcol(0,11);
+      break;
+    case SEL_SCAFFOLDY:
+      if (pt->scaffoldy == thischar->parent->scaffold.index-8) wimp_gcol(0,11);
+  }
+
+  if (x-8<gx1 || y-8>gy1 || x+8>gx0 || y+8>gy0)
+    bbc_rectanglefill(x-4,y-4,8,8);
+}
+
+
+void drawaline(line)
+Line_Block *line;
+{
+  Pt_Block *endp1 = line->p[0];
+  Pt_Block *ctrl1 = line->p[1];
+  Pt_Block *ctrl2 = line->p[2];
+  Pt_Block *endp2 = line->p[3];
+
+  if (ctrl1==NULL) return;   /* null line is marked by p[1]==0 */
+
+  switch(ctrl1->type)
+  {
+    case PT_STRAIGHT:
+         bbc_move(scalex(endp1->x),scaley(endp1->y));
+         bbc_draw(scalex(endp2->x),scaley(endp2->y));
+         break;
+
+    case PT_CONTROL:
+         bezier(endp1->x,endp1->y,
+                ctrl1->x,ctrl1->y,
+                ctrl2->x,ctrl2->y,
+                endp2->x,endp2->y);
+  }
+}
+
+
+int drawline(line)
+Line_Block *line;
+{
+  int bx0,by0,bx1,by1,bx2,by2,bx3,by3;
+
+  switch(line->p[1]->type)
+  {
+    case PT_STRAIGHT:
+         minx = maxx = bx0 = line->p[0]->x;
+         if ((bx1 = line->p[3]->x)<minx) minx = bx1; if (bx1>maxx) maxx = bx1;
+
+         miny = maxy = by0 = line->p[0]->y;
+         if ((by1 = line->p[3]->y)<miny) miny = by1; if (by1>maxy) maxy = by1;
+
+         if (minx-4<gx1 && maxx+4>gx0 && miny-4<gy1 && maxy+4>gy0)
+         {
+           if (selected(thischar, line->p[1])) wimp_gcol(0,15); else wimp_gcol(0,7);
+           bbc_move(scalex(bx0),scaley(by0));
+           bbc_draw(scalex(bx1),scaley(by1));
+         }
+         break;
+
+    case PT_CONTROL:
+         minx = maxx = bx0 = line->p[0]->x;
+         if ((bx1 = line->p[1]->x)<minx) minx = bx1; if (bx1>maxx) maxx = bx1;
+         if ((bx2 = line->p[2]->x)<minx) minx = bx2; if (bx2>maxx) maxx = bx2;
+         if ((bx3 = line->p[3]->x)<minx) minx = bx3; if (bx3>maxx) maxx = bx3;
+
+         miny = maxy = by0 = line->p[0]->y;
+         if ((by1 = line->p[1]->y)<miny) miny = by1; if (by1>maxy) maxy = by1;
+         if ((by2 = line->p[2]->y)<miny) miny = by2; if (by2>maxy) maxy = by2;
+         if ((by3 = line->p[3]->y)<miny) miny = by3; if (by3>maxy) maxy = by3;
+
+         if (minx-4<gx1 && maxx+4>gx0 && miny-4<gy1 && maxy+4>gy0)
+         {
+           if (selected(thischar, line->p[1])) wimp_gcol(0,15); else wimp_gcol(0,7);
+           bezier(bx0,by0,bx1,by1,bx2,by2,bx3,by3);
+         }
+
+  }
+  return(0);
+}
+
+
+/* mousex, mousey = coordinates to match with ('unscaled' coordinates) */
+
+int matchpoint(pt)
+Pt_Block *pt;
+{
+  int x = scalex(pt->x);
+  int y = scaley(pt->y);
+
+  if (mousex+tt>=x && mousey+tt>=y && mousex-tt<=x && mousey-tt<=y)
+    return(true);
+  return(false);
+}
+
+
+int matchendpoint(pt)
+Pt_Block *pt;
+{
+  int x = scalex(pt->x);
+  int y = scaley(pt->y);
+
+  if (pt->type == PT_HINGED ||
+      pt->type == PT_PARALLEL)
+    if (mousex+tt>=x && mousey+tt>=y && mousex-tt<=x && mousey-tt<=y)
+      return(true);
+  return(false);
+}
+
+
+/* mousex, mousey = coordinates to match with ('unscaled' coordinates) */
+
+int matchline(Line_Block *line)
+{
+  int outpath[MAXPATH2], *section;
+  int inpath[3+7+2+4];
+  os_regset r;
+
+  if (line->p[1]==NULL) return(false);
+
+  {
+    register int cc;
+
+    minx = maxx = cc = line->p[0]->x;
+    if ((cc = line->p[1]->x)<minx) minx = cc; if (cc>maxx) maxx = cc;
+    if ((cc = line->p[2]->x)<minx) minx = cc; if (cc>maxx) maxx = cc;
+    if ((cc = line->p[3]->x)<minx) minx = cc; if (cc>maxx) maxx = cc;
+
+    miny = maxy = cc = line->p[0]->y;
+    if ((cc = line->p[1]->y)<miny) miny = cc; if (cc>maxy) maxy = cc;
+    if ((cc = line->p[2]->y)<miny) miny = cc; if (cc>maxy) maxy = cc;
+    if ((cc = line->p[3]->y)<miny) miny = cc; if (cc>maxy) maxy = cc;
+  }
+
+/*
+  printf("MinMax: %5d %5d %5d %5d\n",
+             scalex(minx),scaley(miny),scalex(maxx),scaley(maxy));
+*/
+
+  if (mousex+tt>=scalex(minx) && mousey+tt>=scaley(miny) &&
+      mousex-tt<=scalex(maxx) && mousey-tt<=scaley(maxy) )
+  {
+    initsize(inpath);    /* needed for moveto() and curveto() */
+    buildoutptr = inpath;
+
+    erx(moveto(line->p[0],NULL));                            /* these shouldn't return errors */
+    erx(curveto(line->p[1],line->p[2],line->p[3],NULL));
+    endpath();
+
+/*
+    {
+      int *i;
+      mytracef("Input path is ");
+      for (i=inpath; i<=buildoutptr; i++) mytracef("%d ",*i);
+      mytracef("\nOutput path is:\n");
+    }
+*/
+
+    initsize(outpath);
+    r.r[0] = (int) inpath;
+    r.r[1] = (int) outpath;
+    r.r[2] = 0;                         /* default flatness */
+    erx(os_swix(Draw_FlattenPath,&r));                 /* shouldn't overflow for a single bezier */
+
+    section = outpath;
+
+    {
+      int x0,y0,x1,y1, d,k;
+
+      do
+      {
+        switch (*section++)
+        {
+          case DRAW_MOVE:
+               x0 = *section++ >> 8;
+               y0 = *section++ >> 8;
+/*
+               mytracef("moveto %d,%d\n",x0,y0);
+*/
+               break;
+  
+          case DRAW_LINE:
+               x1 = *section++ >> 8;
+               y1 = *section++ >> 8;
+/*
+               mytracef("line from %d,%d to %d,%d\n",x0,y0,x1,y1);
+*/  
+               k = mousex*(y0-y1) + mousey*(x1-x0) + x0*y1 - y0*x1;
+  
+               d = (((x0<x1)?-1:1)==((y0<y1)?-1:1))
+                 ? (x0+y0-x1-y1)*tt
+                 : (x0+y1-x1-y0)*tt;
+
+               if (((k<d)?-1:1)!=((k+d<0)?-1:1))
+               {
+                 if ((minx=x0) > x1) { minx=x1; maxx=x0; } else { maxx=x1; }
+                 if ((miny=y0) > y1) { miny=y1; maxy=y0; } else { maxy=y1; }
+  
+                 if (mousex+tt>=minx && mousey+tt>=miny &&
+                     mousex-tt<=maxx && mousey-tt<=maxy)
+                       return(true);
+               }
+               x0 = x1;
+               y0 = y1;
+               break;
+  
+          case DRAW_TERM:
+               return(false);
+  
+        }
+      } while (true);
+    }
+  }
+  return(false);   /* can't actually get here! */
+}
+
+/* Update all displays relating to the character in question
+ * If the char is an outline, then any dependent bitmaps may also be updated
+ * NB: Doesn't do composite characters, as this involves unsuspending all chars in the font.
+ * NB: use ForceRedraw, so Font Index window can prompt bitmap reconstruction
+ *     (then it doesn't matter which order the windows are found in).
+ * If the char is a bitmap, then only the font index image is updated (bitmap already up-to-date)
+ * Note that in general the primary window is already up-to-date, so is not invalidated
+ */
+
+/* NOT YET IMPLEMENTED !!! */
+#define findcomposite(from, to) 0
+
+os_error * updatecopies(Char_Block *charptr, BOOL saveit)
+{
+  Wind_Link *wlink = Wind_Head.next;
+
+  if (heaptrace)
+  mytracef("updatecopies(charptr='%c', saveit=%d) bpp =%d\n",
+                charptr->charno,saveit,charptr->parent->filedata->bpp);
+
+  if (saveit) {
+    if ((charptr->parent->filedata->bpp) == 0) {
+      er(makesprite(charptr,(nonzerowinding(charptr))));
+    }
+    er(savechar(charptr));    /* char itself must already be up-to-date */
+  }
+
+  while (wlink!=NULL)
+  {
+    switch(wlink->type)
+    {
+      case W_FONTINDEX:                /* update bitmap(s) if outline char changes */
+           {
+             Font_Block *font = wlink->info;
+             if (font->filedata->bpp == 1 && charptr->charno < font->nchars) {
+               Char_Block *char2 = font->chars[charptr->charno];
+               if (char2 != NULL)
+               if (char2->template == charptr) {
+                 makesprite1bpp(char2,(nonzerowinding(charptr)));
+                 er(savechar(char2));
+                 displaychar(wlink->wind_handle,font,charptr->charno);
+               }
+             }
+             if (font==charptr->parent) {   /* catches outline / bitmap changes */
+               if (heaptrace) mytracef("displaychar()\n");
+               displaychar(wlink->wind_handle,font,charptr->charno);
+             }
+           }
+           break;
+
+      case W_FULL:
+           if ((Char_Block *) wlink->info==charptr) {
+             invalidate(wlink->wind_handle,-big,-big,big,big);
+           }
+           break;
+
+      case W_BITMAP:
+           { Char_Block *chr = wlink->info;
+             if (chr->template==charptr || findcomposite(chr, charptr))   /* bitmap already recomputed */
+               invalidate(wlink->wind_handle,-big,-big,big,big);             /* so just redraw window */
+           }
+           break;
+
+      case W_SKELETON:
+           { Char_Block *chr = wlink->info;
+             if (chr->template==charptr || findcomposite(chr, charptr))
+               invalidate(wlink->wind_handle,-big,-big,big,big);
+           }
+    }
+
+    wlink=wlink->next;
+  }
+  return(NULL);
+}
+
+
+/* Update bounding box of outline character
+ * If it has changed, and bbox is being displayed, redraw the skeleton window
+ * NB: The font bbox is only updated when the file is saved
+ */
+
+os_error *updatebbox(Char_Block *charptr, wimp_w handle)
+{
+  int path1[MAXPATH];
+  int path2[MAXPATH2];                 /* extra space required for output path */
+  wimp_box minmax;
+
+  bx = -(dx >> 1);
+  by = -(dy >> 1);
+  x0 = y1 = 0;
+  xscale = yscale = 1 << 16;         /* 1 design unit => 256 draw module units */
+
+  initsize(path1);
+  er(buildpath(charptr, path1, NULL, FALSE));
+
+  minmax.x0 = minmax.y0 = minmax.x1 = minmax.y1 = 0;   /* outer bbox always includes origin */
+  er(minmaxpath(path1, &minmax));
+  charptr->windowbox = minmax;        /* used for setting extent of window */
+
+  initsize(path2);
+  er(os_swi3(Draw_FlattenPath, (int) path1, (int) path2, 256));
+
+  minmax.x0 = minmax.y0 = big;
+  minmax.x1 = minmax.y1 = -big;       /* doesn't necessarily include origin */
+  er(minmaxpath(path2, &minmax));
+  if (minmax.x0==big) { minmax.x0 = minmax.y0 = minmax.x1 = minmax.y1 = 0; }     /* null bbox */
+
+  if (minmax.x0 != charptr->xlowc ||
+      minmax.y0 != charptr->ylowc ||
+      minmax.x1 != charptr->xupperc ||
+      minmax.y1 != charptr->yupperc) {
+    charptr->xlowc = minmax.x0;
+    charptr->ylowc = minmax.y0;
+    charptr->xupperc = minmax.x1;
+    charptr->yupperc = minmax.y1;
+    if (handle && showbbox) invalidate(handle, -big,-big,big,big);
+  }
+
+  if (handle) {
+    Wind_Link *wlink;
+    er(setextent(findwindlink(handle)));       /* extent may have changed */
+    wlink = findwindinfo(W_FULL, charptr);
+    if (wlink) er(setextent(wlink));              /* process full char window if visible */
+  }
+
+  return(NULL);
+}
+
+
+/* Scan a draw path, returning the bounding box
+ * The path may or may not have been flattened beforehand
+ */
+
+os_error *minmaxpath(int *ptr, wimp_box *m)
+{
+  while(*ptr != DRAW_TERM) {
+    register int count = 1;      /* 1 set of coords */
+    switch(*ptr++) {
+      case DRAW_CURV: count = 3;          /* 3 sets of coords */
+      case DRAW_MOVE:
+      case DRAW_LINE:
+        for ( ; count; count--) {
+          register int x = (*ptr++ + 128) >> 8;
+          register int y = (*ptr++ + 128) >> 8;
+          if (x < m->x0) m->x0=x;
+          if (y < m->y0) m->y0=y;
+          if (x > m->x1) m->x1=x;
+          if (y > m->y1) m->y1=y;
+        }
+        break;
+      default: returnerr("UpdateBBox: Unexpected path element");
+    }
+  }
+  return(NULL);
+}
+
+
+/* Redraw the character box in the font index
+ * The sprite is not recalculated - this is used when the char index colour changes
+ */
+
+void displaychar(wimp_w handle, Font_Block *font, int charno)
+{
+  wimp_redrawstr rblk;
+  BOOL more;
+
+  mytracef("displaychar(&%X,&%p,%d)\n",handle,font,charno);
+
+  rblk.w = handle;
+  getcharbox(font,charno,0,0,&rblk.box);         /* window-relative coordinates */
+  erx(wimp_update_wind(&rblk,&more));
+
+  bx = rblk.box.x0 - rblk.scx;
+  by = rblk.box.y1 - rblk.scy;
+
+  erx(redraw_font(more,&rblk,font));
+}
+

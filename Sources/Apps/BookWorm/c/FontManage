@@ -1,0 +1,645 @@
+/*
+
+RISC OS Font management
+
+Merlyn Kline, 1995
+
+:NOTES
+This module provides a range of veneers for font management. It allows a typeface
+to be defined including bold, italic and bold-italic attributes. These typefaces
+are given names by which they are referred to in subsequent use. When defining a
+typeface an alternative to be used can be specified for cases where the primary
+selection is unavailable for some reason. If the alternative does not exist, *its*
+alternative is checked. This goes on for several attempts (about 4) before giving
+up after which the ordinary system font is used, scaled appropriately. This limit
+on the number of attempts improves performance and means you don't have to worry too
+much about defining loops (eg pairs of typefaces which specify each other as alternatives).
+
+The system provides veneers for all font related functions and these use an internal
+font handle. This font handle is either the RISC OS font handle when an appropriate
+font was available or a negative number made up from the x and y font sizes.
+
+Note the use of the word 'typeface' to describe the four-font structure used by this
+module. This is to avoid confusion with the RISC OS term 'font' underlying it.
+
+Typefaces are defined by passing strings to the font definition routine, which contain
+a description of the desired font, like:
+
+   name=normal:italic:bold:bolditalic;alternative
+
+where:
+
+   name         is the name you want to refer to this typeface by (case insensitive)
+   normal       is the RISC OS font name to use in normal rendering
+   italic       is the RISC OS font name to use in italic rendering
+   bold         is the RISC OS font name to use in bold rendering
+   bolditalic   is the RISC OS font name to use in bold plus italic rendering
+   alternative  is the alternative typeface name to use if necessary
+
+Any of these fields may be missing except <name>. If the font names used for
+bold/italic rendering are missing, the normal one will be used instead. If
+the normal font name is missing, the alternative typface is used. If the
+alternative is missing, system font will be used when the requested fonts are
+not available.
+
+When defining typefaces for optimum performance define the one which will be used
+most, last. This is because they are kept in a linked list and new ones are added to
+the start of the list and so will be found more quickly.
+
+If you define a typeface with the same name as an existing one the new definition
+overwrites the old one.
+
+Default font definitions are available as follows:
+
+  system=System.Fixed:Corpus.Medium.Oblique:Corpus.Bold:Corpus.Bold.Oblique;fixed
+  sans=Homerton.Medium:Homerton.Medium.Oblique:Homerton.Bold:Homerton.Bold.Oblique;serif
+  serif=Trinity.Medium:Trinity.Medium.Italic:Trinity.Bold:Trinity.Bold.Italic;sans
+  fixed=Corpus.Medium:Corpus.Medium.Oblique:Corpus.Bold:Corpus.Bold.Oblique
+
+Font sizes are defined in sixteenths of a point. The system font is treated as a font
+with a 2:1 aspect ratio so set both xsize and ysize to the same to get normal looking text.
+A size of 205 (=8*2*16*72/90 ie:
+   pixels * os_units_per_pixel * sixteenths_of_a _point_per_inch / os_units_per_inch )
+will get system font at its normal size. This size should therefore be used for any display
+of information where size is pretty arbitrary, ensuring a reasonable appearnce should system
+font be used. To help, it is #defined as FM_STANDARD_SIZE
+
+There is also code to create, display and interpret font menus for both RO2 and RO3. To use this,
+you generally call fm_build_font_menu() followed by fm_create_menu() to build and display the menu.
+This will re-use a menu cached from a previous call if there is one. You can then call
+fm_font_name_from_menu() to get the result and finally fm_dispose_font_menu() to free the memory
+and destroy any cache. Note the way that caching works - a typical use might be:
+
+    dbox_new
+    dbox_show
+    do
+    {
+      dbox_fillin()
+      if()
+      {
+        fm_build_font_menu()
+        fm_create_font_menu()
+      }
+      if()
+      {
+        fm_font_name_from_menu()
+      }
+    } while()
+    dbox_dispose()
+    fm_dispose_font_menu()
+
+This ensures that repetitive calls in the fillin loop are quick (due to caching)
+but that the memory is recovered afterwards and the font menu regenerated from scratch
+next time the dialogue is used (in case the font list has changed in the interim).
+
+:END
+
+:MESSAGES
+BADTYPE:Illegal typeface definition
+NOMEM:Not enough free memory. Please free some memory and try again.
+NOFACE:Reference to undefined typeface.
+Fontmenu:Font list
+:END
+
+*/
+
+#include "stdlib.h"
+#include "stdio.h"
+#include "string.h"
+#include "ctype.h"
+
+/*----------------------------------------------------------------------*/
+#include "os.h"
+#include "font.h"
+#include "wimpt.h"
+#include "colourtran.h"
+#include "bbc.h"
+#include "menu.h"
+#include "swis.h"
+#include "msgs.h"
+
+#include "ErrorGen.h"
+#include "FontManage.h"
+#include "Utils.h"
+#include "Browser.h"
+#include "Printing.h"
+
+#if 0
+
+/*----------------------------------------------------------------------*/
+#define FONTNAMELEN 64
+/*----------------------------------------------------------------------*/
+#define TYPENAMELEN 20
+
+/*----------------------------------------------------------------------*/
+#define FM_STANDARD_SIZE (205) /* see above about the size of system font */
+
+/*----------------------------------------------------------------------*/
+typedef struct fm_typeface
+{ /* definition of a typeface for the outside world to see */
+  char               name[TYPENAMELEN];         /* the name of the typeface in lowercase */
+  char               fontnames[4][FONTNAMELEN]; /* the names of the RO fonts for normal, italic, bold & bolditalic */
+  char               alternative[TYPENAMELEN];  /* the name of the alternative typeface */
+} fm_typeface;
+
+/*----------------------------------------------------------------------*/
+typedef int fm_face;
+
+#endif
+
+#define FM_SYSTEM_HANDLE(x,y) (0x80000000 | ((x)<<14) | (y))
+#define FM_SYSTEM_SIZE_X(h) (((h)>>14)&0x3FFF)
+#define FM_SYSTEM_SIZE_Y(h) ((h)&0x3FFF)
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+typedef struct fm_facelist
+{ /* entry in the list of dwfine typefaces */
+  struct fm_facelist *next;
+  fm_typeface        face;
+} fm_facelist;
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static fm_facelist *fm_list=NULL;
+static BOOL        fm_systemfont=FALSE;
+static int         fm_allowblend=-1;
+static menu        fm_cached_menu=NULL;
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static fm_typeface *fm_find_typeface(char *name)
+{
+  char        lname[TYPENAMELEN],*p;
+  int         i;
+  fm_facelist *f;
+
+  p=name;
+  i=0;
+  while(*p && i<sizeof(lname)-1)
+  {
+    lname[i++]=tolower(*p);
+    p++;
+  }
+  lname[i]=0;
+  f=fm_list;
+  while(f)
+  {
+    if(!strcmp(f->face.name,lname)) return(&f->face);
+    f=f->next;
+  }
+  return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static fm_typeface *fm_new_typeface(void)
+{
+  fm_facelist *f;
+
+  f=malloc(sizeof(fm_facelist));
+  if(f)
+  {
+    memset(f,0,sizeof(fm_facelist));
+    f->next=fm_list;
+    fm_list=f;
+  }
+  return(&f->face);
+}
+
+
+/*----------------------------------------------------------------------*/
+os_error *fm_define_typeface_explicit(fm_typeface *f)
+{
+  fm_typeface *fp;
+  char        *p;
+
+  fp=fm_find_typeface(f->name);
+  if(!fp) fp=fm_new_typeface();
+  if(!fp) return(errorgen_tag("NOMEM:"));
+  *fp=*f;
+  p=fp->name;
+  while(*p) {*p=tolower(*p); p++;}
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_define_typeface(char *description)
+{ /* define a new typeface - see above for definition string */
+  fm_typeface f;
+  char        *p;
+  int         i;
+
+  p=description;
+  i=0;
+  memset(&f,0,sizeof(f));
+  while(*p && *p!='=')
+  {
+    if(i<sizeof(f.name)-1) f.name[i++]=tolower(*p);
+    p++;
+  }
+  if(*p)
+  {
+    int n;
+
+    for(n=0;n<4;n++)
+    {
+      p++;
+      i=0;
+      while(*p && *p!=':' && *p!=';')
+      {
+        if(i<sizeof(f.fontnames[n])-1) f.fontnames[n][i++]=*p;
+        p++;
+      }
+      if(!*p || *p==';') break;
+    }
+    if(*p==';')
+    {
+      p++;
+      strncpy(f.alternative,p,sizeof(f.alternative)-1);
+    }
+  }
+  if(f.name[0]) return(fm_define_typeface_explicit(&f));
+  return(errorgen_tag("BADTYPE:"));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_define_default_typefaces(void)
+{ /* set up standard default typefaces */
+  ERROUT(fm_define_typeface("system=System.Fixed:Corpus.Medium.Oblique:Corpus.Bold:Corpus.Bold.Oblique;fixed"));
+  ERROUT(fm_define_typeface("fixed=Corpus.Medium:Corpus.Medium.Oblique:Corpus.Bold:Corpus.Bold.Oblique"));
+  ERROUT(fm_define_typeface("sans=Homerton.Medium:Homerton.Medium.Oblique:Homerton.Bold:Homerton.Bold.Oblique;serif"));
+  ERROUT(fm_define_typeface("serif=Trinity.Medium:Trinity.Medium.Italic:Trinity.Bold:Trinity.Bold.Italic;sans"));
+  return(NULL);
+}
+
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
+static fm_face fm_sub_find_font(fm_typeface *f,int xsize,int ysize,BOOL italic,BOOL bold)
+{
+  int        n;
+  fm_face    h;
+
+  n=(italic?1:0)|(bold?2:0);
+  if(!f->fontnames[n][0]) n&=2;
+  if(!f->fontnames[n][0]) n=0;
+  if(!f->fontnames[n][0]) return(-1);
+  if(font_find(f->fontnames[n],xsize,ysize,180/Wimpt_dx,180/Wimpt_dy,&h)) return(-1);
+  return(h);
+}
+
+/*----------------------------------------------------------------------*/
+fm_face fm_find_font(char *name,int xsize,int ysize,BOOL italic,BOOL bold)
+{ /* do a find_font to get a handle for a specified face at a specified size */
+  fm_typeface *f;
+  fm_face     s,h;
+  int         i;
+
+  s=FM_SYSTEM_HANDLE(xsize,ysize);
+  if(fm_systemfont) return(s);
+  f=fm_find_typeface(name);
+  if(!f) return(s);
+  h=fm_sub_find_font(f,xsize,ysize,italic,bold);
+  for(i=0;i<3 && h<0 && f->alternative[0];i++)
+  {
+    f=fm_find_typeface(f->alternative);
+    if(!f) return(s);
+    h=fm_sub_find_font(f,xsize,ysize,italic,bold);
+  }
+  if(h<0) return(s);
+  return(h);
+}
+
+/*----------------------------------------------------------------------*/
+void fm_lose_font(fm_face h)
+{ /* lose any record of a font handle */
+  if(h>=0) font_lose(h);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_font_box(fm_face h,wimp_box *box)
+{ /* get the bounding box of a font */
+  if(h<0)
+  {
+    int xs,ys;
+
+    xs=FM_SYSTEM_SIZE_X(h);
+    ys=FM_SYSTEM_SIZE_Y(h);
+    box->x0=0;
+    box->x1=xs*10/128;
+    box->y0=-ys*10/85;
+    box->y1=ys*10/25;
+    box->y1=ys*(10*13)/(64*16);
+    box->y0=ys*(10*-3)/(64*16);
+  }
+  else
+  {
+    /* ;{{ this probably needs to a char by char scan of the font and cache the result */
+    return(font_readinfo(h,(font_info*)box));
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_set_font_colour(fm_face handle,int fore,int back)
+{ /* set the colour for subsequent painting */
+  if(handle<0)
+  {
+    wimp_paletteword c;
+
+    c.word=fore;
+    return(colourtran_setGCOL(c,0,0,&fore));
+  }
+  else
+  {
+    int maxoffset=14;
+
+    font_setfont(handle);
+    return(colourtran_setfontcolours(&handle,(wimp_paletteword*)&back,(wimp_paletteword*)&fore,&maxoffset));
+  }
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_puts(fm_face handle,int x,int y,char *s,BOOL os,BOOL blend)
+{ /* output a string in the specified font, x and y in font or OS coords */
+  if(handle<0)
+  {
+    int xs,ys;
+
+    if(!os) convert_pair_to_os(x,y,&x,&y);
+    xs=FM_SYSTEM_SIZE_X(handle)*10/128/Wimpt_dx;
+    ys=FM_SYSTEM_SIZE_Y(handle)*10/64/Wimpt_dy;
+    bbc_vduq(23,17,7,6,xs&255,xs>>8,ys&255,ys>>8,0,0);
+    bbc_move(x,y+FM_SYSTEM_SIZE_Y(handle)*(10*13)/(64*16)-1); /* 10/64 converts to OS units, 13/16 is hgt above base */
+    printf(s);
+    bbc_vduq(23,17,7,6,16/Wimpt_dx,0,32/Wimpt_dy,0,0,0);
+    return(NULL);
+  }
+  else
+  {
+    if(fm_allowblend<0)
+    {
+      int a,b,c;
+
+      if(font_cacheaddress(&a,&b,&c)) a=0;
+      fm_allowblend=a>=335?1<<11:0;
+    }
+    font_setfont(handle);
+    return(font_paint(s,
+                      (printing ? 0 : (blend ? fm_allowblend : 0))
+                        | font_ABS
+                        | (os ? font_OSCOORDS : 0),
+                      x,
+                      y));
+  }
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_putsl(fm_face handle,int x,int y,char *s,int length,BOOL os,BOOL blend)
+{ /* output length bytes of a string in the specified font, x and y in font or OS coords */
+  char     c;
+  os_error *e;
+
+  c=*(s+length);
+  *(s+length)=0;
+  e=fm_puts(handle,x,y,s,os,blend);
+  *(s+length)=c;
+  return(e);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_write_descriptor(char *name,char *buffer)
+{ /* get a description string for a typeface - the buffer must be big enough! */
+  fm_typeface *f;
+
+  f=fm_find_typeface(name);
+  if(!f) return(errorgen_tag("NOFACE:"));
+  sprintf(buffer,"%s=%s:%s:%s:%s;%s",
+          f->name,f->fontnames[0],f->fontnames[1],f->fontnames[2],f->fontnames[3],f->alternative);
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_write_name(char *name,char *buffer,BOOL italic,BOOL bold)
+{ /* get a RISC OS fontname string for a typeface - the buffer must be big enough! */
+  fm_typeface *f;
+  int         n;
+
+  n=(italic?1:0)|(bold?2:0);
+  f=fm_find_typeface(name);
+  if(!f) return(errorgen_tag("NOFACE:"));
+  sprintf(buffer,"%s",f->fontnames[n]);
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_read_typeface(fm_typeface *face)
+{ /* fill in the rest of the typeface definition given its name */
+  fm_typeface *f;
+
+  f=fm_find_typeface(face->name);
+  if(!f) return(errorgen_tag("NOFACE:"));
+  *face=*f;
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+void fm_destroy_typefaces(void)
+{ /* destroy all typeface records and empty the list */
+  fm_facelist *f,*c;
+
+  f=fm_list;
+  while(f)
+  {
+    c=f;
+    f=f->next;
+    free(c);
+  }
+  fm_list=NULL;
+}
+
+/*----------------------------------------------------------------------*/
+void fm_set_system_font(BOOL systemfont)
+{
+  fm_systemfont=systemfont;
+}
+
+/*----------------------------------------------------------------------*/
+BOOL fm_system_font(void)
+{
+  return(fm_systemfont);
+}
+
+/*----------------------------------------------------------------------*/
+void fm_init(BOOL systemfont)
+{ /* initialise the library, set the flag to force system font use */
+  fm_destroy_typefaces();
+  fm_set_system_font(systemfont);
+}
+
+/*----------------------------------------------------------------------*/
+void fm_font_name_from_menu(void *menubuf,int *hit,char *result,int resultsize)
+{ /* get the font name from the menu hit when the menu was generated by the code below */
+  os_regset r;
+  char      op[100],*p;
+  char      *from;
+
+  if(os_cli("RMEnsure UtilityModule 3.00 Error RO2"))
+  {
+    wimp_menuitem *p;
+
+    p=(wimp_menuitem*)((int)menu_syshandle(menubuf)+sizeof(wimp_menuhdr));
+    p+=hit[0];
+    if(p->iconflags&wimp_INDIRECT)
+      from=p->data.indirecttext.buffer;
+    else
+    {
+      from=op;
+      strncpy(op,p->data.text,12);
+      op[12]=0;
+    }
+  }
+  else
+  {
+    r.r[0]=0;
+    r.r[1]=(int)menubuf;
+    r.r[2]=(int)hit;
+    r.r[3]=(int)op;
+    r.r[4]=sizeof(op);
+    op[0]=0;
+    os_swix(Font_DecodeMenu|XOS_Bit,&r);
+    p=strchr(op+2,'\\');
+    if(p) *p=0;
+    from=op+2;
+  }
+  strncpy(result,from,resultsize);
+  result[resultsize-1]=0;
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_build_font_menu(void **menubuf)
+{ /* build the font menu in memory */
+  if(os_cli("RMEnsure UtilityModule 3.00 Error RO2"))
+  {
+    int       font;
+    os_regset r;
+    char      string[80];
+    os_error  *e;
+
+    if(!fm_cached_menu)
+    {
+      fm_cached_menu=menu_new(msgs_lookup("Fontmenu:Font list"),"");
+      if(!fm_cached_menu) return(errorgen(2));
+      e=NULL;
+      font=0;
+      while(font>=0 && !e)
+      {
+        r.r[1]=(int)string;
+        r.r[2]=font;
+        r.r[3]=-1;
+        e=os_swix(Font_ListFonts|XOS_Bit,&r);
+        font=r.r[2];
+        if(font>=0 && !e)
+        {
+          *strchr(string,13)=0;
+          menu_extend(fm_cached_menu,string);
+        }
+      }
+      if(e)
+      {
+        e=errorgen((int)e);
+        menu_dispose(&fm_cached_menu,TRUE);
+        return(e);
+      }
+    }
+    *menubuf=fm_cached_menu;
+  }
+  else
+  {
+    os_regset r;
+    int       bufsz;
+
+    if(*menubuf) return(NULL);
+    r.r[1]=0;
+    r.r[2]=(1<<19)+(1<<21);
+    r.r[4]=0;
+    r.r[6]=0;
+    ERROUT(os_swix(Font_ListFonts|XOS_Bit,&r))
+    bufsz=r.r[3]+r.r[5]+8;
+    *menubuf=malloc(bufsz);
+    if(!*menubuf) return(errorgen(2));
+    r.r[1]=(int)*menubuf;
+    r.r[4]=r.r[1]+r.r[3];
+    r.r[6]=0;
+    ERROUT(os_swix(Font_ListFonts|XOS_Bit,&r))
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+void fm_dispose_font_menu(void **menubuf)
+{ /* free the memory used by the font menu */
+  if(!os_cli("RMEnsure UtilityModule 3.00 Error RO2") && *menubuf) free(*menubuf);
+}
+
+/*----------------------------------------------------------------------*/
+void fm_create_font_menu(void *menubuf,int x,int y)
+{ /* pop up the font menu */
+  if(os_cli("RMEnsure UtilityModule 3.00 Error RO2"))
+    wimp_create_menu(menu_syshandle(menubuf),x,y);
+  else
+    wimp_create_menu(menubuf,x,y);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *fm_get_string_width(fm_face handle,char *s,int maxwid,int maxbytes,int split,int *bytes,int *width)
+{ /* calculate the width of maxbytes bytes of the given string
+     or up to maxwid if it is possible to split it. Return the discovered
+     width (which could be above or below maxwid) and the number of bytes
+     used to make it. Split the string at given split character. Returns trailing
+     spaces as part of the pre-split section of the string */
+  if(handle>=0)
+  {
+    font_string fs;
+    char        c;
+    os_error    *e;
+
+    fs.s=s;
+    fs.x=maxwid;
+    fs.y=100000000;
+    fs.split=split;
+    fs.term=maxbytes;
+    c=s[maxbytes];
+    s[maxbytes]=0;
+    e=font_setfont(handle);
+    if(!e) e=font_strwidth(&fs);
+    if(!e && fs.x<10 && split>0)
+    {
+      fs.s=s;
+      fs.x=100000000;
+      fs.y=100000000;
+      fs.split=-1;
+      fs.term=maxbytes;
+      e=font_strwidth(&fs);
+    }
+    s[maxbytes]=c;
+    if(e) return(e);
+    while(fs.term<maxbytes && s[fs.term]==' ') {fs.term++; /* fs.x+=3200; */}
+    *bytes=fs.term;
+    *width=fs.x;
+  }
+  else
+  {
+    int wCurr,wLastSplit,oLastSplit,oCurr,wChar;
+
+    wCurr=wLastSplit=oCurr=oLastSplit=0;
+    wChar=FM_SYSTEM_SIZE_X(handle)*10*400/128;
+
+    while(oCurr<maxbytes && wCurr<=maxwid)
+    {
+      if(split>0 && s[oCurr]==split) {oLastSplit=oCurr; wLastSplit=wCurr;}
+      wCurr+=wChar;
+      oCurr++;
+    }
+    if(wCurr>maxwid && oLastSplit) {oCurr=oLastSplit; wCurr=wLastSplit;}
+    while(oCurr<maxbytes && s[oCurr]==' ') {oCurr++; /* wCurr+=wChar; */}
+    *bytes=oCurr;
+    *width=wCurr;
+  }
+  return(NULL);
+}

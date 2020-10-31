@@ -1,0 +1,582 @@
+#include "Patch.h"
+
+
+#ifdef DEBUG
+
+/* Debugging printf - goes to tube podule if HOST_DEBUG defined, otherwise
+   it shits all over the screen. */
+
+void debug_printf
+(
+    char const * const                  format_string,
+    ...
+)
+{
+    va_list                             args;
+#ifdef HOST_DEBUG
+    _kernel_swi_regs                    regs;
+#endif
+
+
+    /* Switch output to host if enabled. Ignore errors - almost certainly
+       means we haven't got a tube podule, so shit all over the screen. */
+
+#ifdef HOST_DEBUG
+    _kernel_swi(XHostFS_HostVdu, &regs, &regs);
+#endif
+
+
+    /* Print the error, using stderr as it is unbuffered. */
+
+    va_start(args, format_string);
+    vfprintf(stderr, format_string, args);
+    va_end(args);
+
+
+    /* Switch output back to tube end (ie. us) if enabled. Ignore errors -
+       probably means no tube podule. */
+
+#ifdef HOST_DEBUG
+    _kernel_swi(XHostFS_TubeVdu, &regs, &regs);
+#endif
+
+}
+
+#endif /* DEBUG */
+
+
+
+/* Allocation functions that always return a good pointer, or fatal the
+   process. Note that if the allocation fails, then the stack checking to
+   call report_alloc_err() may fail, but it is not very likely and anyway
+   if that happens an error will still get reported, just a different one.
+
+   buffer[16] is for ten digits, (32 bits -> 4 billion-ish), plus three
+   spaces plus one for termination gives 14. */
+
+static ERROR_BLOCK(NoAppMem);
+
+static void report_alloc_error
+(
+    size_t                              size
+)
+{
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+    char                                buffer[16];
+
+    regs.r[0] = size;
+    regs.r[1] = (int) buffer;
+    regs.r[2] = sizeof(buffer);
+
+    error = _kernel_swi(XOS_ConvertSpacedCardinal4, &regs, &regs);
+
+    error = msgtrans_error_lookup(ErrorBlock_NoAppMem,
+                                  error == NULL ?
+                                         buffer : error->errmess,
+                                  0, 0, 0);
+
+    report_error(error, wimp_ECANCEL);
+}
+
+
+void * malloc_noerr
+(
+    size_t                              size
+)
+{
+    void *                              ptr;
+
+    ptr = malloc(size);
+
+    if (ptr == NULL && size > 0)
+    {
+        report_alloc_error(size);
+    }
+    return ptr;
+}
+
+void * calloc_noerr
+(
+    size_t                              size,
+    size_t                              multiplier
+)
+{
+    void *                              ptr;
+
+    ptr = calloc(size, multiplier);
+
+    if (ptr == NULL && size > 0)
+    {
+        report_alloc_error(size * multiplier);
+    }
+    return ptr;
+}
+
+
+
+/* Function to report the error passed to the wimp. If Cancel is pressed,
+   aborts the program. If OK is pressed, continues. */
+
+void report_error
+(
+    _kernel_oserror const * const       error,
+    wimp_errflags                       errflags
+)
+{
+    _kernel_swi_regs                    regs;
+    _kernel_oserror *                   wimp_error;
+
+    regs.r[0] = (int) error;
+    regs.r[1] = (int) errflags;
+    regs.r[2] = (int) MSG_LOOKUP0("ErrorTitle");
+
+    /* Quit on errors from Wimp_ReportError - I mean, what the
+       hell can you do? */
+
+    wimp_error = _kernel_swi(XWimp_ReportError, &regs, &regs);
+
+    if (wimp_error != NULL || regs.r[1] == wimp_ECANCEL)
+    {
+        /* If he hit cancel, then quit the program. */
+
+        exit(0);
+    }
+}
+
+
+
+/* Useful function to create a window from a template. */
+
+ERROR_BLOCK(NoTemplate);
+
+void create_window
+(
+    char *                              name,
+    wimp_w *                            handle
+)
+{
+    wimp_wind *                         window;
+
+
+    /* Find template for the window. */
+
+    window = template_syshandle(name);
+
+    if (window == 0)
+    {
+        report_error(msgtrans_error_lookup(ErrorBlock_NoTemplate, name,
+                                           NULL, NULL, NULL),
+                     wimp_ECANCEL);
+    }
+
+
+    /* Create the window. */
+
+    NOERR(wimp_create_wind(window, handle));
+}
+
+
+
+/* Enumerate all the objects in the directory passed, and on each
+   one call the function passed (if of the object type asked for - file or
+   directory or both) giving it the canonical directory, the object within
+   the directory and the file type. */
+
+typedef struct
+{
+    int                                 load_addr;
+    int                                 exec_addr;
+    int                                 length;
+    int                                 attributes;
+    int                                 object_type;
+    int                                 file_type;
+    char                                name[257];
+} ENTRY;
+
+static void enumerate_files_in_dir
+(
+    char const * const                  directory,
+    int                                 present_type,
+    void                                (*entry_fn) (char const * const,
+                                                     char const * const,
+                                                     int const)
+)
+{
+    int                                 dir_len;
+    int                                 name_len;
+    char *                              next_dir;
+    ENTRY *                             entry;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    gbpb;
+    ENTRY                               entries_mem;
+
+
+    /* Get the length of this directory name outside the loop. */
+
+    dir_len = strlen(directory);
+
+
+    /* Set up the registers that are preserved for us, or have an initial
+       condition. Does not include R0, as R0 is corrupted on error and
+       we retry errors. */
+
+    gbpb.r[1] = (int) directory;        /* Directory to enumerate. */
+    gbpb.r[2] = (int) &entries_mem;     /* Memory for info. */
+    gbpb.r[4] = 0;                      /* Start at beginning. */
+    gbpb.r[5] = sizeof(entries_mem);    /* Size of memory for info. */
+    gbpb.r[6] = 0;                      /* I want all filenames please. */
+
+    do
+    {
+        /* Set number of filenames to the maximum that will possibly fit
+           in the memory chunk, and read them.
+
+           The minimum size for each entry is all the header fields, plus
+           4 bytes for a word of filename - the next entry must start
+           word aligned. So we divide the total space by the minimum size
+           to get the maximum possible number of entries. */
+
+        gbpb.r[0] = OSGBPB_ReadDirEntriesFileType;
+        gbpb.r[3] = sizeof(entries_mem) / (offsetof(ENTRY, name) + 4);
+/*
+        DEBUG_PRINTF(("Want dir ents: %d &%X ('%s') &%X %d %d %d %d\n",
+                      gbpb.r[0], gbpb.r[1], (char *) gbpb.r[1], gbpb.r[2],
+                      gbpb.r[3], gbpb.r[4], gbpb.r[5], gbpb.r[6]));
+*/
+        error = _kernel_swi(XOS_GBPB, &gbpb, &gbpb);
+
+        if (error != NULL)
+        {
+            /* Report the error, give the user the choice of whether to
+               continue or not. */
+
+            report_error(error, (wimp_EOK | wimp_ECANCEL));
+
+            /* He hit OK, so try again. We may have got a timeout on
+               a network filing system or something similar. */
+        }
+        else
+        {
+            /* We get zero names read on finishing, and it is in fact
+               legal to get zero names half way through, since whether
+               you got a name or not is not the marker for whether you
+               have finished. So see if we got a name. */
+/*
+            DEBUG_PRINTF(("Got %d dir entries\n", gbpb.r[3]));
+*/
+            entry = &entries_mem;
+
+            while (gbpb.r[3]-- > 0)
+            {
+                /* Pass this one to the function if it has the correct
+                   bits set in the object_type. */
+
+                if (entry->object_type & present_type)
+                {
+                    DEBUG_PRINTF(("'%s' in '%s', object %d, file &%03X\n",
+                                  entry->name, directory,
+                                  entry->object_type, entry->file_type));
+
+                    (*entry_fn)(directory, entry->name, entry->file_type);
+                }
+
+
+                /* If this can be treated as a directory, then recurse
+                   down into it. */
+
+                name_len = strlen(entry->name);
+
+                if (entry->object_type & object_directory)
+                {
+                    /* Need to concatenate this level's directory and the
+                       entry we have just found to get the next level's
+                       directory. +2 is for null termination and '.' */
+
+                    next_dir = malloc_noerr(name_len + dir_len + 2);
+                    strcpy(next_dir, directory);
+                    next_dir[dir_len] = '.';
+                    strcpy(next_dir + dir_len + 1, entry->name);
+
+                    enumerate_files_in_dir(next_dir, present_type, entry_fn);
+                    free(next_dir);
+                }
+
+
+                /* Move on to the next entry. Add in the length of the
+                   header fields, and add in the filename length (plus
+                   null termination) rounded up to a multiple of 4
+                   (done with +3 & ~3). */
+
+                entry = (ENTRY *) (offsetof(ENTRY, name) +
+                                   (((name_len + 1) + 3) & ~3) +
+                                   (char *) entry);
+
+            } /* End while (gbpb.r[3]-- > 0) */
+
+        } /* End if (error != NULL) */
+    }
+    while (gbpb.r[4] != -1);
+}
+
+
+
+/* Enumerate all the objects in the file or directory passed, and on each
+   one call the function passed (if of the object type asked for - file or
+   directory or both) giving it the canonical directory, the object within
+   the directory and the file type. The object passed in to us should NOT
+   have a dot on the end of it.
+
+   This is an entry function on top of enumerate_files_in_dir(), to cope
+   with the fact that the starting case is special as we might actually
+   get passed a file (not a directory) and we have to canonicalise it
+   and split off the file from the directory it is in. Once we have got
+   going in the main directory loop, we don't need to do any of this. */
+
+void enumerate_files_in_object
+(
+    char const * const                  object,
+    int                                 present_type,
+    void                                (*entry_fn) (char const * const,
+                                                     char const * const,
+                                                     int const)
+)
+{
+    int                                 object_type;
+    int                                 file_type;
+    char *                              canon_object = NULL;
+    char *                              ptr;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+
+    /* Canonicalise what we have been passed. Make two calls - the first
+       one to find out how much buffer we need, and the second one to
+       do the canonicalisation. */
+
+    regs.r[0] = FSControl_CanonicalisePath;
+    regs.r[1] = (int) object;
+    regs.r[2] = 0;                              /* Buffer pointer */
+    regs.r[3] = 0;                              /* No path variable */
+    regs.r[4] = 0;                              /* No path string */
+    regs.r[5] = 0;                              /* Buffer length */
+
+    error = _kernel_swi(XOS_FSControl, &regs, &regs);
+
+    if (error != NULL)
+    {
+        goto error_label;
+    }
+
+
+    /* Allocate the memory and do the canonicalisation. The buffer length
+       is determined from how much overflowed, plus an extra byte for the
+       null termination. */
+
+    regs.r[5] = 1 - regs.r[5];
+    regs.r[2] = (int) (canon_object = malloc_noerr(regs.r[5]));
+
+    error = _kernel_swi(XOS_FSControl, &regs, &regs);
+
+    if (error != NULL)
+    {
+        goto error_label;
+    }
+
+
+    /* Get the object type (file/dir/image) and file type. */
+
+    regs.r[0] = OSFile_ReadWithTypeNoPath;
+    regs.r[1] = (int) canon_object;
+
+    error = _kernel_swi(XOS_File, &regs, &regs);
+
+    object_type = regs.r[0];
+    file_type = regs.r[6];
+
+    if (error == NULL && object_type == object_nothing)
+    {
+        /* Object doesn't exist - it damned well ought to!
+           Construct an error block, and drop into the error
+           handling code. */
+
+        regs.r[0] = OSFile_MakeError;
+        regs.r[1] = (int) canon_object;
+        regs.r[2] = object_nothing;
+
+        error = _kernel_swi(XOS_File, &regs, &regs);
+    }
+
+    if (error != NULL)
+    {
+        goto error_label;
+    }
+
+
+    /* Only call the function if the object type bits wanted are set. */
+
+    if (object_type & present_type)
+    {
+        /* We need to split off the directory and the object within it.
+           Find the last '.' (directory seperator) and replace it with
+           a null. There should always be one (the dot after the $)
+           but be robust anyway. */
+
+        ptr = strrchr(canon_object, '.');
+
+        if (ptr != NULL)
+        {
+            *ptr = '\0';
+
+            DEBUG_PRINTF(("(Top) '%s' in dir '%s',"
+                          " object type %d, file type &%03X\n",
+                          ptr + 1, canon_object, object_type, file_type));
+            (*entry_fn)(canon_object, ptr + 1, file_type);
+
+
+            /* Now put the directory seperator back. */
+
+            *ptr = '.';
+        }
+        else
+        {
+            /* Hmm. Weird filing system? Oh well, try and cope. Call
+               the function without a directory but with the full path
+               for the file. */
+
+            DEBUG_PRINTF(("(Top) '%s' (unable to split off dir),"
+                          " object type %d, file type &%03X\n",
+                          canon_object, object_type, file_type));
+            (*entry_fn)(NULL, canon_object, file_type);
+        }
+    }
+
+
+    /* Enter the recursive directory enumeration code if appropriate. */
+
+    if (object_type & object_directory)
+    {
+        enumerate_files_in_dir(canon_object, present_type, entry_fn);
+    }
+
+
+    /* We come here to free up the buffer, report an error (if there is
+       one) and return. */
+
+error_label:
+
+    free(canon_object);
+
+    if (error != NULL)
+    {
+        report_error(error, (wimp_EOK | wimp_ECANCEL));
+    }
+}
+
+
+
+/* Function to simplify calling SWI OS_ReadUsigned to read numbers,
+   including signed ones (eg. filetype -1 for untyped). */
+
+int read_number
+(
+    char const *                        string
+)
+{
+    int                                 negative;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+
+    /* See if we have a negative number. */
+
+    if (*string == '-')
+    {
+        negative = TRUE;
+        string++;
+    }
+    else
+    {
+        negative = FALSE;
+    }
+
+
+    /* Read the number. We ask for default to base 10 and give an error
+       if it ends in a non space or control character. */
+
+    regs.r[0] = 10 | 0x8000;
+    regs.r[1] = (int) string;
+
+    error = _kernel_swi(XOS_ReadUnsigned, &regs, &regs);
+
+    if (error != NULL)
+    {
+        /* Need better error handling than this! eg. patch file name, line
+           number, and display the line. */
+
+        report_error(error, wimp_ECANCEL);
+    }
+
+
+    if (negative)
+    {
+        regs.r[2] *= -1;
+    }
+
+    return regs.r[2];
+}
+
+
+
+/* Performs an OS_GSTrans on the string passed, returning a new string
+   on the heap that the caller is responsible for freeing. Returns
+   NULL if there was an error and the user clicked OK in the error box. */
+
+static ERROR_BLOCK(GSBufOvFlow);
+
+char * gstrans
+(
+    char const * const                  source,
+    int const                           source_len,
+    int * const                         result_len
+)
+{
+    char *                              result;
+    int                                 carry;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+
+    /* Result string is gaurunteed shorter than source string. */
+
+    result = malloc_noerr(source_len + 1);
+
+    regs.r[0] = (int) source;
+    regs.r[1] = (int) result;
+    regs.r[2] = source_len + 1;
+
+    error = _kernel_swi_c(XOS_GSTrans, &regs, &regs, &carry);
+
+    if (carry && error == NULL)
+    {
+        /* Curses! The buffer overflowed. This should NEVER happen.
+           Convert to an error. */
+
+        error = msgtrans_error_lookup(ErrorBlock_GSBufOvFlow, 0,0,0,0);
+    }
+
+    if (error != NULL)
+    {
+        report_error(error, (wimp_ECANCEL | wimp_EOK));
+
+        /* If user clicked OK, I just hope the caller can cope! */
+
+        free(result);
+
+        *result_len = 0;
+        return NULL;
+    }
+
+    *result_len = regs.r[2];
+    return result;
+}

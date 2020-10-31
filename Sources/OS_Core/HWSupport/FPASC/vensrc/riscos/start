@@ -1,0 +1,406 @@
+; >riscos.start
+;
+; Copyright (c) 1993 Acorn Computers Ltd., Cambridge, England.
+;
+; Assembler source for FPA support code and emulator
+; ==================================================
+; RISCOS veneer code assembled before the core routines
+;
+
+;
+; character constants
+;
+NULL            *       &00
+TAB             *       &09
+LF              *       &0a
+CR              *       &0d
+
+;
+; base of module SWI chunk
+;
+FPESWIBase      *       &40480
+
+;
+; **********************************************************************
+;
+; Module Header
+;
+        AREA    |!!!Module$Header|, CODE, READONLY
+
+        ENTRY
+
+Module_BaseAddr
+
+        ASSERT  (. - Module_BaseAddr) = 0
+
+        DCD     0                               ; Start code (there isn't any)
+        DCD     FPEInit - Module_BaseAddr       ; Initialisation code
+        DCD     FPEFinal - Module_BaseAddr      ; Finalisation code
+        DCD     FPEServ - Module_BaseAddr       ; Service Call handler
+        DCD     FPETitle - Module_BaseAddr      ; Title string
+        DCD     FPEHelp - Module_BaseAddr       ; Help string
+        DCD     0                               ; *commands (there aren't any)
+        DCD     FPESWIBase                      ; SWI chunk base number
+        DCD     FPESWI - Module_BaseAddr        ; SWI handler code
+        DCD     FPESTable - Module_BaseAddr     ; SWI decoding table
+
+;
+; Header is complete, dump miscellaneous strings and tables
+;
+
+;
+; Title string is shared with start of SWI decoding table
+;
+FPETitle
+FPESTable
+        DCB     "FPEmulator", 0
+        DCB     "Version", 0
+        DCB     "DeactivateContext", 0
+        DCB     "ActivateContext", 0
+        DCB     0
+        ALIGN
+
+BadSWItoken
+	DCD	&1E6
+	DCB	"BadSWI", 0
+	ALIGN
+
+;
+; Despite what the current issue of the PRMs claims, ALL versions of
+; the FPEmulator, whether hardware only, hardware/software, or
+; software only, must have a version number greater than 4.00.  This
+; allows software to easily test whether the additions to the floating
+; point instruction set introduced with the FPA are available on a
+; particular machine (by using RMEnsure FPEmulator 4.00).
+;
+        ASSERT  Verno >= 400
+
+;
+; **********************************************************************
+;
+; FPESWI
+;
+FPESWI          ROUT
+	CMP	r11,#(FPESWIJumpTableEnd - FPESWIJumpTable) /4
+	ADDLO	pc, pc, r11, LSL #2
+	B	BadSWI
+FPESWIJumpTable
+	B	FPESWI_Version
+	B	FPESWI_DeactivateContext
+	B	FPESWI_ActivateContext
+FPESWIJumpTableEnd
+
+BadSWI
+	STMFD	sp!, {r1,r2,r4,lr}
+	ADR	r0, BadSWItoken
+	MOV	r1, #0
+	MOV	r2, #0
+	ADR	r4, FPETitle
+	SWI	XMessageTrans_ErrorLookup
+	LDMFD	sp!, {r1,r2,r4,pc}
+
+FPESWI_Version
+	LDR	r0, =Verno
+	MOVS	pc, lr
+
+FPESWI_DeactivateContext
+	STMFD	sp!, {lr}
+	BL	core_deactivatecontext
+	LDMFD	sp!, {pc}^
+
+FPESWI_ActivateContext
+	STMFD	sp!, {r10, lr}
+	MOV	r10, r0
+	BL	core_activatecontext
+	LDMFD	sp!, {r10, pc}^
+
+; **********************************************************************
+;
+; FPEInit - Initialisation Code
+;
+FPEInit         ROUT
+        STR     lr, [sp, #-4]!
+
+;
+; check whether workspace already allocated
+;
+        LDR     r2, [r12]
+        CMP     r2, #0
+        BNE     %F5
+
+;
+; no workspace allocated - claim some
+;
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =WorkspaceLength
+        SWI     XOS_Module
+
+;
+; return error if SWI failed
+;
+        LDRVS   lr, [sp], #4
+        ORRVSS  pc, lr, #V_bit
+
+;
+; workspace claim succeeded: zero it and save it in private word
+;
+        BL      MemClear
+        STR     r2, [r12]
+5       MOV     r12, r2
+
+;
+; workspace pointer claimed if necessary, save it away in our
+; private piece of page 0, ready for retrieval during traps.
+;
+        LDR     r0, =FPEAnchor
+        STR     r12, [r0]
+
+    [ Arm600
+;
+; on an Arm600 based system, control must not be passed straight along
+; to the next handler, but must pass through some veneer code that is
+; entered in svc26 mode and passes the call along in undef32 mode as
+; if this module did not exist
+;
+; here we pass to the core the address of a location pointing
+; to the passalong veneer (which won't actually be used until we
+; get to veneer_newhandlers)
+
+        AdrWS   r0
+        ADD     r1, r0, #:INDEX:UnwantedAddr
+        ADRL    r0, PassAlong_veneer
+        STR     r0, [r1]
+    |
+;
+; load the current undefined instruction vector, and ascertain
+; what flavour it is (i.e. B    <addr> or LDR pc, <addr>)
+;
+        MOV     r0, #Undef_vector
+        LDR     r0, [r0]
+
+        MOV     r1, r0, LSR #24
+        CMP     r1, #&ea                ; 0xea?????? -> B <addr>
+        BEQ     %F10
+
+;
+; vector is not B <addr>, assume it must be LDR pc, <addr> - get
+; offset from bottom 12 bits of instruction
+;
+        MOV     r1, r0, LSL #20
+        MOV     r1, r1, LSR #20
+
+;
+; now adjust for a PC relative load from vector address
+;
+        ADD     r1, r1, #12
+      [ debug > 1
+        DREG    r1, "Current vector is LDR pc, "
+      ]
+
+      [ debug > 9
+        ;
+        ; set r0 for debugs down below
+        ;
+        MOV     r0, #0
+      ]
+        B       %F15
+
+;
+; undefined instruction vector is of the form B <addr> - get offset
+; from bottom 24 bits of instruction
+;
+10      AND     r0, r0, #&ff000000
+
+;
+; convert from word to byte offset, then adjust for vector address
+; and instruction pipelining
+;
+        MOV     r0, r0, LSL #2
+        ADD     r0, r0, #12
+
+;
+; save this branch target in module workspace
+;
+        ADD     r1, r12, #:INDEX:UIBranchDest
+        STR     r0, [r1]
+
+     [  debug > 1
+        DREG    r0, "Current vector is B "
+     ]
+    ]
+
+;
+; at this point r1 contains the address to be loaded into NextHandler,
+; which is exactly what core_initws is expecting - load other registers
+; and make the call
+;
+15      MOV     r10, r12
+
+    [   debug > 5
+        DREG    r1, "Calling core_initws with r1 = ", cc
+        DREG    r10, ", r10 = "
+    ]
+
+        BL      core_initws
+
+    [ Flavour = "HardOnly"
+     [  debug > 1
+        DREG    r0, "SysId from core_initws = 0x"
+     ]
+
+;
+; if the module only supports FPA based systems, then the absence
+; of an FPA is a handicap that is best not to try to overcome
+;
+        CMP     r0, #SysID_FPA
+        BEQ     %F20
+
+;
+; load message token. NOTE:  this is a new message, that does not
+; appear in the default resources file in the RISC OS 3 ROMs, so
+; it needs a default message to supply to MsgTrans.
+;
+        ADR     r0, NoHWMesg
+        MOV     r1, #0                          ; no %0 substitution
+        BL      copy_error_one
+
+;
+; return *without* restoring PSR (need to return V set)
+;
+        LDMFD   sp!, {pc}
+
+NoHWMesg
+        DCD     ErrorBase_FloatingPoint + 6
+        DCB     "NoHW:Initialisation failed: FPA not present", 0
+        ALIGN
+    ]
+
+;
+; workspace is initialised, now activate the context.  the context is at
+; the base of the claimed workspace, address is already in r10.
+;
+20      BL      core_activatecontext
+
+;
+; that's all folks
+;
+        LDMFD   sp!, {pc}^
+
+;
+; **********************************************************************
+;
+; FPEFinal - Finalisation code
+;
+; all we need to do is call core_shutdown,
+; do not bother coming back here
+;
+FPEFinal        ROUT
+        B       core_shutdown
+
+;
+; **********************************************************************
+;
+; FPEServ - Service Call Handler
+;
+; this routine needs to check for Service_PreReset, and Service_Reset.
+; on a Service_PreReset it should mimic the finalisation code (i.e.
+; branch to core_shutdown); on a ServiceReset it should re-initialise the
+; system if a soft-reset has just occured.
+;
+FPEServ         ROUT
+
+        CMP     r1, #Service_PreReset
+        BEQ     core_shutdown
+
+        CMP     r1, #Service_Reset
+        MOVNES  pc, lr
+
+;
+; Service_Reset: read last reset type, ignore if not soft-reset
+;
+        STMFD   sp!, {r0-r3, lr}
+        MOV     r0, #253
+        MOV     r1, #0
+        MOV     r2, #255
+
+	SWI	XOS_Byte
+
+        CMP     r1, #0
+        LDMNEFD sp!, {r0-r3, pc}^
+
+;
+; there has just been a soft-reset, get workspace pointer in r12
+; and call initialisation routine
+;
+        AdrWS   r12
+        BL      FPEInit
+
+;
+; finished
+;
+        LDMFD   sp!, {r0-r3, pc}^
+
+;
+; **********************************************************************
+;
+; MemClear - clear (word aligned) memory claimed via OS_Module 6
+;
+; On entry: r2 = pointer to claimed block, r3 = byte count
+;
+MemClear        ROUT
+        STMFD   sp!, {r0-r9, lr}
+
+        MOV     r3, r3, LSR #2                          ; bytes -> words
+
+;
+; most fills are done 8 words at a time: clear up residual first
+;
+        ANDS    r1, r3, #7
+        MOV     r0, #0
+        BEQ     %F1
+
+;
+; fill residual 1 byte at a time
+;
+0       STR     r0, [r2], #4
+        SUBS    r1, r1, #1
+        BNE     %B0
+
+;
+; filling 8-words at a time, adjust count
+;
+1       MOVS    r3, r3, LSR #3
+        LDMEQFD sp!, {r0-r9, pc}^
+
+;
+; initialise all registers
+;
+        MOV     r1, r0
+        MOV     r4, r0
+        MOV     r5, r0
+        MOV     r6, r0
+        MOV     r7, r0
+        MOV     r8, r0
+        MOV     r9, r0
+
+;
+; now fill rest of the block
+;
+2       STMIA   r2!, {r0-r1, r4-r9}
+        SUBS    r3, r3, #1
+        BNE     %B2
+
+;
+; finished
+;
+        LDMIA   sp!, {r0-r9, pc}^
+
+;
+; **********************************************************************
+;
+
+        END
+
+;
+; EOF riscos.start
+;

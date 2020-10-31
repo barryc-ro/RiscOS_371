@@ -1,0 +1,955 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/ShareFS/window.c:networking  1.3  $
+ * $Source: /ax/networking:Starling/ShareFS/ShareFS/window.c: $
+ *
+ * Copyright (c) 1995 ANT Ltd., Cambridge, England
+ *
+ * $Log:	window.c,v $
+ * Revision 1.3  95/02/27  16:42:04  pwain
+ * All existing malloc() calls changed to use rmalloc().
+ * This is because ShareFS uses a different module entry
+ * code which means that its stack is kept in RMA. DO NOT
+ * USE MALLOC IN ShareFS CODE.
+ * 
+ * Revision 1.2  95/01/17  09:04:24  pwain
+ * Removed compilation warning messages.
+ * 
+ * Revision 1.1  95/01/09  13:53:35  kwelton
+ * Initial revision
+ * 
+ */
+
+/* $Id: c.window 2.20 93/11/16 23:08:23 brian Exp $ */
+
+/*{{{  compile options*/
+#define SERVERTIMEOUT 1000
+#define QUICKSIZE 8192
+/*}}}  */
+
+/*{{{  Brief explanation of protocol:*/
+/*
+Messages are exchanged with a 4-byte header that gives its context.
+  
+The first byte determins the meaning, and next 3 bytes are usually a
+transaction key.
+  
+Note that internet owns
+'F' for server broadcasts back to clients
+'H','J','h','j' to maintain server map
+  
+client-->server
+  
+--> 'A'   : request for action detailed in rest of message
+--> 'B'   : request with small data, answer with S.
+<-- 'E'   : error returned
+<-- 'R'   : result returned
+<-- 'S'   : result and data returned. word[1] result len, word[2] data len.
+<-- 'Q'   : the server has you queued. Please be patient.
+<-- 'q'   : server is waiting till its client side is free.
+  
+read mode, once started
+  
+<-- 'D'   : data chunk
+--> 'r'   : ack of data chunks
+  
+write mode replaces them with:
+  
+--> 'd'   : data chunk
+<-- 'w'   : ack/tells client server is in write mode
+*/
+/*}}}  */
+
+
+/*{{{  includes*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdarg.h>
+
+#include "debug.h"
+#include "ker.h"
+#include "swis.h"
+#include "interface.h"
+#include "ModuleWrap.h"
+#include "util.h"
+#include "fscore.h"
+#include "evil.h"
+#include "ralloc.h"
+
+#include "visdelay.h"
+#include "esc.h"
+
+#include "remswis.h"
+#include "stream.h"
+#include "window.h"
+#include "ticker.h"
+
+/*{{{  errors*/
+#ifndef LOOKUPERR
+static DEFERR(lost, ERRlost, MSGlost);
+static DEFERR(timeout, ERRtimeout, MSGtimeout);
+static DEFERR(NotServ, ERRNotServ, MSGNotServ);
+static DEFERR(DeadServ, ERRDeadServ, MSGDeadServ);
+static DEFERR(Recurse, ERRRecurse, MSGRecurse);
+#endif /* LOOKUPERR */
+
+/*{{{  vars*/
+/* Those marked volatile may be modified by gotpacket */
+
+/*{{{  client status*/
+int clientkey;			/* id of current client transaction */
+static int lastclientkey;
+static int volatile clientreplylen;	/* length of a result
+					 * generated */
+static int volatile clientqueued;	/* its in the server queue */
+static int volatile clientred;
+static int clientqueueddisplay;
+static int *clientreply;	/* area into which result arrives */
+static char *clientdataptr;	/* data area that client is
+				 * sending/receiving */
+static int clientdatalen;	/* length of that */
+static int clientdatalim;	/* limit of data that server wants
+				 * yet, or that client got */
+static int volatile clientdatapos;	/* position of data we are
+					 * sending to server */
+static int volatile clientdatadone;	/* level of data
+					 * sent/received */
+static unsigned volatile clientdatabits;	/* bit mask of chunks
+						 * done ahead of
+						 * clientdatadone */
+static int volatile clientdatagot;	/* theres been some data
+					 * received, so we know
+					 * server got request */
+static int volatile clientsending;	/* Starts off 0 until an 'w'
+					 * ack received */
+static int volatile clientserveroktime;	/* last time server talked to
+					 * us (maybe saying queued) */
+static int volatile clientserverok;	/* server has started
+					 * processing for us */
+static int clientsendtime;	/* When we last sent to server */
+static int clientconnection;
+static int *clientmessage;
+static int clientmessagesize;
+error *lasterror = NULL;
+static long lastdeadserver;	/* Shorted timeout if retrying at him */
+
+/*{{{  server status*/
+static int serverkey;		/* id of current server transaction,
+				 * or 0 */
+static char *serverdataptr;	/* buffer server transmits/receives
+				 * to */
+static int serverdatalen;	/* length of that buffer */
+static int serverdatabase;	/* data offset of that buffer */
+static int serverdatapos;	/* current transmit position */
+static int volatile serverdatadone;	/* level of data
+					 * sent/received (data
+					 * offset) */
+static int volatile serverdatabits;	/* bit mask of chunks done
+					 * ahead of serverdatadone */
+static int volatile serverreceiving;	/* non-zero to indicated
+					 * server receives
+					 * data/transmits acks */
+static int volatile serverdatagot;	/* server has had some data,
+					 * so can send a new ack */
+static int volatile serverclientoktime;	/* last time we heard from
+					 * client */
+static int serverconnection;
+static int serversendtime;
+static int lostkey;		/* non-zero send this person a lost
+				 * error */
+static int lostresultc;
+static int savecolour;
+
+/*{{{  queue of server commands*/
+/* A queue entry contains either a request waiting to be served from
+ * a given client, or a result that has been saved in case the client missed it.
+ * Things are keyed by the client - we only keep a result until we receive the
+ * next request, or for 30 secs.
+ *
+ * Note that only doserver is allowed to remove things from the queue,
+ * though extras may be added *at the end* by gotmsg.
+ */
+struct queue
+{
+    struct queue *next;
+    int client;
+    int len;			/* +ve, a waiting command       -ve a
+				 * saved result */
+    int when;			/* last time queued send        time
+				 * result generated */
+    int resend:1;		/* needs result resent */
+    int recurse:1;		/* retry because it caused recursion
+				 * error */
+    int data[MSGSIZE / 4];
+};
+static struct queue *thequeue;
+
+/*{{{  prototypes*/
+static void doserver(void);
+extern msgproc d_msg;
+
+static void pollserver(void)
+{
+     doserver();		/* P:132492 */
+}
+
+void window_done(void)	/**/
+{
+    struct queue *q, *q1;	/* P:0 */
+    RemoveCallEvery(pollserver);
+    RemoveCallEvery(doserver);
+    free(clientreply);
+    for (q = thequeue, thequeue = 0; q; q = q1)	/* P:0 */
+    {
+	q1 = q->next;		/* P:0 */
+	free(q);
+    }
+}
+
+error *window_init(void)	/**/
+{
+    clientreply = rmalloc(MSGSIZE);	/* P:3 */
+    thequeue = 0;
+    serverkey = clientkey = lostkey = lastclientkey = 0;
+    savecolour = 0;
+    CallEvery(pollserver, 1);
+    return NULL;		/* P:3 */
+}
+
+static void lostsend(void)	/* send a lost reply error */
+{
+    int k = 'E' + (lostkey << 8);	/* P:0 */
+    error *err = ERR(lost);
+    DEBUGf("lostresult %x to %x..", lostkey, lostresultc);	/* P:0 */
+    sendsplitpacket(lostresultc, &k, sizeof(k), err,
+		    strlen(err->errmess) + 8 & ~3, NICE);
+    lostkey = 0;
+}
+
+static void serversend(void)	/* server send side */
+{
+    if (serverreceiving)	/* P:55542 */
+    {
+	if (serverdatagot || MONOTIME - serversendtime > 30)	/* P:1336 */
+	{
+	    int ack[4];		/* P:24 */
+	    serverdatagot = 0;
+	    DEBUGf(">Want:%x,%x,%x>", serverdatadone, serverdatabits,
+		   serverdatabase + serverdatalen);	/* P:0 */
+	    ack[0] = 'w' + (serverkey << 8);
+	    ack[1] = serverdatadone;	/* tell client how much we've
+					 * got */
+	    ack[2] = serverdatabits;
+	    ack[3] = serverdatabase + serverdatalen;	/* and how much we want */
+	    sendpacket(serverconnection, &ack, sizeof(ack));
+	    serversendtime = MONOTIME;
+	}
+    }
+    else
+    {
+	if (serverdatalen > 0)	/* P:55542 */
+	{
+	    int i, m, l;	/* P:31898 */
+	    m = serverdatabase + serverdatalen;	/* max data offset */
+	    if (serverdatapos >= m || serverdatapos >= serverdatadone + WINDOWSIZE * CHUNKSIZE || serverdatapos < serverdatadone)	/* P:38772 */
+		serverdatapos = serverdatadone;	/* P:12632 */
+	    i = (serverdatapos - serverdatadone) / CHUNKSIZE;
+	    l = m - serverdatapos;
+	    if (l > CHUNKSIZE)
+		l = CHUNKSIZE;	/* P:19112 */
+	    if (l > 0 && (!(serverdatabits & (1 << i))))	/* P:31526 */
+	    {
+		int d[2];	/* P:902 */
+		DEBUGf(">DATA %x+%x>", serverdatapos, l);	/* P:322 */
+		d[0] = 'D' + (serverkey << 8);
+		d[1] = serverdatapos;
+		sendsplitpacket(serverconnection, &d, sizeof(d), &serverdataptr[serverdatapos - serverdatabase], l, EVIL);
+		serversendtime = MONOTIME;
+		serverdatabits |= (1 << i);
+	    }
+	    serverdatapos += l;
+	}
+	if (MONOTIME - serversendtime > 30)
+	{
+	    int d[2];		/* P:24 */
+	    DEBUGf(">DATA XXX %x>", serverdatapos);	/* P:7 */
+	    d[0] = 'D' + (serverkey << 8);
+	    d[1] = serverdatapos;
+	    sendpacket(serverconnection, &d, sizeof(d));
+	    serversendtime = MONOTIME;
+	}
+    }
+}
+
+static void clientsend(void)	/* client transmit side */
+{
+    if (clientreplylen)		/* its all done bar the shouting *//* P
+				 * :428232 */
+    {
+	 visdelay_percent(100);
+	return;
+    }				/* P:102 */
+    if (MONOTIME - clientserveroktime > 300)
+    {
+	if (!savecolour)
+	{
+	    savecolour = 0x000000FF;
+	    visdelay_colour(&savecolour);
+	}
+	visdelay_percent(30 - (MONOTIME - clientserveroktime) / 100);	/* P:0 */
+    }
+    else
+    if (savecolour)
+    {
+	visdelay_colour(&savecolour);
+	savecolour = 0;
+    }
+    if (clientqueued != clientqueueddisplay)
+	visdelay_LEDs(0, clientqueueddisplay = clientqueued);	/* P:0 */
+    if (clientred)
+	_swix(OS_Word, _IN(0) | _BLOCK(1), 12, 0x00FF1901, 0x00);	/* P:0 */
+    if (!clientserverok)
+    {
+	if (MONOTIME - clientsendtime > 100)	/* Assume most messages
+						 * aren't lost, so this
+	     * delay can be long *//* P:389069 */
+	{
+	    sendpacket(clientconnection, clientmessage, clientmessagesize);
+	    clientsendtime = MONOTIME;
+	}
+	return;
+    }				/* P:1216 */
+    if (clientsending)
+    {
+	int i, l;		/* P:39112 */
+	if (clientdatapos >= clientdatalim ||	/* P:19688 */
+	 clientdatapos >= clientdatadone + WINDOWSIZE * CHUNKSIZE ||
+	    clientdatapos < clientdatadone)
+	    clientdatapos = clientdatadone;	/* P:29284 */
+	i = (clientdatapos - clientdatadone) / CHUNKSIZE;
+	l = CHUNKSIZE < clientdatalim - clientdatapos ? CHUNKSIZE : clientdatalim - clientdatapos;
+	if (l && !(clientdatabits & (1 << i)))	/* P:26340 */
+	{
+	    int d[2];		/* P:136 */
+	    DEBUGf(">data %x+%x>", clientdatapos, l);	/* P:0 */
+	    d[0] = 'd' + (clientkey << 8);
+	    d[1] = clientdatapos;
+	    sendsplitpacket(clientconnection, &d, sizeof(d), &clientdataptr[clientdatapos], l, NICE);
+	    clientsendtime = MONOTIME;
+	    clientdatabits |= (1 << i);
+	}
+	if (MONOTIME - clientserveroktime > 30 && MONOTIME - clientsendtime > 30)	/* P:0 */
+	{
+	    int d[2];		/* P:0 */
+	    DEBUGf(">data XXX %x>", clientdatapos);	/* P:0 */
+	    d[0] = 'd' + (clientkey << 8);
+	    d[1] = clientdatapos;
+	    sendpacket(clientconnection, &d, sizeof(d));
+	    clientsendtime = MONOTIME;
+	}
+	clientdatapos += l;
+    }
+    else
+    if (clientdatagot || MONOTIME - clientsendtime > 30)	/* P:816034 */
+    {
+	int ack[3];		/* acknowledge any data received
+				 * immediately, but resend ack after
+	 * a while *//* P:20 */
+	clientdatagot = 0;
+	DEBUGf(">read done %x bits %x>", clientdatadone, clientdatabits);	/* P:3 */
+	ack[0] = 'r' + (clientkey << 8);
+	ack[1] = clientdatadone;
+	ack[2] = clientdatabits;
+	sendpacket(clientconnection, &ack, sizeof(ack));
+	clientsendtime = MONOTIME;
+    }
+}
+
+static void maysend(void)	/* possibly transmit */
+{
+    static int x = 0;		/* P:593752 */
+
+    if (x)
+    {
+#ifdef DEBUG
+	printf("******* maysend recursed!!!\n");	/* P:0 */
+#endif
+	return;			/* P:0 */
+    }
+
+    x = 1;
+    if (serverkey)
+	serversend();		/* P:55542 */
+    if (clientkey)
+	clientsend();		/* P:428232 */
+
+    if (lostkey)
+	lostsend();		/* P:0 */
+
+    x = 0;
+}
+
+static error *quickmore(int c, char *next, int nextsize, char *buf,
+			int bufsize, char **outbuf, int *outbufsize)	/* Use our buffer */
+{
+    private_word = private_word;	/* P:1738 */
+    c = c;
+    DEBUGf("quickmoreproc %p+%x,%p+%x\n", next, nextsize, buf, bufsize);	/* P:896 */
+    if (!next)
+    {
+	serverdatadone += bufsize;	/* P:1738 */
+	*outbuf = buf + bufsize;
+	*outbufsize = QUICKSIZE - serverdatadone;
+	return 0;		/* P:1738 */
+    }
+    return ERR(BadParm);	/* P:0 */
+}
+
+error *winmore(int zzz, char *next, int nextsize, char *buf, int bufsize,
+	       char **outbuf, int *outbufsize)	/**/
+{
+    int m;			/* P:282 */
+    zzz = zzz;
+    private_word = private_word;
+    DEBUGf("moreproc %p+%x,%p+%x\n", next, nextsize, buf, bufsize);	/* P:102 */
+    if (!next)			/* some data ready to be sent to
+				 * client */
+    {
+	while (serverdatadone < serverdatabase + serverdatalen)	/* P:4108 */
+	{
+	    poll();		/* P:3286 */
+	    if (MONOTIME - serverclientoktime > SERVERTIMEOUT)
+		return ERR(timeout);	/* P:0 */
+	    maysend();
+	}
+	serverdatabase += serverdatalen;
+	serverdataptr = buf;
+	serverdatalen = bufsize;
+	serverdatapos = serverdatadone;
+	while (serverdatapos < serverdatadone + WINDOWSIZE * CHUNKSIZE &&
+	       serverdatapos < serverdatabase + serverdatalen)	/* P:2214 */
+	{
+	    poll();		/* P:696 */
+	    if (MONOTIME - serverclientoktime > SERVERTIMEOUT)
+		return ERR(timeout);	/* P:0 */
+	    maysend();
+	}
+	*outbuf = 0;
+    }
+    else			/* server wants some data to write */
+    {
+	serversendtime = MONOTIME - 31;	/* ensure we send want
+					 * immediately *//* P:282 */
+	serverreceiving = 1;
+	if (!serverdataptr)
+	{
+	    serverdataptr = buf;/* P:8 */
+	    serverdatalen = bufsize;
+	    serverdatabase = 0;
+	}
+#ifdef DEBUG
+	else
+	if (serverdataptr != buf || serverdatalen != bufsize)	/* P:8 */
+	    return lookuperr(0, "Wrong");	/* P:0 */
+#endif
+	m = serverdatabase + serverdatalen;	/* data offset we wait
+						 * for */
+	while (serverdatadone < m)	/* P:680 */
+	{
+	    poll();		/* P:664 */
+	    if (MONOTIME - serverclientoktime > SERVERTIMEOUT)
+		return ERR(timeout);	/* P:0 */
+	    maysend();
+	}
+	*outbuf = serverdataptr;
+	*outbufsize = serverdatalen;
+	serverdataptr = next;	/* continue advance receiving */
+	serverdatalen = nextsize;
+	serverdatabase = m;
+	serverdatagot = 1;	/* force an ack transmit for new len */
+	maysend();
+    }
+    return 0;			/* P:282 */
+}
+
+static void doserver(void)	/* server (if needed) */
+{
+    struct queue *q, **pq;	/* P:135738 */
+    error *err;
+    int reslen;
+    int stacksize;
+    static int minstack = 8 << 10;
+    stacksize = (int) &stacksize & ~(-1 << 20);	/* stack limit on MB
+						 * boundary */
+    if (stacksize < minstack)
+	minstack = stacksize;	/* P:34 */
+    if (stacksize < 6 << 10)	/* not interested in <6K stack */
+	return;			/* P:24 */
+    maysend();
+    if (debug > 14)
+	printf("ps(%x):", stacksize);	/* P:0 */
+    for (pq = &thequeue; 0 != (q = *pq); pq = &q->next)	/* P:310582 */
+    {
+	if (q->resend)		/* P:39130 */
+	{
+	    DEBUGf("Resend result:");	/* P:4 */
+	    sendpacket(q->client, q->data, -q->len);	/* resend a result */
+	    q->resend = 0;
+	}
+	if (q->len > 0 && MONOTIME - q->when > 100 && serverkey != q->data[0] >> 8)	/* P:4209 */
+	{
+	    int x;		/* P:0 */
+	    DEBUGf("Queued %x send:", q->data[0]);	/* P:0 */
+	    x = q->data[0];
+	    *(char *) &x = q->recurse ? 'q' : 'Q';
+	    sendpacket(q->client, &x, sizeof(x));
+	    q->when = MONOTIME;
+	}
+    }
+    if (serverkey)		/* busy already */
+    {
+	if (debug > 14)
+	    printf("Busy.");
+	return;
+    }				/* P:1900 */
+    for (pq = &thequeue; 0 != (q = *pq); pq = &q->next)	/* P:304484 */
+    {
+	if (q->len > 0)		/* P:38180 */
+	    if (!q->recurse || !clientkey)	/* P:3272 */
+		goto doit;	/* P:3248 */
+    }
+    if (debug > 14)
+	printf("None.");	/* P:0 */
+    return;			/* none suitable queued *//* P:131528 */
+
+  doit:				/* P:3248 */
+    DEBUGf("Stack %x/%x,Queue %p:", stacksize, minstack, q);	/* P:1585 */
+    serverconnection = q->client;
+    serverkey = q->data[0] >> 8;
+    DEBUGf("** Server: %d bytes key %x Code %d..", q->len, serverkey, q->data[1]);	/* P:1585 */
+    if ('B' == *(char *) q->data)
+    {
+	struct
+	{
+	    int key;		/* P:1748 */
+	    int datalen;
+	    int reslen;
+	    char data[QUICKSIZE + MSGSIZE];
+	} *buf = rmalloc(sizeof(*buf));
+	int len;
+	if (!buf)
+	{
+	    err = ERR(NoMem);	/* P:0 */
+	    goto reterr;
+	}
+	serverdatalen = 0;
+	serverdatadone = 0;
+	err = d_msg(serverconnection, (union Message *) & q->data[0], q->len, &buf->data[0], QUICKSIZE, makemp(&quickmore), &len);
+	if (err)
+	{
+	    free(buf);
+	    goto reterr;
+	}			/* P:15 */
+	buf->key = 'S' + (serverkey << 8);
+	buf->datalen = serverdatadone;
+	buf->reslen = len;
+	memcpy(&buf->data[serverdatadone], q->data, len);
+	DEBUGf("Return S %d data %d result:", serverdatadone, len);	/* P:895 */
+	len = 12 + serverdatadone + len;
+	sendpacket(serverconnection, buf, len);
+	if (len < MSGSIZE)
+	{
+	    memcpy(&q->data[0], buf, len);	/* P:806 */
+	    q->len = -len;
+	    q->resend = 0;
+	    q->when = MONOTIME;
+	}
+	else
+	{
+	    *pq = q->next;	/* we don't hold onto this - its
+	     * idempotent *//* P:1733 */
+	    free(q);
+	}
+	free(buf);
+	goto fin;
+    }
+    serverdatadone = 0;
+    serverdatabits = 0;
+    serverdatabase = 0;
+    serverdatalen = 0;
+    serverdataptr = 0;
+    serverreceiving = 0;
+    serverdatagot = 0;
+    serverclientoktime = MONOTIME;
+    err = d_msg(serverconnection, (union Message *) q->data, q->len,
+		0, 0, makemp(&winmore), &reslen);
+    if (!err && !serverreceiving)	/* P:1474 */
+    {
+	while (serverdatadone < serverdatabase + serverdatalen)	/* P:31516 */
+	{
+	    poll();		/* P:27118 */
+	    if (MONOTIME - serverclientoktime > SERVERTIMEOUT)
+	    {
+		err = ERR(timeout);
+		break;
+	    }			/* P:0 */
+	    maysend();
+	}
+    }
+    if (!err)
+    {
+	DEBUGf("Done size=%d..", reslen);	/* P:2162 */
+	q->data[0] = 'R' + (serverkey << 8);
+    }
+    else
+    {
+	if (err->errnum == 0x1e6)	/* P:1513 */
+	    err = ERR(NotServ);	/* P:0 */
+
+      reterr:			/* P:41 */
+	DEBUGf("Error %s..", err->errmess);	/* P:2 */
+	if (err->errnum == ERRRecurse)
+	{
+	    q->recurse = 1;
+	    goto fin;
+	}			/* P:2 */
+	reslen = 9 + strlen(err->errmess);
+	memcpy(&q->data[1], err, reslen - 4);
+	q->data[0] = 'E' + (serverkey << 8);
+    }
+    sendpacket(serverconnection, q->data, reslen);
+    q->len = -reslen;
+    q->resend = 0;
+    q->when = MONOTIME;
+
+  fin:					/* P:3248 */
+    DEBUGf("** Server DONE **\n");	/* P:1585 */
+    serverkey = 0;
+}
+
+error *domsg(int c, union Message *m, int msize, char *p, int n,
+	     struct moreproc *mp, int *outsize)	/* client */
+{
+    int oldesc, esctime;	/* P:608 */
+    int pal;
+    error *err = NULL;
+    mp = mp;			/* We don't support moreprocs */
+    if (clientkey)
+	return ERR(Recurse);	/* P:0 */
+    lasterror = NULL;
+    while (!clientkey || clientkey == lastclientkey)	/* P:1824 */
+	clientkey = (MONOTIME << 12 ^ MONOTIME) & 0x7FFFFF;	/* P:608 */
+    lastclientkey = clientkey;
+    clientmessage = (int *) m;
+    clientconnection = c;
+    clientmessagesize = msize;
+    clientdatadone = 0;
+    clientdatalim = 0;
+    clientdatabits = 0;
+    clientdatapos = 0;
+    clientdatagot = 0;
+    clientdataptr = p;
+    clientsending = 0;
+    if (clientdataptr)
+	clientdatalen = n;	/* P:266 */
+    else
+	clientdatalen = 0;	/* P:608 */
+    clientreplylen = 0;
+    clientmessage[0] = (p && n <= QUICKSIZE && *(char *) clientmessage == 'R' ? 'B' : 'A') + (clientkey << 8);	/* P:506 */
+    DEBUGf("**Client: %d bytes id %x code %d..", msize, clientmessage[0], clientmessage[1]);	/* P:37 */
+    _swix(OS_ReadPalette, _INR(0, 1) | _OUT(2), 1, 25, &pal);
+    visdelay_begin();
+    esctime = MONOTIME + 300;	/* Wait 3 sec till enable esc */
+    oldesc = -3;
+    clientserveroktime = MONOTIME;	/* last time we heard from
+					 * server */
+    if (clientconnection == lastdeadserver)
+	clientserveroktime = MONOTIME - 2500;	/* he gets only 5 secs *//* P
+						 * :0 */
+    clientserverok = 0;
+    clientsendtime = MONOTIME - 300;	/* Force the first message
+					 * transmit */
+    clientqueueddisplay = clientqueued = clientred = 0;
+    for (;;)			/* P:426862 */
+    {
+	poll();			/* receive anything *//* P:426862 */
+	if (clientreplylen)
+	    break;		/* P:608 */
+	if (oldesc == -3)
+	{
+	    if (MONOTIME - esctime > 0 || clientred)	/* P:852508 */
+		oldesc = enableesc();	/* P:0 */
+	}
+	else
+	if (testesc())		/* P:426254 */
+	{
+	    err = ERR(Escape);	/* P:0 */
+	    lastdeadserver = clientconnection;
+	    fs_receive((int) lastdeadserver, 0, -2);	/* server departs */
+	    goto reterr;	/* P:0 */
+	}
+	if (MONOTIME - clientserveroktime > 3000)
+	{
+	    if (!lasterror)
+		lasterror = ERR(DeadServ);	/* P:0 */
+	    err = lasterror;
+	    lastdeadserver = clientconnection;
+	    fs_receive((int) lastdeadserver, 0, -2);	/* server departs */
+	    goto reterr;
+	}
+	maysend();
+    }
+    if (clientreplylen < 0)
+    {
+	memcpy(clientmessage, clientreply, -clientreplylen);	/* P:28 */
+	err = (void *) &clientmessage[1];
+	goto reterr;
+    }
+    memcpy(clientmessage, clientreply, clientreplylen);
+    DEBUGf("**Client done Replylen %d\n", clientreplylen);	/* P:34 */
+    if (lastdeadserver == clientconnection)
+	lastdeadserver = -1;	/* P:0 */
+
+  reterr:			/* P:608 */
+    visdelay_end();
+    _swix(OS_Word, _IN(0) | _BLOCK(1), 12, (pal << 8) | 1, pal >> 24);
+    if (oldesc && oldesc != -3)	/* P:608 */
+	disableesc();		/* P:0 */
+    clientkey = 0;
+    *outsize = clientreplylen;
+    if (err)
+	DEBUGf("**Client returns error %s\n", err->errmess);	/* P:31 */
+    return err;			/* P:608 */
+}
+
+static void gotclientdata(int pos, void *buf, int l)	/**/
+{
+    if (clientdataptr && l > 0 && pos >= clientdatadone &&
+	pos + l <= clientdatalen)	/* P:690 */
+    {
+	int ahead = (pos - clientdatadone) / CHUNKSIZE;	/* P:166 */
+	if (ahead < WINDOWSIZE)
+	{
+	    if (pos + l > clientdatalim)	/* P:166 */
+		clientdatalim = pos + l;	/* P:166 */
+	    DEBUGf("recv data %x+%x,", pos, l);	/* P:8 */
+	    memcpy(clientdataptr + pos, buf, l);
+	    clientdatabits |= (1 << ahead);
+	    while (clientdatabits & 1)	/* P:498 */
+	    {
+		clientdatabits >>= 1;	/* P:166 */
+		clientdatadone += CHUNKSIZE;
+	    }
+	    if (clientdatadone > clientdatalim)
+		clientdatadone = clientdatalim;	/* P:166 */
+	    clientdatagot = 1;
+	    clientserverok = 1;
+	}
+    }
+    clientserveroktime = MONOTIME;
+}
+
+void gotpacket(int c, int *pptr, int len)	/**/
+{
+    int which = *(char *) pptr;	/* P:4533 */
+    int key = *pptr >> 8;
+    if (!len)
+	return;			/* P:0 */
+
+    DEBUGf("%c%x:", which, key);/* P:1863 */
+    switch (which)		/* P:4533 */
+    {
+      case 'R':	/* reply *//* P:414 */
+	if (key == clientkey)
+	{
+	    memcpy(clientreply, pptr, len);	/* P:406 */
+	    clientreplylen = len;
+	    DEBUGf("reply %d\n", clientreplylen);	/* P:25 */
+	}
+	else
+	    DEBUGf("????\n");	/* P:414 */
+	break;
+
+      case 'E':	/* error response to an action *//* P:28 */
+	if (key == clientkey)
+	{
+	    memcpy(clientreply, pptr, len);	/* P:28 */
+	    clientreplylen = -len;
+	    DEBUGf("error %d\n", clientreplylen);	/* P:3 */
+	}
+	else
+	    DEBUGf("????\n");	/* P:28 */
+	break;
+
+      case 'Q':
+      case 'q':		/* action queued *//* P:0 */
+	if (key == clientkey)
+	{
+	    clientserveroktime = MONOTIME;	/* P:0 */
+	    /*
+	     * Do not set clientserverok=1 so we continue sending
+	     * request, not acks 
+	     */
+	    clientqueued++;
+	    if (which == 'q')
+		clientred = 1;	/* P:0 */
+	}
+	else
+	    DEBUGf("????\n");	/* P:0 */
+	break;
+
+      case 'S':	/* a combined data and reply packet.
+		 * [1]datalen [2]reslen [3] data
+		 * [..]reply *//* P:174 */
+	if (key == clientkey)
+	{
+	    gotclientdata(0, &pptr[3], pptr[1]);	/* P:174 */
+	    memcpy(clientreply, (char *) &pptr[3] + pptr[1], pptr[2]);
+	    clientreplylen = pptr[2];
+	    if (len >= MSGSIZE)
+		clientserverok = 0;	/* we must not send any acks
+					 * as server has no record */
+	    DEBUGf("done %x ahead %x,reply %d\n", clientdatadone, clientdatabits, clientreplylen);	/* P:9 */
+	}
+	else
+	    DEBUGf("????\n");	/* P:174 */
+	break;
+
+      case 'D':	/* a chunk of data read from the action *//* P:10 */
+	if (key == clientkey)
+	    gotclientdata(pptr[1], &pptr[2], len - 2 * sizeof(int));	/* P:10 */
+	DEBUGf("done %x ahead %x\n", clientdatadone, clientdatabits);	/* P:3 */
+	break;
+
+      case 'd':	/* a chunk of data to write to an action *//* P:8 */
+	if (key == serverkey && serverdataptr)	/* P:8 */
+	{
+	    int pos = pptr[1];	/* P:8 */
+	    int l = len - 2 * sizeof(int);
+	    void *buf = &pptr[2];
+	    if (l && pos >= serverdatadone &&
+		pos + l <= serverdatabase + serverdatalen)	/* P:16 */
+	    {
+		int ahead = (pos - serverdatadone) / CHUNKSIZE;	/* P:8 */
+		if (ahead < WINDOWSIZE)
+		{
+		    DEBUGf("Writedata %x+%x,", pos, l);	/* P:8 */
+		    memcpy(&serverdataptr[pos - serverdatabase], buf, l);
+		    serverdatabits |= (1 << ahead);
+		    while (serverdatabits & 1)	/* P:24 */
+		    {
+			serverdatabits >>= 1;	/* P:8 */
+			serverdatadone += CHUNKSIZE;
+		    }
+		    if (serverdatadone > serverdatabase + serverdatalen)
+			serverdatadone = serverdatabase + serverdatalen;	/* P:8 */
+		}
+	    }
+	    DEBUGf("done %x bits %x\n", serverdatadone, serverdatabits);	/* P:0 */
+	    serverdatagot = 1;
+	    serverclientoktime = MONOTIME;
+	}
+	else
+	    goto oldresult;	/* P:8 */
+	break;
+
+      case 'w':	/* acknowledgement of how much data
+		 * received to write *//* P:218 */
+	if (key == clientkey)
+	{
+	    DEBUGf("Ack-w %x done %x bits %x lim %x\n", pptr[0], pptr[1], pptr[2], pptr[3]);	/* P:218 */
+	    clientsending = 1;
+	    clientdatadone = pptr[1];
+	    clientdatabits = pptr[2];
+	    clientdatalim = pptr[3];
+	    clientserveroktime = MONOTIME;
+	    clientserverok = 1;
+	}
+	break;
+
+      case 'r':	/* acknowledgement of how much data
+		 * read from an action *//* P:435 */
+	if (key == serverkey)
+	{
+	    DEBUGf("Ack-r %x done %x bits %x (base %x len %x)\n", pptr[0], pptr[1], pptr[2], serverdatabase, serverdatalen);	/* P:666 */
+	    serverdatadone = pptr[1];
+	    serverdatabits = pptr[2];
+	    serverclientoktime = MONOTIME;
+	    break;
+	}
+	else
+	    goto oldresult;
+
+      case 'A':
+      case 'B':		/* An action arriving to be queued *//* P:4744 */
+	if (key == serverkey)
+	{
+	    DEBUGf("Going\n");	/* P:0 */
+	    serverclientoktime = MONOTIME;
+	    serverdatabits = 0;
+	    break;
+	}
+
+      oldresult:			/* P:3253 */
+	{
+	    struct queue *q, **pq;
+	    for (pq = &thequeue; 0 != (q = *pq); pq = &q->next)	/* P:6506 */
+		if (c == q->client)	/* P:2325 */
+		{
+		    if (key == q->data[0] >> 8)	/* P:2325 */
+		    {
+			DEBUGf("Matches queue %p,", q);	/* P:8 */
+			if (q->len < 0)
+			{
+			    DEBUGf("(old result len %d)\n", q->len);	/* P:8 */
+			    q->resend = 1;
+			}
+			else
+			    DEBUGf("Already queued\n");	/* P:7 */
+			return;	/* P:7 */
+		    }
+		    break;
+		}
+	    if (which != 'A' && which != 'B')	/* P:1748 */
+	    {
+		lostresultc = c;/* P:0 */
+		lostkey = key;
+		printf("***** Lost result due to receiving %c type ****\n", which);
+		DEBUGf("LostResult\n");	/* P:0 */
+		break;
+	    }
+	    if (!q)
+	    {
+		q = rmalloc(sizeof(struct queue));	/* P:928 */
+		if (!q)
+		{
+		    DEBUGf("No room to queue\n");	/* P:0 */
+		    return;	/* P:0 */
+		}
+		q->next = 0;
+		q->client = c;
+		*pq = q;
+	    }
+	    DEBUGf("queued %p\n", q);	/* P:1584 */
+	    q->len = len;
+	    q->resend = 0;
+	    q->recurse = 0;
+	    q->when = MONOTIME;
+	    memcpy(q->data, pptr, len);
+	    CallAfter(doserver, 0);
+	}
+    }
+}
+
+#ifdef DEBUG
+void showqueue(void)
+{
+    struct queue *q;		/* P:0 */
+    for (q = thequeue; q; q = q->next)	/* P:0 */
+	printf("Queue %p: client %x len %d\n", q, q->client, q->len);
+}
+#endif
+
+/* EOF window.c */

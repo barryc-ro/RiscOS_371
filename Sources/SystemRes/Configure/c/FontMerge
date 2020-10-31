@@ -1,0 +1,1170 @@
+/*
+ * fonts.c
+ *
+ * This is the module that handles the Fonts window.
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+/*#define FONTSDEBUG*/
+/*#define FONTSTEST*/
+
+#define MESSAGEFILE "FontMerge:Messages"
+
+#define No (0)
+#define Yes (!No)
+
+/* -----------------------------------------------------------------------
+
+                          Font Merging
+
+----------------------------------------------------------------------- */
+
+/*
+
+
+Notes:
+
+This code appears to be tatty. It is not. Given this is a stand-alone
+application which is performing a single-shot job, it has a reasonable right
+to expect it's workspace will be 'vaped when it finishes, hence the small
+bits of apparent heap rot.
+
+Also, note this program generates errors to be processed by the system. This
+is on purpose. Any time when this happens it should. Any errors which are to
+be caught are caught.
+
+*/
+
+static char *msg_lookup( char *tag, char *parm );
+
+/*
+        Display error
+*/
+static void show_error( char *text, int flags )
+{
+        _kernel_oserror err;
+
+        err.errnum = 0;
+        strncpy( err.errmess, text, 252 );
+        _swi( Wimp_ReportError, _IN(0)|_IN(1)|_IN(2), &err, flags, msg_lookup("Name",NULL) );
+}
+
+/*
+        Returns the type of the file:
+        0 - does not exist/couldn't do the SWI
+        1 - file
+        2 - directory
+        3 - image
+*/
+static int file_type( char *filename )
+{
+        int t;
+
+        if ( _swix( OS_File, _IN(0)|_IN(1)|_OUT(0), 17, filename, &t ) ) return 0;
+
+        return t;
+}
+
+/*
+        Makes a directory
+*/
+static _kernel_oserror *mkdir( char *dirname )
+{
+#ifdef FONTSDEBUG
+printf("mkdir %s\n", dirname );
+#endif
+        return _swix( OS_File, _IN(0)|_IN(1)|_IN(4), 8, dirname, 0 );
+}
+
+/*
+        Adds any encodings files in root to the end of messages file ofile
+*/
+static _kernel_oserror *scan_for_encodings( char *root, char *bufend, FILE *ofile )
+{
+        _kernel_oserror *err;
+        int numread;
+        int pos;
+        char *tpos = root + strlen( root );
+        char *enumbuf;
+
+        strcpy( tpos, ".Encodings" );
+        enumbuf = tpos + strlen( tpos ) + 1;
+
+        if ( file_type( root ) == 0 )
+        {
+                *tpos=0;
+                return NULL;
+        }
+
+        for ( pos = 0; pos != -1; )
+        {
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, root, enumbuf, 1, pos, bufend - enumbuf, "*",
+                        &numread, &pos );
+
+                if ( err ) break;
+
+                if ( numread > 0 )
+                {
+                        enumbuf[-1] = '.';
+                        if ( file_type( root ) == 1 )
+                        {
+                                if ( enumbuf[0] == '/' )
+                                {
+                                        if ( fprintf( ofile, "BEncoding_%s:\n", enumbuf+1 ) < 0 )
+                                        {
+                                                err = _kernel_last_oserror();
+                                                break;
+                                        }
+                                }
+                                else
+                                {
+                                        if ( fprintf( ofile, "Encoding_%s:\n", enumbuf ) < 0 )
+                                        {
+                                                err = _kernel_last_oserror();
+                                                break;
+                                        }
+                                }
+                        }
+                        enumbuf[-1] = 0;
+                }
+        }
+
+        *tpos = 0;
+
+        return err;
+}
+
+/*
+        Adds any fonts in fontbase to the end of messages file ofile.
+        This is a recursive routine.
+        All fonts are assumed to be language fonts
+*/
+static _kernel_oserror *scan_for_fonts( char *root, char *fontbase, char *bufend, FILE *ofile )
+{
+        _kernel_oserror *err;
+        int numread;
+        int pos;
+        char *tpos = fontbase + strlen( fontbase );
+        char *enumbuf;
+
+        enumbuf = tpos+1;
+
+        for ( pos = 0; pos != -1; )
+        {
+                *tpos = 0;
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, root, enumbuf, 1, pos, bufend - enumbuf, "*",
+                        &numread, &pos );
+
+                if ( err ) break;
+
+                *tpos = '.';
+
+                if ( numread > 0 )
+                {
+                        switch( file_type( root ) )
+                        {
+                        case 1: /* file */
+                                if ( strncmp( enumbuf, "IntMetric", strlen( "IntMetric" ) ) == 0 )
+                                {
+                                        *tpos = 0;
+                                        if ( fprintf( ofile, "LFont_%s:\n", fontbase+1 ) < 0 )
+                                        {
+                                                *tpos = 0;
+                                                return _kernel_last_oserror();
+                                        }
+                                        *tpos = '.';
+                                }
+                                break;
+
+                        case 2: /* directory */
+                                err = scan_for_fonts( root, fontbase, bufend, ofile );
+                                if ( err )
+                                {
+                                        *tpos = 0;
+                                        return _kernel_last_oserror();
+                                }
+                                break;
+                        }
+                }
+        }
+
+        *tpos = 0;
+
+        return err;
+}
+
+/*
+        Ensures the messages file called mfile exists in dest.
+        If not it constructs mfile.
+        If there is another messages file in dest it copies that without the
+                language strings.
+        If there is no other messages file the encodings and fonts are
+                enumerated and placed in the mfile.
+*/
+static _kernel_oserror *ensure_messages_file( char *dest, char *mfile )
+{
+        _kernel_oserror *err;
+        char enumbuf[256];
+        int numread;
+        int pos;
+        char sfile[256];
+        char dfile[256];
+        char *rover;
+        char *rover1;
+        FILE *ifile;
+        FILE *ofile;
+
+        sprintf( sfile, "%s.%s", dest, mfile );
+#ifdef FONTSDEBUG
+printf("Ensuring %s\n", sfile );
+#endif
+        if ( file_type( sfile ) != 0 ) return NULL;
+
+        for ( pos = 0; pos != -1; )
+        {
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, dest, enumbuf, 1, pos, sizeof( enumbuf ), "Messages*",
+                        &numread, &pos );
+
+                if ( err ) return err;
+
+                if ( numread > 0 ) break;
+        }
+
+        if ( numread > 0 )
+        {
+#ifdef FONTSDEBUG
+printf("Copy from example file\n" );
+#endif
+                /*
+                        Got an example messages file to base the new one on
+                */
+                sprintf( sfile, "%s.%s", dest, enumbuf );
+                sprintf( dfile, "%s.%s", dest, mfile );
+
+                ifile = fopen( sfile, "r" );
+                if ( !ifile ) return _kernel_last_oserror();
+                ofile = fopen( dfile, "w" );
+                if ( !ofile )
+                {
+                        fclose( ifile );
+                        return _kernel_last_oserror();
+                }
+
+                while ( !feof( ifile ))
+                {
+                        if ( !fgets( enumbuf, sizeof( enumbuf ), ifile ) ) continue;
+
+                        /*
+                                Junk the language specific bit of the line
+                        */
+                        for ( rover = enumbuf; *rover && *rover != ':'; rover++ );
+                        rover1 = rover+1;
+                        for ( ; *rover && *rover != '*' && *rover != '\n'; rover++ );
+                        strcpy( rover1, rover );
+
+                        if ( fputs( enumbuf, ofile ) == EOF )
+                        {
+                                fclose( ifile );
+                                fclose( ofile );
+                                return _kernel_last_oserror();
+                        }
+                }
+
+                fclose( ifile );
+                fclose( ofile );
+        }
+        else
+        {
+#ifdef FONTSDEBUG
+printf("Make new file\n" );
+#endif
+                /*
+                        No example messages file - have to construct it by hand
+                */
+                sprintf( dfile, "%s.%s", dest, mfile );
+                ofile = fopen( dfile, "w" );
+                if ( !ofile ) return _kernel_last_oserror();
+
+                strcpy( sfile, dest );
+                err = scan_for_encodings( sfile, sfile+sizeof(sfile), ofile );
+#ifdef FONTSDEBUG
+if ( err ) printf("Error from scan_for_encodings %s\n", err->errmess );
+#endif
+                if ( !err )
+                {
+                        err = scan_for_fonts( sfile, sfile+strlen(sfile), sfile+sizeof(sfile), ofile );
+#ifdef FONTSDEBUG
+if ( err ) printf("Error from scan_for_fonts %s\n", err->errmess );
+#endif
+                }
+
+                fclose( ofile );
+        }
+
+#ifdef FONTSDEBUG
+if ( err ) printf("Error is %s\n", err->errmess );
+#endif
+        return err;
+}
+
+/*
+        For all messages files in destdir
+                Scan the corresponding messages file in sourcedir for tagged
+                lines which go <tag>:<something> and append those lines to the
+                destdir messages file.
+*/
+static _kernel_oserror *copy_messages_for_thing( char *destdir, char *sourcedir, char *tag0, char *tag1 )
+{
+        _kernel_oserror *err = NULL;
+        int numread;
+        int numread1;
+        int pos;
+        int pos1;
+        char enumbuf[256];
+        char tbuf[256];
+        FILE *ifile;
+        FILE *ofile;
+        char *rover;
+        char *rover1;
+
+#ifdef FONTSDEBUG
+printf("copy messages for thing %s\n", tag0 );
+#endif
+
+        for ( pos = 0; !err && pos != -1; )
+        {
+                /*
+                        Scan for all Messages files in the destination directory
+                */
+
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, destdir, enumbuf, 1, pos, sizeof( enumbuf ), "Messages*",
+                        &numread, &pos );
+
+                if ( err ) break;
+
+                /*
+                        If a Messages file has been found copy/generate a suitable entry in it
+                */
+                if ( numread > 0 )
+                {
+                        sprintf( tbuf, "%s.%s", destdir, enumbuf );
+                        ofile = fopen( tbuf, "a" );
+                        if ( !ofile )
+                        {
+                                err = _kernel_last_oserror();
+                                break;
+                        }
+
+                        sprintf( tbuf, "%s.%s", sourcedir, enumbuf );
+
+                        ifile = fopen( tbuf, "r" );
+                        if ( !ifile )
+                        {
+                                /*
+                                        Didn't find a language file for that language, so we'll
+                                        try finding a different language file
+                                */
+
+                                for ( pos1 = 0; !err && pos1 != -1; )
+                                {
+                                        err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                                                9, sourcedir, enumbuf, 1, pos1, sizeof( enumbuf ), "Messages*",
+                                                &numread1, &pos1 );
+
+                                        if ( numread1 > 0 ) break;
+                                }
+
+                                if ( !err && numread1 > 0 )
+                                {
+                                        /*
+                                                Found an alternative language file so we'll
+                                                transfer the relevant message lines without
+                                                the language strings
+                                        */
+
+                                        sprintf( tbuf, "%s.%s", sourcedir, enumbuf );
+                                        ifile = fopen( tbuf, "r" );
+                                        if ( !ifile )
+                                        {
+                                                err = _kernel_last_oserror();
+                                        }
+
+                                        while ( !err && !feof( ifile ))
+                                        {
+                                                if ( !fgets( tbuf, sizeof( tbuf ), ifile ) ) continue;
+
+                                                if ( ( strncmp( tbuf, tag0, strlen( tag0 )) == 0 && tbuf[ strlen( tag0 ) ] == ':' ) ||
+                                                     ( tag1 && strncmp( tbuf, tag1, strlen( tag1 )) == 0 && tbuf[ strlen( tag1 ) ] == ':' ) )
+                                                {
+
+                                                        /*
+                                                                Junk the language specific bit of the line
+                                                        */
+                                                        for ( rover = tbuf; *rover && *rover != ':'; rover++ );
+                                                        rover1 = rover+1;
+                                                        for ( ; *rover && *rover != '*' && *rover != '\n'; rover++ );
+                                                        strcpy( rover1, rover );
+
+                                                        if ( fputs( tbuf, ofile ) == EOF )
+                                                        {
+                                                                err = _kernel_last_oserror();
+                                                                break;
+                                                        }
+                                                }
+                                        }
+                                        if ( ifile ) fclose( ifile );
+                                }
+                                else if ( !err )
+                                {
+                                        /*
+                                                No alternative messages file.
+                                                Generate a fresh messages entry
+                                        */
+                                        if ( fprintf( ofile, "%s:\n", tag0 ) < 0 )
+                                        {
+                                                err = _kernel_last_oserror();
+                                        }
+                                }
+                        }
+                        else
+                        {
+                                /*
+                                        Copy messages entry across( if present! )
+                                */
+                                while ( !err && !feof( ifile ))
+                                {
+                                        if ( !fgets( tbuf, sizeof( tbuf ), ifile ) ) continue;
+
+                                        if ( ( strncmp( tbuf, tag0, strlen( tag0 )) == 0 && tbuf[ strlen( tag0 ) ] == ':' ) ||
+                                             ( tag1 && strncmp( tbuf, tag1, strlen( tag1 )) == 0 && tbuf[ strlen( tag1 ) ] == ':' ) )
+                                        {
+                                                if ( fputs( tbuf, ofile ) == EOF )
+                                                {
+                                                        err = _kernel_last_oserror();
+                                                }
+                                        }
+                                }
+
+                                fclose( ifile );
+                        }
+
+                        fclose( ofile );
+                }
+        }
+
+        return err;
+}
+
+/*
+        Copy a file/directory recursively
+*/
+static _kernel_oserror *copy_file( char *destdir, char *sourcedir, char *what )
+{
+        _kernel_oserror *err;
+        char sbuf[256];
+        char dbuf[256];
+
+        sprintf( sbuf, "%s.%s", sourcedir, what );
+        sprintf( dbuf, "%s.%s", destdir, what );
+
+#ifdef FONTSDEBUG
+printf("copy %s from %s to %s\n", what, sourcedir, destdir );
+#endif
+
+        err = _swix( OS_FSControl, _IN(0)|_IN(1)|_IN(2)|_IN(3), 26, sbuf, dbuf, 0x8003 );
+
+#ifdef FONTSDEBUG
+        if ( err ) printf( "Error:%s\n", err->errmess );
+#endif
+
+        return err;
+}
+
+/*
+        Find all fonts in root and copy their messages across
+*/
+static _kernel_oserror *copy_fonts_across( char *root, char *fontbase, char *bufend, char *dest )
+{
+        _kernel_oserror *err = NULL;
+        int numread;
+        int pos;
+        char *tpos = fontbase + strlen( fontbase );
+        char *enumbuf;
+        char tbuf[256];
+        char t1buf[256];
+        int copy_the_files;
+        int done_messages = No;
+        int tfont;
+
+#ifdef FONTSDEBUG
+printf("%s\n",dest);
+#endif
+
+        /*
+                Check for this font's existance
+        */
+        if ( _swix( Font_FindFont, _IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_OUT(0), fontbase+1, 16*12, 16*12, 0, 0, &tfont ) )
+        {
+                /* font not found */
+                copy_the_files = Yes;
+        }
+        else
+        {
+                /* font found */
+                copy_the_files = No;
+                show_error( msg_lookup("E00",fontbase+1), 0x11 );
+                err = _swix( Font_LoseFont, _IN(0), tfont );
+                if ( err ) return err;
+        }
+
+        enumbuf = tpos+1;
+
+        for ( pos = 0; !err && pos != -1; )
+        {
+                *tpos = 0;
+
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, root, enumbuf, 1, pos, bufend - enumbuf, "*",
+                        &numread, &pos );
+
+                if ( err ) continue;
+
+                *tpos = '.';
+
+                if ( numread > 0 )
+                {
+                        switch( file_type( root ) )
+                        {
+                        case 1: /* file */
+                                if ( copy_the_files )
+                                {
+                                        char *npos;
+
+                                        /*
+                                                Ensure the parent directories are made
+                                        */
+#ifdef FONTSDEBUG
+printf( "fontbase='%s', dest='%s'\n", fontbase, dest );
+#endif
+                                        for ( npos = fontbase; !err && *npos; )
+                                        {
+                                                npos++;
+                                                while ( *npos && *npos != '.' ) npos++;
+
+                                                if ( *npos )
+                                                {
+                                                        *npos = '\0';
+                                                        sprintf( tbuf, "%s%s", dest, fontbase );
+#ifdef FONTSDEBUG
+printf("CDIR '%s'\n", tbuf );
+#endif
+                                                        err = _swix( OS_File, _IN(0)|_IN(1)|_IN(4), 8, tbuf, 0 );
+                                                        *npos = '.';
+                                                }
+                                        }
+
+                                        /*
+                                                Copy the file across
+                                        */
+                                        if ( !err )
+                                        {
+                                                *tpos = '\0';
+                                                sprintf( tbuf, "%s%s", dest, fontbase );
+                                                err = copy_file( tbuf, root, enumbuf );
+                                                *tpos = '.';
+                                        }
+
+                                        if ( err ) break;
+
+                                        /*
+                                                If that was IntMetric* we just copied, lets process the
+                                                Messages file entries for it too.
+                                        */
+                                        if ( strncmp( enumbuf, "IntMetric", strlen( "IntMetric" ) ) == 0 && !done_messages )
+                                        {
+                                                *tpos = 0;
+                                                sprintf( tbuf, "LFont_%s", fontbase+1 );
+                                                sprintf( t1buf, "Font_%s", fontbase+1 );
+                                                fontbase[0] = 0;
+                                                err = copy_messages_for_thing( dest, root, tbuf, t1buf );
+                                                fontbase[0] = '.';
+                                                done_messages = Yes;
+                                        }
+                                }
+                                break;
+
+                        case 2: /* directory */
+                                err = copy_fonts_across( root, fontbase, bufend, dest );
+                                break;
+                        }
+                }
+        }
+
+        *tpos = 0;
+
+        return err;
+}
+
+/*
+        Plug in number to the sprite file.
+        Makes the new fonts directories have the right sprite names
+*/
+static _kernel_oserror *adjust_sprite_number( char *dir, char *sfile, int number )
+{
+        _kernel_oserror *err = NULL;
+        char sbuf[256];
+        int ofile;
+        int fileend;
+        int pos;
+        int offset;
+
+        sprintf( sbuf, "%s.%s", dir, sfile );
+#ifdef FONTSDEBUG
+printf("Adjust sprite file %s\n", sbuf );
+#endif
+        err = _swix( OS_Find, _IN(0)|_IN(1)|_OUT(0), 0xCF, sbuf, &ofile );
+        if ( err ) return err;
+
+        err = _swix( OS_Args, _IN(0)|_IN(1)|_OUT(2), 2, ofile, &fileend );
+        if ( err ) return err;
+
+        /* Read the offset to the first sprite */
+        err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4), 3, ofile, &offset, sizeof( offset ), 4 );
+        if ( err ) return err;
+
+        pos = offset - 4;
+        while ( pos < fileend )
+        {
+#ifdef FONTSDEBUG
+printf( "pos=%d\n", pos );
+#endif
+                /* Read the sprite's name */
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4), 3, ofile, sbuf, 12, pos+4 );
+                if ( err ) return err;
+
+#ifdef FONTSDEBUG
+printf( "name=%s\n", sbuf );
+#endif
+                /* Check and convert !fonts and sm!fonts */
+                if ( strncmp( sbuf, "!fonts", 6 ) == 0 )
+                {
+                        sprintf( sbuf, "!fonts%d", number );
+                        err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4), 1, ofile, sbuf, 12, pos+4 );
+                        if ( err ) return err;
+                }
+
+                if ( strncmp( sbuf, "sm!fonts", 8 ) == 0 )
+                {
+                        sprintf( sbuf, "sm!fonts%d", number );
+                        err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4), 1, ofile, sbuf, 12, pos+4 );
+                        if ( err ) return err;
+                }
+
+                /* Move on to the next sprite */
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4), 3, ofile, &offset, sizeof( offset ), pos );
+                if ( err ) return err;
+
+                pos = pos + offset;
+        }
+
+        (void)_swix( OS_Find, _IN(0)|_IN(1), 0, ofile );
+
+        return err;
+}
+
+/*
+        Return TRUE if found a non-ROM family location.
+        destbuf and destbuflen define the buffer to put the found font family's prefix.
+*/
+static _kernel_oserror *font_family_location( char *fontname, char *destbuf, int destbuflen, int *found )
+{
+        _kernel_oserror *err = NULL;
+        char fontbuf[256];
+        int pos;
+        char *idpos;
+        int fnlen = strlen( fontname );
+        int tfont;
+        int flags;
+        int foundfontlen;
+
+        *found = No;
+
+        for ( pos = 0x10000; pos != -1; )
+        {
+                err = _swix( Font_ListFonts, _IN(1)|_IN(2)|_IN(3)|_OUT(2), fontbuf, pos, sizeof( fontbuf ), &pos );
+#ifdef FONTSDEBUG
+if ( err ) printf( "list fonts error\n" );
+#endif
+                if ( err ) return err;
+
+                if ( pos == -1 )
+                        continue;
+
+                err = _swix( Font_FindField, _IN(1)|_IN(2)|_OUT(1), fontbuf, 'F', &idpos );
+#ifdef FONTSDEBUG
+if ( err ) printf( "find field error\n" );
+#endif
+                if ( err ) return err;
+
+                if ( strncmp( idpos, fontname, fnlen ) == 0 &&
+                      ( idpos[fnlen] == 0 ||
+                        idpos[fnlen] == ' ' ||
+                        idpos[fnlen] == '.' ||
+                        idpos[fnlen] == '\\'
+                      ) )
+                {
+#ifdef FONTSDEBUG
+printf( "Font_FindFont('%s')\n", fontbuf );
+#endif
+                        err = _swix( Font_FindFont, _IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_OUT(0), fontbuf, 16*12, 16*12, 0, 0, &tfont );
+#ifdef FONTSDEBUG
+if ( err ) printf( "find font error\n" );
+#endif
+                        if ( !err ) err = _swix( Font_LookupFont, _IN(0)|_IN(1)|_IN(2)|_OUT(2), tfont, 0, 0, &flags );
+#ifdef FONTSDEBUG
+if ( err ) printf( "find font/lookup font font error\n" );
+#endif
+                        if ( err ) return err;
+
+                        if ( (flags & 2) == 0 )
+                        {
+                                /* non-ROM font - use that family location */
+                                err = _swix( Font_ReadFontPrefix, _IN(0)|_IN(1)|_IN(2), tfont, destbuf, destbuflen );
+#ifdef FONTSDEBUG
+if ( err ) printf( "read font prefix error\n" );
+#endif
+                                if ( err ) return err;
+
+                                /* Work out the length of the identifier */
+                                for ( foundfontlen = 0;
+                                      idpos[foundfontlen]!=0 && idpos[foundfontlen]!=' ' && idpos[foundfontlen]!='\\';
+                                      foundfontlen++ );
+
+#ifdef FONTSDEBUG
+printf( "font prefix='%s'  fonttag='%s'  fonttaglen=%d\n", destbuf, idpos, foundfontlen );
+#endif
+                                if ( strlen( destbuf ) > foundfontlen+2 )
+                                        destbuf[ strlen(destbuf) - foundfontlen - 2 ] = '\0';
+                        }
+
+                        err = _swix( Font_LoseFont, _IN(0), tfont );
+#ifdef FONTSDEBUG
+if ( err ) printf( "lose font error\n" );
+#endif
+                        if ( err ) return err;
+
+                        *found = Yes;
+                }
+        }
+
+        return err;
+}
+
+/*
+
+        itemsprocessed = number of items which were successfully merged in
+        itemstoskip = number of items to skip before processing starts
+        itemscovered = processed+skipped items
+        totitems = the grand total for percentage purposes
+*/
+
+#define PREPROCESSITEM (*itemscovered)++; if ( itemstoskip++ < 0 ) continue;
+#define POSTPROCESSITEM (*itemsprocessed)++; _swi( Hourglass_Percentage, _IN(0), (*itemscovered) * 100 / totitems );
+static _kernel_oserror *merge_into_particular( char *destination, int *itemsprocessed, char *source, int itemstoskip, int *itemscovered, int totitems )
+{
+        _kernel_oserror *err;
+        int pos;
+        char enumbuf[256];
+        char tbuf[256];
+        char ubuf[256];
+        char rbuf[256];
+        char family_prefix[256];
+        int numread;
+        int found_family;
+
+        *itemscovered = 0;
+
+        /*
+                Make sure the destination has all the necessary Messages files
+        */
+        for ( pos = 0; pos != -1; )
+        {
+                _swi( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, source, enumbuf, 1, pos, sizeof( enumbuf ), "Messages*",
+                        &numread, &pos );
+
+                if ( numread > 0 )
+                {
+                        err = ensure_messages_file( destination, enumbuf );
+                        if ( err != NULL ) return err;
+                }
+        }
+
+        /*
+                Copy the Encodings across
+        */
+        sprintf( ubuf, "%s.Encodings", source );
+        if ( file_type( ubuf ) == 2 )
+        {
+                sprintf( tbuf, "%s.Encodings", destination );
+                err = mkdir( tbuf );
+                if ( err != NULL ) return err;
+
+                for ( pos = 0; pos != -1; )
+                {
+                        _swi( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                                9, ubuf, enumbuf, 1, pos, sizeof( enumbuf ), "*",
+                                &numread, &pos );
+
+                        if ( numread > 0 )
+                        {
+                                PREPROCESSITEM
+
+                                err = copy_file( tbuf, ubuf, enumbuf );
+                                if ( err != NULL ) return err;
+
+                                if ( enumbuf[0]=='/' )
+                                        sprintf( rbuf, "BEncoding_%s", enumbuf+1 );
+                                else
+                                        sprintf( rbuf, "Encoding_%s", enumbuf );
+
+                                err = copy_messages_for_thing( destination, source, rbuf, NULL );
+                                if ( err ) _swi( OS_GenerateError, _IN(0), err );
+
+                                POSTPROCESSITEM
+                        }
+                }
+        }
+
+        /*
+                Copy the fonts across
+        */
+        for ( pos = 0; pos != -1; )
+        {
+                _swi( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, source, enumbuf, 1, pos, sizeof( enumbuf ), "*",
+                        &numread, &pos );
+
+                if ( numread > 0 )
+                {
+                        sprintf( tbuf, "%s.%s", source, enumbuf );
+
+                        if ( file_type( tbuf ) == 2 && strcmp( enumbuf, "Encodings" ) != 0 )
+                        {
+                                PREPROCESSITEM
+
+                                err = font_family_location( enumbuf, family_prefix, sizeof( family_prefix ), &found_family );
+
+                                if ( !err && !found_family )
+                                {
+                                        strcpy( family_prefix, destination );
+                                }
+#ifdef FONTSDEBUG
+printf("family prefix='%s', err = %#010x\n", family_prefix, (int)err );
+#endif
+
+                                if ( !err )
+                                        err = copy_fonts_across( tbuf, tbuf+strlen(source), tbuf+sizeof(tbuf), family_prefix );
+                                if ( err ) return err;
+
+                                POSTPROCESSITEM
+                        }
+                }
+        }
+
+        return NULL;
+}
+
+static _kernel_oserror *fonts_merge( char *destination, char *source )
+{
+        _kernel_oserror *err;
+        int base_number;
+        int pos;
+        int numread;
+        char enumbuf[256];
+        char currentdest[256];
+        char tbuf[256];
+        int itemsprocessed = 0;
+        int itemstoskip = 0;
+        char *tc;
+        int t;
+        char dirprefix[256];
+        char fontdirtail[256];
+        int fontdirtaillen;
+        int totitems;
+        int itemscovered;
+
+        /*
+                Check both source and destination exist and are directory things
+        */
+        t = file_type( source );
+        if ( (t & 2) == 0 ) _swi( OS_File, _IN(0)|_IN(1)|_IN(2), 19, source, t );
+        t = file_type( destination );
+        if ( (t & 2) == 0 ) _swi( OS_File, _IN(0)|_IN(1)|_IN(2), 19, destination, t );
+
+        /*
+                Directory to search for fonts directories in
+        */
+        sprintf( dirprefix, "%s.^", destination );
+
+        /*
+                Work out a suitable prefix to look for.
+                eg, if we're given "blah.blah.!Fonts23" we get !Fonts
+        */
+        /* find the leaf */
+        tc = strrchr( destination, '.' );
+        if ( tc == NULL ) tc = strrchr( destination, ':' );
+        if ( tc == NULL ) tc = destination-1;
+        tc++;
+        /* take a copy and strip trailing digits */
+        strcpy( fontdirtail, tc );
+        tc = fontdirtail + strlen( fontdirtail ) - 1;
+        while ( tc > fontdirtail && '0' <= *tc && *tc <= '9' )
+        {
+                tc--;
+        }
+        tc[1] = '\0';
+        fontdirtaillen = strlen( fontdirtail );
+        sprintf( tbuf, "%s*", fontdirtail );
+
+
+        /*
+                Work out the highest numbered !Fonts directory
+        */
+        base_number = -1;
+        for ( pos = 0; pos != -1; )
+        {
+                _swi( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, dirprefix, enumbuf, 1, pos, sizeof( enumbuf ), tbuf,
+                        &numread, &pos );
+
+                if ( numread > 0 )
+                {
+                        if ( atoi( enumbuf + fontdirtaillen ) > base_number )
+                                base_number = atoi( enumbuf + fontdirtaillen );
+                }
+        }
+
+        /*
+                Make the destname for use later
+        */
+        if ( base_number > 0 )
+                sprintf( currentdest, "%s.^.%s%d", destination, fontdirtail, base_number );
+        else
+                sprintf( currentdest, "%s.^.%s", destination, fontdirtail );
+
+#ifdef FONTSDEBUG
+printf("merge fonts from %s into %s\n", source, currentdest );
+printf("dirprefix = %s, fontdirtail = %s\n", dirprefix, fontdirtail );
+#endif
+
+        (void) merge_into_particular( currentdest, &itemsprocessed, source, -1000000, &totitems, 1000000 );
+
+        do
+        {
+#ifdef FONTSDEBUG
+printf( "itemstoskip = %d, itemsprocessed = %d\n", itemstoskip, itemsprocessed );
+#endif
+                /*
+                        Merge in until finished, or until error
+                */
+                err = merge_into_particular( currentdest, &itemsprocessed, source, itemstoskip, &itemscovered, totitems );
+
+                /*
+                        Anything but directory full is a no no
+                */
+                if ( err && (err->errnum & 0xff00ff) != 0x0100B3 ) _swi( OS_GenerateError, _IN(0), err );
+
+                /*
+                        Merge went OK, so Filer_Boot it
+                */
+                sprintf( tbuf, "Filer_Boot %s", currentdest );
+                _swi( OS_CLI, _IN(0), tbuf );
+
+                /*
+                        Check for directory full
+                */
+                if ( err )
+                {
+                        /*
+                                Got directory full, so create overflow fonts directory
+                        */
+                        base_number += 1;
+                        sprintf( tbuf, "%s.%s%d", dirprefix, fontdirtail, base_number );
+
+                        err = mkdir( tbuf );
+                        if ( !err ) err = copy_file( tbuf, currentdest, "!Boot" );
+                        if ( !err ) err = copy_file( tbuf, currentdest, "!Run" );
+                        if ( !err ) err = copy_file( tbuf, currentdest, "!Sprites" );
+                        if ( !err ) err = adjust_sprite_number( tbuf, "!Sprites", base_number );
+                        if ( !err ) err = copy_file( tbuf, currentdest, "!Sprites22" );
+                        if ( !err ) err = adjust_sprite_number( tbuf, "!Sprites22", base_number );
+                        if ( !err ) err = copy_file( tbuf, currentdest, "!Sprites23" );
+                        if ( !err ) err = adjust_sprite_number( tbuf, "!Sprites23", base_number );
+                        if ( !err ) err = copy_file( tbuf, currentdest, "!Help" );
+                        if ( err ) _swi( OS_GenerateError, _IN(0), err );
+
+                        strcpy( currentdest, tbuf );
+#ifdef FONTSDEBUG
+printf("new fonts dir is %s\n", currentdest );
+#endif
+
+                        itemstoskip = -itemsprocessed;
+
+                        err++;          /* to some non-NULL value */
+                }
+        } while ( err );
+
+        /*
+                All finished, so prod the font manager
+        */
+        (void)_swix( OS_CLI, _IN(0), "FontInstall" );
+
+        return NULL;
+}
+
+/*
+        Automatically generate a destination directory from Font$Path
+
+        This is the 3rd from right hand font$path element
+*/
+static char *auto_destination( void )
+{
+        char fontpath[4096];
+        int len;
+        char *t;
+        char *u;
+
+        _swi( OS_ReadVarVal, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_OUT(2),
+                "Font$Path", fontpath, sizeof( fontpath ), 0, 3, &len );
+        fontpath[len] = '\0';
+
+        t = strrchr( fontpath, ',' );
+        if ( t )
+        {
+                *t='\0';
+                t = strrchr( fontpath, ',' );
+        }
+        if ( t )
+        {
+                t[-1] = 0;
+        }
+        t = strrchr( fontpath, ',' );
+        if ( t == NULL ) t = fontpath-1;
+        t++;
+
+        u = malloc( strlen( t )+1 );
+        strcpy( u, t );
+
+        return u;
+}
+
+/*
+        Message handling
+*/
+static int msgblock[4];
+
+static void open_messages_file( void )
+{
+        int filesize;
+        char *memblk;
+
+        _swi( MessageTrans_FileInfo, _IN(1)|_OUT(2), MESSAGEFILE, &filesize );
+
+        memblk = malloc( filesize );
+        if ( !memblk ) exit(1);
+
+        _swi( MessageTrans_OpenFile, _IN(0)|_IN(1)|_IN(2), msgblock, MESSAGEFILE, memblk );
+}
+
+static char *msg_lookup( char *tag, char *parm )
+{
+        static char msgbuffer[256];
+        int ressize;
+
+        _swi( MessageTrans_Lookup, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_IN(7)|_OUT(3),
+                msgblock, tag, msgbuffer, sizeof( msgbuffer ), parm, 0, 0, 0, &ressize );
+
+        msgbuffer[ ressize ] = '\0';
+
+        return msgbuffer;
+}
+
+/*
+        Display error cleanly
+*/
+static void errhandler(int signal)
+{
+        _swi( Wimp_ReportError, _IN(0)|_IN(1)|_IN(2),
+                _kernel_last_oserror(), 0x1, msg_lookup( "Name", NULL ));
+        exit(1);
+        signal=signal;
+}
+
+/*
+        Syntax:
+        FontMerge <source> [<destination>]
+*/
+int main( int argc, char **argv )
+{
+        char *source;
+        char *destination;
+        int msgs[1];
+
+#ifdef FONTSTEST
+adjust_sprite_number( "@","TSprites",12);
+return 0;
+#endif
+
+        open_messages_file();
+
+        if ( argc < 2 || argc > 3 )
+        {
+                printf( msg_lookup( "Help1", NULL ) );
+                printf( "\n" );
+                printf( msg_lookup( "Help2", NULL ), argv[0] );
+                printf( "\n" );
+                exit( 1 );
+        }
+
+        /*
+                This is done simply to clean up the behaviour when an error
+                happens.
+        */
+        msgs[0] = 0;
+#ifndef FONTSDEBUG
+        _swi( Wimp_Initialise, _IN(0)|_IN(1)|_IN(2)|_IN(3),
+                310, 0x4b534154, msg_lookup( "Name", NULL ), msgs );
+        signal(SIGOSERROR, &errhandler);
+#endif
+
+        source = argv[1];
+
+        if ( argc < 3 )
+        {
+                destination = auto_destination();
+        }
+        else
+        {
+                destination = argv[2];
+        }
+
+#ifdef FONTSDEBUG
+printf( "merge %s into %s\n", source, destination );
+#endif
+        fonts_merge( destination, source );
+
+        return 0;
+}

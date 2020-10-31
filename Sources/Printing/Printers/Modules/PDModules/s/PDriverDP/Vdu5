@@ -1,0 +1,212 @@
+; > Sources.PDriverDP.Vdu5
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; printer specific code to deal with a VDU 5 character. On
+; some printer drivers (e.g. the PostScript one, to avoid
+; generating massive numbers of "show" commands), this will
+; usually result in the characters concerned being buffered up
+; until they have to be output; other printer drivers will
+; simply deal with characters as and when they arrive.
+;   Note that this routine is NOT expected to try to change
+; the graphics cursor position - this will be done by the
+; printer dependent code. If it buffers characters, it should
+; print them separated by the amount specified in
+; 'vdu5autoadvance'.
+; Entry: R0 holds the character.
+;        R1 holds the X co-ordinate of the top left corner of
+;           the character. It is in OS units, relative to the
+;           bottom left corner of the user's box.
+;        R2 holds the Y co-ordinate of the top left corner of
+;           the character. It is also in OS units, relative to
+;           the bottom left corner of the user's box.
+;             It should be noted that this is NOT the same as
+;           the Y co-ordinate of the graphics cursor, but one
+;           screen pixel line above it. (Things are done this
+;           way essentially because the top left corner of the
+;           character is a resolution independent concept,
+;           whereas the bottom left corner of the top left
+;           pixel of the character is not. PostScript and
+;           similar printer drivers can use this position
+;           directly. Dot matrix and similar printer drivers
+;           which are going to invoke the VDU drivers to print
+;           the character to a sprite will need to subtract
+;           one sprite pixel line from this Y co-ordinate to
+;           get the appropriate graphics cursor position.)
+;        R10 is the file handle for the print job.
+;        R11 = job's workspace pointer.
+;        'vdu5charsize' (2 words) contains the required VDU 5
+;           character size, in OS units (not pixels, as
+;           supplied to VDU 23,17,7,...).
+;        'vdu5autoadvance' (2 words) contains the required VDU
+;           5 character advance, again in OS units. If the
+;           printer driver is buffering characters up, it only
+;           needs to remember the first character's position,
+;           then move by this amount between characters.
+;        The correct colour has been set up (note that this
+;           makes it a very good idea for printer drivers that
+;           buffer their output to ensure they only produce
+;           output for one colour change if a large number of
+;           identical colour changes occur in succession).
+;        Printer drivers which wish to buffer VDU 5 characters
+;           may use 'textbuffer', a buffer of 'textbufferlen'
+;           (which is a constant) bytes, and 'textbufferpos'
+;           (a byte variable, containing the number of
+;           characters currently in 'textbuffer'), provided
+;           they take care to empty the buffer whenever
+;           'vdu5_flush' (see below) is called, and that they
+;           take care not to overfill the buffer. They may
+;           also assume that 'textbufferpos' is zero when
+;           'vdu5_char' is called for the first time, and that
+;           its value and the valid characters in the buffer
+;           are preserved between calls to 'vdu_char' and
+;           'vdu5_flush'.
+; Exit:  R0 to R3 may be corrupted.
+;        All other registers preserved.
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+vdu5_char ROUT
+          Push     "r0-r3, lr"
+          CLRV
+          LDRB     lr, disabled
+          TST      lr, #disabled_nullclip
+          Pull    "r0-r3, pc", NE
+
+          LDRB     r3, passthrough             ; need to allow SpriteExtend
+          ORR      lr, r3, #passthrough_spr    ; to do PlotCharScaled
+          STRB     lr, passthrough
+   
+          Debuga   Vdu5,"Vdu5 priting",R0
+          Debuga   Vdu5," at",R1
+          Debug    Vdu5,",",R2
+
+     ; set the text size:
+
+          ADR       r0, set_text_width_string
+          BL        vdu_counted_string
+          BVS       %FT99
+
+          LDR       r0, vdu5charsize
+          BL        XScale                        ; -> our OS units
+          MOV       r0, r0, LSR #bufferpix_l2size ; -> our pixels
+        
+          Debuga    Vdu5,"Text size",R0
+
+          BL        vdu_pair
+          BVS       %FT99
+
+          LDR       r0, vdu5charsize+4
+          BL        YScale                        ; -> our OS units
+          MOV       r0, r0, LSR #bufferpix_l2size ; -> our pixels
+
+          Debug     Vdu5,",",R0
+   
+          BL        vdu_pair
+          MOVVC     r0, #0
+          BLVC      vdu_pair
+          BVS       %FT99
+
+ ; now calculate the position
+
+          MOV       r0, r1, LSL #8
+          BL        XScale
+          LDR       lr, job_currentXoffset
+          SUB       r0, r0, lr
+          MOV       r1, r0, ASR #8
+          MOV       r0, r2, LSL #8
+          BL        YScale
+          LDR       lr, job_currentYoffset
+          SUB       r0, r0, lr
+          MOV       r2, r0, ASR #8
+          SUB       r2, r2, #1:SHL: bufferpix_l2size
+
+          Debuga    Vdu5,"Move To",R1
+          Debug     Vdu5,",",R2
+
+          LDR       r0, =25+4*256
+          BL        vdu_pair              ; MOVE...
+          MOVVC     r0, r1
+          BLVC      vdu_pair
+          MOVVC     r0, r2
+          BLVC      vdu_pair
+          LDRVC     r0, [stack]
+          BLVC      vdu_char
+
+99        STRVS     r0, [stack]
+          STRB      r3, passthrough
+          Pull     "r0-r3, pc"
+          LTORG
+
+set_text_width_string = 4, 23, 17, 7, 6
+          ALIGN
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; printer specific code to write a solid block character in
+; the current (background) colour, to do a VDU 5 DELETE.
+; Entry and exit conditions are as for 'vdu5_char', except:
+;   (a) the background colour has been set up, not the
+;       foreground.
+;   (b) R0 is irrelevant on entry.
+;   (c) the printer specific code is not allowed to buffer
+;       DELETEs, and hence 'vdu5autoadvance' is irrelevant on
+;       entry.
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+vdu5_delete  ROUT
+        Push "r0, r3, lr"
+        MOV   r0, #" "
+        BL    vdu5_char
+        LDRB  r3, passthrough
+        ORR   lr, r3, #passthrough_spr
+        STRB  lr, passthrough
+        MOVVC r0, #127
+        BLVC  vdu_char
+        STRVS r0, [stack]
+        STRB  r3, passthrough
+        Pull "r0, r3, pc"
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; this printer specific call is of interest to printer drivers
+; which try to buffer up VDU 5 characters in 'textbuffer' or
+; elsewhere. It is called at the following points:
+;   (a) when an intercepted call is going to (or is likely to)
+;       produce some output, so that the VDU 5 characters must
+;       be printed to get the overwriting order right.
+;   (b) when any VDU control sequence is about to be obeyed.
+;   (c) when a PDriver_DrawPage/PDriver_GetRectangle-supplied
+;       rectangle is about to be finished.
+; The printer specific code should respond by flushing any
+; buffered VDU 5 characters to the printer and ensuring that
+; 'textbufferpos' is set to zero.
+;   If the printer driver does not use 'textbuffer' and/or
+; 'textbufferpos' to buffer characters, it should provide a
+; null implementation of this routine. It may safely assume
+; that 'textbufferpos' is zero if none of its routines change
+; it.
+; Entry: R10 is the file handle for the print job.
+;        R11 = job's workspace pointer.
+; Exit:  All registers preserved (except R0 on an error).
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+vdu5_flush  Return
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; this call informs the printer specific code that the
+; definition of a VDU 5 character (or of the entire VDU 5
+; character set) has changed, or at least may have changed. It
+; is called for a specific character if that character is
+; redefined, and is called for the entire character set
+; whenever the printer driver turns interception of VDU calls
+; on (as character definitions may have been changed while it
+; was off). Note that this call is made to all existing print
+; jobs under both these circumstances - not just the current
+; print job.
+; Entry: R1 = character that may have changed, or anything
+;           else to indicate that all characters may have
+;           changed.
+;        R11 = job's workspace pointer.
+; Exit:  All registers preserved. May not produce an error.
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+vdu5_changed Return
+
+        END

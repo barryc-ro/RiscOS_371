@@ -1,0 +1,229 @@
+; -> Sources.Redirect
+; -*- Mode: Assembler -*-
+;
+; Sources lifted out of the RISC OS 2.05 kernel,
+; to do redirection on RISC OS 2.00.
+;
+;---------------------------------------------------------------------------
+;       Change history.
+;
+; 02-Aug-94  AMcC   GET uptodate WorkSpace values (from PublicWS)
+;                   Was previously getting them from Space200
+;
+
+        GET     Hdr:PublicWS
+
+                GBLL    redirectinkey
+redirectinkey   SETL    {TRUE}
+
+RedirectWrch_A500       *       &3801ACC
+RedirectRdch_A500       *       &381EB9C
+
+RedirectWrch_A1         *       &3801A2C
+RedirectRdch_A1         *       &381EA60   ; this is wrong!
+
+SetRedirectWrch ROUT
+;
+; Entry:- R12 -> task workspace
+;
+; Exit:- RedirectWrch = address of MOS routine
+;        0 => not found (try to use SWI OS_ChangeRedirection)
+;        RedirectRdch = address of MOS routine
+;
+        Push    "r1-r2, lr"
+
+      [ redirectinkey
+        LDR     r1, =RedirectWrch_A500
+        BL      checkcode
+        LDRNE   r1, =RedirectWrch_A1
+        BLNE    checkcode
+        MOVNE   r1, #0
+        STR     r1, RedirectWrch
+      |
+        LDR     r1, =RedirectWrch_A500
+        LDR     r2, =RedirectRdch_A500
+        BL      checkcode
+        LDRNE   r1, =RedirectWrch_A1
+        LDRNE   r2, =RedirectRdch_A1
+        BLNE    checkcode
+        MOVNE   r1, #0
+        STR     r1, RedirectWrch
+        STR     r2, RedirectRdch
+      ]
+
+      [ Version >= 26
+        MOVNE   r0, #-1
+        MOVNE   r1, #-1
+        SWINE   XOS_ChangeRedirection
+        ADRVS   r0, ErrorBlock_TaskWindow_NoRedirection
+        BLVS    CopyError
+      ]
+
+        Pull    "r1-r2, pc"
+        LTORG
+
+      [ Version >= 26
+        MakeInternatErrorBlock TaskWindow_NoRedirection,,M06
+      ]
+
+; In    r1 -> trial address
+; Out   EQ => code here matches RedirectWrch code
+
+checkcode       ROUT
+
+        Push    "r1-r4, lr"
+
+        ADR     r2, checkstart
+        MOV     r14, #(checkend-checkstart)/4
+01      LDR     r3, [r1], #4
+        LDR     r4, [r2], #4
+        CMP     r3, r4
+        Pull    "r1-r4, pc", NE         ; NE => doesn't match
+        SUBS    r14, r14, #1
+        BNE     %b01
+
+        Pull    "r1-r4, pc"             ; EQ => matches
+
+; code that should be found at RedirectWrch address
+
+checkstart
+        Push    "R1"
+        MOV     R1, #0
+        LDRB    R1, [R1, #RedirectOutHandle]
+        SWI     XOS_BPut
+        Pull    "R1,PC",VC,^
+checkend
+
+;.........................................................................
+;
+;       SWI OS_ChangeRedirection - Read/write redirection handles
+;
+; in:   R0 = new input  handle (0 => not redirected, -1 => leave alone)
+;       R1 = new output handle (0 => not redirected, -1 => leave alone)
+;       R12 -> task block for this task
+;
+; out:  R0 = old input  handle (0 => not redirected)
+;       R1 = old output handle (0 => not redirected)
+;
+; NB: references to R12 in the original code have been changed to R9
+;     since the R12 pointer is required to access RedirectWrch
+;
+
+ChangeRedirection ROUT
+
+        Push    "r2-r12,lr"
+
+        LDR     r14, RedirectWrch       ; can we use SWI OS_ChangeRedirection?
+        CMP     r14, #0
+        BNE     %f01
+        SWI     XOS_ChangeRedirection   ; use SWI if routine not found
+        Pull    "r2-r12,pc"
+01
+        MOV     r9, pc
+        TST     r9, #SVC_mode
+        SWIEQ   OS_EnterOS              ; just in case zero page is protected
+
+        Push    "r9"                    ; save old state on SVC stack
+
+        MOV     R9, #0
+        LDRB    R10, [R9, #RedirectInHandle]
+        LDRB    R11, [R9, #RedirectOutHandle]
+
+; do input handle
+
+        CMP     R0, #&100               ; if out of range then just read
+        BCS     %FT20
+
+        STRB    R0, [R9, #RedirectInHandle]
+
+ [ :LNOT: redirectinkey
+        CMP     R0, #1                  ; CS <=> (R0 non-zero)
+        TEQ     R10, #0                 ; NE <=> (R10 non-zero)
+        BHI     %FT20                   ; [both non-zero, skip]
+
+        BCS     %FT10                   ; [just R0 non-zero, so claim]
+        BEQ     %FT20                   ; [both zero, skip]
+
+; R10 non-zero, R0 zero, so release vector
+
+        Push    "R0-R2, lr"             ; set up registers for claim or release
+        MOV     R0, #RdchV
+        LDR     R1, RedirectRdch        ; <== used to be ADR
+        MOV     R2, #0
+        SWI     XOS_Release
+        STRVS   R0, [sp, #0*4]
+        Pull    "R0-R2, lr"
+        ORRVS   lr, lr, #V_bit
+        BVS     %f99
+        B       %FT20
+
+; R10 zero, R0 non-zero, so claim vector
+
+10
+        Push    "R0-R2, lr"
+        MOV     R0, #RdchV
+        LDR     R1, RedirectRdch
+        MOV     R2, #0
+        SWI     XOS_Claim
+        STRVS   R0, [sp, #0*4]
+        Pull    "R0-R2, lr"
+        ORRVS   lr, lr, #V_bit
+        BVS     %f99
+ ]
+
+20
+
+; do output handle
+
+        CMP     R1, #&100               ; if out of range then just read
+        BCS     %FT40
+
+        STRB    R1, [R9, #RedirectOutHandle]
+        CMP     R1, #1                  ; CS <=> (R1 non-zero)
+        TEQ     R11, #0                 ; NE <=> (R11 non-zero)
+        BHI     %FT40                   ; [both non-zero, skip]
+
+        BCS     %FT30                   ; [just R1 non-zero, so claim]
+        BEQ     %FT40                   ; [both zero, skip]
+
+; R11 non-zero, R1 zero, so release vector
+
+        Push    "R0-R2, lr"             ; set up registers for claim or release
+        MOV     R0, #WrchV
+        LDR     R1, RedirectWrch
+        MOV     R2, #0
+        SWI     XOS_Release
+        STRVS   R0, [sp, #0*4]
+        Pull    "R0-R2, lr"
+        ORRVS   lr, lr, #V_bit
+        BVS     %f99
+        B       %FT40
+
+; R11 zero, R1 non-zero, so claim vector
+
+30
+        Push    "R0-R2, lr"
+        MOV     R0, #WrchV
+        LDR     R1, RedirectWrch
+        MOV     R2, #0
+        SWI     XOS_Claim
+        STRVS   R0, [sp, #0*4]
+        Pull    "R0-R2, lr"
+        ORRVS   lr, lr, #V_bit
+        BVS     %f99
+
+40
+        MOV     R0, R10                 ; R0 = original input handle
+        MOV     R1, R11                 ; R1 = original output handle
+
+99
+        Pull    "r14"                   ; on SVC stack
+        ORRVS   r14, r14, #V_bit
+        TEQP    r14, #0                 ; restore processor mode
+        NOP
+
+        Pull    "r2-r12,pc"             ; on SVC/USR stack depending on mode
+
+        LTORG
+
+        END

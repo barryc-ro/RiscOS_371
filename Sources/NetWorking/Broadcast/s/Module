@@ -1,0 +1,686 @@
+        ;       => &.Arthur.BrLoader.Module
+        TTL     A broadcast loader for RISC OS and NetFS.
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:ModHand
+        GET     Hdr:Services
+        GET     Hdr:FSNumbers                           ; Required by Hdr:NewErrors
+        GET     Hdr:HighFSI
+        GET     Hdr:LowFSI
+        GET     Hdr:Econet
+        GET     Hdr:NewErrors
+        GET     Hdr:CMOS
+        GET     Hdr:MsgTrans
+        GET     Hdr:Symbols
+
+        GET     Time+Date
+        GET     s.Debug
+
+        SUBT    Module header => &.Arthur.Broadcast.Module
+
+        ;       **************************************
+        ;       ***   Assembly time conditionals   ***
+        ;       **************************************
+
+        GBLL    Debug                                   ; Include debugging
+        GBLL    TestRetries
+        GBLL    CLIOptions                              ; Set block size on initialisation
+
+Debug           SETL (:LNOT: ReleaseVersion) :LAND: False
+TestRetries     SETL (:LNOT: ReleaseVersion) :LAND: False
+CLIOptions      SETL False
+
+        ;       ***********************************
+        ;       ***   Assembly time constants   ***
+        ;       ***********************************
+
+                        ^       0                       ; Packet types sent in the Flag byte
+Type_Connect            #       1                       ; 0, Connect request
+Type_Grant              #       1                       ; 1, Connection granted
+Type_Data               #       1                       ; 2, Data chunk
+Type_Over               #       1                       ; 3, Chunk over
+Type_Ack                #       1                       ; 4, Thanks
+Type_Request            #       1                       ; 5, Request for data
+Type_Error              #       1                       ; 6, Error from server
+Type_Server             #       1                       ; 7, Confirmation of server status
+
+                        ^       0                       ; The Mode of the state machine
+Mode_Normal             #       1                       ; 0, No outside interference
+Mode_Weak               #       1                       ; 1, We are goint to be the Client (Male)
+Mode_Client             #       1                       ; 2, We are the Client (Male)
+Mode_Server             #       1                       ; 3, We are the Server (Female)
+Mode_Serving            #       1                       ; 4, We are actually broadcasting the file
+Mode_Served             #       1                       ; 5, We have finished broadcasting/loading the file
+
+                        ^       0
+Finalisation_OK         #       1                       ; 0, Finalise as normal
+Finalisation_InitFail   #       1                       ; 1, Initialisation failed
+Finalisation_Fatal      #       1                       ; 2, Don't release space
+
+BooleanFalse            *       0
+
+ChunkIdentifier         *       &644C7242               ; "BrLd"
+
+BroadcastSize           *       &400                    ; Nice round number
+DefaultGetBytesSize     *       &F00                    ; Exactly 3 BigBuffers full
+
+WaitDelay               *       3
+MaxWaitDelay            *       512
+WeakeningTime           *       20                      ; Time during which weakening may occur
+CallBackMargin          *       500
+CallBackMinimum         *       100
+InterDataDelay          *       5                       ; Time between broadcasts
+ConnectRepeatCount      *       20
+ConnectRepeatDelay      *       10                      ; Time between broadcasts
+FinalisationRetryCount  *       10
+FinalisationRetryDelay  *       50
+
+                GBLS    ModuleName
+ModuleName      SETS    "BroadcastLoader"
+
+Origin
+        DCD     0                                       ; Don't start up as a filing system
+        DCD     InitModule - Origin                     ; Initialisation
+        DCD     KillModule - Origin                     ; Finalisation
+        DCD     Service - Origin
+        DCD     ModuleTitle - Origin
+        DCD     HelpString - Origin
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+
+MyFS_FileCodeEstimate   *       &18
+MaxTxHandles            *       7
+
+        GET     s.Memory
+
+        MACRO
+        Err     $name
+        ALIGN
+Error$name
+        DCD     ErrorNumber_$name
+        DCB     ErrorString_$name
+        DCB     0
+        ALIGN
+        MEND
+
+        SUBT    Module entry stuff
+        OPT     OptPage
+
+HelpString
+        GBLS    Version
+Version SETS    ModuleName :CC: " 1." :CC: CurrentVersion
+        [       :LNOT: ReleaseVersion
+Version SETS    Version:CC:"/":CC:CurrentIteration
+        ]
+Version SETS    Version:CC:" (":CC:CurrentDate:CC:")":CC:OsString
+        [       :LNOT: ReleaseVersion
+Version SETS    Version:CC:" assembled at ":CC:CurrentTime
+        ]
+        !       0, "Assembling " :CC: Version
+        DCB     Version
+        DCB     0
+        ALIGN
+
+        SUBT    Initialisation code
+        OPT     OptPage
+
+InitModule      ROUT
+        ;       OS_Module(Run | Load | ReInit | Tidy)
+        ;       Trash:    R0-R6, R12
+        ;       Preserve: R7-R11, R13
+        ;       R10 ==> Environment string, size of getbytes to use
+        ;       R11 ==> Instantiation number
+        ;       R12 ==> Address of private word (IF [R12]=0 THEN Init ELSE ReInit) 
+        Push    lr
+        MOV     r0, #ReadCMOS
+        MOV     r1, #Mode2CMOS
+        SWI     XOS_Byte
+        Pull    pc, VS                                  ; Error here is fatal
+        TST     r2, #BitSix
+        BNE     Disabled
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =:INDEX: SpaceEnd
+        [       :LNOT: ReleaseVersion
+        !       0, "Space used is " :CC: :STR: :INDEX: SpaceEnd
+        ]
+        SWI     XOS_Module                              ; Claim workspace in the RMA
+        Pull    pc, VS                                  ; Error here is fatal
+        MOV     r4, r12                                 ; Save the address of my private word
+        MOV     r6, #Finalisation_InitFail              ; Show why we are in the finalisation
+        STR     r2, [ r12 ]                             ; Shove the address of my workspace
+        MOV     wp, r2                                  ; In the private word
+        ADD     r1, r2, r3                              ; Calculate end address
+        MOV     r0, #0
+ClearSpaceLoop
+        STR     r0, [ r2 ], #4                          ; Zero workspace
+        CMP     r2, r1                                  ; At end yet?
+        BLO     ClearSpaceLoop                          ; No, so do more
+
+        [       Debug
+        ADRL    r1, DebugPointer
+        ADD     r14, r1, #DebugBuffer - DebugPointer
+        STR     r14, [ r1 ]
+        ADD     r14, r14, #?DebugBuffer - &100
+        STR     r14, [ r1, #DebugLimit - DebugPointer ]
+        DREG    r12, "Module Initialisation, space claimed at &"
+        ]
+        [       CLIOptions
+        LDRB    r1, [ r10 ]                             ; See what the command tail is
+        [       Debug
+        DREG    r10, "Command tail pointer is &"
+        BREG    r1, "Byte at pointer is &"
+        ]
+        CMP     r1, #" "
+        MOVLE   r2, #DefaultGetBytesSize                ; No tail so default
+        BLE     SetGetBytesSize
+        MOV     r0, #16                                 ; Default base is hex
+        MOV     r1, r10                                 ; Command tail
+        SWI     XOS_ReadUnsigned
+        MOVVS   r5, r0                                  ; Preserve the original error
+        BVS     ReleaseSpace
+        TEQ     r2, #0                                  ; Argument is zero, this is stupid
+        MOVEQ   r2, #DefaultGetBytesSize
+SetGetBytesSize
+        [       Debug
+        DREG    r2, "GetBytesSize is &"
+        ]
+        STR     r2, GetBytesSize
+        ]       ; CLIOptions
+        [       WeakeningTime=0
+        MOV     r0, #ReadCMOS
+        MOV     r1, #NetPSIDCMOS
+        SWI     XOS_Byte
+        STRVCB  r2, WeakTime
+        [       Debug
+        BVS     %37
+        BREG    r2, "Weakening time is &"
+37
+        ]
+        SWIVC   XEconet_ReadLocalStationAndNet          ; Get this once and for all
+        |
+        SWI     XEconet_ReadLocalStationAndNet          ; Get this once and for all
+        ]
+        BVC     StationNumberOK
+        LDR     r1, [ r0 ]
+        LDR     r14, =ErrorNumber_NoSuchSWI
+        TEQ     r1, r14
+        ADREQ   r0, ErrorNoEconet
+        [       UseMsgTrans
+        BLEQ    MessageTransErrorLookup
+        ]
+        MOV     r5, r0                                  ; Preserve the original error
+        B       ReleaseSpace
+
+StationNumberOK
+        STRB    r0, LocalStation                        ; Mostly to save error checking later
+        MOV     r0, #Port_BroadcastData
+        SWI     XEconet_ClaimPort
+        MOVVS   r5, r0                                  ; Preserve the original error
+        BVS     ReleaseSpace                            ; Jump into the finalisation routine
+        [       Debug
+        DLINE  "Data Port claimed OK"
+        ]
+        MOV     r0, #Port_BroadcastControl
+        SWI     XEconet_ClaimPort
+        MOVVS   r5, r0                                  ; Preserve the original error
+        BVS     ReleaseDataPort                         ; Jump into the finalisation routine
+        [       Debug
+        DLINE  "Control Port claimed OK"
+        ]
+        BL      StartMyFilingSystem
+        Pull    pc, VC                                  ; Initialisation complete
+        MOV     r5, r0                                  ; Preserve the original error
+        B       ReleaseControlPort                      ; Jump into the finalisation routine
+
+        [       UseMsgTrans
+Disabled                                                ; Come here if CMOS disables us
+        DEC     sp, ?MessageBlock
+        MOV     r0, sp                                  ; Address of the temporary block
+        [       Debug
+        ADRL    r1, MessageFileName
+        |
+        ADR     r1, MessageFileName
+        ]
+        MOV     r2, #0                                  ; Use the file where it is
+        SWI     XMessageTrans_OpenFile
+        ADR     r0, ErrorBLDisabled                     ; Always return this error
+        BVS     ExitDisabled                            ; Very tragic, exit immediately
+        MOV     r1, sp                                  ; Address of the temporary block
+        MOV     r2, #0                                  ; Allocate a buffer for me
+        MOV     r3, #0
+        MOV     r4, #0
+        MOV     r5, #0
+        MOV     r6, #0
+        SWI     XMessageTrans_ErrorLookup
+        MOV     r6, r0                                  ; Keep the error pointer
+        MOV     r0, sp                                  ; Address of the temporary block
+        SWI     XMessageTrans_CloseFile
+        MOV     r0, r6                                  ; Get back the translated error
+ExitDisabled
+        INC     sp, ?MessageBlock                       ; Retore the stack
+        SETV
+        Pull    pc
+
+ErrorBLDisabled
+        DCD     ErrorNumber_BLDisabled
+        DCB     "BLNtCfg", 0
+        ALIGN
+
+ErrorNoEconet
+        DCD     ErrorNumber_NoEconet
+        DCB     "NoEco", 0
+        ALIGN
+        |
+Disabled                                                ; Come here if CMOS disables us
+        ADR     r0, ErrorBLDisabled
+        SETV
+        Pull    pc
+
+        Err     BLDisabled
+        Err     NoEconet
+        ALIGN
+        ]
+
+StartMyFilingSystem
+        Push    "r1-r2, lr"                             ; Trashes R0
+        MOV     r0, #FSControl_LookupFS                 ; Read the Filing system control block
+        MOV     r1, #fsnumber_net
+        SWI     XOS_FSControl
+        BVS     ExitStartMyFilingSystem
+        TEQ     r2, #0                                  ; Is the filing system there?
+        BEQ     NoNetFS                                 ; No, so complain
+        LDR     r0, [ r2, #FS_open ]                    ; Make a note of the entry points
+        STR     r0, NetFS_OpenVector                    ; I need when BGetting a file
+        LDR     r0, [ r2, #FS_close ]
+        STR     r0, NetFS_CloseVector
+        LDR     r0, [ r2, #FS_get ]
+        STR     r0, NetFS_GetBytesVector
+        LDR     r0, [ r2, #FS_file ]
+        STR     r0, NetFS_FileVector
+        [       Debug
+        DREG   r0, "Original NetFS_FileVector is &"
+        ]
+        ADR     r1, MyFS_FileCodeSpace                  ; Patch me into NetFS module
+        STR     r1, [ r2, #FS_file ]                    ; Control block entry for OS_File
+        ADR     r2, MyFS_FileCode
+        ADR     r14, MyFS_FileCodeSpace + ?MyFS_FileCodeSpace
+MoveMyFS_FileCodeLoop
+        LDR     r0, [ r2 ], #4
+        STR     r0, [ r1 ], #4
+        TEQ     r1, r14
+        BNE     MoveMyFS_FileCodeLoop
+        [       Debug
+        ADRL    r0, MyFS_FileLoad                       ; Get run-time address
+        |
+        ADR     r0, MyFS_FileLoad                       ; Get run-time address
+        ]
+        STR     r0, MyFS_FileLoadVector
+ExitStartMyFilingSystem
+        Pull    "r1-r2, pc"                             ; V still clear from last SWI
+
+NoNetFS
+        ADR     r0, ErrorNoEconet
+        [       UseMsgTrans
+        BL      MessageTransErrorLookup
+        |
+        SETV
+        ]
+        B       ExitStartMyFilingSystem
+
+
+MyFS_FileCode                                           ; This code gets copied into my RMA space
+        TEQ     r0, #fsfile_Load                        ; Is it a Load?
+        LDRNE   pc, MyFS_FileCode + ( NetFS_FileVector - MyFS_FileCodeSpace ) ; No
+        MOV     r0, wp                                  ; Save entry value of WP
+        ADR     wp, MyFS_FileCode - :INDEX:MyFS_FileCodeSpace ; Compute my WP
+        STR     r0, [ wp, #:INDEX: NetFS_R12 ]
+        LDR     pc, MyFS_FileLoadVector
+MyFS_FileCodeSize  * . - MyFS_FileCode
+
+        [       MyFS_FileCodeSize > MyFS_FileCodeEstimate
+        !       1, "MyFS_FileCodeEstimate to small, should be ":CC::STR:MyFS_FileCodeSize
+        |
+        [       :LNOT: (MyFS_FileCodeSize = MyFS_FileCodeEstimate)
+        !       0, "MyFS_FileCodeEstimate to large, should be ":CC::STR:MyFS_FileCodeSize
+        ]
+        ]
+
+KillModule      ROUT    ; Unpatch from NetFS and release resources
+        ;       Trash:    R0-R6, R12
+        ;       Preserve: R7-R11, R13
+        ;       R10 ==> Fatalness (IF R10=0 THEN NonFatal ELSE Fatal )
+        ;       R11 ==> Instantiation number
+        ;       R12 ==> Address of private word
+        ;       No need to differentiate between fatal and non-fatal
+        ;       finalisation, there isn't any global state to keep.
+        ;       R6 is the finalisation flag
+        ;       R5 is the Error pointer if R6<>Finalisation_OK
+        Push    lr
+        MOV     r4, r12                                 ; Keep the address of my private word
+        LDR     wp, [ r12 ]                             ; Get my workspace
+        [       Debug
+        DLINE   "Module Finalisation"
+        ]
+        MOV     r6, #Finalisation_OK                    ; Set the finalisation mode
+        BL      ReleaseNetFS                            ; Deactivate ourselves
+        BVC     ReleaseControlPort                      ; Easy case so continue
+        [       Debug
+        DLINE   "ReleaseNetFS fails"
+        ]
+        MOV     r6, #Finalisation_Fatal                 ; This is really bad
+        BL      PrintErrorAsWarning                     ; Tell the user what happened
+        LDR     r0, MyFS_AlternateFileCode              ; Get the code that does nothing
+        STR     r0, MyFS_FileCodeSpace                  ; Put it in place
+        MOV     r0, #0
+        STR     r0, NetFS_FileVector                    ; Mark us as out so we won't try again
+ReleaseControlPort
+        MOV     r0, #Port_BroadcastControl
+        SWI     XEconet_ReleasePort
+        BLVS    PrintErrorAsWarning
+ReleaseDataPort
+        MOV     r0, #Port_BroadcastData
+        SWI     XEconet_ReleasePort
+        BLVS    PrintErrorAsWarning
+ReleaseSpace
+        TEQ     r6, #Finalisation_Fatal                 ; Is this really bad?
+        BEQ     DontReleaseSpace
+        [       UseMsgTrans
+        LD      r0, MessageBlockAddress                 ; Is it open?
+        MOV     r1, #0
+        ST      r1, MessageBlockAddress                 ; Mark it as closed
+        TEQ     r0, #0
+        SWINE   XMessageTrans_CloseFile                 ; Close it if it was open
+        ]       ; UseMsgTrans
+ReleaseSpaceOnly
+        [       Debug
+        DREG    wp, "Release &"
+        ADRL    r0, DebugBuffer
+        LDR     r1, [ r0, #DebugPointer - DebugBuffer ]
+        SUB     r1, r1, r0
+        SWI     OS_WriteN
+        SWI     OS_NewLine
+        ]
+        Pull    lr                                      ; Get the return address
+        TEQ     r6, #Finalisation_InitFail              ; Is there an error to return?
+        BICNES  pc, lr, #VFlag                          ; No, so exit with V clear
+        MOV     r0, r5                                  ; Get the error
+        ORRS    pc, lr, #VFlag                          ; And exit with V set
+
+DontReleaseSpace
+        [       UseMsgTrans
+        ADR     r0, WorkspaceNotReleased - 4
+        BL      MessageTransErrorLookup
+        |
+        ADR     Error, ErrorWorkspaceNotReleased
+        ]
+        BL      PrintErrorAsWarning
+        [       UseMsgTrans
+        LD      r0, MessageBlockAddress                 ; Is it open?
+        MOV     r1, #0
+        ST      r1, MessageBlockAddress                 ; Mark it as closed
+        TEQ     r0, #0
+        SWINE   XMessageTrans_CloseFile                 ; Close it if it was open
+        ]       ; UseMsgTrans
+        MOV     r0, #0                                  ; Zero my private word so that
+        STR     r0, [ r4 ]                              ; The kernel won't free my workspace
+        Pull    lr                                      ; Get the return address
+        BICS    pc, lr, #VFlag                          ; And exit with V clear
+
+        [       UseMsgTrans
+        ALIGN
+WorkspaceNotReleased
+        DCB     "NotRel", 0
+        ALIGN
+        |
+        Err     WorkspaceNotReleased
+        ALIGN
+        ]       ; UseMsgTrans
+
+MyFS_AlternateFileCode                                  ; This code gets copied into my RMA space
+        LDR     pc, MyFS_FileCode + ( NetFS_FileVector - MyFS_FileCodeSpace )
+
+ReleaseNetFS    ROUT
+        Push    "r1-r3, lr"
+        PHPSEI  r3                                      ; Better do all this atomically
+        LDR     r0, NetFS_FileVector                    ; Also used as an "interception on" flag
+        TEQ     r0, #0                                  ; Are we intercepting?
+        BEQ     ExitReleaseNetFS                        ; No, don't try to release NetFS then
+        MOV     r0, #FSControl_LookupFS                 ; Get the entry point vector
+        MOV     r1, #fsnumber_net                       ; Of NetFS
+        SWI     XOS_FSControl                           ; So we can restore it
+        BVS     ReleaseError
+        TEQ     r2, #0                                  ; Is there a filing system there?
+        BEQ     ExitReleaseNetFS                        ; No, don't try to release NetFS then
+        ;       Test here to see if location in NetFS vector is overwritten
+        LDR     r0, [ r2, #FS_file ]                    ; Get the current state
+        ADR     r1, MyFS_FileCodeSpace                  ; Here is what I reckon it should be
+        TEQ     r0, r1                                  ; Well, is it the same?
+        BNE     VectorCorrupt                           ; No, so exit with an error indication
+        LDR     r0, NetFS_FileVector                    ; Also used as an "interception on" flag
+        MOV     r1, #0                                  ; Mark our flag so we know we're out
+        STR     r1, NetFS_FileVector                    ; and we won't try to again
+        STR     r0, [ r2, #FS_file ]                    ; Restore the NetFS entry vector
+ExitReleaseNetFS
+        PLP     r3                                      ; Restore interrupt enable state
+        CLRV
+        Pull    "r1-r3, pc"                             ; Return with a clean bill of health
+
+VectorCorrupt
+        [       Debug
+        DREG    r0, "Current vector value is &"
+        DREG    r1, "The address of my code  &"
+        ]
+        ADR     r0, ErrorNetFSVectorCorrupt
+        [       UseMsgTrans
+        BL      MessageTransErrorLookup
+        ]
+ReleaseError
+        PLP     r3                                      ; Restore interrupts
+        SETV                                            ; Return with error
+        Pull    "r1-r3, pc"
+
+        [       UseMsgTrans
+ErrorNetFSVectorCorrupt
+        DCD     ErrorNumber_NetFSVectorCorrupt
+        DCB     "BadVect", 0
+        ALIGN
+        ]       ; UseMsgTrans
+
+        [       UseMsgTrans
+PrintErrorAsWarning
+        Push    "r0-r7, lr"                             ; Save the initial pointer
+        ;       R0 ==> Pointer to a standard error block
+        ADD     r4, r0, #4                              ; First parameter is the error text
+        LD      r0, MessageBlockAddress
+        CMP     r0, #0                                  ; Clears V
+        BNE     DoGSLookup
+        ADR     r0, MessageBlock
+        ADR     r1, MessageFileName
+        MOV     r2, #0                                  ; Use the file where she lies
+        SWI     XMessageTrans_OpenFile
+        ADRVC   r0, MessageBlock
+        STRVC   r0, MessageBlockAddress
+DoGSLookup
+        ADR     r1, Token_Final
+        ADR     r2, ErrorBuffer                         ; Use as a text buffer
+        MOV     r3, #?ErrorBuffer                       ; Not that we are likely to overflow it
+        ADR     r5, ModuleTitle
+        MOV     r6, #0
+        MOV     r7, #0
+        SWIVC   XMessageTrans_GSLookup
+        MOVVC   r0, r2                                  ; The passed buffer
+        MOV     r1, r3                                  ; Length of the resultant string
+        SWIVC   XOS_WriteN
+        Pull    "r0-r7, lr"
+        BICS    pc, lr, #VFlag                          ; Return without error
+
+Token_Final
+        DCB     "Final"
+        DCB     0
+        ALIGN
+ModuleTitle
+        DCB     ModuleName
+        DCB     0
+        ALIGN
+        |       ; UseMsgTrans
+        Err     NetFSVectorCorrupt
+
+PrintErrorAsWarning
+        Push    "r0-r2, lr"                             ; Save the initial pointer
+        ADR     r1, ErrorBuffer                         ; Use as a text buffer
+        MOV     r2, #?ErrorBuffer                       ; Not that we are likely to overflow it
+        ;       R0 ==> Pointer to a standard error block
+        ;       R1 ==> Pointer to text block
+        ;       R2 ==> Size of the text block
+        BL      AddString                               ; Ignore error from copying
+        DCB     "Warning: ", 0                          ; The front of the output string
+        ALIGN
+        Pull    r0                                      ; The original error pointer
+        INC     r0, 4                                   ; Move to the textual part
+        BL      CopyString                              ; Ignore error from copying
+        BL      AddString                               ; Ignore error from copying
+        DCB     " during finalisation of "              ; The tail of the output string
+ModuleTitle
+        DCB     ModuleName
+        DCB     0
+        ALIGN
+        ADR     r0, ErrorBuffer                         ; The original buffer pointer
+        SWI     XOS_Write0                              ; Ignore error 
+        SWI     XOS_NewLine                             ; Ignore this error
+        Pull    "r1-r2, lr"
+        BICS    pc, lr, #VFlag                          ; Return without error
+
+AddString ROUT
+        Push    "r1, r3"
+        BIC     lr, lr, #ARM_CC_Mask                    ; Remove PSR
+10
+        DECS    r2
+        BEQ     %50
+        LDRB    r0, [ lr ], #1
+        STRB    r0, [ r1 ], #1
+        TEQ     r0, #0
+        BNE     %10
+        DEC     r1                                      ; Point back at the zero
+        INC     r2
+        INC     lr, 3                                   ; Get to the right word boundary
+        B       %30
+
+CopyString
+        Push    "r1, r3"
+20
+        DECS    r2
+        BEQ     %50
+        LDRB    r3, [ r0 ], #1
+        STRB    r3, [ r1 ], #1
+        TEQ     r3, #0
+        BNE     %20
+        DEC     r1                                      ; Point back at the zero
+        INC     r2
+30
+        Pull    "r0, r3"
+        BIC     pc, lr, #3                              ; Implicit
+
+50
+        Pull    "r1, r3"
+        ADR     Error, ErrorCDATBufferOverflow
+        SETV
+        BIC     pc, lr, #3                              ; Implicit
+
+        Err     CDATBufferOverflow
+        ]       ; UseMsgTrans
+
+Service ROUT
+        TEQ     r1, #Service_NetFS
+        TEQNE   r1, #Service_NetFSDying
+        TEQNE   r1, #Service_ReAllocatePorts
+        MOVNE   pc, lr
+        Push    "r0, lr"                                ; Preserve ALL registers
+        LDR     wp, [ r12 ]                             ; Get the workspace pointer
+        TEQ     r1, #Service_NetFS                      ; Most frequent first
+        BEQ     DoNetFS
+        TEQ     r1, #Service_NetFSDying
+        BEQ     DoNetFSDying
+DoReAllocatePorts                                       ; Note the drop through
+        [       Debug
+        DLINE   "Service: ReAllocate ports"
+        ]
+        MOV     r0, #Port_BroadcastData
+        SWI     XEconet_ClaimPort
+        BLVS    PrintErrorAsWarning
+        MOV     r0, #Port_BroadcastControl
+        SWI     XEconet_ClaimPort
+        BLVS    PrintErrorAsWarning
+        B       ExitService
+
+DoNetFSDying
+        [       Debug
+        DLINE   "Service: NetFS dying"
+        ]
+        BL      ReleaseNetFS
+        BLVS    PrintErrorAsWarning
+        B       ExitService
+
+DoNetFS ROUT                                            ; This is only a hint
+        [       Debug
+        DLINE   "Service: NetFS"
+        ]
+        LDR     r0, NetFS_FileVector                    ; Also used as an "interception on" flag
+        CMP     r0, #0                                  ; Are we intercepting? (Clears V)
+        BLEQ    StartMyFilingSystem                     ; No, get back in the way
+        BLVS    PrintErrorAsWarning                     ; V can only be set if BL was executed
+ExitService
+        Pull    "r0, lr"                                ; Restore registers
+        BIC     pc, lr, #VFlag                          ; And exit without error
+
+        [       UseMsgTrans
+MessageTransErrorLookup
+        Push    "r4, lr"
+        MOV     r4, #0
+        BL      MessageTransErrorLookup1
+        Pull    "r4, pc"
+
+MessageTransErrorLookup1
+        Push    "r1-r3, r5-r7, lr"
+        LD      r1, MessageBlockAddress
+        CMP     r1, #0                                  ; Clears V
+        BNE     DoErrorLookup
+        MOV     r7, r0
+        ADR     r0, MessageBlock
+        ADR     r1, MessageFileName
+        MOV     r2, #0                                  ; Use the file where she lies
+        SWI     XMessageTrans_OpenFile
+        ADRVC   r1, MessageBlock
+        STRVC   r1, MessageBlockAddress
+        MOV     r0, r7                                  ; Preserve R0 even in the error case
+DoErrorLookup
+        MOV     r2, #0
+        MOV     r3, #0
+        MOV     r5, #0
+        MOV     r6, #0
+        MOV     r7, #0
+        SWIVC   XMessageTrans_ErrorLookup
+        Pull    "r1-r3, r5-r7, pc"
+
+MessageFileName
+        DCB     "Resources:$.Resources.NetFS.Messages", 0
+        ALIGN
+
+        ]       ; UseMsgTrans
+
+        LTORG
+
+        GET     s.Load
+        GET     s.Client
+        GET     s.Server
+        GET     s.Event
+
+        [       Debug
+        InsertDebugRoutines
+        ]
+
+        END

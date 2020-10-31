@@ -1,0 +1,222 @@
+#include "defs.h"
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <sys/syslog.h>
+
+extern struct  interface *ifnet;
+extern struct  interface **ifnext;
+extern int routed_changes, startup_timer;
+int startup_count = 0;
+
+#define STARTUP_RETRIES  6
+#define STARTUP_DELAY    2000
+
+startup_routed()
+{
+    msg = (struct rip *)packet;
+    routed_changes = 0;
+    ifdinit();
+    rtinit();
+    ifinit();
+    startup_count = STARTUP_RETRIES;
+    do_ripcmd_req();
+    return (0);
+}
+
+do_ripcmd_req()
+{
+    msg->rip_cmd = RIPCMD_REQUEST;
+    msg->rip_vers = RIPVERSION;
+    msg->rip_nets[0].rip_dst.sa_family = htons((u_short)AF_UNSPEC);
+    msg->rip_nets[0].rip_metric = htonl((u_long)HOPCNT_INFINITY);
+    toall(rsendmsg);
+    startup_timer = --startup_count > 0 ? STARTUP_DELAY : 0;
+}
+
+ifdinit()
+{
+        struct interface *ifp;
+
+        ifnext = &ifnet;
+        for (ifp = ifnet; ifp; ifp = ifp->int_next) 
+            free ((char *)ifp);
+        ifnet = 0;
+}
+
+
+ifinit()
+{
+        struct interface ifs, *ifp;
+        int s, n;
+        char buf[512];
+        struct ifconf ifc;
+        struct ifreq ifreq, *ifr;
+        struct sockaddr_in *sin;
+        u_long i;
+
+        if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) 
+                return;
+
+        ifc.ifc_len = sizeof (buf);
+        ifc.ifc_buf = buf;
+        if (socketioctl(s, SIOCGIFCONF, (char *)&ifc) < 0) {
+                socketclose(s);
+                return;
+        }
+        ifr = ifc.ifc_req;
+        for (n = ifc.ifc_len / sizeof (struct ifreq); n > 0; n--, ifr++) {
+                bzero((char *)&ifs, sizeof(ifs));
+                ifs.int_addr = ifr->ifr_addr;
+                ifreq = *ifr;
+                if (socketioctl(s, SIOCGIFFLAGS, (char *)&ifreq) < 0) {
+                        continue;
+                }
+                ifs.int_flags = ifreq.ifr_flags | IFF_INTERFACE;
+                if (ifs.int_flags & IFF_LOOPBACK)
+                        continue;
+                if ((ifs.int_flags & IFF_UP) == 0 ||
+                    ifr->ifr_addr.sa_family == AF_UNSPEC) 
+                        continue;
+                if (if_ifwithaddr(&ifs.int_addr)) 
+                        continue;
+                if (ifs.int_flags & IFF_BROADCAST) {
+                        if (socketioctl(s, SIOCGIFBRDADDR, (char *)&ifreq) < 0) {
+                                continue;
+                        }
+                        ifs.int_broadaddr = ifreq.ifr_broadaddr;
+                }
+#ifdef SIOCGIFMETRIC
+                if (socketioctl(s, SIOCGIFMETRIC, (char *)&ifreq) < 0) {
+                        ifs.int_metric = 0;
+                } else
+                        ifs.int_metric = ifreq.ifr_metric;
+#else
+                ifs.int_metric = 0;
+#endif
+
+                ifs.int_metric++;
+                if (socketioctl(s, SIOCGIFNETMASK, (char *)&ifreq) < 0) {
+                        continue;
+                }
+                sin = (struct sockaddr_in *)&ifreq.ifr_addr;
+                ifs.int_subnetmask = ntohl(sin->sin_addr.s_addr);
+                sin = (struct sockaddr_in *)&ifs.int_addr;
+                i = ntohl(sin->sin_addr.s_addr);
+                if (IN_CLASSA(i))
+                        ifs.int_netmask = IN_CLASSA_NET;
+                else if (IN_CLASSB(i))
+                        ifs.int_netmask = IN_CLASSB_NET;
+                else
+                        ifs.int_netmask = IN_CLASSC_NET;
+                ifs.int_net = i & ifs.int_netmask;
+                ifs.int_subnet = i & ifs.int_subnetmask;
+                if (ifs.int_subnetmask != ifs.int_netmask)
+                        ifs.int_flags |= IFF_SUBNET;
+                ifp = (struct interface *)malloc(sizeof (struct interface));
+                if (ifp == 0) 
+                        break;
+                *ifp = ifs;
+                ifp->int_name = malloc(strlen(ifr->ifr_name) + 1);
+                if (ifp->int_name == 0) {
+                        socketclose(s);
+                        return;
+                }
+                strcpy(ifp->int_name, ifr->ifr_name);
+                *ifnext = ifp;
+                ifnext = &ifp->int_next;
+                addrouteforif(ifp);
+                setrtdelay(); 
+        }
+        socketclose(s);
+        return;
+}
+
+
+addrouteforif(ifp)
+        struct interface *ifp;
+{
+        struct sockaddr_in net;
+        struct sockaddr *dst;
+        register struct rt_entry *rt;
+
+        if (ifp->int_flags & IFF_POINTOPOINT)
+                dst = &ifp->int_dstaddr;
+        else {
+                bzero((char *)&net, sizeof (net));
+                net.sin_family = AF_INET;
+                net.sin_addr = inet_rmakeaddr(ifp->int_subnet, INADDR_ANY);
+                dst = (struct sockaddr *)&net;
+        }
+        rt = rtfind(dst);
+        if (rt &&
+            (rt->rt_state & (RTS_INTERFACE | RTS_INTERNAL)) == RTS_INTERFACE) 
+                return;
+        if (rt)
+                rtdelete(rt);
+
+        if ((ifp->int_flags & (IFF_SUBNET|IFF_POINTOPOINT)) == IFF_SUBNET) {
+                struct in_addr subnet;
+
+                subnet = net.sin_addr;
+                net.sin_addr = inet_rmakeaddr(ifp->int_net, INADDR_ANY);
+                rt = rtfind(dst);
+                if (rt == 0)
+                        rtadd(dst, &ifp->int_addr, ifp->int_metric,
+                            ((ifp->int_flags & (IFF_INTERFACE|IFF_REMOTE)) |
+                            RTS_INTERNAL | RTS_SUBNET));
+                else if ((rt->rt_state & (RTS_INTERNAL|RTS_SUBNET)) == 
+                    (RTS_INTERNAL|RTS_SUBNET) &&
+                    ifp->int_metric < rt->rt_metric)
+                        rtchange(rt, &rt->rt_router, ifp->int_metric);
+                net.sin_addr = subnet;
+        }
+        rtadd(dst, &ifp->int_addr, ifp->int_metric, 
+            ifp->int_flags & (IFF_INTERFACE | IFF_REMOTE | IFF_SUBNET));
+}
+
+
+struct qelem {
+        struct qelem *q_forw;
+        struct qelem *q_back;
+        char *q_data;
+};
+
+void
+insque(elem, pred)
+struct qelem *elem, *pred;
+{
+        if (pred == 0 || elem == 0)
+                return;
+        if (pred->q_forw)
+                pred->q_forw->q_back = elem;
+        elem->q_forw = pred->q_forw;
+        pred->q_forw = elem;
+        elem->q_back = pred;
+}
+
+void
+remque(elem)
+struct qelem *elem;
+{
+        if (elem == 0)
+                return;
+        if (elem->q_back != 0)
+                elem->q_back->q_forw = elem->q_forw;
+        if (elem->q_forw)
+                elem->q_forw->q_back = elem->q_back;
+}
+
+unsigned
+min(a, b)
+        u_int a, b;
+{
+
+        return (a < b ? a : b);
+}
+
+int gettimeofday( struct timeval *tv, struct timezone *tzp )
+{
+        tv->tv_sec = time( NULL );
+        tv->tv_usec = 0;
+        return NULL;
+}

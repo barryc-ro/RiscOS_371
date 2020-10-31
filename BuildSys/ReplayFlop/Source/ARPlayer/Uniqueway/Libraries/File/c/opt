@@ -1,0 +1,552 @@
+/* > c.opt
+
+ * © SJ Middleton, 1992
+
+ * Generalised options file save library.
+ * For saving a set of options from a program in a textual form in a generalised way.
+
+ */
+
+#include "msgs.h"
+#include "visdelay.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "macros.h"
+
+#include "opt.h"
+
+/* ----------------------------------------------------------------------------------------------------- */
+
+#define END_OF_FILE             msgs_lookup("opt0:end of options file")
+#define END_OF_GENERATED_FILE   msgs_lookup("opt1:end of generated section")
+#define SAVED_MSG               msgs_lookup("opt2:Saved at")
+#define MAX_TAG_SIZE            31
+
+enum
+{ 
+    linetype_Error = -5,
+    linetype_EndOfFile,
+    linetype_Ignore,
+    linetype_ExtraList,
+    linetype_Tag
+};
+
+struct optfile__str
+{
+    FILE *f;
+    BOOL reading,
+         used_line;
+    int  linetype;
+};
+
+static char global_buffer[256];
+
+/* ----------------------------------------------------------------------------------------------------- */
+
+static const opt_line_t *find_option(const char *tag, const opt_line_t *opt_types)
+{
+    const opt_line_t *olp = opt_types;
+    for (; olp->type != opt_EndOfList; olp++)
+        if (strcmp(olp->tag, tag) == 0)
+            return olp;
+    return NULL;
+} 
+
+/* 
+ * Output a string that may contain control characters, converting to GSTrans format (roughly).
+ * return < 0 of error
+ */
+
+static int output_string(const char *s, FILE *f)
+{
+    int c, r = 0;
+    while ((c = *s++) != '\0' && r != EOF)
+    {
+        if (c < ' ')
+        {            
+            r = fputc('|', f);
+            c += '@';
+        }
+        else if (c == '|')
+        {
+            r = fputc('|', f);
+        }
+        if (r != EOF)
+            r = fputc(c, f);
+    }
+    return r;
+}
+
+static int write_options(FILE *f, const char *optptr, int n_elements, int type)
+{
+    int i, ret = 0;
+
+    switch (type)
+    {
+        case opt_String:
+            ret = output_string(optptr, f);
+            break;
+
+        case opt_MallocString:
+            if (*(const char **)optptr)
+                ret = output_string(*(const char **)optptr, f);
+            break;
+
+        case opt_FlagField:
+        {
+            int bitstart = n_elements & 0xff,
+                bitwidth = (n_elements & 0xff00) >> 8;
+            unsigned long val = *(unsigned long *)optptr;
+            ret = fprintf(f, "%lu ", ((val >> bitstart) & ((1 << bitwidth) - 1)));
+            break;
+        }
+
+        default:
+            for (i = 0; i < n_elements && ret >= 0; i++)
+            {
+                switch (type)
+                {
+                    case opt_UByte:
+                        ret = fprintf(f, "%u ", *(unsigned char *) optptr++);
+                        break;
+                    case opt_SByte:
+                        ret = fprintf(f, "%d ", *(signed char *) optptr++);
+                        break;
+                    case opt_UShort:
+                        ret = fprintf(f, "%hu ", *(unsigned short *) optptr);
+                        optptr += 2;
+                        break;
+                    case opt_SShort:
+                        ret = fprintf(f, "%hd ", *(signed short *) optptr);
+                        optptr += 2;
+                        break;
+                    case opt_ULong:
+                        ret = fprintf(f, "%lu ", *(unsigned long *) optptr);
+                        optptr += 4;
+                        break;
+                    case opt_SLong:
+                        ret = fprintf(f, "%ld ", *(signed long *) optptr);
+                        optptr += 4;
+                        break;
+                    case opt_Char:
+                        ret = fprintf(f, "%c ", *(unsigned char *) optptr++);
+                        break;
+                    case opt_HexLong:
+                        ret = fprintf(f, "0x%lx ", *(unsigned long *) optptr);
+                        optptr += 4;
+                        break;
+                    case opt_Double:
+                        ret = fprintf(f, "%f ", *(double *)optptr);
+                        optptr += sizeof(double);
+                        break;
+                    case opt_Timecode:
+                    {
+                        int val = *(int *)optptr;
+                        ret = fprintf(f, "%02d:%02d:%02d:%02d ",
+                            val/(60*60*25), (val/(60*25)) % 60, (val/25) % 60, val % 25);
+                        optptr += sizeof(int);
+                        break;
+                    }
+                }
+            }
+            break;
+    }
+    return ret;
+}
+
+
+
+/*
+ * Copy not more than out_len chars from 'from' to 'to' and then add a null at the end.
+ * Convert |c to control c, || to |
+ */
+
+static void input_string(const char *from, char *to, int out_len)
+{
+    int c;
+    while ((c = *from++) != '\0' && out_len > 0)
+    {
+        if (c >= ' ')
+        {
+            if (c == '|')
+            {
+                if ((c = *from++) != '|')
+                    c -= '@';
+            }
+            *to++ = c;
+            out_len--;
+        }
+    }
+    *to++ = '\0';
+}
+
+static void process_input(char *buffer, const opt_line_t *opt_types, void *options)
+{
+    int         nbytes = 0;
+    const opt_line_t *olp;
+
+    char        tag[MAX_TAG_SIZE+1];
+    sscanf(buffer, "%[^:\n]:%n", tag, &nbytes);
+
+    olp = find_option(tag, opt_types);
+
+    if (olp != NULL)
+    {
+        char *out = (char *)options + olp->start_offset;
+        char *ptr = &buffer[nbytes];
+        switch (olp->type)
+        {
+            case opt_FlagField:
+            {
+                int bitstart = olp->n_elements & 0xff,
+                    bitwidth = (olp->n_elements & 0xff00) >> 8;
+                unsigned long bitmask = (1 << bitwidth) - 1;
+                *(unsigned long *)out &=~ (bitmask << bitstart);
+                *(unsigned long *)out |=  strtoul(ptr, NULL, 10) << bitstart;
+                break;
+            }
+
+            case opt_MallocString:
+            case opt_String:
+                if (*ptr == '\0')
+                {
+                    if (olp->type == opt_MallocString)
+                        *(char **)out = NULL;
+                    else
+                        *out = '\0';
+                }
+                else
+                {
+                    char *to;
+                    int  len = strlen(ptr) + 1;
+                    len = lowest(len, olp->n_elements);
+                    to = olp->type == opt_MallocString ?
+                        (*(char **)out = realloc(*(char **)out, len)) : out;
+                    input_string(ptr, to, len);
+                }
+                break;
+
+            default:
+            {
+                int         i;
+                char        *endptr;
+                for (i = 0; i < olp->n_elements; i++)
+                    switch (olp->type)
+                    {
+                        case opt_UByte:
+                            *(unsigned char *)out = (unsigned char) strtoul(ptr, &endptr, 10);
+                            ptr = endptr;
+                            out++;
+                            break;
+                        case opt_UShort:
+                            *(unsigned short *)out = (unsigned short) strtoul(ptr, &endptr, 10);
+                            ptr = endptr;
+                            out += 2;
+                            break;
+                        case opt_ULong:
+                            *(unsigned long *)out = strtoul(ptr, &endptr, 10);
+                            ptr = endptr;
+                            out += 4;
+                            break;
+                        case opt_SByte:
+                            *(signed char *)out = (signed char) strtol(ptr, &endptr, 10);
+                            ptr = endptr;
+                            out++;
+                            break;
+                        case opt_SShort:
+                            *(signed short *)out = (signed short) strtol(ptr, &endptr, 10);
+                            ptr = endptr;
+                            out += 2;
+                            break;
+                        case opt_SLong:
+                            *(signed long *)out = strtol(ptr, &endptr, 10);
+                            ptr = endptr;
+                            out += 4;
+                            break;
+                        case opt_Char:
+                            ptr += strspn(ptr, " ");
+                            sscanf(ptr, "%c", out);
+                            out++;
+                            break;
+                        case opt_HexLong:
+                            *(unsigned long *)out = strtoul(ptr, &endptr, 16);
+                            ptr = endptr;
+                            out += 4;
+                            break;
+                        case opt_Double:
+                            *(double *)out = strtod(ptr, &endptr);
+                            ptr = endptr;
+                            out += sizeof(double);
+                            break;
+                        case opt_Timecode:
+                        {
+                            int h, m, s, f;
+                            ptr += strspn(ptr, " ");
+                            sscanf(ptr, "%02d:%02d:%02d:%02d", &h, &m, &s, &f);
+                            *(int *)out = ((h*60 + m)*60 + s)*25 + f;
+                            ptr += 11;
+                            out += sizeof(int);
+                            break;
+                        }
+                    }
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static int get_nextline(optfile of)
+{
+    int linetype = of->linetype;
+    if (of->used_line) 
+    {
+        if (fgets(global_buffer, sizeof(global_buffer), of->f) == NULL)
+        {   
+            linetype = feof(of->f) ? linetype_EndOfFile : linetype_Error;
+        }
+        else
+        {
+            global_buffer[strlen(global_buffer)-1] = '\0';  /* get rid of new line */
+            switch (*global_buffer)
+            {
+                case '#':           /* comment */
+                case ' ':           /* empty line */
+                case '\0':          /* empty line */
+                    linetype = linetype_Ignore;
+                    break;
+
+                case '@':           /* old style list */
+                    linetype = linetype_ExtraList;
+                    break;
+
+                case '*':           /* eof marker */
+                    linetype = linetype_EndOfFile;
+                    break;
+
+                case '%':           /* type marker */
+                    linetype = (int) strtol(&global_buffer[1], NULL, 10);
+                    break;
+
+                default:            /* tag */
+                    linetype = linetype_Tag;
+                    break;
+            }
+        }
+
+        of->used_line = FALSE;
+        of->linetype = linetype;
+    }
+
+    return linetype;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+/* New style save and load functions */
+
+
+optfile opt_open(const char *filename, const char *options, const char *title)
+{
+    optfile of;
+    if ((of = malloc(sizeof(struct optfile__str))) != NULL)
+    {
+        if ((of->f = fopen(filename, options)) != NULL)
+        {
+            of->reading = strchr(options, 'r') != NULL || strchr(options, 'R') != NULL;
+            if (!of->reading)
+            {
+                time_t t = time(NULL);
+                fprintf(of->f, "# %s\n# %s %s\n\n", title, SAVED_MSG, ctime(&t));
+            }
+            else
+            {
+                of->linetype = linetype_Ignore;
+                of->used_line = FALSE;
+            }
+        }
+        else
+        {
+            free(of);
+            of = NULL;
+        }
+    }
+    return of;
+}
+
+void opt_close(optfile of)
+{
+    if (of)
+    {
+        if (!of->reading)
+            fprintf(of->f, "\n\n* %s\n", END_OF_FILE);
+
+        fclose(of->f);
+        free(of);
+    }
+}
+
+int opt_write(optfile of, int type, const opt_line_t *opt_types, void *base)
+{
+    const opt_line_t    *olp;
+    int                 ret = 0;
+
+    if (type != -1)
+        ret = fprintf(of->f, "%% %d\n", type);
+
+    for (olp = opt_types; olp->type != opt_EndOfList && ret >= 0; olp++)
+    {
+        if (olp->comment)
+            ret = fprintf(of->f, "# %s\n", olp->comment);
+
+        if (ret >= 0)
+            ret = fprintf(of->f, "%.*s:", MAX_TAG_SIZE, olp->tag);
+
+        ret = write_options(of->f, (char *)base + olp->start_offset, olp->n_elements, olp->type);
+
+        if (ret >= 0)
+            ret = fprintf(of->f, "%s\n", olp->postfix ? olp->postfix : "");
+    }
+    return ret;
+}
+
+int opt_read(optfile of, const opt_line_t *opt_types, void *base)
+{
+    BOOL finished = FALSE;
+    int ret = 0;
+    do
+    {
+        int linetype = get_nextline(of);
+
+        of->used_line = TRUE;
+        switch (linetype)
+        {
+            case linetype_Error:
+            case linetype_EndOfFile:
+                ret = -1;
+                finished = TRUE;
+                break;
+
+            case linetype_Ignore:
+                break;
+
+            case linetype_ExtraList:
+                finished = TRUE;
+                ret = linetype;
+                break;
+
+            case linetype_Tag:
+                if (opt_types != NULL && base != NULL)
+                    process_input(global_buffer, opt_types, base);
+                break;
+
+            default:
+                if (opt_types != NULL && base != NULL)
+                    of->used_line = FALSE;
+                finished = TRUE;
+                ret = linetype;
+                break;
+        }
+
+    }
+    while (!finished);
+
+    return ret;
+}
+
+int opt_nextsection(optfile of)
+{
+    BOOL finished = FALSE;
+    int linetype = -1;
+
+    do           
+    {
+        linetype = get_nextline(of);
+        switch (linetype)
+        {
+            case linetype_Error:
+            case linetype_EndOfFile:
+                linetype = -1;
+                finished = TRUE;
+                break;
+
+            case linetype_Ignore:
+            case linetype_ExtraList:
+            case linetype_Tag:
+                of->used_line = TRUE;
+                break;
+
+            default:
+                finished = TRUE;
+                break;
+        }
+    }
+    while (!finished);
+
+    return linetype;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+/* Old style save and load functions */
+
+int opt_save(const char *filename, const char *title, const opt_line_t *opt_types, void *options, opt_extrafn_t xtrafn)
+{
+    int         ret = -1;
+    optfile     of;
+
+    visdelay_begin();
+
+    if ((of = opt_open(filename, "w", title)) != NULL)
+    {
+        ret = opt_write(of, -1, opt_types, options);
+
+        if (ret >= 0)
+        {
+            if (xtrafn)
+            {
+                ret = fprintf(of->f, "\n\n@ %s\n\n", END_OF_GENERATED_FILE);
+                if (ret >= 0)
+                    ret = xtrafn(of->f, options);
+            }
+        }
+
+        opt_close(of);
+    }
+
+    visdelay_end();
+
+    return ret;
+}
+
+int opt_load(const char *filename, const char *title, const opt_line_t *opt_types, void *options, opt_extrafn_t xtrafn)
+{
+    int         ret = -1;
+    optfile     of;
+
+    visdelay_begin();
+
+    if ((of = opt_open(filename, "r", title)) != NULL)
+    {
+        ret = opt_read(of, opt_types, options);
+
+        if (ret == linetype_ExtraList)
+        {
+            if (xtrafn)
+                ret = xtrafn(of->f, options);
+        }
+
+        opt_close(of);
+    }
+
+    visdelay_end();
+
+    return ret;
+}
+
+
+/* eof opt.c */

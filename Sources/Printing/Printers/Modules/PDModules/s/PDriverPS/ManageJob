@@ -1,0 +1,395 @@
+; > Sources.PDriverPS.ManageJob
+
+; Job management routines for the PostScript printer driver
+
+;----------------------------------------------------------------------------
+;
+; The print job workspace allocation routine
+;
+;----------------------------------------------------------------------------
+
+managejob_allocate
+        Push    "R0-R4,LR"
+        MOV     R0,#ModHandReason_Claim ;Claim workspace
+        LDR     R4,info_globalfeatures  ;If output destined for a colour
+        TST     R4,#1                   ;  printer, allocate the
+        LDR     R3,=jobwslength         ;  'pixelvalues' table as well as
+        ADDNE   R3,R3,#4*&100           ;  the standard amount of workspace.
+        SWI     XOS_Module
+        MOV     R11,R2
+        BLVC    managejob_allocate_inittable
+        STRVS   R0,[R13]
+        Pull    "R0-R4,PC"
+
+        LTORG
+
+managejob_allocate_inittable            ;Subroutine to initialise the
+        TST     R4,#1                   ;  'pixelvalues' table if necessary
+        Return  EQ                      ;Return if monochrome output
+        ADRL    R0,pixelvalues
+        MOV     R1,#255                 ;Start at entry 255
+        MOV     R4,#3
+managejob_allocate_initloop
+        AND     R2,R4,R1                ;Construct red component from bottom
+        ADD     R2,R2,R2,LSL #2         ;  two bits of index by multiplying
+        ADD     R2,R2,R2,LSL #4         ;  by &55
+        MOV     R3,R2,LSL #8
+        AND     R2,R4,R1,LSR #2         ;Construct green component from next
+        ADD     R2,R2,R2,LSL #2         ;  two bits of index by multiplying
+        ADD     R2,R2,R2,LSL #4         ;  by &55
+        ORR     R3,R3,R2,LSL #16
+        AND     R2,R4,R1,LSR #4         ;Construct blue component from next
+        ADD     R2,R2,R2,LSL #2         ;  two bits of index by multiplying
+        ADD     R2,R2,R2,LSL #4         ;  by &55
+        ORR     R3,R3,R2,LSL #24
+        AND     R2,R4,R1,LSR #6         ;Make this entry undefined if top
+        TEQ     R2,#3                   ;  two bits of index are not both set
+        ORRNE   R3,R3,#&FF
+        STR     R3,[R0,R1,LSL #2]       ;Store the result
+        SUBS    R1,R1,#1                ;Then loop if necessary
+        BGE     managejob_allocate_initloop
+        Return
+
+for_name        DCB     "PDriver$For",0
+                ALIGN
+
+address_name    DCB     "PDriver$Address",0
+                ALIGN
+
+;----------------------------------------------------------------------------
+;
+; The print job initialisation routine
+;
+;----------------------------------------------------------------------------
+
+managejob_init
+        Push    "R0-R4,LR"
+        PrError managejob_init_return           ;Set up error label
+        [       PSDebugManageJ
+        PrLnIm  "% managejob_init"
+        ]
+
+; Record whether this job requires a CTRL-D at its end.
+ [ 1=1
+; SMC: We want a CTRL-D if it's not an illustration job but not if it is.
+        LDRB    r14, illustrationjob
+        TEQ     r14, #0
+        MOVEQ   r14, #-1
+        MOVNE   r14, #0
+ |
+        LDRB    r14, globalusectrld
+ ]
+        STRB    r14, jobusectrld
+
+; Record the prologue verbosity
+
+        LDRB    r14, globalverbose
+        STRB    r14, jobverbose
+
+; Record whether accent generation is needed
+
+        LDRB    r14, globalaccents
+        STRB    r14, jobaccents
+
+;record whether Level 2
+        LDRB    r14, globallevel2
+        STRB    r14, joblevel2
+
+; Current colour is unknown.
+
+        ADR     r14, currentcols
+        STR     r14, currentcolptr
+        MOV     r14, #-1
+        STR     r14, currentcols
+
+; Initialise the list of declared fonts to "no list"
+
+        STR     r14,  declaredfonts
+
+; Initialise the flag that says we should send a prologue out to TRUE
+
+        STRB    r14,  sendprologue
+
+        [       PSTextSpeedUps
+
+; Current font is unknown.
+
+        ADR     r14, currentfonts
+        STR     r14, currentfontptr
+        MOV     r14, #-1
+        STR     r14, currentfonts
+
+        ]
+
+; Zero the font mapping table
+
+        ADR     r14, fontmapping
+        MOV     r0, #0
+        MOV     r2, #255
+00      STR     r0, [r14, r2, LSL #2]
+        SUBS    r2, r2, #1
+        BPL     %BT00
+
+;initialise bput buffering
+        MOV     R14,#0
+        STRB    R14,bputNbuff
+
+; Output print job header comments. First the version identifier and creating
+; program. OSS Changed version numbers. Used to be the latest version of
+; Postscript and EPSF that we knew about. This has been changed to the
+; earliest version of Postscript and EPSF to which our output conforms.
+; This is important - applications accepting encapsulated Postscript check
+; these numbers.
+
+        PrStrIm "%!PS-Adobe-2.0"        ; OSS Was 2.1
+        LDRB    r14, illustrationjob
+        TEQ     r14, #0
+        BEQ     managejob_init_notanillustration
+        PrStrIm " EPSF-1.2"             ; OSS Was 2.0
+managejob_init_notanillustration
+        PrNewLn
+        PrLnIm  "%%Creator: $PrinterType PDriver module $VersionString"
+
+; Next the creation time and date.  This used to use the rune
+; PrGLnIm "%%CreationDate: <Sys$Time> <Sys$Date> <Sys$Year>"
+; but that sometimes provoked a re-entrancy problem in OS_GSTrans.
+; It has been rewritten to use OS_ReadVarVal instead.
+
+        PrStrIm "%%CreationDate: "
+        PrVarIm "Sys$Time"
+        PrStrIm " "
+        PrVarIm "Sys$Date"
+        PrStrIm " "
+        PrVarIm "Sys$Year"
+        PrNewLn
+
+; Next the title string pointed to by R1, if it exists.
+
+        TEQ     R1,#0
+        BEQ     managejob_init_untitled
+        PrStrIm "%%Title: "
+        PrLn    R1,32,126
+managejob_init_untitled
+
+; Now the intended recipient in PDriver$For, if it exists.
+
+        ADR     R0,for_name
+        MOV     R2,#-1
+        MOV     R3,#0
+        SWI     XOS_ReadVarVal
+        CMP     R2,#0           ;Clears V, sets EQ if non-existent variable
+        BEQ     managejob_init_nofor
+        PrGLnIm "%%For: <PDriver$For>"
+managejob_init_nofor
+
+; And the intended address/routing in PDriver$Address, if that exists.
+
+        ADRL    R0,address_name
+        MOV     R2,#-1
+        MOV     R3,#0
+        SWI     XOS_ReadVarVal
+        CMP     R2,#0           ;Clears V, sets EQ if non-existent variable
+        BEQ     managejob_init_noaddress
+        PrGLnIm "%%Routing: <PDriver$Address>"
+managejob_init_noaddress
+
+; Number of pages, bounding box and font comments will only
+; appear at the end of output.
+
+        PrLnIm  "%%Pages: (atend)"
+        PrLnIm  "%%BoundingBox: (atend)"
+        PrLnIm  "%%DocumentFonts: (atend)"
+        PrLnIm  "%%DocumentSuppliedFonts: (atend)"
+
+; Initialise job bounding boxes.
+
+        MOV     R0,#&7FFFFFFF
+        MOV     R1,#&7FFFFFFF
+        MOV     R2,#&80000000
+        MOV     R3,#&80000000
+        ADR     r14, jobboundingbox
+        STMIA   r14, {R0-R3}
+
+        PrError                                 ;Cancel error label
+managejob_init_return
+        STRVS   R0,[R13]
+        Pull    "R0-R4,PC"
+
+;----------------------------------------------------------------------------
+;
+; The print job finalisation routine
+;
+;----------------------------------------------------------------------------
+
+managejob_finalise
+        Push    "R0-R7,LR"
+        PrError managejob_finalise_return       ;Set up error label
+        [       PSDebugManageJ
+        PrLnIm  "% managejob_finalise"
+        ]
+
+; Start the trailer section
+
+        PrLnIm  "%%Trailer"
+
+; Give the number of pages produced
+
+        PrStrIm "%%Pages: "
+        LDR     r0, numberofpages
+        PrNum   r0, CorruptR0
+        PrNewLn
+
+; Give the resulting bounding box. If nothing printed, produce a null
+; bounding box rather than a contradictory one.
+
+        ADR     r14, jobboundingbox
+        LDMIA   r14, { r0-r3 }
+        CMP     R0, R2
+        MOVGT   R0, #0
+        MOVGT   R1, #0
+        MOVGT   R2, #0
+        MOVGT   R3, #0
+        PrStrIm "%%BoundingBox: "
+        PrPair  R0, R1, CorruptR0andR1
+        PrNumSp R2, CorruptR0
+        PrNum   R3, CorruptR0
+        PrNewLn
+        
+; Output the DocumentFonts stuff.  We only do this if we're not
+; verbose (ie declaredfonts >= 0), and if there is a font list,
+; ie. (declaredfonts > 0).  Note that we don't actually get the fonts
+; from declaredfont; we get them from the MiscOp list.
+
+        LDR     r0, declaredfonts
+        CMP     r0, #0
+        BLT     managejob_finalise_terminate    ;;; was BLE
+
+        MOV     r6, #0                  ; DocumentFonts
+        BL      managejob_outputfontcomment
+        MOV     r6, #1                  ; DocumentSuppliedFonts
+        BL      managejob_outputfontcomment
+
+
+managejob_finalise_terminate
+
+; Output the Epilogue file (if present)
+
+        ADRL    r0, epilogue_filename
+        BL      pagebox_insertfile      ; Ignore errors
+
+; And terminate with a CTRL-D if required.
+
+        LDRB    r14, jobusectrld
+        TEQ     r14, #0
+        BEQ     managejob_finalise_freefonts
+        PrChr   #4
+
+; Now free the list of declared fonts
+
+managejob_finalise_freefonts
+        MOV     r0, #ModHandReason_Free
+        ADR     r1, declaredfonts
+        LDR     r2, [ r1, #0 ]
+managejob_finalise_freefontsloop
+        CMP     r2, #0
+        BLE     managejob_finalise_return
+        LDR     r1, [ r2, #0 ]
+        SWI     XOS_Module
+        BVS     managejob_finalise_return
+        MOVS    r2, r1
+        BNE     managejob_finalise_freefontsloop
+
+        PrError                                 ;Cancel error label
+
+managejob_finalise_return
+;make sure output is flushed
+        BLVC    bput_flush
+        STRVS   r0, [ sp, #0 ]
+        Pull    "r0-r7, pc"
+
+
+; Output DocumentFonts or DocumentSuppliedFonts comments.  Do this
+; by scanning the MiscOp list for entries with appropriate values
+; in the flags word.
+; On entry, r6 is 0 for DocumentFonts, 1 for DocumentSuppliedFonts.
+;
+; REGISTERS R0-R5,R7 CORRUPTED.
+
+managejob_outputfontcomment
+        Push    "lr"
+
+        PrError managejob_outputfontcomment_end
+        PrStrIm "%%Document"
+        TEQ     r6, #0                  ; is it DocumentFonts
+        BEQ     %FT00                   ; yes, so don't print Supplied
+        PrStrIm "Supplied"
+00
+        PrStrIm "Fonts: "
+
+        ADR     r5, enumeration_buf
+        MOV     r3, #0                  ; first handle
+        MOV     r4, #0                  ; flags
+        MOV     r7, #0
+        B       %FT02
+
+01      TEQ     r3, #0                  ; was returned handle 0?
+        BEQ     %FT04                   ; yes, then done
+        
+02      MOV     r0, #2                  ; enumerate fonts
+        MOV     r1, r5                  ; clobbered by the call
+        MOV     r2, #12                 ; size is clobbered too
+        SWI     XPDriver_MiscOp
+        BVS     %FT04                   ; if there was an error, or
+        TEQ     r2, #0                  ; remaining size is nonzero
+        BNE     %FT04                   ; then there are no more
+
+        LDR     r1, [r5, #8]            ; check flags word
+        LDR     r2, [r5, #0]
+
+        TEQ     r6, #1                          ; if we're doing DocumentSuppliedFonts...
+        BEQ     %FT05                           ; then skip the first test
+        TEQ     r1, #PDriverMiscOp_PS_DF        ; is it DocumentFonts?
+        BEQ     %FT06
+05      TEQ     r1, #PDriverMiscOp_PS_DSF       ; ...then is it DocumentSuppliedFonts?
+        BNE     %BT01
+
+06      TEQ     r7, #0                  ; don't do %%+ for the first line
+        ADD     r7, r7, #1
+        BEQ     %FT03
+        PrStrIm "%%+ "
+03
+        PrLn    r2,32,126
+
+        B       %BT01                   ; go back for the next entry
+
+04
+        PrNewLn
+
+managejob_outputfontcomment_end
+        PrError
+        Pull    "pc"
+
+
+managejob_suspend
+        Push    "LR"
+        BL      bput_flush
+        Pull    "PC"
+
+managejob_resume
+        Return
+
+managejob_abort
+        ; set the output stream to 0 if the job is aborted
+        ; this stops pages being printed if background printing
+        ; is on!
+
+        Push    "R0-R2,LR"
+        MOV     R0, #3
+        MOV     R1, R10
+        MOV     R2, #0
+        SWI     XOS_Args
+        Pull    "R0-R2,PC"
+
+
+        END
+

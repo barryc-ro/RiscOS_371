@@ -1,0 +1,639 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/fslib/_Func.c:networking  1.1  $
+ * $Source: /ax/networking:Starling/ShareFS/fslib/_Func.c: $
+ *
+ * Copyright (c) 1995 ANT Ltd., Cambridge, England
+ *
+ * $Log:	_Func.c,v $
+ * Revision 1.1  95/01/04  17:56:59  kwelton
+ * Initial revision
+ * 
+ */
+
+/* $Id: c._Func 3.3 93/09/28 08:47:13 nobody Exp $ */
+
+#include "FS.h"
+#include "RO3ONLY.h"
+
+#ifdef IMAGESUPPORT
+# include "ifscore.h"
+#endif
+
+/* #define DEBUG */
+
+#if !RISCOS3ONLY
+static FileEntry *csd = NULL, *psd = NULL, *lib = NULL;
+
+void fs_terminate(void)
+{
+    FileEntry_Close(csd);
+    FileEntry_Close(psd);
+    FileEntry_Close(lib);
+    csd = NULL;
+    psd = NULL;
+    lib = NULL;
+}
+#else
+
+#define csd 0
+void fs_terminate(void)
+{
+}
+#endif
+
+_kernel_oserror *reportusage(char *drivespec)
+{
+    struct freespace b;
+    FileEntry *fe;
+    _kernel_oserror *err;
+    char buf[256];
+    if (drivespec[0] && drivespec[0] != ':')
+    {
+	strcpy(buf, ":");
+	strcat(buf, drivespec);
+	drivespec = buf;
+    }
+    fe = NULL;
+    err = FileEntry_Open(NULL, NULL, drivespec, OPENIN, &fe);
+    if (err)
+	return err;
+    err = FileEntry_FreeSpace(fe, &b);
+    FileEntry_Close(fe);
+    if (err)
+	return err;
+    printf("Bytes free &%08x = %9d\n\rBytes used &%08x = %9d\n\r",
+	   b.free, b.free, b.size - b.free, b.size - b.free);
+    return NULL;
+}
+
+#if !RISCOS3ONLY
+static void header(FileEntry *fse)
+{
+    char *disc = FileEntry_DiscName(csd);
+    printf("%-20s", FileEntry_Name(fse));
+    if (disc)
+	printf("Disc %-15s", disc);
+    printf("Option %-13s", "");
+    printf("\n\r");
+    printf("Dir %-16s", FileEntry_Name(csd));
+    printf("Lib %-16s", FileEntry_Name(lib));
+    printf("Prev %-15s", FileEntry_Name(psd));
+    printf("\n\r\n");
+}
+
+static int maxname(FileEntry *fse)
+{
+    int i;
+    FileDesc d;
+    char *name;
+    int m = 0;
+    for (i = 0; !FileEntry_DirScan(fse, i, &d, &name); ++i)
+	if (strlen(name) > m)
+	    m = strlen(name);
+    return m;
+}
+
+static void catdir(FileEntry *fse)
+{
+    int i;
+    int width = readwidth();
+    int k = 0;
+    int l = maxname(fse) + 1;
+    FileDesc d;
+    char *name;
+    header(fse);
+    for (i = 0; !FileEntry_DirScan(fse, i, &d, &name); ++i)
+    {
+	if (k > width - l)
+	{
+	    printf("\r\n");
+	    k = 0;
+	}
+	printf("%-*s", l + 1, name);
+	k += l + 1;
+    }
+    printf("\r\n");
+}
+
+static char *accessstring(int a)
+{
+    static char buf[5];
+    char *p = buf;
+    if (a & Attr_L)
+	*p++ = 'L';
+    if (a & Attr_R)
+	*p++ = 'R';
+    if (a & Attr_W)
+	*p++ = 'W';
+/*  if ( a&Attr_D )
+    *p++='D'; */
+    *p++ = 0;
+    return buf;
+}
+
+static char *infoobject(FileDesc d)
+{
+    int date[2];
+    _kernel_swi_regs r;
+    int l;
+#define MAXCOL 70
+    static char buf[MAXCOL];
+    date[0] = d.info.date_type.part_2;
+    date[1] = d.info.date_type.part_1;
+#define TYPECOL 4
+#define DATECOL 14
+#define MAXDATELEN 30
+    sprintf(buf, "%-3s ", accessstring(d.attr));
+    r.r[0] = (int) &date;
+    r.r[1] = (int) buf + DATECOL;
+    r.r[2] = MAXDATELEN;
+    if (2 == d.type)
+    {
+	strcpy(buf + TYPECOL, "Directory ");
+	_kernel_swi(XOS_Bit + OS_ConvertStandardDateAndTime, &r, &r);
+    }
+    else
+    if ((d.info.date_type.part_1 >> 20) == -1)
+    {
+	int t = d.info.date_type.part_1 >> 8 & 0xfff;
+	char *n;
+	sprintf(buf + TYPECOL, "File$Type_%03x", t);
+	n = getenv(buf + TYPECOL);
+	if (n)
+	    sprintf(buf + TYPECOL, "%-8.8s  ", n);
+	else
+	    sprintf(buf + TYPECOL, "&%03x      ", t);
+	_kernel_swi(XOS_Bit + OS_ConvertStandardDateAndTime, &r, &r);
+    }
+    else
+    {
+	_kernel_swi(XOS_Bit + OS_ConvertStandardDateAndTime, &r, &r);
+	l = DATECOL + strlen(buf + DATECOL) - TYPECOL - 17;
+	sprintf(buf + TYPECOL, "%*s%08x %08x", l, "", d.info.date_type.part_1, d.info.date_type.part_2);
+    }
+    strcat(buf, " ");
+    l = strlen(buf);
+    r.r[0] = d.length;
+    r.r[1] = (int) buf + l;
+    r.r[2] = MAXCOL - l;
+    _kernel_swi(OS_ConvertFixedFileSize, &r, &r);
+    return buf;
+}
+
+static void examinedir(FileEntry *fse)
+{
+    int i;
+    FileDesc d;
+    char *name;
+    int l = maxname(fse) + 1;
+    header(fse);
+    for (i = 0; !FileEntry_DirScan(fse, i, &d, &name); ++i)
+	printf("%-*s %s\n", l, name, infoobject(d));
+}
+#endif
+
+#if RISCOS3ONLY
+void normalise(FileEntry **dir, char **name)
+{
+    /* shut the compiler up */
+    name = name;
+
+    *dir = 0;
+}
+#else
+void normalise(FileEntry **dir, char **name)
+{
+    if (!*dir)
+	*dir = csd;
+    if (*name)
+    {
+	switch ((*name)[0])
+	{
+	  default:
+	    return;
+	  case '@':
+	    *dir = csd;
+	    break;
+	  case '\\':
+	    *dir = psd;
+	    break;
+	  case '%':
+	    *dir = lib;
+	    break;
+	}
+	switch ((*name)[1])
+	{
+	  case '.':
+	    *name += 2;
+	    break;
+	  case 0:
+	    *name = NULL;
+	    break;
+	  default:
+	    *name = NULL;
+	    break;
+	}
+    }
+}
+#endif
+
+_kernel_oserror *fsentry_func(FSEntry_Func_Parameter *parm)
+{
+    _kernel_oserror *err = NULL;
+    FileEntry *fse = NULL;
+#ifdef DEBUG
+    printf("Func( %d )%s\n", parm->reason,
+	   parm->first_parameter.name_1 ?
+	   parm->first_parameter.name_1 : "NULL");
+#endif
+
+    switch (parm->reason)
+    {
+#if !RISCOS3ONLY
+      case FSEntry_Func_Reason_SetCurrentDirectory:
+      case FSEntry_Func_Reason_SetLibraryDirectory:
+        {
+	    char *name = parm->first_parameter.name_1;
+	    FileDesc d;
+	    if (!name || !name[0])
+		err = FileEntry_Open(NULL, fixsf(parm->special_field_1),
+				     NULL, OPENDIR, &fse);
+	    else
+		err = FileEntry_Open(csd, fixsf(parm->special_field_1),
+				     parm->first_parameter.name_1,
+				     OPENDIR, &fse);
+	    if (err)
+		return err;
+	    d = FileEntry_Desc(fse);
+	    if (2 != d.type)
+	    {
+		FileEntry_Close(fse);
+		return ERR(NotFound);
+	    }
+	    if (parm->reason == FSEntry_Func_Reason_SetCurrentDirectory)
+	    {
+		FileEntry_Close(psd);
+		psd = csd;
+		csd = fse;
+	    }
+	    else
+	    {
+		FileEntry_Close(lib);
+		lib = fse;
+	    }
+	    return NULL;
+	}
+
+      case FSEntry_Func_Reason_CatalogueDirectory:
+      case FSEntry_Func_Reason_ExamineCurrentDirectory:
+      case FSEntry_Func_Reason_CatalogueLibraryDirectory:
+      case FSEntry_Func_Reason_ExamineLibraryDirectory:
+	{
+	    FileDesc d;
+	    err = FileEntry_Open(parm->reason == FSEntry_Func_Reason_CatalogueLibraryDirectory ||
+				 parm->reason == FSEntry_Func_Reason_ExamineLibraryDirectory ? lib : csd,
+				 fixsf(parm->special_field_1), parm->first_parameter.name_1, OPENDIR, &fse);
+	    if (err)
+		return err;
+	    d = FileEntry_Desc(fse);
+	    if (2 != d.type)
+	    {
+		FileEntry_Close(fse);
+		return ERR(NotFound);
+	    }
+	    if (parm->reason == FSEntry_Func_Reason_ExamineLibraryDirectory ||
+		parm->reason == FSEntry_Func_Reason_ExamineCurrentDirectory)
+		examinedir(fse);
+	    else
+		catdir(fse);
+	    FileEntry_Close(fse);
+	    return NULL;
+	}
+
+	  case FSEntry_Func_Reason_ExamineObjects:
+	    err = FileEntry_Open(csd, fixsf(parm->special_field_1),
+			     parm->first_parameter.name_1, OPENIN, &fse);
+	if (err)
+	    return err;
+	printf("%s %s\n", FileEntry_Name(fse),
+	       infoobject(FileEntry_Desc(fse)));
+	    FileEntry_Close(fse);
+	    return NULL;
+
+      case FSEntry_Func_Reason_SetFilingSystemOptions:
+	return NULL;
+#endif
+
+      case FSEntry_Func_Reason_RenameObject:
+	err = FileEntry_Rename(csd, fixsf(parm->special_field_1), parm->first_parameter.name_1,
+			       csd, fixsf(parm->special_field_2), parm->second_parameter.name_2);
+	parm->first_parameter.rename_invalid = !!err;
+	return err;
+
+#if !RISCOS3ONLY
+      case FSEntry_Func_Reason_AccessObjects:
+	{
+	    char *p = parm->second_parameter.access_string;
+	    int a = 0;
+	    int sl = 0;
+	    for (;;)
+	    {
+		switch (*p++)
+	    {
+		  case 0:
+		    break;
+		  case '/':
+		    sl = 1;
+		    continue;
+		  case 'L':
+		  case 'l':
+		    a |= Attr_L;
+		    continue;
+		  case 'R':
+		    a |= sl ? Attr_r : Attr_R;
+		    continue;
+		  case 'W':
+		    a |= sl ? Attr_w : Attr_W;
+		    continue;
+		  case 'r':
+		    a |= Attr_r;
+		    continue;
+		  case 'w':
+		    a |= Attr_w;
+		    continue;
+		}
+		break;
+	    }
+	    err = FileEntry_Access(csd, fixsf(parm->special_field_1),
+				   parm->first_parameter.name_1, a);
+	    return err;
+	}
+#endif
+
+      case FSEntry_Func_Reason_BootFilingSystem:
+	(void) FileEntry_Boot();
+	return NULL;
+
+      case FSEntry_Func_Reason_ReadNameAndBootOptionOfDisc:
+	{
+	    char *disc = FileEntry_DiscName(csd);
+	    strcpy((char *)parm->second_parameter.parameter + 1,
+		   disc ? disc : "");
+	    *(char *)parm->second_parameter.parameter =
+		strlen((char *)parm->second_parameter.parameter + 1);
+	    return NULL;
+	}
+
+#if !RISCOS3ONLY
+      case FSEntry_Func_Reason_ReadCurrentDirectoryNameAndPrivilegeByte:
+	{
+	    char *p = (char *) parm->second_parameter.parameter;
+	    char *name = FileEntry_Name(csd);
+	    *p++ = 0;
+	    *p++ = strlen(name);
+	    strcpy(p, name);
+	    return NULL;
+	}
+
+      case FSEntry_Func_Reason_ReadLibraryDirectoryNameAndPrivilegeByte:
+	{
+	    char *p = (char *) parm->second_parameter.parameter;
+	    char *name = FileEntry_Name(lib);
+	    *p++ = 0;
+	    *p++ = strlen(name);
+	    strcpy(p, name);
+	    return NULL;
+	}
+#endif
+
+      case FSEntry_Func_Reason_ReadDirectoryEntries:
+      case FSEntry_Func_Reason_ReadDirectoriesAndInformation:
+      case FSEntry_Func_Reason_ReadDirectoryEntriesAndInformation:
+	{
+	    int xtra = parm->reason == FSEntry_Func_Reason_ReadDirectoryEntries ? 0 :
+	    parm->reason == FSEntry_Func_Reason_ReadDirectoriesAndInformation ? 20 : 30;
+	    int *par = (int *) parm;
+	    int *p = (int *) par[2];
+	    int n = par[3];
+	    int o = par[4];
+	    int l = par[5];
+	    int k = 0, x = 0;
+	    FileDesc d;
+	    char *name;
+	    err = FileEntry_Open(csd, fixsf(parm->special_field_1), parm->first_parameter.name_1, OPENDIR, &fse);
+	    if (err)
+		return err;
+	    d = FileEntry_Desc(fse);
+	    if (2 != d.type)
+	    {
+		FileEntry_Close(fse);
+		return ERR(NotFound);
+	    }
+#ifdef DEBUG
+	    printf("at $%p+%d %d from %d:", p, l, n, o);
+#endif
+	    for (x = o; NULL == (err = FileEntry_DirScan(fse, x, &d, &name)) &&
+		 n > 0 && l > xtra + (k = strlen(name)); ++x)
+		if (parm->reason == FSEntry_Func_Reason_ReadDirectoryEntries)
+		{
+		    strcpy((char *) p, name);
+		    p = (int *) ((int) p + k + 1);
+		    --n;
+		    l -= k + 1;
+		}
+		else
+		{
+		    *p++ = (int) d.info.load_exec.load_address;
+		    *p++ = (int) d.info.load_exec.execute_address;
+		    *p++ = d.length;
+		    *p++ = d.attr;
+		    *p++ = d.type;
+		    if (parm->reason == FSEntry_Func_Reason_ReadDirectoriesAndInformation)
+		    {
+			strcpy((char *) p, name);
+			p += k / 4 + 1;
+			--n;
+			l -= (k / 4 + 1) * 4 + 20;
+		    }
+		    else
+		    {
+			*p++ = 0;
+			*p++ = d.info.date_type.part_2;
+			*(char *) p = d.info.date_type.part_1;
+			strcpy((char *) p + 1, name);
+			p += (k + 1) / 4 + 1;
+			--n;
+			l -= ((k + 1) / 4 + 1) * 4 + 30;
+		    }
+		}
+
+	    par[3] = x - o;
+	    par[4] = (!err || x - o) ? x : -1;
+	    FileEntry_Close(fse);
+	    if (err && 0x100D6 != err->errnum)
+		return err;
+	    return NULL;
+	}
+
+      case FSEntry_Func_Reason_ShutDown:
+	ShutDown_FileEntrys();
+	return NULL;
+
+      case FSEntry_Func_Reason_PrintStartUpBanner:
+	printf("\n%s\n", ModuleName);
+	return NULL;
+
+#if 0
+      case FSEntry_Func_Reason_SetDirectoryContexts:
+	{
+	    int *par = (int *) parm;
+	    FileEntry *oldcsd = csd, *oldlib = lib;
+	    printf("****SetDirectoryContexts %x %x %x\n", par[1], par[2], par[3]);
+	    if (par[1])
+		csd = par[1] == -1 ? NULL : (FileEntry *) par[1];
+	    if (par[3])
+		lib = par[3] == -1 ? NULL : (FileEntry *) par[3];
+	    par[1] = oldcsd ? (int) oldcsd : -1;
+	    par[2] = -1;
+	    par[3] = oldlib ? (int) oldlib : -1;
+	    return NULL;
+	}
+#endif
+
+      case FSEntry_Func_Reason_OutputFullInformationOnObjects:
+	{
+	    err = FileEntry_Open(csd, fixsf(parm->special_field_1),
+				 parm->first_parameter.name_1, OPENIN, &fse);
+	    if (err)
+		return err;
+	    FileEntry_FileInfoObject(fse);
+	    FileEntry_Close(fse);
+	    return NULL;
+
+	}
+      case FSEntry_Func_Reason_CanonicaliseSpecialFieldAndDiscName:
+	{
+	    struct canonparms
+	    {
+		int reason;
+		char *special_field, *discname;
+		char *sfbuf, *discbuf;
+		int sflen, disclen;
+	    } *p = (struct canonparms *) parm;
+	    char buf[256];
+	    char *sf, *disc;
+#ifdef DEBUG
+	    printf("%d %x %x %x %x %x %x\n", *p);
+#endif
+	    if (p->discname)
+	    {
+		strcpy(buf, ":");
+		strcat(buf, p->discname);
+		err = FileEntry_Open(csd, fixsf(p->special_field),
+				     buf, OPENIN, &fse);
+	    }
+	    else
+		err = FileEntry_Open(csd, fixsf(p->special_field),
+				     "$", OPENIN, &fse);
+	    if (err)
+	    {
+		if (err->errnum != ERRNotFound)
+		    return err;
+		else
+		{
+		    sf = p->special_field;
+		    disc = p->discname;
+		    fse = NULL;
+		    err = NULL;
+		}
+	    }
+	    else
+	    {
+		sf = FileEntry_SpecialField(fse);
+		disc = FileEntry_DiscName(fse);
+	    }
+#ifdef DEBUG
+	    printf("sf=%s,disc=%s\n", sf ? sf : "NULL", disc ? disc : "NULL");
+#endif
+	    if (sf)
+	    {
+		int l = strlen(sf) + 1;
+		p->special_field = p->sfbuf;
+		if (p->sfbuf)
+		{
+		    memcpy(p->sfbuf, sf, l < p->sflen ? l : p->sflen);
+		    p->sfbuf = (char *) (l < p->sflen ? 0 : p->sflen - l);
+		}
+		else
+		    p->sfbuf = (char *) (l - 1);
+	    }
+	    else
+	    {
+		p->special_field = NULL;
+		p->sfbuf = (char *) 0;
+	    }
+	    if (disc)
+	    {
+		int l = strlen(disc) + 1;
+		p->discname = p->discbuf;
+		if (p->discbuf)
+		{
+		    memcpy(p->discbuf, disc, l < p->disclen ? l : p->disclen);
+		    p->discbuf = (char *) (l < p->disclen ? 0 : p->disclen - l);
+		}
+		else
+		    p->discbuf = (char *) (l - 1);
+	    }
+	    else
+	    {
+		p->discname = NULL;
+		p->discbuf = (char *) 0;
+	    }
+	    if (fse)
+		FileEntry_Close(fse);
+#ifdef DEBUG
+	    printf("==>%d %x %x %x %x %x %x\n", *p);
+#endif
+	    return err;
+	}
+
+      case FSEntry_Func_Reason_ReadFreeSpace:
+	{
+	    err = FileEntry_Open(csd, fixsf(parm->special_field_1), parm->first_parameter.name_1, OPENIN, &fse);
+	    if (err)
+		return err;
+	    err = FileEntry_FreeSpace(fse, (struct freespace *) parm);
+	    FileEntry_Close(fse);
+	    return err;
+	}
+
+      case FSEntry_Func_Reason_ReadBootOption:
+	parm->second_parameter.parameter = 0;
+	return NULL;
+
+      case FSEntry_Func_Reason_ResolveWildcard:
+	parm->read_offset = -1;
+	return NULL;
+
+      case FSEntry_Func_Reason_StampImage:
+	return NULL;
+
+#ifdef IMAGESUPPORT
+      case FSEntry_Func_Reason_NotificationOfNewImage:
+	parm->first_parameter.parameter =
+	    (int)FileEntry_NewImage(parm->first_parameter.parameter,
+				    parm->second_parameter.parameter);
+	return NULL;
+
+      case FSEntry_Func_Reason_NotificationOfImageAboutToBeClosed:
+	FileEntry_OldImage((ImageEntry *) parm->first_parameter.parameter);
+	return NULL;
+#endif
+
+      default:
+	return ERR(BadParm);
+    }
+}
+
+/* EOF _Func.c */

@@ -1,0 +1,1090 @@
+        SUBT    BMU interface code -> Source.BMU
+
+; Change record
+; =============
+;
+; CDP - Christopher Partington, Cambridge Systems Design
+;
+;
+; 30-Jan-92  12:59  CDP
+; First version.
+;
+; 12-Feb-92  13:00  CDP
+; Changed TickerCB_UpdateBMU to check that incrementing UsedLife does not
+; cause it to exceed a byte.
+;
+; 02-Apr-92  10:40  CDP
+; New specification: rewrite started.
+; Time stuff conditionalled out.
+;
+; 12-May-92  11:23  CDP
+; Rewrite continues.
+; Blank/unblank of screen on lid close/open removed (now handled by
+; Portable module). Code to beep remains but now checks monitor type is LCD
+; before beeping.
+;
+; 13-May-92  14:03  CDP
+; Code to maintain ChargeEstimate added to TickerCB_UpdateBMU.
+;
+; 19-May-92  13:09  CDP
+; HandleLidChange now unblanks screen when lid opened (and LCD in use) as
+; Portable module only does this if the ScreenBlanker has not blanked the
+; screen itself.
+;
+; 20-May-92  16:28  CDP
+; TickerCB_UpdateBMU now updates Previous_UsedCapacity *before* checking
+; whether charging/discharging. Before this change, it could get things
+; wrong when switching from discharging to charging.
+;
+; 26-May-92  12:53  CDP
+; Screen flash rate on T1 changed from 50/100 centiseconds to 100/200
+; centiseconds.
+; Calculation of Estimate during discharge changed to keep remainder after
+; division. Initialisation clears remainder.
+;
+;
+;*End of change record*
+
+;******************************************************************************
+
+AddCallBack     ENTRY   "R1"
+;
+; Adds a callback, switching to SVC mode to do so
+;
+; Entry:
+;    R0 -> routine to callback
+;    MODE: SVC or IRQ
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+;    All other registers preserved
+
+; switch to SVC mode for SWI
+
+        MOV     R1,PC                           ; save mode
+        TEQP    PC,#SVC_mode :OR: I_bit         ; enter SVC mode, IRQs off
+        NOP
+
+; now in SVC mode, IRQs disabled
+; add callback to make beep
+
+        Push    "R1,LR"
+
+        MOV     R1,MWP
+        SWI     XOS_AddCallBack
+        MOVVC   R0,#0
+
+        Pull    "R1,LR"
+
+        TEQP    PC,R1                           ; reenter old mode
+        NOP
+
+        PullEnv
+        TEQS    R0,#0
+        ORRNES  PC,LR,#V_bit
+        BICEQS  PC,LR,#V_bit
+
+;******************************************************************************
+
+TickerCB_LidClosedBeep  ENTRY   "R0-R3"
+;
+; Ticker routine CallBack to beep when the lid is closed
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    All registers and flags preserved
+
+; Check whether using LCD or external monitor as must not beep unless LCD.
+
+        MOV     R0,#1
+        SWI     XOS_ReadSysInfo
+        EXITS   VS
+
+        TEQS    R1,#5                           ; LCD?
+        EXITS   NE                              ; quit if not
+
+; issue sound SWIs, (no effect if speaker off)
+
+        LDIMM   R0,&016F0001                    ; amplitude/channel
+        LDIMM   R1,&00086000                    ; duration/pitch
+        SWI     XSound_ControlPacked
+
+        MOV     R0,#60                          ; schedule period
+        MOV     R1,#0                           ; Sound_ControlPacked
+        LDIMM   R2,&016F0001                    ; amplitude/channel
+        LDIMM   R3,&00086000                    ; duration/pitch
+        SWI     XSound_QSchedule
+
+        EXITS
+
+;******************************************************************************
+
+Ticker_LidClosedBeep    ENTRY   "R0"
+;
+; A callevery routine called when the lid is closed
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: IRQ or SVC
+;    IRQs disabled
+;
+; Exit:
+;    All registers and flags preserved
+
+; add callback to do work
+
+        addr    R0,TickerCB_LidClosedBeep
+        BL      AddCallBack
+        EXITS
+
+;******************************************************************************
+ [ CycleBattery
+
+HandleChargerPresentChange ENTRY
+;
+; Called from event callback routine when the charger present bit has changed
+;
+; Entry:
+;    R1 = BMU flags
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+        TSTS    R1,#PortableBMUF_ChargerPresent ;Is charger present?
+        BLEQ    AbortCycling                    ;EQ, no, better to abort cycling, than perform
+                                                ;    a discharge and discover we can't recharge
+;
+; Cycling the battery suppresses normal handling of 'battery low' and 'battery flat'
+; events. If the charger has been disconnected whilst the battery is low or flat, we
+; set the appropriate 'changed' bits in R2 so that the event receives attension.
+;
+; This also causes 'battery low' events to be repeated if the charger (connected in
+; response to a battery low warning) is disconnected whilst the battery is still low.
+;
+        TSTS    R1,#PortableBMUF_ChargerPresent
+        ANDEQ   R0, R1, #PortableBMUF_Threshold_1 :OR: PortableBMUF_Threshold_2
+        ORREQ   R2, R2, R0
+        EXITS
+ ]
+;******************************************************************************
+
+HandleT1Change  ENTRY   "R1-R5"
+;
+; Called from event callback routine when the state of the T1 bit has changed
+; i.e. when Threshold 1 (low battery) has been crossed in either direction.
+;
+; Entry:
+;    R1 = BMU flags
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+        TSTS    R1,#PortableBMUF_Threshold_1    ; T1 has arrived?
+        BEQ     %FT10                           ; branch if not
+
+; T1 has arrived
+ [ CycleBattery
+        LDRB    R0,CycleCount
+        CMP     R0,#0                           ; are we cycling the battery?
+        EXITS   NE                              ; yes, so suppress low battery warning
+ ]
+; Set flag so will beep on ScreenBlanker service calls
+
+        MOV     R0,#1
+        STRB    R0,T1BeepActive
+
+        MOV     R5,R1                           ; save BMU flags
+
+; Start screen flash
+
+        MOV     R0,#ScreenBlankerReason_Flash
+        MOV     R1,#100                         ; on time
+        MOV     R2,#200                         ; off time
+        MOV     R3,#2                           ; 2 initial flashes
+        MOV     R4,#1                           ; send beep service calls
+        SWI     XScreenBlanker_Control
+
+        EXITS
+
+;~~~~~~~~~~~~~~~
+10
+; T1 has now disappeared
+; Clear flag to stop beeping on ScreenBlanker service calls
+
+        MOV     R0,#0
+        STRB    R0,T1BeepActive
+
+; Stop screen flashing
+
+        MOV     R0,#ScreenBlankerReason_Unblank
+        SWI     XScreenBlanker_Control
+
+        EXITS
+
+;******************************************************************************
+ [ CycleBattery
+
+HandleT3Change  ENTRY   "R1-R5"
+;
+; Called from event callback routine when the state of the T3 bit has changed
+; i.e. when Threshold 3 (battery fully charged) has been crossed in either
+; direction.
+;
+; Entry:
+;    R1 = BMU flags
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+        TSTS    R1,#PortableBMUF_Threshold_3    ; T3 has arrived?
+        BEQ     %FT10                           ; branch if not
+
+; If the threshold is reached whilst we are charging, this marks the
+; end of a discharge/charge cycle. Any other indication is ignored.
+; We ignore an indication whilst discharging, as this must be power
+; supply noise at the beginning of a cycle.
+ 
+        LDRB    R0,CycleState
+        CMP     R0,#CycleStateReason_Discharging
+        BEQ     %FT10
+
+        LDRB    R0,CycleCount
+        CMP     R0, #0
+        BEQ     %FT10
+
+        SUBNE   R0, R0, #1                      ; decrement cycle count
+        BLNE    StartCycling                    ; will either begin a new cycle (discharge)
+                                                ; or complete cycling
+10
+        EXITS
+
+ ]
+;******************************************************************************
+
+HandleLidChange ENTRY   "R1-R2"
+;
+; Called from event callback routine when the lid open/closed bit has changed
+;
+; Entry:
+;    R1 = BMU flags
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+        TSTS    R1,#PortableBMUF_LidOpen        ; lid now open?
+        BEQ     %FT10                           ; branch if not
+
+; lid has been opened
+; remove beeping call every
+
+        addr    R0,Ticker_LidClosedBeep
+        MOV     R1,MWP
+        SWI     XOS_RemoveTickerEvent
+
+; remove any pending callback for that routine
+
+        addr    R0,TickerCB_LidClosedBeep
+        MOV     R1,MWP
+        SWI     XOS_RemoveCallBack
+
+; unblank screen if using LCD
+
+        MOV     R0,#1
+        SWI     XOS_ReadSysInfo
+        MOVVS   R1,#5                           ; if error, assume LCD
+
+        TEQS    R1,#5                           ; LCD?
+        MOVEQ   R0,#ScreenBlankerReason_Unblank ; if so, unblank screen
+        SWIEQ   XScreenBlanker_Control
+
+        EXITS
+
+;~~~~~~~~~~~~~~~
+
+10
+
+; lid has been closed
+; add call every to do beep
+
+        LDIMM   R0,LidBeepTicks - 1             ; ticks (-1 for OS bug)
+        addr    R1,Ticker_LidClosedBeep
+        MOV     R2,MWP
+        SWI     XOS_CallEvery
+
+        EXITS
+
+;******************************************************************************
+
+BMUEvent        ENTRY   "R0-R2"
+;
+; Entered on callback from event routine or called from initialisation
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    All registers preserved
+
+        MOV     R1,#PollWordReason_BMUEvent
+        STR     R1,PollWord                     ; force task reschedule
+
+; now handle the event
+
+        LDRB    R2,Module_BMU_Flags             ; get flags we know about
+        LDRB    R1,BMU_Flags                    ; get current flags
+        STRB    R1,Module_BMU_Flags             ; update flags known about
+
+; R1 = current BMU flags
+; R2 = old flags
+
+ [ debug
+        DREG    R2,"M: flags change from ",cc
+        DREG    R1," to ",cc
+ ]
+        EOR     R2,R1,R2
+ [ debug
+        DREG    R2,", changed = "
+ ]
+;
+; look for changes of state
+; R1 = current BMU flags
+; R2 = flag bits that have changed state
+;
+ [ CycleBattery
+        TSTS    R2,#PortableBMUF_ChargerPresent ; charger present flag changed?
+        BLNE    HandleChargerPresentChange      ; may alter R2, see comments in routine
+ ]
+        TSTS    R2,#PortableBMUF_Threshold_2    ; threshold 2 changed?
+        TSTNES  R1,#PortableBMUF_Threshold_2    ; if so, has it just arrived
+        BNE     %FT90                           ; branch if threshold 2
+
+        TSTS    R2,#PortableBMUF_LidOpen        ; lid opened or closed?
+        BLNE    HandleLidChange                 ; yes - handle it
+
+        TSTS    R2,#PortableBMUF_Threshold_1    ; T1 arrived or disappeared?
+        BLNE    HandleT1Change
+
+ [ CycleBattery
+        TSTS    R2,#PortableBMUF_Threshold_3    ; T3 arrived or disappeared?
+        BLNE    HandleT3Change
+ ]
+        EXITS
+
+;~~~~~~~~~~~~~~~
+
+90
+; Threshold 2 crossed
+ [ CycleBattery
+; if cycling the battery, reconnect the charger 
+        LDRB    R0,CycleCount
+        CMP     R0,#0
+        BLNE    ChargeBattery
+        EXITS   NE
+ ]
+; blank screen
+; if outside wimp
+;    *shutdown
+;    remove power
+
+        MOV     R0,#ScreenBlankerReason_Blank
+        SWI     XScreenBlanker_Control
+
+; Find out if Wimp is running.
+;    If it is, the task will shutdown everything
+;    If not, we must shutdown the machine here
+
+        MOV     R0,#3                           ; read Wimp state
+        SWI     XWimp_ReadSysInfo
+        MOVVS   R0,#0                           ; if error, assume no Wimp
+        TEQS    R0,#0                           ; Wimp?
+        EXITS   NE                              ; if yes, exit
+
+; Wimp is not running so shutdown machine
+
+        B       StarShutdown
+
+ [ HotKeyTasks
+KeyEvent1               ;HotKey_ToolBox
+        ENTRY   "R1"
+        MOV     R1,#PollWordReason_Task1
+        STR     R1,PollWord
+        EXITS
+
+KeyEvent2               ;HotKey_Heart
+        ENTRY   "R1"
+        MOV     R1,#PollWordReason_Task2
+        STR     R1,PollWord
+        EXITS
+
+KeyEvent3               ;HotKey_Battery
+        ENTRY   "R1,TWP"
+        LDR     TWP,TaskWorkspacePtr            ; set task workspace ptr
+        LDRB    R1,Task_Flags                   ; icon already present?
+        TSTS    R1,#F_IconPresent
+        MOVEQ   R1,#PollWordReason_AddIcon      ;EQ - no, so request its creation
+        MOVNE   R1,#PollWordReason_DelIcon      ;NE - yes, so request its deletion
+        STR     R1,PollWord
+        EXITS
+
+KeyEvent4               ;HotKey_Off
+        ENTRY   "R0,R1"
+  [ 1 = 0
+; Find out if Wimp is running.
+;    If it is, ask the TaskManager to shutdown the machine
+;    ???If not, we must shutdown the machine here???
+        MOV     R0,#3                           ; read Wimp state
+        SWI     XWimp_ReadSysInfo
+        MOVVS   R0,#0                           ; if error, assume no Wimp
+        TEQS    R0,#0                           ; Wimp?
+        EXITS   EQ                              ; if no, exit
+;EQ, Wimp is not running
+;NE, Wimp is running
+  ]
+        MOV     R1,#PollWordReason_Task4
+        STR     R1,PollWord
+        EXITS
+ ]
+
+;******************************************************************************
+
+Event   ROUT
+;
+; Entry:
+;    R0 = event number
+;         Event_PortableBMU => R1 = BMU flags
+;    MWP -> workspace
+;    MODE: SVC or IRQ
+;    IRQs disabled
+;
+; Exit:
+;    All registers and flags preserved
+
+ [ HotKeyTasks
+        TEQS    R0,#Event_Keyboard
+        BEQ     %FT10
+ ]
+        TEQS    R0,#Event_PortableBMU           ; our event?
+        MOVNES  PC,LR                           ; if no, quit
+
+; it is our event: save flags and add callback to handle status change
+
+        Push    "R0,LR"
+        STRB    R1,BMU_Flags                    ;  save new flags
+
+ [ Paranoid
+
+; reentrancy check
+
+        LDRB    LR,InEvent
+        TEQS    LR,#0
+        Pull    "R0,PC",NE,^                    ; quit if already in event
+
+; set reentrancy flag
+
+        MOV     LR,#1
+        STRB    LR,InEvent
+
+ ]
+
+; add callback to do work
+
+        addr    R0,BMUEvent
+        BL      AddCallBack
+
+; IRQs still disabled
+
+ [ Paranoid
+
+; clear reentrancy flag
+
+        MOV     LR,#0
+        STRB    LR,InEvent
+
+ ]
+
+        Pull    "R0,PC",,^
+
+ [ HotKeyTasks
+10
+        TEQS    R1, #1                          ;Only interested in keyboard key down event
+        MOVNES  PC,LR                           ; if not, quit
+
+        TEQS    R2, #HotKey_ToolBox             ;One of our keys?
+        TEQNES  R2, #HotKey_Heart
+        TEQNES  R2, #HotKey_Battery
+        TEQNES  R2, #HotKey_Off
+        MOVNES  PC,LR                           ; if not, quit
+
+        Push    "R0,LR"
+        ADR     R0, KeyEvent1
+        TEQS    R2, #HotKey_ToolBox
+        ADRNE   R0, KeyEvent2
+        TEQNES  R2, #HotKey_Heart
+        ADRNE   R0, KeyEvent3
+        TEQNES  R2, #HotKey_Battery
+        ADRNE   R0, KeyEvent4
+        TEQNES  R2, #HotKey_Off
+        BL      AddCallBack
+        Pull    "R0,PC",,^
+ ]
+
+;******************************************************************************
+
+ [ EstimateSetting
+TickerCB_UpdateBMU      ENTRY   "R0-R3"
+;
+; Callback from the ticker routine for maintaining the BMU variables.
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    All registers preserved
+
+; unavoidable windows in this code as BMU can update variables between
+; our reading and writing
+
+        LDRB    R3,BMU_Flags                    ; get flags
+
+        TSTS    R3,#PortableBMUF_BatteryPresent ; if no battery...
+        EXITS   EQ                              ; ...quit
+
+; have got a battery, update estimate (even if not in estimate mode)
+
+        MOV     R0,#PortableBMUV_ChargeEstimate ; read estimate
+        SWI     XPortable_ReadBMUVariable
+        EXITS   VS                              ; quit if error
+
+        TEQS    R1,#&FF                         ; valid?
+        EXITS   EQ                              ; quit if not
+
+; estimate byte is valid so update it
+
+        MOV     R2,R1                           ; save estimate
+        MOV     R0,#PortableBMUV_UsedCapacity   ; read used capacity
+        SWI     XPortable_ReadBMUVariable
+        EXITS   VS                              ; quit if error
+
+; update Previous_UsedCapacity before checking for charge/discharge
+; so that it's always up to date
+
+        LDR     R0,Previous_UsedCapacity        ; get previous value
+        STR     R1,Previous_UsedCapacity        ; write new previous
+
+; now check whether charging/discharging
+
+        TSTS    R3,#PortableBMUF_ChargerPresent ; charging?
+        BEQ     %F50                            ; branch if not
+
+; charging: set estimate = estimate - change in used capacity
+; R0 = previous value of used capacity
+; R1 = current value of used capacity
+; R2 = current estimate
+
+        SUBS    R0,R0,R1                        ; R0 = difference
+        MOVLT   R0,#0                           ; should always be positive
+
+; R0 = Previous_UsedCapacity - UsedCapacity
+; i.e. +ve if charging, -ve if discharging
+
+        SUBS    R1,R2,R0                        ; R2 = estimate - diff
+        MOVLT   R1,#0
+10
+; R1 = new estimate to write to BMU
+
+        CMPS    R1,#&FE
+        MOVHI   R1,#&FE
+        MOV     R0,#PortableBMUV_ChargeEstimate ; write new estimate
+        SWI     XPortable_WriteBMUVariable
+        EXITS
+
+;~~~~~~~~~~~~~~~
+
+50
+; discharging: set estimate = estimate + (current * hours)
+; R2 = current estimate
+
+        MOV     R0,#PortableBMUV_Current        ; read current
+        SWI     XPortable_ReadBMUVariable
+        EXITS   VS                              ; quit if error
+
+; R1 = current in units of 10.3 mA
+
+ [ debug
+        DREG    R1,"M: Current = ",cc
+ ]
+
+; estimate is in units of 11.7 mAh
+; sample period is in centiseconds
+
+        LDIMM   R0,103*(BMUTicks/100)           ; convert to mAs (*10)
+        MUL     R0,R1,R0
+
+ [ debug
+        DREG    R0," (",cc
+        DLINE   "/10 mAs)"
+ ]
+
+; do division, using previous remainder
+
+        LDR     R1,Previous_Remainder           ; get remainder
+        ADD     R0,R0,R1                        ; add it in
+        LDIMM   R1,60*60*117                    ; convert to units of 11.7 mAh
+        DivRem  R3,R0,R1,LR
+        STR     R0,Previous_Remainder           ; and save remainder
+
+ [ debug
+        DREG    R3,"M: add ",cc
+ ]
+        ADD     R1,R2,R3
+ [ debug
+        DREG    R1," to estimate, giving ",cc
+        DREG    R0," remainder "
+ ]
+        B       %B10
+ ]
+
+;******************************************************************************
+
+ [ EstimateSetting
+Ticker_UpdateBMU        ENTRY   "R0"
+;
+; Ticker routine to update BMU variables
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: IRQ or SVC
+;    IRQs disabled
+;
+; Exit:
+;    All registers and flags preserved
+
+ [ Paranoid
+
+; reentrancy check
+
+        LDRB    LR,InTicker
+        TEQS    LR,#0
+        Pull    "R0,PC",NE,^                    ; quit if already in ticker
+
+; set reentrancy flag
+
+        MOV     LR,#1
+        STRB    LR,InTicker
+
+ ]
+
+; add callback to do work
+
+        addr    R0,TickerCB_UpdateBMU
+        BL      AddCallBack
+
+; IRQs still disabled
+
+ [ Paranoid
+
+; clear reentrancy flag
+
+        MOV     LR,#0
+        STRB    LR,InTicker
+
+ ]
+
+        EXITS
+ ]
+
+;******************************************************************************
+
+ClaimEvent      ENTRY   "R1-R2"
+;
+; Claims event vector and enables BMU event
+;
+; Entry:
+;    MWP -> workspace
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+
+; claim event vector
+
+        MOV     R0,#EventV
+        addr    R1,Event
+        MOV     R2,MWP
+        SWI     XOS_Claim
+
+; enable BMU event
+
+        MOVVC   R0,#14                          ; enable
+        MOVVC   R1,#Event_PortableBMU
+        SWIVC   XOS_Byte
+
+        EXIT
+
+;******************************************************************************
+
+ReleaseEvent    ENTRY   "R1-R2"
+;
+; Disables BMU event and releases event vector
+;
+; Entry:
+;    MWP -> workspace
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+
+ [ OnStork
+; tell BMU to stop sending BMU event interrupts
+        MOV     R0, #PortableBMUC_DisablePMInts
+        SWI     XPortable_CommandBMU            ;
+ ]
+
+; disable BMU event
+
+        MOV     R0,#13                          ; disable
+        MOV     R1,#Event_PortableBMU
+        SWI     XOS_Byte
+
+; release event vector, even if disable failed
+
+        MOV     R0,#EventV
+        addr    R1,Event
+        MOV     R2,MWP
+        SWI     XOS_Release
+
+        EXIT
+
+;******************************************************************************
+
+InitBMUVars     ENTRY   "R1"
+;
+; Initialises copies of BMU variables
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: SVC
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+
+ [ EstimateSetting
+; Initialise remainder for Estimate code
+
+        MOV     R0,#0
+        STR     R0,Previous_Remainder
+ ]
+
+; Read BMU flags: we can do this with IRQs disabled and it will not
+; enable IRQs. We'll then receive any changes via the event
+
+        TEQP    PC,#SVC_mode :OR: I_bit         ; IRQs off
+
+; First initialise flags known about (for the event routine) to a value
+; that assumes that we have no charger, lid is open and have seen
+; no thresholds
+
+        MOV     R0,#PortableBMUF_LidOpen
+        STRB    R0,Module_BMU_Flags
+
+ [ EstimateSetting
+; Initialise Previous_UsedCapacity (will enable IRQs but restore on exit)
+
+        MOV     R0,#PortableBMUV_UsedCapacity   ; read BMU variable
+        SWI     XPortable_ReadBMUVariable
+        STRVC   R1,Previous_UsedCapacity
+ ]
+
+; Read and process flags
+
+        MOVVC   R0,#PortableBMUV_Flags          ; variable
+        SWIVC   XPortable_ReadBMUVariable
+        STRVCB  R1,BMU_Flags
+        BLVC    BMUEvent
+
+; exit, restoring previous IRQ state
+
+        PullEnv
+        ORRVSS  PC,LR,#V_bit
+        BICVCS  PC,LR,#V_bit
+
+;******************************************************************************
+
+BMUBegin        ENTRY   "R1-R2"
+;
+; Sets stuff up for access to BMU.
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: SVC
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+
+; initialise BMU flags
+
+        MOV     R0,#PortableBMUF_LidOpen
+        STRB    R0,BMU_Flags
+
+        MOV     R0,#0
+        STRB    R0,T1BeepActive
+
+ [ Paranoid
+
+; clear locks
+
+ [ EstimateSetting
+        STRB    R0,InTicker
+ ]
+        STRB    R0,InEvent
+
+ ]
+
+ [ CycleBattery
+        ASSERT  CycleStateReason_Charging = 0
+        STRB    R0, CycleState                  ; normal machine use, ie not
+        STRB    R0, CycleCount                  ; discharge/charge cycling the battery
+        MOV     R0, #PortableBMUC_ConnectCharger ;ensure charger is actually on
+        SWI     XPortable_CommandBMU            ;
+ ]
+
+; claim event vector and enable the BMU event
+
+        BL      ClaimEvent
+        EXIT    VS                              ; quit if error
+
+; initialise the BMU variables
+
+        BL      InitBMUVars
+        BVS     %FT10                           ; branch if error
+
+ [ OnStork
+; tell BMU to start sending BMU event interrupts when power state changes
+        MOV     R0, #PortableBMUC_EnablePMInts
+        SWI     XPortable_CommandBMU            ;
+ ]
+
+ [ EstimateSetting
+; set up a CallEvery to update the time variables in the BMU
+
+        LDIMM   R0,BMUTicks - 1                 ; call frequency (-1 for OS bug)
+        addr    R1,Ticker_UpdateBMU             ; R1 -> code
+        MOV     R2,MWP                          ; R2 = R12 value to pass
+        SWI     XOS_CallEvery
+ ]
+        PullEnv VC                              ; quit if all ok
+        BICVCS  PC,LR,#V_bit
+10
+; error: release event vector
+
+        MOV     R1,R0                           ; save error
+        BL      ReleaseEvent
+        MOV     R0,R1                           ; get back error
+
+        SETV
+        EXIT
+
+;******************************************************************************
+
+BMUEnd  ENTRY   "R1"
+;
+; Shuts down BMU access stuff
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: SVC
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+
+ [ EstimateSetting
+; remove ticker event
+
+        addr    R0,Ticker_UpdateBMU             ; R0 -> code
+        MOV     R1,MWP                          ; R1 = R12 value
+        SWI     XOS_RemoveTickerEvent
+ ]
+; remove beeping call every
+; R1 preserved
+
+        addr    R0,Ticker_LidClosedBeep,VC
+        SWIVC   XOS_RemoveTickerEvent
+
+; remove event interception
+
+        BLVC    ReleaseEvent
+        EXIT    VS
+
+; remove any callbacks, ignoring errors
+; no more callbacks can be added now as we have removed the
+; ticker and event routines
+; R1 preserved
+
+        addr    R0,BMUEvent
+        SWI     XOS_RemoveCallBack
+
+ [ HotKeyTasks
+        ADR     R0, KeyEvent1           ;HotKey_ToolBox
+        MOV     R1,MWP
+        SWI     XOS_RemoveCallBack
+
+        ADR     R0, KeyEvent2           ;HotKey_Heart
+        MOV     R1,MWP
+        SWI     XOS_RemoveCallBack
+
+        ADR     R0, KeyEvent3           ;HotKey_Battery
+        MOV     R1,MWP
+        SWI     XOS_RemoveCallBack
+
+        ADR     R0, KeyEvent4           ;HotKey_Off
+        MOV     R1,MWP
+        SWI     XOS_RemoveCallBack
+ ]
+
+ [ EstimateSetting
+        addr    R0,TickerCB_UpdateBMU
+        MOV     R1,MWP
+        SWI     XOS_RemoveCallBack
+ ]
+        addr    R0,TickerCB_LidClosedBeep
+        MOV     R1,MWP
+        SWI     XOS_RemoveCallBack
+
+        CLRV
+        EXIT
+
+;******************************************************************************
+ [ CycleBattery
+AbortCycling
+;
+; Abort battery discharge/charge cycling.
+;
+; Entry:
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+        MOV     R0, #0
+                                ;drop into...
+
+
+StartCycling ENTRY "R1"
+;
+; Discharge/charge the battery a specified number of times.
+;
+; Entry
+;    R0 = number of cycles or zero to abort
+;    MWP -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+        LDRB    R1,BMU_Flags                    ; get current flags
+        TSTS    R1,#PortableBMUF_ChargerPresent ; is charger available?
+        MOVEQ   R0,#0                           ; no, abort cycling
+
+        STRB    R0,CycleCount
+        CMP     R0, #0
+        BLEQ    ChargeBattery
+        BLNE    DischargeBattery
+
+        EXITS
+
+
+DischargeBattery ENTRY "R1"                     ;Part of battery discharge/charge cycling.
+; 
+; No checks for charger presence, as cycling can only be started if it is,
+; also BMUevent aborts cycling when charger disappears.
+;
+        LDRB    R0, CycleState
+        CMP     R0, #CycleStateReason_Discharging       ;are we discharging?
+        EXITS   EQ                                      ;Yes, so nothing to do
+
+        MOV     R0, #PortableBMUC_DisconnectCharger ;turn charger off
+        SWI     XPortable_CommandBMU
+ [ 1=0
+        MOV     R0, #PowerWasters
+        MOV     R1, #:NOT:PowerWasters
+        SWI     XPortable_Control
+
+        EORVC   R0, R0, R1                      ;bits that changed
+        ANDVC   R0, R0, R1                      ;bits that we forced on
+
+        STRVC   R0, CyclePowered                ;bits that are on at our request
+                                                ;NB its our responsibility to attempt to turn
+                                                ;   them off once discharge completes or aborts
+ ]
+10
+        MOV     R0, #CycleStateReason_Discharging
+        STRB    R0, CycleState
+20
+        EXITS
+
+
+
+
+
+ChargeBattery ENTRY "R1"                        ;Part of battery discharge/charge cycling.
+        LDRB    R0, CycleState
+        CMP     R0, #CycleStateReason_Discharging       ;are we discharging?
+        EXITS   NE                                      ;No, so nothing to do
+
+        MOV     R0,#CycleStateReason_Charging   ;must remove discharge indication or our service handler
+        STRB    R0, CycleState                  ;will prevent powerdown
+  [ 1=0
+        LDR     R1, CyclePowered                ;try to power down those units that we powered up in DischargeBattery
+        MOV     R0, #&FFFFFFFF
+        EOR     R1, R1, R0      
+        MOV     R0, #0           
+        SWI     XPortable_Control               ;or were held powered up by our service handler
+
+        MOV     R1, #0                          ;we are no longer holding units powered up
+        STR     R1, CyclePowered                ;
+  ]
+
+        MOV     R0,#PortableBMUC_ConnectCharger ;turn charger on
+        SWI     XPortable_CommandBMU            ;
+
+        EXITS
+
+ ]
+;******************************************************************************
+
+        LTORG
+
+        END

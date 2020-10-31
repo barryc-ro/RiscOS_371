@@ -1,0 +1,394 @@
+/* > screenmode.h
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "bbc.h"
+#include "swis.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define screenmode_internal
+#include "screenmode.h"
+
+#ifndef OS_ScreenMode
+#define OS_ScreenMode   0x65
+#endif
+
+#define err_UnknownSWI  0x1E6
+
+enum
+{
+    ScreenMode_Select,
+    ScreenMode_ReturnSpecifier,
+    ScreenMode_Enumerate,
+    ScreenMode_SetMonitorType
+};
+
+#define sprite_Xppi 0x00000002
+#define sprite_Yppi 0x00004000
+#define sprite_BPP  0x08000000
+
+#define sprite_typeword(bpp,x,y)    ((bpp)*sprite_BPP + (x)*sprite_Xppi + (y)*sprite_Yppi + 1)
+
+#define OS_UNITS_PER_INCH   180
+
+mode_infostr screen_Vars;
+
+static int defmodes[4][4] =
+{
+    { 25, 26, 27, 28 }, /* 90x90 */
+    { 0, 8, 12, 15 },   /* 90x45 */
+    { -1, -1, -1, -1 }, /* 45x90 */
+    { 4, 1, 9, 13 }     /* 45x45 */
+};
+
+int mode_EquivalentMode(int bpp, int xeig, int yeig)
+{
+    int type = -1;
+    if ((xeig == 1 || xeig == 2) &&
+        (yeig == 1 || yeig == 2) &&
+        bpp <= 8)
+    {
+        int         val = (xeig-1)*2 + (yeig-1);
+        const int   *modes = defmodes[val];
+        switch (bpp)
+        {
+            case 1:
+                type = modes[0];
+                break;
+            case 2:
+                type = modes[1];
+                break;
+            case 4:
+                type = modes[2];
+                break;
+            case 8:
+                type = modes[3];
+                break;
+        }
+    }
+    return type;
+}
+
+mode_infostr screen_CurrentInfo(void)
+{
+    mode_infostr    info;
+    static bbc_modevariable modevars[] =
+    {
+        bbc_XWindLimit,
+        bbc_YWindLimit,
+        bbc_Log2BPP,
+        bbc_XEigFactor,
+        bbc_YEigFactor,
+        bbc_LineLength,
+        -1
+    };
+
+    bbc_vduvars((int *)modevars, (int *)&info);
+
+    if (info.linelength == (info.npixels + 1)*2)    /* fix for ColourCard */
+        info.log2bpp = 4;
+
+    info.oswidth = ++info.npixels << info.xeig;
+    info.osheight = ++info.nlines << info.yeig;
+    info.bpp = 1 << info.log2bpp;
+    info.dx = 1 << info.xeig;
+    info.dy = 1 << info.yeig;
+
+    info.spritetype = sprite_typeword(info.log2bpp + 1,
+                            OS_UNITS_PER_INCH >> info.xeig,
+                            OS_UNITS_PER_INCH >> info.yeig);
+
+    info.spritemode = mode_EquivalentMode(info.bpp, info.xeig, info.yeig);
+    if (info.spritemode == -1)
+    {
+        mode_specifier  spec = screen_ReturnSpecifier();
+
+        if (spec.mode < 128)
+            info.spritemode = spec.mode;
+        else
+            info.spritemode = info.spritetype;
+    }
+
+    screen_Vars = info;
+    return info;
+}
+
+os_error *mode_Select(mode_specifier mode)
+{
+    os_error *e = _swix(OS_ScreenMode, _IN(0)|_IN(1), ScreenMode_Select, mode);
+    if (e && e->errnum == err_UnknownSWI)
+        e = bbc_mode(mode.mode);
+    return e;
+}
+
+mode_specifier screen_ReturnSpecifier(void)
+{
+    mode_specifier mode;
+    os_error *e = _swix(OS_ScreenMode, _IN(0)|_OUT(1), ScreenMode_ReturnSpecifier, &mode.mode);
+    if (e && e->errnum == err_UnknownSWI)
+    {
+        int x;
+        os_byte(135, &x, &mode.mode);
+    }
+    return mode;
+}
+
+static char *depth_string[16] =
+{
+    "2", "4", "16", "256", "32K", "16M",        /* modes */
+    "24bit", "CMYK"                             /* extra sprite types */
+};
+
+mode_type mode_String(mode_specifier mode, char *buffer)
+{
+    mode_type type = mode_Type(mode.mode);
+    switch (type)
+    {
+        case mode_IsModeNumber:
+            sprintf(buffer, "%d", mode.mode);
+            break;
+
+        case mode_IsSpriteType:
+            sprintf(buffer, "C%s XDPI%d YDPI%d",
+                depth_string[(unsigned)mode.spritetype >> 27],
+                (mode.spritetype >> 1)  & 0x00001fff,
+                (mode.spritetype >> 14) & 0x00001fff);
+            break;
+
+        case mode_IsSpecifier:
+        {
+            int n = sprintf(buffer, "X%d,Y%d,C%s,EX%d,EY%d",
+                mode.specifier->xres,
+                mode.specifier->yres,
+                depth_string[mode.specifier->depth],
+                mode_xeig(mode.mode),
+                mode_yeig(mode.mode));
+
+            if (mode.specifier->frame_rate != -1)
+                sprintf(buffer+n, ",F%d", mode.specifier->frame_rate);
+            break;
+        }
+    }
+    return type;
+}
+
+/*
+ * Initialise *context to 0
+ * set *size to space pointed to by blk  
+ * Returns TRUE if there are more modes to be returned
+ */
+
+BOOL mode_Enumerate(mode_enumeratestr *blk, int *context, int *size)
+{
+    int claimed;
+    _swix(OS_ScreenMode, _IN(0)|_IN(2)|_IN(6)|_IN(7) | _OUT(1)|_OUT(2)|_OUT(7),
+            ScreenMode_Enumerate, *context, blk, *size,
+            &claimed, context, size);
+    return claimed == 0;
+}
+
+int mode_CountEntries(int *size)
+{
+    int nentries, blocksize;
+    _swix(OS_ScreenMode, _IN(0)|_IN(2)|_IN(6)|_IN(7) | _OUT(2)|_OUT(7),
+            ScreenMode_Enumerate, 0, 0, 0,
+            &nentries, &blocksize);
+    if (size)
+        *size = -blocksize;
+    return nentries;
+}
+
+mode_type mode_Type(int mode)
+{
+    if ((unsigned)mode < 128 || mode == -1)
+        return mode_IsModeNumber;
+    if (mode & 1)
+        return mode_IsSpriteType;
+    return mode_IsSpecifier;
+}
+
+static int get_eig(int ppi)
+{
+    switch (ppi)
+    {
+        case OS_UNITS_PER_INCH/8:   return 3;
+        case OS_UNITS_PER_INCH/4:   return 2;
+        case OS_UNITS_PER_INCH/2:   return 1;
+        case OS_UNITS_PER_INCH:     return 0;
+    }
+    return -1;
+}
+
+BOOL mode_var(int mode, int var, int *val)
+{
+    int flags;
+    return _swix(OS_ReadModeVariable,
+                _IN(0)|_IN(1)|_OUT(2)|_OUT(_FLAGS),
+                mode, var, val, &flags) == NULL &&
+            (flags & _C) == 0;
+}
+
+int mode_xeig(int mode)
+{
+    int eig;
+    if (!mode_var(mode, bbc_XEigFactor, &eig))
+        eig = get_eig((mode >> 1) & 0x00001fff);
+    return eig;
+}
+
+int mode_yeig(int mode)
+{
+    int eig;
+    if (!mode_var(mode, bbc_YEigFactor, &eig))
+        eig = get_eig((mode >> 14) & 0x00001fff);
+    return eig;
+}
+
+int mode_xppi(int mode)
+{
+    if (mode_Type(mode) == mode_IsSpriteType)
+        return (mode >> 1) & 0x00001fff;
+    return OS_UNITS_PER_INCH >> bbc_modevar(mode, bbc_XEigFactor);
+}
+
+int mode_yppi(int mode)
+{
+    if (mode_Type(mode) == mode_IsSpriteType)
+        return (mode >> 14) & 0x00001fff;
+    return OS_UNITS_PER_INCH >> bbc_modevar(mode, bbc_YEigFactor);
+}
+
+static char mode__bpp[32] =
+{
+    0, 1, 2, 4, 8, 16, 32, 32,
+    24,0, 0, 0, 0,  0,  0, 0,
+    0, 0, 0, 0, 0,  0,  0, 0,
+    0, 0, 0, 0, 0,  0,  0, 0
+};
+
+int mode_bpp(int mode)
+{
+    int log2bpp;
+    if (mode_var(mode, bbc_Log2BPP, &log2bpp))
+        return 1 << log2bpp;
+    return mode__bpp[(unsigned)mode >> 27];
+}
+
+static os_error *mode__ReadPalette(int mode, void **pbuffer, int *size_out, BOOL default_palette)
+{
+    int size, palette = default_palette ? 0 : -1;
+    os_error *e;
+
+    if (mode_bpp(mode) > 8)
+    {
+        *pbuffer = NULL;
+        if (size_out)
+            *size_out = NULL;
+        return NULL;
+    }
+
+    if ((e = _swix(ColourTrans_ReadPalette,
+                _IN(0)|_IN(1)|_IN(2)|_IN(3)|
+                _OUT(3),
+                mode, palette, 0, 0, &size)) != NULL)
+        return e;
+
+    if (size_out)
+        *size_out = size;
+
+    if ((*pbuffer = malloc(size)) != NULL)
+    {
+        if ((e = _swix(ColourTrans_ReadPalette,
+                _IN(0)|_IN(1)|_IN(2)|_IN(3),
+                mode, palette, *pbuffer, size)) != NULL)
+            free(*pbuffer);
+    }
+    return e;
+}
+
+os_error *screen_ReadPalette(void **pbuffer, int *size_out)
+{
+    return mode__ReadPalette(-1, pbuffer, size_out, FALSE);
+}
+
+os_error *mode_ReadDefaultPalette(int mode, void **pbuffer, int *size_out)
+{
+    return mode__ReadPalette(mode, pbuffer, size_out, TRUE);
+}
+
+os_error *screen_WritePalette(void *palette)
+{
+    return _swix(ColourTrans_WritePalette,
+                _IN(0) | _IN(1) | _IN(2) | _IN(3),
+                -1, -1, palette, 0);
+}
+
+os_error *screen_SetFGCol(int paletteword)
+{
+    return _swix(ColourTrans_SetGCOL, _IN(0)|_IN(3)|_IN(4),
+                 paletteword, 0x100, 0);
+}
+
+os_error *screen_SetBGCol(int paletteword)
+{
+    return _swix(ColourTrans_SetGCOL, _IN(0)|_IN(3)|_IN(4),
+                 paletteword, 0x180, 0);
+}
+
+os_error *screen_SetOppFGCol(int paletteword)
+{
+    return _swix(ColourTrans_SetOppGCOL, _IN(0)|_IN(3)|_IN(4),
+                 paletteword, 0x100, 0);
+}
+
+os_error *screen_SetOppBGCol(int paletteword)
+{
+    return _swix(ColourTrans_SetOppGCOL, _IN(0)|_IN(3)|_IN(4),
+                 paletteword, 0x180, 0);
+}
+
+os_error *screen_SetFontColours(int font, int background, int foreground, BOOL anti_alias)
+{
+    return _swix(ColourTrans_SetFontColours, _IN(0)|_IN(1)|_IN(2)|_IN(3),
+                 font, background, foreground, anti_alias ? 14 : 0);
+}
+
+int screen_BitAddress(int osx, int osy)
+{
+    return ((screen_Vars.osheight - osy) >> screen_Vars.yeig)*(screen_Vars.linelength << 3) +
+            ((osx >> screen_Vars.xeig) << screen_Vars.log2bpp);
+}
+
+BOOL wimpt_checkmode(void)
+{
+    int oldmode = screen_Vars.spritemode;
+    (void)screen_CurrentInfo();
+    return oldmode != screen_Vars.spritemode;
+}
+
+int wimpt_bpp(void)
+{
+    return screen_Vars.bpp;
+}
+
+int wimpt_dx(void)
+{
+    return screen_Vars.dx;
+}
+
+int wimpt_dy(void)
+{
+    return screen_Vars.dy;
+}
+
+int wimpt_mode(void)
+{
+    return screen_Vars.spritemode;
+}
+
+/* eof screenmode.c */

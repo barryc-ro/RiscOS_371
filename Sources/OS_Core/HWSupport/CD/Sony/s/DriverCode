@@ -1,0 +1,2248 @@
+; DriverCode.s
+
+; "CD-ROM CDU-541 " - identifier for 541 drive
+; "CD-ROM CDU-6XXX" - identifier for 6111 drive
+; "CD-ROM CDU-561 " - identifier for 561 drive
+
+
+;     NEVER CHANGE R7 or R11
+
+
+
+
+
+
+
+
+
+; This carries out the CD_ SWI commands for Sony 541's (and compatible 6111) and 561's
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+;-----------------------------------------------------------------------------------------------
+driver_handler_code ROUT
+;
+; on entry:
+;          r0  - r6= Whatever values the various CD_ SWIs use
+;          r7 -> control block
+;                control block + 0   = SCSI device id (0-7)
+;                control block + 4   = SCSI card number (0-3 usually 0)
+;                control block + 8   = Logical Unit Number (0-7 usually 0)
+;                control block + 12  = Drive type for this module
+;          r8  = full drive type
+;          r11 = the number of the CD_ SWI, ie/ 0 = CD_ReadData, 1 = CD_SeekTo etc;
+;          r12 -> workspace for this module
+;          r13 -> a full descending stack, approx. 1024 bytes
+;          r14 = address to return to
+; on exit:
+;          r0 must be preserved or be return value for the particular SWI
+;          r1 - r12 & r14 corrupted
+;-----------------------------------------------------------------------------------------------
+
+;--------------------
+; Special tag
+;--------------------
+ DCD       &EE50EE50
+
+;--------------------
+; Code
+;--------------------
+
+ STASH     "r0, r14"
+
+;----------------------------------------------------------
+; Branch to the correct piece of code to handle the command
+; The two top bits of R11 (SWIN) are used to indicate the
+; number of retries
+;----------------------------------------------------------
+ BIC       r14, SWIN, #3:SHL:30
+ ADR       r10, jump_table_start
+ LDR       r14, [ r10, r14, LSL #1 ]
+ MOV       r14, r14, LSL #16
+ ADD       pc, pc, r14, LSR #16
+
+jump_table_start
+ [ Version >=103
+ DCW ReadData        - jump_table_start - 4      ;  0   OK  
+ |
+ DCW notsupported    - jump_table_start - 4      ;  0   OK  ReadData
+ ]
+ DCW notsupported    - jump_table_start - 4      ;  1   OK  SeekTo
+ DCW notsupported    - jump_table_start - 4      ;  2   OK  DriveStatus
+ DCW notsupported    - jump_table_start - 4      ;  3   OK  DriveReady
+ DCW GetParameters   - jump_table_start - 4      ;  4   OK
+ DCW SetParameters   - jump_table_start - 4      ;  5             541 problem going in to mode 2
+ DCW notsupported    - jump_table_start - 4      ;  6   OK  OpenDrawer
+ DCW EjectButton     - jump_table_start - 4      ;  7   OK
+ DCW EnquireAddress  - jump_table_start - 4      ;  8   OK
+ DCW EnquireDataMode - jump_table_start - 4      ;  9   OK
+ DCW PlayAudio       - jump_table_start - 4      ; 10   OK
+ DCW PlayTrack       - jump_table_start - 4      ; 11   OK
+ DCW AudioPause      - jump_table_start - 4      ; 12   OK give illegalrequest if not playing
+ DCW EnquireTrack    - jump_table_start - 4      ; 13   OK
+ DCW ReadSubChannel  - jump_table_start - 4      ; 14   OK
+ DCW notsupported    - jump_table_start - 4      ; 15   OK  CheckDrive
+ DCW DiscChanged     - jump_table_start - 4      ; 16   OK
+ DCW notsupported    - jump_table_start - 4      ; 17   OK  StopDisc
+ DCW notsupported    - jump_table_start - 4      ; 18   OK  DiscUsed
+ DCW AudioStatus     - jump_table_start - 4      ; 19   OK
+ DCW notsupported    - jump_table_start - 4      ; 20   OK  Inquiry
+ DCW DiscHasChanged  - jump_table_start - 4      ; 21   OK
+ DCW notsupported    - jump_table_start - 4      ; 22   OK  Control
+ DCW Supported       - jump_table_start - 4      ; 23   OK
+ DCW notsupported    - jump_table_start - 4      ; 24   OK  Prefetch
+ DCW notsupported    - jump_table_start - 4      ; 25   OK  Reset
+ DCW notsupported    - jump_table_start - 4      ; 26   OK  CloseDrawer
+ DCW IsDrawerLocked  - jump_table_start - 4      ; 27   OK
+ DCW notsupported    - jump_table_start - 4      ; 28   OK  AudioControl
+ DCW notsupported    - jump_table_start - 4      ; 29   OK  AudioLevel
+ DCW Identify        - jump_table_start - 4      ; 30 should identify 541/6111 and 561
+ DCW ReadAudio       - jump_table_start - 4      ; 31       ReadAudio
+ DCW notsupported    - jump_table_start - 4      ; 32       ReadUserData - see CDFSDriver
+
+ ALIGN
+
+notsupported
+ ADR       r0, not_supported_error
+ B         error_handler_lookup
+
+;-----------------------------------------------------------------------------------------------
+ [ Version >= 103
+ReadData ROUT
+ ]
+;
+; on entry:
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r2 =   number of blocks
+;          r3 ->  where to put data
+;          r4 =   number of bytes from each block wanted
+;          r7 ->  control block
+;          r12 -> my workspace
+;          r13 -> full descending stack
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+ Debug "ReadData",NL
+
+ [ Version >=103
+
+
+ LDMIA     r7, { r8, r9, r10 }
+
+
+ MUL       r4, r2, r4
+
+;---------------------
+; Set up the cdb block
+;---------------------
+ MOV       r5, #&28
+ ORR       r5, r5, r10, LSL #8+5
+ MOV       r6, r2, LSR #8         ; Number of blocks
+ MOV       r6, r6, LSL #24        ;
+ AND       r14, r2, #255          ;
+ ADR       r2, buffer
+ STMIA     r2, { r5, r6, r14 }
+
+
+
+; R0 = address mode, R1 = address, RETURNS R1 = address
+
+ SWI       XCD_ConvertToLBA
+ BVS       error_handler
+
+
+; Trying to load PVD on a 561 drive ?
+ LDR       r14, [ r7, #drivetypeoffset ]
+ TEQ       r14, #SONY_561
+ TEQEQ     r1, #16
+ BLEQ      last_session
+
+;------------------
+; put in start pos
+;------------------
+ STRB      r1, buffer + 5
+ MOV       r1, r1, LSR #8
+ STRB      r1, buffer + 4
+ MOV       r1, r1, LSR #8
+ STRB      r1, buffer + 3
+ MOV       r1, r1, LSR #8
+ STRB      r1, buffer + 2
+
+
+;--------------------
+; Do the SCSI command
+;--------------------
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+; r1 = size of cdb
+ MOV       r1, #10
+
+; r2 -> cdb
+
+; r3 -> put data here
+
+; r4 = number of bytes returned
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ GRABS     "r0, pc", VC
+
+
+;-----------------------------------------------
+; If the error is "Illegal Request", "DataProtect" or "Blank check"
+; THEN make it WrongDataMode
+;-----------------------------------------------
+ LDR       r6, [ r0 ]
+
+ LDR       r14, =IllegalRequest
+ SUBS      r6, r6, r14
+ SUBNES    r6, r6, #(DataProtect - IllegalRequest)
+ SUBNES    r6, r6, #(BlankCheck  - DataProtect)
+ addr      r0, wrong_data_mode_error, EQ 
+;-----------------------------------------------
+
+ BEQ       error_handler_lookup
+ B         error_handler
+
+
+;-----------------------------------------------
+last_session
+;-----------------------------------------------
+; This finds the number of sessions on the disc
+; and the first block + 16 in the last session
+; and returns it in r1.
+
+; r7  -> control block
+; r10 =  logical unit number
+
+ STASH     "r0, r2-r8, r14"
+
+ Debug "last_session",NL
+
+ ADR       r2, buffer + 32
+ MOV       r1, #&43
+ ORR       r1, r1, r10, LSL #8+5
+ MOV       r3, #0
+ MOV       r4, #12
+ ORR       r4, r4, #64:SHL:8
+ STMIA     r2, { r1, r3, r4 }
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 64
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+ MOVVS     r1, #16
+ GRAB      "r0, r2-r8, pc", VS
+
+; Load the first block address of the last session
+ LDR       r2, buffer + 64 + 4 + 4
+ MOV       r5, #&ff00
+ ORR       r5, r5, r5, LSL #16
+ AND       r6, r5, r2, ROR #8
+ AND       r1, r5, r2
+ ORR       r1, r6, r1, ROR #24
+ ADD       r1, r1, #16
+
+ GRAB      "r0, r2-r8, pc"
+
+;-----------------------------------------------
+
+
+ |
+; Old way is to use the CDFSDriver internal routine instead
+ ]
+
+;-----------------------------------------------------------------------------------------------
+;SeekTo ROUT
+;
+; on entry:
+;          
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+;DriveStatus ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          r0 = status { 1=OK, 2=BUSY, 4=NOTREADY, 8=UNAVAILABLE }
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+;DriveReady ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          r0 = 0 if drive is OK, else r0 = 1
+;
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+GetParameters ROUT
+;
+; on entry:
+;          r0 -> parameter block
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "GetParameters",NL
+
+ MOV       r6, #1
+
+set_parameters_jumps_in_here
+
+ STASH     r0
+
+ LDMIA     r7, { r8, r9, r10 }
+
+; r3 -> store here
+
+;--------------------------------
+; SCSI ModeSense command
+;--------------------------------
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ ADR       r2, buffer
+ MOV       r1, #&1a
+ ORR       r1, r1, r10, LSL #8+5
+ ORR       r1, r1, #&3f:SHL:16
+ MOV       r4, #66
+ STMIA     r2, { r1, r4 }
+
+ MOV       r1, #6
+
+ ADR       r3, buffer + 16
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ GRAB      r4
+
+ BVS       error_handler
+
+
+;-----------------------------------
+; Pick out the actual data to return
+;-----------------------------------
+
+; Walk along the pages
+; r8  -> page 8
+
+ ADR       r8, buffer + 16 + 12
+ LDRB      r9, [ r8, #1 ]        ; -> page 1
+ ADD       r9, r9, #3
+
+ LDRB      r10, [ r8, r9 ]!      ; -> page 2
+ ADD       r10, r10, #2
+
+ LDRB      r9, [ r8, r10 ]!      ; -> page 7
+ ADD       r9, r9, #2
+
+ LDRB      r10, [ r8, r9 ]!
+; SUB       r8, r8, #1            ; -> page 8
+
+
+; Inactivity timer multiplier
+; LDRB      r1, buffer + 16 + 12 + 8 + 12 + 8 + 3
+ LDRB      r1, [ r8, #3 - 1 ]
+ AND       r2, r1, #15
+
+; read retry count  OK
+ LDRB      r3, buffer + 16 + 12 + 3
+
+; data mode         OK
+ LDRB      r14, buffer + 16 + 4 + 7
+ LDRB      r1, buffer + 16 + 4 + 6
+ ORR       r14, r14, r1, LSL #8
+ LDRB      r1, buffer + 16 + 4 + 5
+ ORR       r14, r14, r1, LSL #16
+ TEQ       r14, #mode1datasize
+
+;------------------------------------
+; Mode 1, mode 2 or mode 2 form 1 ?
+;------------------------------------
+ [ Version > 100
+
+; If the buffering has been set to 2 then it must be mode 2 form 1
+ LDRB      r9, buffer + 16 + 12 + 8 + 2
+ TEQEQ     r9, #2
+ MOVEQ     r5, #3
+ BEQ       %FT01
+
+ TEQ       r14, #mode1datasize
+ MOVEQ     r5, #1
+ MOVNE     r5, #2
+01
+
+ | ; old way - only mode 1 or mode 2
+ MOVEQ     r5, #1
+ MOVNE     r5, #2
+ ]
+
+
+ MOV       r9, r6
+
+; RESERVED or on sony 561 this is speed switch
+ LDR       r6, [ r7, #drivetypeoffset ]
+ TEQ       r6, #SONY_561
+ LDREQB    r6, buffer + 16 + 12 + 8 + 16 + 8 + 16 + 2
+ ADDEQ     r6, r6, #1
+ MOVNE     r6, #0
+
+ TEQ       r9, #0
+ BEQ       set_parameters_back
+
+
+ STMIA     r4, { r2, r3, r5, r6 }
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+SetParameters ROUT
+;
+; on entry:
+;          r0 -> parameter block
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "SetParameters",NL
+
+ MOV       r6, #0
+ B         set_parameters_jumps_in_here
+
+set_parameters_back
+ ; r4 -> parameter block
+ ; r8 -> page 8 + 1
+
+ Debug "set_parameters_back",NL
+
+; Quick check to see if user wants to change parameters or leave as currently are
+ LDMIA     r4, { r0, r1, r10, r14 }
+ TEQ       r0, r2
+ TEQEQ     r1, r3
+ TEQEQ     r10, r5
+ TEQEQ     r14, r6
+ BEQ       timer_kludge
+
+ LDMIA     r4, { r0, r1, r2, r3 }
+
+
+ MOV       r6, #0
+
+;-----------------------------------------
+; Go about setting parameters
+; not used in ModeSelect
+;-----------------------------------------
+ STRB      r6, buffer + 16 + 0
+ STRB      r6, buffer + 16 + 4 + 1
+ STRB      r6, buffer + 16 + 4 + 2
+ STRB      r6, buffer + 16 + 4 + 3
+
+;-------------------------------------------------
+; Insert chosen parameters into current parameters
+;-------------------------------------------------
+
+; Inactivity multiplier
+; STRB      r0, buffer + 16 + 6 + 12 + PAGE1 + PAGE2 + PAGE7 + 3
+ STRB      r0, [ r8, #3 - 1 ]
+
+; Read retry count
+ STRB      r1, buffer + 16 + 12 + 3
+
+;-----------------------------------------------------------------
+; Mode 2 data must have L-EC turned off - Mode 1 should have it on
+;-----------------------------------------------------------------
+
+ TEQ       r2, #2
+
+; no L-EC - mode 2 data only
+ MOVEQ     r14, #&27
+
+; L-EC, CIRC - other modes
+ MOVNE     r14, #0
+
+ STRB      r14, buffer + 16 + 4 + 8 + 2
+
+;------------------------------
+; Change LBA size in disc drive
+;------------------------------
+ LDREQ     r1, =mode2datasizeHBLB
+ MOVNE     r1, #mode1datasizeHBLB
+ STR       r1, buffer + 16 + 4 + 4
+
+
+; Kludge for SONY 561 drive so that end blocks on disc are read !!!!
+ [ Version > 100
+
+; This sets the buffering to only 1 block if in mode 2 form 1, else it buffers 128 blocks
+
+ TEQ       r2, #3
+ MOVEQ     r8, #2                        ; buffer 1 block
+ MOVNE     r8, #4                        ; default of 2 blocks
+ STRB      r8, buffer + 16 + 12 + 8 + 2
+ ]
+
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+
+;-----------------------------------------
+; RESERVED word or on 561 is drive speed
+;-----------------------------------------
+ TEQ       r14, #SONY_561
+ BNE       %FT01
+
+ CMP       r3, #3
+ MOVCS     r3, #2
+ SUBS      r3, r3, #1
+ STRGEB    r3, buffer + 16 + 12 + 8 + 16 + 8 + 16 + 2
+
+
+01
+
+ TEQ       r14, #SONY_561
+
+;--------------------------------
+; SCSI ModeSelect command
+;--------------------------------
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + writedata  ; prevent 'escape key'
+
+ ADR       r2, buffer
+ MOV       r1, #&15
+ ORR       r1, r1, r10, LSL #8+5
+ MOVNE     r4, #44
+ MOVEQ     r4, #64
+ STMIA     r2, { r1, r4 }
+
+ MOV       r1, #6
+
+ ADR       r3, buffer + 16
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+ BVS       error_handler
+
+;-------------------------
+; Kludge - Sony561 problem
+;-------------------------
+timer_kludge
+
+ LDR       r14, [ r7, #12 ]
+ TEQ       r14, #SONY_561
+ GRABS     "r0, pc", NE
+
+ SWI       XOS_ReadMonotonicTime
+ MOV       r2, r0
+01
+ SWI       XOS_ReadMonotonicTime
+ SUB       r0, r0, r2
+ CMP       r0, #3
+ BLT       %BT01
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+;OpenDrawer ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+EjectButton ROUT
+;
+; on entry:
+;          r0 = 0 to allow eject, 1 to prevent
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "EjectButton",NL
+
+;-----------------------
+; Check for valid switch
+;-----------------------
+ CMP       r0, #2
+ BCS       invalidparameter
+
+;-----------------------
+
+ LDMIA     r7, { r8, r9, r10 }
+
+ MOV       r6, r0
+
+;--------------------------------
+; SCSI Prevent/allow command
+;--------------------------------
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + nodata     ; prevent 'escape key'
+
+ MOV       r1, #6
+
+ ADR       r2, buffer
+ MOV       r4, #&1e
+ ORR       r4, r4, r10, LSL #8+5
+ STMIA     r2, { r4, r6 }
+
+ MOV       r3, #0
+
+ MOV       r4, #8
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ BVS       error_handler
+
+ MOV       r0, r6
+ BL        SetDrawerStatus
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+EnquireAddress ROUT
+;
+; on entry:
+;          r0 = addressing mode for returned data
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = current laser position
+;-----------------------------------------------------------------------------------------------
+
+ STASH     r0
+
+ Debug "EnquireAddress",NL
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+;--------------------
+; Is it a 561 drive ?
+;--------------------
+ TEQ       r14, #SONY_561
+
+;--------------------------------
+; SCSI ReadSubChannel command
+;--------------------------------
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ ADR       r2, buffer
+ MOVNE     r1, #&c2
+ MOVEQ     r1, #&42
+ ORR       r1, r1, r10, LSL #8+5
+ ORRNE     r1, r1, #1:SHL:22
+ ORREQ     r1, r1, #(1:SHL:22)+(1:SHL:24)
+ MOV       r3, #0
+ MOV       r4, #16
+ STMIA     r2, { r1, r3, r4 }
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ GRAB      r4
+
+ BVS       error_handler
+
+;-----------------------------------
+; Get the LBAFormat absolute address
+;-----------------------------------
+ LDRNEB    r1, buffer + 16 + 8
+ LDRNEB    r2, buffer + 16 + 7
+ LDRNEB    r3, buffer + 16 + 6
+ ORRNE     r1, r1, r2, LSL #8
+ ORRNE     r1, r1, r3, LSL #16
+
+ LDREQ     r2, buffer + 16 + 8
+ MOVEQ     r5, #&ff00
+ ORREQ     r5, r5, r5, LSL #16
+ ANDEQ     r6, r5, r2, ROR #8
+ ANDEQ     r1, r5, r2
+ ORREQ     r1, r6, r1, ROR #24
+
+;---------------------------------------
+; If caller wants return in MSF then ...
+;---------------------------------------
+
+ TEQ       r4, #MSFFormat
+
+ MOVEQ     r0, #LBAFormat
+
+ SWIEQ     XCD_ConvertToMSF
+ BVS       error_handler
+
+ ADDEQ     r1, r1, #2 * 256
+
+;---------------------------------------
+; If caller wants return in PB format
+;---------------------------------------
+ TEQ       r4, #PBFormat
+
+ ADDEQ     r1, r1, #( MaxNumberOfBlocks + 1 ) * 2
+
+ MOV       r0, r1
+
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+EnquireDataMode ROUT
+;
+; on entry:
+;          r0 = addressing mode for block
+;          r1 = block
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = addressing mode (1 for mode 1, 2 for mode 2, 3 for mode 2 form 1)
+;-----------------------------------------------------------------------------------------------
+
+ Debug "EnquireDataMode",NL
+
+; Preserve the real type number
+ [ Version > 100
+
+ STR       r8, temp_control_block + drivetypeoffset
+
+ ADR       r14, buffer + 256
+ STMIA     r14, { r0, r1 }
+ ]
+
+
+ SWI       XCD_ConvertToLBA
+ BVS       error_handler
+
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+;----------------------
+; Is it the 561 drive ?
+;----------------------
+ TEQ       r14, #SONY_561
+ BEQ       EnquireDataMode_561
+
+;--------------------------------
+; SCSI ReadHeader command
+;--------------------------------
+ MOV       r4, #4
+
+ ADR       r2, buffer
+ MOV       r0, #&c3
+ ORR       r0, r0, r10, LSL #8+5
+
+ AND       r14, r1, #255:SHL:24
+ AND       r3, r1, #255:SHL:16
+
+; r3  = 00000000111111110000000000000000
+; r14 = 11111111000000000000000000000000
+ ORR       r0, r0, r14, LSR #8
+ ORR       r0, r0, r3, LSL #8
+
+; r3  = 00000000000000000000000011111111
+; r14 = 00000000000000001111111100000000
+ AND       r14, r1, #255:SHL:8
+ AND       r3, r1, #255
+ ORR       r3, r14, r3, LSL #16
+
+ MOV       r3, r3, LSR #8
+ STMIA     r2, { r0, r3, r4 }
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ [ Version >= 104
+
+ B         EnquireDataMode_more
+
+ |
+
+ BVS error_handler
+
+ LDRB      r0, buffer + 16 + 3
+
+ GRABS     "r1, pc"
+ ]
+
+;-----------------------------------------------------------------------------------------------
+EnquireDataMode_561 ROUT
+;
+; on entry:
+;          r0 = addressing mode for block
+;          r1 = block in LBA format
+;          r7 -> control block
+;          r8, r9, r10 contents of control block
+; on exit:
+;          usual error stuff
+;          r0 = addressing mode (1 for mode 1, 2 for mode 2, 3 for mode 2 form 1)
+;-----------------------------------------------------------------------------------------------
+
+ Debug "EnquireDataMode_561",NL
+
+;--------------------------------
+; SCSI ReadHeader command
+;--------------------------------
+ MOV       r4, #8
+
+ ADR       r2, buffer
+ MOV       r0, #&44
+ ORR       r0, r0, r10, LSL #8+5
+ AND       r14, r1, #255:SHL:24
+ AND       r3, r1, #255:SHL:16
+ ORR       r0, r0, r14, LSR #8
+ ORR       r0, r0, r3, LSL #8
+ AND       r14, r1, #255:SHL:8
+ AND       r3, r1, #255
+ ORR       r3, r14, r3, LSL #8
+ MOV       r3, r3, LSR #8
+ STMIA     r2, { r0, r3, r4 }
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+;------------------------------------------------
+; If the error is Illegal Request then it's audio
+;------------------------------------------------
+
+ [ Version >= 104
+EnquireDataMode_more
+ ]
+ TEQVC     r0, r0
+ LDRVS     r1, [ r0 ]
+ LDRVS     r2, =IllegalRequest
+ TEQVS     r2, r1
+
+ BNE       error_handler
+;------------------------------------------------
+
+
+ [ Version > 100
+
+ ; the new way that supports mode 0, mode 1 and mode 2 form 1 and mode 2
+
+; Audio - mode 0
+ MOVVS     r0, #0
+ GRABS     "r1, pc", VS
+
+; Data - mode 1
+ LDRB      r0, buffer + 16 + 0
+ TEQ       r0, #1
+ GRABS     "r1, pc", EQ
+
+;--------------------------------
+; Data - mode 2 / mode 2 form 1 ?
+;--------------------------------
+
+; the real drive type has already been put in
+ LDMIA     r7, { r8, r9, r10 }
+ ADR       r7, temp_control_block
+ STMIA     r7, { r8, r9, r10 }
+
+
+; Change to mode 2 form 1
+ ADR       r0, buffer + 128
+ SWI       XCD_GetParameters
+ LDMVCIA   r0!, { r8, r9, r10, r14 }
+
+ MOVVC     r10, #3
+ STMVCIA   r0, { r8, r9, r10, r14 }
+
+ SWIVC     XCD_SetParameters
+ BVS       error_handler
+
+
+; Read data
+ ADD       r3, r0, #4*4
+ ADR       r14, buffer + 256
+ LDMIA     r14, { r0, r1 }
+ MOV       r2, #1
+ MOV       r4, #1
+ SWI       XCD_ReadData
+
+; read data so must be mode 2 form 1
+ MOVVC     r0, #3
+
+; failed to read data in mode 2 form 1, therefore must be mode 2.
+ MOVVS     r0, #2
+
+ GRABS     "r1, pc"
+
+;--------------------------------
+
+ | ; the old way that only supports mode 0, mode 1 and mode 2 form 1
+ MOVVS     r0, #0
+
+;---------------------
+; Return the data mode
+;---------------------
+ LDRVCB    r0, buffer + 16 + 0
+
+;-------------------------------------------
+; If it says it's mode 2 then make it mode 1
+;-------------------------------------------
+ TEQ       r0, #2
+ MOVEQ     r0, #1
+
+ GRABS     "r1, pc"
+ ]
+
+
+
+
+;-----------------------------------------------------------------------------------------------
+PlayAudio ROUT
+;
+; on entry:
+;          r0 = addressing mode for returned data
+;          r1 = start address
+;          r2 = end address
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "PlayAudio",NL
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+;--------------------
+; Is it a 561 drive ?
+;--------------------
+ TEQ       r14, #SONY_561
+
+;--------------------
+
+ MOVNE     r4, #&c7
+ MOVEQ     r4, #&47
+ ORR       r4, r4, r10, LSL #8+5
+ STR       r4, buffer
+
+
+ TEQ       r0, #PBFormat
+ ADDEQ     r1, r1, #( MaxNumberOfBlocks + 1 ) * 2
+ ADDEQ     r2, r2, #( MaxNumberOfBlocks + 1 ) * 2
+
+;--------------------------------------------
+; Convert the address to Minutes,secs ,frames
+;--------------------------------------------
+ SWI       XCD_ConvertToMSF
+ BVS       error_handler
+
+;-------------------------------------------
+; Store MSF start address in parameter block
+;-------------------------------------------
+ STRB      r1, buffer + 5
+ MOV       r1, r1, LSR #8
+ STRB      r1, buffer + 4
+ MOV       r1, r1, LSR #8
+ STRB      r1, buffer + 3
+
+ MOV       r1, r2
+
+;--------------------------------------------
+; Convert the address to Minutes,secs ,frames
+;--------------------------------------------
+ SWI       XCD_ConvertToMSF
+ BVS       error_handler
+
+
+;--------------------------------------------
+; Store end of play ( in M S F )
+;--------------------------------------------
+ STRB      r1, buffer + 8
+ MOV       r1, r1, LSR #8
+ STRB      r1, buffer + 7
+ MOV       r1, r1, LSR #8
+ STRB      r1, buffer + 6
+
+;--------------------------------
+; SCSI PlayMSF command
+;--------------------------------
+ ADR       r2, buffer
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + nodata     ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ MOV       r3, #0
+ STRB      r3, buffer + 9
+
+ MOV       r4, #0
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+;---------------------------------------------------
+; If the error is illegal request then notaudiotrack
+;---------------------------------------------------
+ GRABS     "r0, pc", VC
+
+ LDR       r1, [ r0 ]
+ LDR       r2, =IllegalRequest
+ TEQ       r1, r2
+ BEQ       notaudiotrack
+ B         error_handler
+
+
+;-----------------------------------------------------------------------------------------------
+PlayTrack ROUT
+;
+; on entry:
+;          r0 = track number
+;          r1 = &ff end of disc, &fe play to end of track
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "PlayTrack",NL
+
+;-----------------------
+; Check track is 1 to 99
+;-----------------------
+ ADD       r14, r0, #1
+ CMP       r14, #101
+ BCS       invalidparameter
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+ TEQ       r14, #SONY_561
+
+;--------------------------------
+; SCSI PlayTrack command
+;--------------------------------
+ ADR       r2, buffer
+ MOVNE     r4, #&c6
+ MOVEQ     r4, #&48
+
+ ORRNE     r5, r0, #1:SHL:8        ; start track + start index
+ MOVEQ     r5, r0
+
+ MOVNE     r6, r1
+
+;-------------------------------
+; Play to end of disc on a 561 ?
+;-------------------------------
+ TEQEQ     r1, #&ff
+ ORREQ     r5, r5, #99:SHL:24
+
+; Guess who forgot to put an end track in if only one track should be played !
+
+; Also didn't clear r6 !
+ [ Version >= 102
+ TEQ       r14, #SONY_561
+ BNE       %FT01
+
+ MOV       r6, #0
+
+ TEQ       r1, #&ff
+ ADDNE     r14, r0, #1
+ ORRNE     r5, r5, r14, LSL #24
+01
+ ]
+
+ ORR       r4, r4, r10, LSL #8+5
+ STMIA     r2, { r4, r5, r6 }
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + nodata     ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ MOV       r3, #0
+
+ MOV       r4, #0
+
+ MOV       r5, #0
+
+ MOV       r6, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ GRABS     "r0, pc", VC
+
+;---------------------------------------------------
+; If the error is illegal request then nosuchtrack
+;---------------------------------------------------
+ LDR       r1, [ r0 ]
+ LDR       r2, =IllegalRequest
+ TEQ       r1, r2
+ BEQ       nosuchtrack
+ B         error_handler
+
+
+
+
+;-----------------------------------------------------------------------------------------------
+AudioPause ROUT
+;
+; on entry:
+;          r0 = 0 to resume, 1 to pause
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "AudioPause",NL
+
+;----------------------------
+; Make sure that r0 = 0 to 1
+;----------------------------
+ CMP       r0, #2
+ BCS       invalidparameter
+
+;----------------------------
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+
+;----------------------
+; Is it the 561 drive ?
+;----------------------
+ TEQ       r14, #SONY_561
+ BEQ       AudioPause_561
+
+;--------------------------------
+; SCSI Pause command
+;--------------------------------
+ ADR       r2, buffer
+ MOV       r4, #&c5
+ ORR       r4, r4, r10, LSL #8+5
+ ORR       r4, r4, r0, LSL #8+4
+ MOV       r5, #0
+ MOV       r6, #0
+ STMIA     r2, { r4, r5, r6 }
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + nodata     ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ MOV       r3, #0
+
+ MOV       r4, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ BVS       error_handler
+
+ GRABS     "r0, pc"
+
+
+;-----------------------------------------------------------------------------------------------
+AudioPause_561 ROUT
+;
+; on entry:
+;          r0 = 0 to resume, 1 to pause
+;          r7 -> control block
+;          r8, r9, r10, r14 contents of control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "AudioPause_561",NL
+
+;--------------------------------
+; SCSI Pause command
+;--------------------------------
+
+;------------------
+; Pause or resume ?
+;------------------
+ TEQ       r0, #0
+ ADREQ     r1, pause_off
+ ADRNE     r1, pause_on
+ ORR       r3, r3, r10, LSL #8+5
+ LDMIA     r1, { r3, r4, r5 }
+ ADR       r2, buffer
+ STMIA     r2, { r3, r4, r5 }
+
+ MOVNE     r1, #10
+ MOVEQ     r1, #12
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + nodata     ; prevent 'escape key'
+
+ MOV       r3, #0
+
+ MOV       r4, #0
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ BVS       error_handler
+
+ GRABS     "r0, pc"
+
+
+pause_off
+ DCB &a5
+ DCB &00
+ DCB &ff, &ff, &ff, &ff
+ DCB &1f, &ff, &ff, &ff
+ DCB &00
+ DCB &00
+
+pause_on
+ DCB &4b
+ DCB &00
+ DCB &00, &00, &00, &00, &00, &00
+ DCB &00
+ DCB &00
+ DCB 0, 0
+
+ ALIGN
+
+;-----------------------------------------------------------------------------------------------
+EnquireTrack ROUT
+;
+; on entry:
+;          r0 = 0 start/end track, 1 to 99 info on that track
+;          r1 -> storage area
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "EnquireTrack",NL
+
+;----------------------------
+; Make sure that r0 = 0 to 1
+;----------------------------
+ CMP       r0, #100
+ BCS       invalidparameter
+
+
+ STASH     r0-r1
+
+;----------------------------
+; Special case for 561 drive
+;----------------------------
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+ TEQ       r14, #SONY_561
+ BEQ       EnquireTrack_561
+
+;--------------------------------
+; SCSI Read TOC command
+;--------------------------------
+ ADR       r2, buffer
+ MOV       r4, #&c1
+ ORR       r4, r4, r10, LSL #8+5
+ TEQ       r0, #0
+ MOVNE     r5, r0, LSL #8
+ MOVEQ     r5, #1:SHL:8
+ MOV       r6, #10
+ STMIA     r2, { r4, r5, r6 }
+
+ MOV       r4, #10
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 18
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ GRAB      r1-r2
+
+;---------------------------------------------------
+; If the error is illegal request then nosuchtrack
+;---------------------------------------------------
+ TEQVC     pc, #0
+ LDRVS     r1, [ r0 ]
+ LDRVS     r2, =IllegalRequest
+ TEQVS     r1, r2
+ BEQ       nosuchtrack
+ BVS       error_handler
+
+;-----------------------------------------
+; Was info on a specific track requested ?
+;-----------------------------------------
+ TEQ       r1, #0
+
+ ADR       r3, buffer + 20
+ LDMIA     r3, { r4, r5 }
+ STREQB    r4, [ r2, #0 ]
+ MOVEQ     r4, r4, LSR #8
+ STREQB    r4, [ r2, #1 ]
+
+ MOVNE     r4, r4, LSR #24+2
+ ANDNE     r4, r4, #3
+ STRNEB    r4, [ r2, #4 ]
+
+;--------------------------------
+; Reverse r5 from hi/low to lo/hi
+;--------------------------------
+ MOVNE     r3, #255
+ ORRNE     r3, r3, #255:SHL:16
+
+ ANDNE     r1, r3, r5, ROR #24
+ ANDNE     r4, r3, r5
+ ORRNE     r1, r1, r4, ROR #8
+ STRNE     r1, [ r2, #0 ]
+
+;-----------------------------------------
+
+
+ GRABS     "r0, pc"
+
+
+;-----------------------------------------------------------------------------------------------
+EnquireTrack_561
+;
+; on entry:
+;          r0 = 0 start/end track, 1 to 99 info on that track
+;          r1 -> storage area
+;          r7 -> control block
+;             r8, r9, r10 = control block values
+;          r1 and r1 stacked
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+ Debug "EnquireTrack_561",NL
+
+ ADR       r2, buffer
+ MOV       r4, #&43
+ ORR       r4, r4, r10, LSL #8+5
+ TEQ       r0, #0
+ MOVNE     r5, r0, LSL #16
+ MOVEQ     r5, #&aa:SHL:16
+ MOV       r6, #12
+ STMIA     r2, { r4, r5, r6 }
+
+ MOV       r4, #12
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ MOV       r5, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ GRAB      r1-r2
+
+;---------------------------------------------------
+; If the error is illegal request then nosuchtrack
+;---------------------------------------------------
+ TEQVC     pc, #0
+ LDRVS     r1, [ r0 ]
+ LDRVS     r2, =IllegalRequest
+ TEQVS     r1, r2
+ BEQ       nosuchtrack
+ BVS       error_handler
+
+;------------------------------
+; Just return start/end track ?
+;------------------------------
+ TEQ           r1, #0
+ LDREQB        r14, buffer + 16 + 2
+ STREQB        r14, [ r2, #0 ]
+ LDREQB        r14, buffer + 16 + 3
+ STREQB        r14, [ r2, #1 ]
+
+;---------------------------
+; Return track start address - swap byte order
+;---------------------------
+ ADRNE         r5, buffer + 16 + 4
+ LDMNEIA       r5, { r1, r6 }
+
+ MOVNE         r5, #&ff00
+ ORRNE         r5, r5, r5, LSL #16
+ ANDNE         r4, r5, r6, ROR #8
+ ANDNE         r3, r5, r6
+ ORRNE         r3, r4, r3, ROR #24
+
+ STRNE         r3, [ r2, #0 ]
+
+;-------------
+; Control bits
+;-------------
+ MOVNE         r1, r1, LSR#8+2
+ ANDNE         r1, r1, #3
+ STRNEB        r1, [ r2, #4 ]
+
+;------------------
+ GRABS         "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+ReadSubChannel ROUT
+;
+; on entry:
+;          r0 = sub-channel = 64
+;          r1 -> storage area
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug "ReadSubChannel",NL
+
+ STASH     r1
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+;--------------------
+; Is it a 561 drive ?
+;--------------------
+ TEQ       r14, #SONY_561
+
+;--------------------------------
+; SCSI ReadSubChannel command
+;--------------------------------
+ ADR       r2, buffer
+ MOVNE     r4, #&c2
+ MOVEQ     r4, #&42
+ ORR       r4, r4, r10, LSL #8+5
+ ORR       r4, r4, r0, LSL #16
+ ORREQ     r4, r4, #1:SHL:24
+ MOV       r5, #0
+ MOV       r6, #16
+ STMIA     r2, { r4, r5, r6 }
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ MOV       r4, #16
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+ GRAB      r1
+
+;---------------------------------------------------
+; If the error is illegal request then not channel
+;---------------------------------------------------
+ MOVEQ     r8, #0
+
+ TEQVC     pc, #0
+ LDRVS     r1, [ r0 ]
+ LDRVS     r2, =IllegalRequest
+ TEQVS     r1, r2
+ addr      r0, channel_not_supported_error, EQ
+ BEQ       error_handler_lookup
+ BVS       error_handler
+
+ TEQ       r8, #0
+ BEQ       %FT01
+
+;-------------------------------
+; Pass back the sub-channel data
+; bytes       description
+; -----       -----------
+; 0 to 3      Relative LBA
+; 4 to 7      Absolute LBA
+;   8         Control bits
+;   9         Track number
+;  10         Index number
+
+;-------------------------------
+
+ MOV       r6, #0
+
+ LDRB      r2, buffer + 16 + 5       ; Convert MSB/LSB 3 bytes to
+ STRB      r2, [ r1, #0 ]            ; LSB/MSB 4 bytes
+ LDRB      r2, buffer + 16 + 4       ;
+ STRB      r2, [ r1, #1 ]            ; For Relative to track start
+ LDRB      r2, buffer + 16 + 3       ;
+ STRB      r2, [ r1, #2 ]            ;
+
+ STRB      r6, [ r1, #3 ]            ;
+ STRB      r6, [ r1, #7 ]            ;
+ LDRB      r2, buffer + 16 + 8       ; For ABSOLUTE to start of disc
+ STRB      r2, [ r1, #4 ]            ;
+ LDRB      r2, buffer + 16 + 7       ;
+ STRB      r2, [ r1, #5 ]            ;
+ LDRB      r2, buffer + 16 + 6       ;
+ STRB      r2, [ r1, #6 ]            ;
+
+
+ LDRB      r2, buffer + 16           ; Byte 0 contains the control
+ MOV       r2, r2, LSR #2            ; and only 2 bits are needed
+ STRB      r2, [ r1, #8 ]            ;
+
+ LDRB      r2, buffer + 16 + 1       ; Move track number to new pos.
+ STRB      r2, [ r1, #9 ]            ;
+ LDRB      r2, buffer + 16 + 2       ; Move index number to new pos.
+ STRB      r2, [ r1, #10 ]           ;
+
+ LDRB      r2, buffer + 16 + 6       ; If actually < 0 then set = 0
+ TST       r2, #16                   ; A bit is set to indicate too big
+ STRNE     r6, [ r1, #4 ]            ; ABSOLUTE
+
+ LDRB      r2, buffer + 16 + 3       ; If actually < 0 then set = 0
+ TST       r2, #16                   ; A bit is set to indicate too big
+ STRNE     r6, [ r1, #0 ]            ; RELATIVE
+
+ LDR       r2, [ r1, #4 ]            ; If ABS = 0 THEN REL MUST = 0
+ TEQ       r2, #0                    ;
+ STREQ     r2, [ r1, #0 ]            ;
+
+ GRABS     "r0, pc"
+
+
+
+;---------------------------------------------
+; Get all info returned by drive for 561 drive
+;---------------------------------------------
+01
+ ADR           r14, buffer + 16 + 4
+ LDMIA         r14, { r5, r6, r7 }
+
+;-----------------
+; Relative address - swap byte order
+;-----------------
+ MOV           r8, #&ff00
+ ORR           r8, r8, r8, LSL #16
+ AND           r4, r8, r6, ROR #8
+ AND           r3, r8, r6
+ ORR           r9, r4, r3, ROR #24
+
+;-----------------
+; Absolute address - swap byte order
+;-----------------
+ AND           r4, r8, r7, ROR #8
+ AND           r3, r8, r7
+ ORR           r7, r4, r3, ROR #24
+
+ STMIA         r1, { r7, r9 }
+
+;-------------
+; Control bits
+;-------------
+ MOV           r4, r5, LSR #8 + 2
+ AND           r4, r4, #3
+ STRB          r4, [ r1, #8 ]
+
+;-------------
+; Track number
+;-------------
+ MOV           r5, r5, LSR #16
+ STRB          r5, [ r1, #9 ]
+
+;-------------
+; Index number
+;-------------
+ MOV           r5, r5, LSR#8
+ STRB          r5, [ r1, #10 ]
+
+
+
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+;CheckDrive ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = drive status bits
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+DiscChanged ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = 0 if not changed, 1 if changed
+;-----------------------------------------------------------------------------------------------
+
+ Debug "DiscChanged",NL
+
+ MOV       r6, #0
+
+drawer_status_jumps_in_here
+
+ LDMIA     r7, { r8, r9, r10 }
+
+;--------------------------------
+; SCSI TestUnitReady command
+;--------------------------------
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + nodata     ; prevent 'escape key'
+
+ MOV       r1, #6
+
+ ADR       r2, buffer
+ MOV       r4, r10, LSL #8+5
+ MOV       r5, #0
+ STMIA     r2, { r4, r5 }
+
+ MOV       r3, #0
+
+ MOV       r4, #0
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+
+; Error
+ BVS       error_handler
+
+; No error
+ TEQ       r6, #0
+ BLEQ      HasDiscChanged
+ BLNE      GetDrawerStatus
+
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+;StopDisc ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+;DiscUsed ROUT
+;
+; on entry:
+;          r0 =  addressing mode that the disc length should be returned in
+;          r1 -> storage area to put data in
+;          r7 -> control block
+; on exit:
+;
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+AudioStatus ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = 0 playing audio, 1 paused, 2 muted, 3 play completed, 4 error, 5 not requested
+;-----------------------------------------------------------------------------------------------
+
+ Debug "AudioStatus",NL
+
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+;--------------------
+; Is it a 561 drive ?
+;--------------------
+ TEQ       r14, #SONY_561
+
+;--------------------------------
+; SCSI PlaybackStatus command
+;--------------------------------
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #10
+
+ ADR       r2, buffer
+ MOVNE     r4, #&c4
+ MOVEQ     r4, #&42
+ ORR       r4, r4, r10, LSL #8+5
+ ORREQ     r4, r4, #(64:SHL:16)+(1:SHL:24)
+ MOV       r5, #0
+ MOV       r6, #18
+ STMIA     r2, { r4, r5, r6 }
+
+ ADR       r3, buffer + 16
+
+ MOV       r4, #18
+
+ MOV       r8, #1
+
+ SWI       XSCSI_Op
+
+;----------------------------------------------------------
+; If error was IllegalRequest then audio play not requested
+;----------------------------------------------------------
+ MOVEQ     r8, #0
+
+ TEQVC     r0, r0
+
+ LDRVS     r1, [ r0 ]
+ LDRVS     r2, =IllegalRequest
+ TEQVS     r1, r2
+
+;--------------------
+; Genuine error
+;--------------------
+ BNE       error_handler
+
+;--------------------
+; Is it a 561 drive ?
+;--------------------
+ TEQ       r8, #0
+
+;---------------------------
+; Return status for non-561s
+;---------------------------
+ MOVVS     r0, #5
+ LDRVCB    r0, buffer + 16 + 4
+
+ GRABS     "r1, pc", NE
+
+;---------------------------
+; Return status for 561s
+;---------------------------
+
+ LDRB          r0, buffer + 16 + 1
+ AND           r0, r0, #7
+; ADR           r14, %FT01       wow save 4 bytes !
+ LDRB          r0, [ pc, r0 ]
+
+
+ GRABS     "r1, pc"
+
+01
+ DCB NOPLAY        ; 5
+ DCB PLAYINGAUDIO  ; 0
+ DCB PAUSED        ; 1
+ DCB PLAYCOMPLETED ; 3
+ DCB PLAYERROR     ; 4
+ DCB NOPLAY        ; 5
+
+ ALIGN
+
+;-----------------------------------------------------------------------------------------------
+;Inquiry ROUT
+;
+; on entry:
+;          r0 -> place to put the inquiry data
+;          r7 -> control block
+; on exit:
+; 
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+DiscHasChanged ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ BL        SetDiscChanged
+
+ GRAB      "r0, r14"
+ BICS      pc, r14, #Overflow_Flag
+
+;-----------------------------------------------------------------------------------------------
+;Control ROUT
+;
+; on entry:
+;          r0 =  0, 1 or 2 to set SCSI error response
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+Supported ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = information word with bits set to indicate level of support
+;-----------------------------------------------------------------------------------------------
+ LDR       r14, [ r7, #drivetypeoffset ]
+ TEQ       r14, #SONY_541
+ MOVEQ     r0, #SONY_OLD_VERSIONBITS
+ LDRNE     r0, =SONY_NEW_VERSIONBITS
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+Prefetch ROUT
+;
+; on entry:
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+;Reset ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+;CloseDrawer ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+IsDrawerLocked ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;          r0 = 0 if unlocked, 1 if locked
+;
+;-----------------------------------------------------------------------------------------------
+
+ MOV       r6, #1
+ B         drawer_status_jumps_in_here
+
+;-----------------------------------------------------------------------------------------------
+;AudioControl ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+;AudioLevel ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+Identify ROUT
+; on entry:
+;           r0  -> 36 byte SCSI inquiry data or 0
+;           r1  -> if r0 =0 THEN this -> an error block ie/ the reason inquiry data failed
+;           r7  -> control block, ignore the driver type, ie/ control block + 20
+;           r11 =  reason code for CD_Identify
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r2 = -1 if not recognized, else internal drive type
+;           r0-r1, r3-12 can be corrupted
+;-----------------------------------------------------------------------------------------------
+
+;----------------------------
+; Is there any inquiry data ?
+;----------------------------
+ TEQ       r0, #0
+ BEQ       not_sony
+
+;----------------------------
+; Removable media ?
+;----------------------------
+ LDRB      r1, [ r0 ]
+ LDRB      r2, [ r0, #1 ]
+ TST       r2, #128
+
+;----------------------------
+; Funny LUN ?
+;----------------------------
+ TEQNE     r1, #&7f
+ BEQ       not_sony
+
+;---------------------------- 
+; Is it a sony drive ?
+;---------------------------- 
+; r1 -> manufacturers name
+ MOV       r4, r0
+
+ ADD       r0, r0, #8
+ ADR       r1, sony_name
+ MOV       r2, #?sony_name
+ BL        CompareStrings
+ BNE       not_sony
+
+;---------------------------- 
+; Check description
+;---------------------------- 
+ ADD       r0, r4, #16
+ ADR       r1, sony_description
+ MOV       r2, #?sony_description
+ BL        CompareStrings
+ BNE       not_sony
+
+;--------------------------------
+; What type of Sony drive is it ?
+;--------------------------------
+ ADD       r0, r0, #11
+ LDW       r1, r0, r3, r4
+
+ ADR       r3, drive_names
+
+ MOV       r2, #-1
+
+ LDR       r4, [ r3 ], #4
+ TEQ       r4, r1
+ LDREQ     r2, [ r3, #(end_of_drive_names - drive_names) - 4 ]
+ LDR       r4, [ r3 ], #4
+ TEQ       r4, r1
+ LDREQ     r2, [ r3, #(end_of_drive_names - drive_names) - 4 ]
+ LDR       r4, [ r3 ], #4
+ TEQ       r4, r1
+ LDREQ     r2, [ r3, #(end_of_drive_names - drive_names) - 4 ]
+
+ GRABS     "r0, pc"
+
+;---------------------------- 
+not_sony
+ MOV       r2, #-1
+ GRABS     "r0, pc"
+
+drive_names
+ = "561 "
+ = "541 "
+ = "6XXX"
+end_of_drive_names
+ DCD SONY_561
+ DCD SONY_541
+ DCD SONY_541
+
+;-------------------------------
+sony_name        = "SONY"
+sony_description = "CD-ROM CDU-"
+ ALIGN
+
+
+;-----------------------------------------------------------------------------------------------
+ReadAudio ROUT
+; on entry:
+;           r0 =  addressing mode
+;           r1 =  block number
+;           r2 =  number of blocks
+;           r3 -> put data here
+;           r4  = flags, bits 0 to 7 = read PCM, bits 8 to 31 RESERVED
+;           r7 -> control block
+;           r11 =  reason code for CD_Identify
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r2 = -1 if not recognized, else internal drive type
+;           r0-r1, r3-12 can be corrupted
+;-----------------------------------------------------------------------------------------------
+
+;---------------------------------------------
+; Load the control block details
+;---------------------------------------------
+ LDMIA     r7, { r8, r9, r10, r14 }
+
+;---------------------------------------------
+; ReadAudio only supported on the 561
+;---------------------------------------------
+ TEQ       r14, # SONY_561
+ BNE       notsupported
+
+;---------------------------------------------
+; Check that flag bits are set to to read PCM
+;---------------------------------------------
+
+ ANDS      r4, r4, # &ff
+ BNE       invalidparameter
+
+;---------------------------------------------
+; Convert to LBA
+;---------------------------------------------
+
+ SWI       XCD_ConvertToLBA
+ GRABS     "r14, pc", VS
+
+
+RA_TryAgain
+
+ STASH     "r1, r2, r3, r8"
+
+;---------------------------------------------
+; Layout the control block
+;---------------------------------------------
+ MOV       r0, # &D8:SHL:16
+ ORR       r0, r0, r10, LSL # 24
+
+
+;---------------------------------------------
+; Calculate the total bytes required
+;---------------------------------------------
+ MOV       r14, # 2352
+ MUL       r4, r2, r14
+
+;---------------------------------------------
+; Change byte order of start LBA and length
+;---------------------------------------------
+
+ MOV       r5, #&ff00
+ ORR       r5, r5, r5, LSL #16
+
+ AND       r6, r5, r1, ROR #8
+ AND       r14, r5, r1
+ ORR       r1, r6, r14, ROR #24
+
+ AND       r6, r5, r2, ROR #8
+ AND       r14, r5, r2
+ ORR       r2, r6, r14, ROR #24
+
+ MOV       r14, # 0
+
+ ADR       r5, buffer
+ STMIA     r5, { r0, r1, r2, r14 }
+
+;---------------------------------------------
+; Prepare the registers
+;---------------------------------------------
+
+ ORR       r0, r8, r9,  LSL #3                 ; device id + card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, # escapepolloff + readdata   ; prevent 'escape key'
+
+
+ MOV       r1, # 12
+
+ ADR       r2, buffer + 2
+
+ MOV       r8, # 1
+
+
+;---------------------------------------------
+; Send the control block
+;---------------------------------------------
+
+ SWI       XSCSI_Op
+
+ MOV       r5, r1
+
+ GRAB      "r1, r2, r3, r8"
+
+ GRABS     "r0, pc", VC
+
+
+
+;----------------------------------------------------------------------------------------------
+; If I get the error 'Target error - Illegal Request', then I need to calculate how much of
+; the data has actually been transferred.  The number of blocks transferred is:
+; blocks_asked_for - (r4 / 2352)
+; This is because the SCSI_Op command does not give the correct amount transferred, but does
+; give the correct amount not transferred (!).
+; ie amount_transferred + amount_not_transferred > amount_asked_for
+;----------------------------------------------------------------------------------------------
+
+; r1 =  current start LBA
+; r2 =  number of blocks left to load
+; r3 -> current storage area
+; r5=   error from SCSI details
+
+;---------------------------------------------
+; Check for Target error - Illegal Request
+;---------------------------------------------
+
+ AND       r14, r5, # &ff000000
+ TEQ       r14, # (IllegalRequest:AND:&ff):SHL:24
+ TEQNE     r14, # (MediumError:AND:&ff):SHL:24
+ BNE       error_handler
+
+;---------------------------------------------
+; How many blocks have been transferred ?
+; - 1 to make sure no crap data
+;---------------------------------------------
+
+ DivRem    r5, r4, # 2352, r14
+ SUB       r5, r2, r5
+ SUBS      r5, r5, # 1
+
+ SUBPLS    r2, r2, r5
+ BMI       error_handler
+
+;---------------------------------------------
+; Update the current start LBA
+;---------------------------------------------
+
+ ADD       r1, r1, r5
+
+;---------------------------------------------
+; Update the memory pointer
+;---------------------------------------------
+
+ MOV       r14, # 2352
+ MLA       r3, r14, r5, r3
+
+
+;---------------------------------------------
+; Try again
+;---------------------------------------------
+
+ B         RA_TryAgain
+
+;---------------------------------------------
+; 
+;---------------------------------------------
+;---------------------------------------------
+; 
+;---------------------------------------------
+
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+
+ END

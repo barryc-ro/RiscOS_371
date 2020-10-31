@@ -1,0 +1,550 @@
+; > Sources.SWI
+
+SWInames
+        DCB     "DMA",0
+        DCB     "RegisterChannel",0
+        DCB     "DeregisterChannel",0
+        DCB     "QueueTransfer",0
+        DCB     "TerminateTransfer",0
+        DCB     "SuspendTransfer",0
+        DCB     "ResumeTransfer",0
+        DCB     "ExamineTransfer",0
+        DCB     0
+                ALIGN
+
+;-----------------------------------------------------------------------------
+; LogicalChannel table.
+;
+LogicalChannel
+        DCD     &000    ; Podule 0, DMA line 0, channel 2
+;       DCD     &001    ; Podule 0, DMA line 1, not supported
+        DCD     &010    ; Podule 1, DMA line 0, channel 3
+;       DCD     &011    ; Podule 1, DMA line 1, not supported
+;       DCD     &020    ; Podule 2, DMA line 0, not supported
+;       DCD     &021    ; Podule 2, DMA line 1, not supported
+;       DCD     &030    ; Podule 3, DMA line 0, not supported
+;       DCD     &031    ; Podule 3, DMA line 1, not supported
+;       DCD     &040    ; Podule 4, DMA line 0, not supported
+;       DCD     &041    ; Podule 4, DMA line 1, not supported
+;       DCD     &050    ; Podule 5, DMA line 0, not supported
+;       DCD     &051    ; Podule 5, DMA line 1, not supported
+;       DCD     &060    ; Podule 6, DMA line 0, not supported
+;       DCD     &061    ; Podule 6, DMA line 1, not supported
+;       DCD     &070    ; Podule 7, DMA line 0, not supported
+;       DCD     &071    ; Podule 7, DMA line 1, not supported
+;       DCD     &100    ; On-board SCSI, not supported
+        DCD     &101    ; On-board Floppy, channel 1
+        DCD     &102    ; Parallel, channel 1
+        DCD     &103    ; Sound out, channel 4
+        DCD     &104    ; Sound in, channel 5
+        DCD     &105    ; Network Card, channel 0
+
+        ASSERT .-LogicalChannel = NoLogicalChannels :SHL: 2
+
+;-----------------------------------------------------------------------------
+; PhysicalChannel table.
+;       Maps logical channel to physical channel.
+;
+PhysicalChannel
+        DCB     2
+        DCB     3
+        DCB     1
+        DCB     1
+        DCB     4
+        DCB     5
+        ASSERT .-PhysicalChannel = NoPhysicalChannels
+        DCB     0
+        ALIGN
+
+;---------------------------------------------------------------------------
+;       Handle SWI calls to our module.
+;
+SWIhandler
+        LDR     r12, [r12]
+        CMP     r11, #(SWItabend-SWItabstart):SHR:2
+        ADDCC   pc, pc, r11, LSL #2
+        B       SWIerror
+
+SWItabstart
+        B       SWIRegisterChannel
+        B       SWIDeregisterChannel
+        B       SWIQueueTransfer
+        B       SWITerminateTransfer
+        B       SWISuspendTransfer
+        B       SWIResumeTransfer
+        B       SWIExamineTransfer
+SWItabend
+
+SWIerror
+        ADR     r0, ErrorBlock_DMA_BadSWI
+ [ international
+        ADRL    r4, Title
+ ]
+        DoError
+
+        MakeErrorBlock  DMA_BadSWI
+
+;---------------------------------------------------------------------------
+; SWIRegisterChannel
+;       In:     r0  = flags
+;                       bit     meaning
+;                       0-31    reserved (set to 0)
+;               r1  = logical channel
+;               r2  = DMA cycle speed (0-3)
+;               r3  = transfer unit size (1,2,4 or 16)
+;               r4  ->vector routine
+;               r5  = value to pass to vector routine in r12
+;
+;       Out:    r0  = channel handle
+;               all other registers preserved
+;
+;       Register a channel handling vector with the DMA manager.
+;
+SWIRegisterChannel      ROUT
+        ENTRY   "r6-r8"
+
+        Debug   swi,"SWIRegisterChannel",r1
+
+        ADR     r6, LogicalChannel              ; Find the logical channel number.
+        MOV     lr, #NoLogicalChannels * 4
+10
+        SUBS    lr, lr, #4                      ; Work back from end of table.
+        PullEnv CC                              ; Not found so return error.
+        ADRCC   r0, ErrorBlock_DMA_BadChannel
+        DoError CC
+        LDR     r7, [r6, lr]
+        TEQ     r1, r7
+        BNE     %BT10
+
+        ASSERT  LCBSize = 20
+        ADR     r8, ChannelBlock
+        ADD     r8, r8, lr, LSL #2
+        ADD     r8, r8, lr                      ; r8->logical channel block
+
+        LDR     r6, [r8, #lcb_Flags]
+        TST     r6, #lcbf_Registered
+        PullEnv NE                              ; Return error if already claimed.
+        ADRNE   r0, ErrorBlock_DMA_AlreadyClaimed
+        DoError NE
+
+        CMP     r2, #4                          ; Validate cycle speed.
+        PullEnv CS
+        ADRCS   r0, ErrorBlock_DMA_BadCycleSpeed
+        DoError CS
+
+        TEQ     r3, #1                          ; Validate transfer unit size.
+        TEQNE   r3, #2
+        TEQNE   r3, #4
+        TEQNE   r3, #16
+        PullEnv NE
+        ADRNE   r0, ErrorBlock_DMA_BadTransferUnit
+        DoError NE
+
+        TST     r4, #3                          ; Ensure vector table is word aligned.
+        PullEnv NE
+        ADRNE   r0, ErrorBlock_DMA_BadAddress
+        DoError NE
+
+        ORR     r0, r3, r2, LSL #5              ; Build flags in r0.
+        ORR     r0, r0, #lcbf_Registered
+
+        ADR     r6, PhysicalChannel
+        LDRB    r7, [r6, lr, LSR #2]            ; r7 = physical channel number
+        PhysToDMAQ r6, r7                       ; r6->DMA queue
+
+        ASSERT  lcb_Flags = 0
+        ASSERT  lcb_Vector = lcb_Flags + 4
+        ASSERT  lcb_R12 = lcb_Vector + 4
+        ASSERT  lcb_Queue = lcb_R12 + 4
+        ASSERT  lcb_Physical = lcb_Queue + 4
+
+        STMIA   r8, {r0,r4-r7}                  ; Store flags, vector, r12 value, queue and physical channel.
+
+        MOV     r0, lr, LSR #2                  ; Return channel handle in r0.
+
+        Debug   swi," channel handle =",r0
+
+        TEQ     r7, #4                          ; If not registering a sound channel then
+        TEQNE   r7, #5
+        EXIT    NE                              ;   exit.
+
+        Push    "r0-r2"
+
+        IOMDBase r8
+        IRQOff  lr
+
+        LDRB    r6, [r8, #IOMD_IOTCR]           ; Otherwise set up transfer size/speed in IOTCR.
+        AND     r6, r6, #&0F
+        ORR     r6, r6, r3, LSL #6
+        ORR     r6, r6, r2, LSL #4
+        STRB    r6, [r8, #IOMD_IOTCR]
+
+        LDRB    r6, [r8, #IOMD_DMAMSK]          ; Disable sound channel and set up to claim device.
+        TEQ     r7, #4
+        MOVEQ   r0, #IOMD_DMASound0_DevNo
+        ADREQL  r1, DMAInterruptSound0
+        BICEQ   r6, r6, #IOMD_DMA_SD0
+        MOVNE   r0, #IOMD_DMASound1_DevNo
+        ADRNEL  r1, DMAInterruptSound1
+        BICNE   r6, r6, #IOMD_DMA_SD1
+        STRB    r6, [r8, #IOMD_DMAMSK]
+
+        SetPSR  lr
+
+        Debug   swi," claiming device vector",r0
+
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector           ; Claim appropriate sound device vector.
+
+        Pull    "r0-r2"
+        EXIT
+
+        MakeErrorBlock  DMA_BadChannel
+        MakeErrorBlock  DMA_AlreadyClaimed
+        MakeErrorBlock  DMA_BadCycleSpeed
+        MakeErrorBlock  DMA_BadTransferUnit
+        MakeErrorBlock  DMA_BadAddress
+
+;---------------------------------------------------------------------------
+; SWIDeregisterChannel
+;       In:     r0  = channel handle
+;
+;       Out:    all registers preserved
+;
+;       Deregister a previously registered channel handling vector.
+;
+SWIDeregisterChannel
+        ENTRY   "r1,r7,r8"
+
+        Debug   swi,"SWIDeregisterChannel",r0
+
+        CMP     r0, #NoLogicalChannels          ; Ensure handle in range.
+        PullEnv CS
+        ADRCS   r0, ErrorBlock_DMA_BadHandle
+        DoError CS
+
+        LCBlock r8, r0
+        LDR     r7, [r8, #lcb_Flags]            ; Ensure it's been claimed.
+        TST     r7, #lcbf_Registered
+        PullEnv EQ
+        ADREQ   r0, ErrorBlock_DMA_BadHandle
+        DoError EQ
+
+        MOV     r7, #0                          ; Mark logical channel as not claimed.
+        STR     r7, [r8, #lcb_Flags]
+        BL      DMAPurge                        ; r7=0 so new transfers can start.
+
+        TEQ     r0, #4
+        TEQNE   r0, #5
+        EXIT    NE                              ; If not a sound channel then exit.
+
+        TEQ     r0, #4                          ; Release appropriate sound device vector.
+        MOVEQ   r0, #IOMD_DMASound0_DevNo
+        ADREQL  r1, DMAInterruptSound0
+        MOVNE   r0, #IOMD_DMASound1_DevNo
+        ADRNEL  r1, DMAInterruptSound1
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+        EXIT
+
+        MakeErrorBlock  DMA_BadHandle
+
+;---------------------------------------------------------------------------
+; SWIQueueTransfer
+;       In:     r0  = flags
+;                       bit     meaning
+;                       0       transfer direction:
+;                               0 = from device to memory (read)
+;                               1 = from memory to device (write)
+;                       1       1 = scatter list is circular buffer
+;                       2       1 = call DMASync callback
+;                       3-31    reserved (set to 0)
+;               r1  = channel handle
+;               r2  = value to pass to vector routine in r11
+;               r3  ->word aligned scatter list
+;               r4  = length of transfer (in bytes)
+;               r5  = size of circular buffer (if used)
+;               r6  = number of bytes between DMASync callbacks (if used)
+;
+;       Out:    r0  = DMA tag
+;               all other registers preserved
+;
+;       Queues a DMA request for the specified channel.
+;
+SWIQueueTransfer
+        ENTRY   "r5-r11"
+
+        Debug   swi,"SWIQueueTransfer, channel handle =",r1
+
+        CMP     r1, #NoLogicalChannels          ; Ensure handle in range.
+        PullEnv CS
+        ADRCS   r0, ErrorBlock_DMA_BadHandle
+        DoError CS
+
+        LCBlock r8, r1
+        LDR     lr, [r8, #lcb_Flags]            ; Ensure it's been claimed.
+        TST     lr, #lcbf_Registered
+        PullEnv EQ
+        ADREQ   r0, ErrorBlock_DMA_BadHandle
+        DoError EQ
+
+        TST     r3, #3                          ; Ensure scatter list is word aligned.
+        PullEnv NE
+        ADRNE   r0, ErrorBlock_DMA_BadAddress
+        DoError NE
+
+        TST     r0, #dmarf_Circular             ; If not circular then
+        MOVEQ   r5, #0                          ;   buff size = 0
+        MOVEQ   r7, r4                          ;   test for zero length below
+        MOVNE   r7, r5                          ; else test for zero buffer size below
+        ORRNE   r0, r0, #dmarf_Infinite         ;   assume infinite
+        TEQNE   r4, #0                          ;   but if length<>0 then
+        BICNE   r0, r0, #dmarf_Infinite         ;     not infinite.
+
+        TEQ     r7, #0
+        PullEnv EQ
+        ADREQ   r0, ErrorBlock_DMA_ZeroLength
+        DoError EQ
+
+        TST     r0, #dmarf_Sync                 ; If not calling DMASync then
+        MOVEQ   r6, #0                          ;   sync gap = 0
+        BEQ     %FT10
+        TEQ     r6, #0
+        PullEnv EQ
+        ADREQ   r0, ErrorBlock_DMA_ZeroLength
+        DoError EQ
+10
+        AND     lr, lr, #lcbf_TransferSize      ; lr=flags from above
+        SUB     lr, lr, #1
+        TST     lr, r4                          ; Ensure length is multiple of transfer unit size.
+        TSTEQ   lr, r5                          ; Ensure buff size is multiple of t.u.s.
+        TSTEQ   lr, r6                          ; Ensure sync gap is multiple of t.u.s.
+        PullEnv NE
+        ADRNE   r0, ErrorBlock_DMA_BadSize
+        DoError NE
+
+        ASSERT  dmar_R11 = dmar_Flags + 4
+        ASSERT  dmar_ScatterList = dmar_R11 + 4
+        ASSERT  dmar_Length = dmar_ScatterList + 4
+        ASSERT  dmar_BuffSize = dmar_Length + 4
+        ASSERT  dmar_SyncGap = dmar_BuffSize + 4
+        ASSERT  dmar_Done = dmar_SyncGap + 4
+        ASSERT  dmar_LCB = dmar_Done + 4
+        ASSERT  dmar_PageTable = dmar_LCB + 4
+
+        BL      DMAGetRequestBlock              ; Set up request block (r10=pointer).
+        EXIT    VS
+
+        ADD     lr, r10, #dmar_Flags
+        MOV     r7, #0                          ; Set amount done to 0.
+        MOV     r9, #0                          ; Set no page table
+        Debug   swi," flags,r11,scat,len,buffsz,gap,LCB =",r0,r2,r3,r4,r5,r6,r8
+        STMIA   lr, {r0,r2-r9}                  ; Store flags, r11, scat list, length, buff size, gap, done, LCB, page table.
+
+        LDR     r5, TagIndex                    ; Build DMA request tag in r0.
+        ADD     r5, r5, #1
+        LDR     lr, [r8, #lcb_Physical]
+        ORR     r0, lr, r5, LSL #3
+        STR     r0, [r10, #dmar_Tag]
+
+        Debug   swi," DMA tag = ",r0
+
+        LDR     r9, [r8, #lcb_Queue]            ; r9->DMA queue
+        BL      DMALinkRequest                  ; Stick it on the queue.
+        IOMDBase r11
+        BL      DMAActivate                     ; Try to activate it.
+        STRVC   r5, TagIndex
+        STRVS   r7, [r9, #dmaq_Active]          ; If activate returned error then unblock channel
+        BLVS    DMAUnlinkRequest                ;   and delete request.
+        BLVS    DMAFreeRequestBlock
+        EXIT
+
+        MakeErrorBlock  DMA_ZeroLength
+        MakeErrorBlock  DMA_BadSize
+
+;---------------------------------------------------------------------------
+; SWITerminateTransfer
+;       In:     r0  ->error block
+;               r1  = DMA tag
+;
+;       Out:    all registers preserved
+;
+;       Terminate a DMA transfer if it is active or just remove from the queue.
+;
+SWITerminateTransfer
+        ENTRY   "r0,r8-r11"
+
+        Debug   swi,"SWITerminateTransfer",r1
+
+        BL      DMAFindTag
+        STRVS   r0, [sp]
+        EXIT    VS
+
+        TEQ     r0, #0                          ; If caller is stupid and provides no error then
+        ADREQ   r0, ErrorBlock_DMA_Terminated   ;   use our own (or DMATerminate will think we're suspending).
+        BLEQ    MsgTrans_ErrorLookup
+
+        LDR     r8, [r10, #dmar_LCB]            ; r8->logical channel block
+        IOMDBase r11
+        CLRV
+        BL      DMATerminate                    ; Terminate (if active, physical channel remains blocked).
+        STRVS   r0, [sp]
+        EXIT    VS
+
+        BL      DMAUnlinkRequest
+        LDR     lr, [r10, #dmar_Flags]
+        TST     lr, #dmarf_Blocking             ; If it was blocking logical channel then
+        LDRNE   lr, [r8, #lcb_Flags]            ;   unblock it.
+        BICNE   lr, lr, #lcbf_Blocked
+        STRNE   lr, [r8, #lcb_Flags]
+        LDR     lr, [r9, #dmaq_Active]
+        TEQ     lr, r10                         ; If it was active then
+        BLEQ    DMASearchQueue                  ;   try to start something else (unblock physical channel).
+        BL      DMAFreeRequestBlock
+
+        EXIT
+
+        MakeErrorBlock  DMA_Terminated
+
+;---------------------------------------------------------------------------
+; SWISuspendTransfer
+;       In:     r0  = flags
+;                       bit     meaning
+;                       0       0 = don't start queued transfers
+;                               1 = start next queued transfer
+;                       1-31    reserved (set to 0)
+;               r1  = DMA tag
+;
+;       Out:    all registers preserved
+;
+;       Suspend a DMA transfer.
+;
+SWISuspendTransfer
+        ENTRY   "r0,r8-r11"
+
+        Debug   swi,"SWISuspendTransfer",r1
+
+        BL      DMAFindTag
+        STRVS   r0, [sp]
+        EXIT    VS
+
+        LDR     r8, [r10, #dmar_LCB]            ; r8->logical channel block
+        IOMDBase r11
+        MOV     r0, #0                          ; Suspend not terminate.
+        BL      DMATerminate                    ; Terminate (physical channel should remain blocked).
+        STRVS   r0, [sp]
+        EXIT    VS
+
+        LDR     lr, [r10, #dmar_Flags]
+        TST     lr, #dmarf_Completed            ; If completed anyway then
+        BLNE    DMAUnlinkRequest                ;   free block,
+        BLNE    DMAFreeRequestBlock
+        BNE     %FT10                           ;   and unblock physical channel.
+
+        ORR     lr, lr, #dmarf_Suspended :OR: dmarf_BeenActive  ; Mark as suspended and been active.
+        LDR     r0, [sp]
+        TST     r0, #&00000001                  ; If don't want queued transfers to start
+        LDREQ   r0, [r8, #lcb_Flags]
+        TSTEQ   r0, #lcbf_Blocked               ;     and the channel is not blocked already then
+        ORREQ   r0, r0, #lcbf_Blocked           ;   block logical channel
+        STREQ   r0, [r8, #lcb_Flags]
+        ORREQ   lr, lr, #dmarf_Blocking         ;   and mark as blocking.
+        STR     lr, [r10, #dmar_Flags]
+10
+        BL      DMASearchQueue                  ; Try to start another request (unblock physical channel).
+        EXIT
+
+;---------------------------------------------------------------------------
+; SWIResumeTransfer
+;       In:     r0  = flags
+;                       bit     meaning
+;                       0       1 = move to head of queue
+;                       1-31    reserved (set to 0)
+;               r1  = DMA tag
+;
+;       Out:    all registers preserved
+;
+;       Resume a previously suspended DMA transfer.
+;
+SWIResumeTransfer
+        ENTRY   "r8-r11"
+
+        Debug   swi,"SWIResumeTransfer",r1
+
+        BL      DMAFindTag
+        EXIT    VS
+
+        LDR     lr, [r10, #dmar_Flags]          ; Make sure it's suspended.
+        TST     lr, #dmarf_Suspended
+        PullEnv EQ
+        ADREQ   r0, ErrorBlock_DMA_NotSuspended
+        DoError EQ
+
+        LDR     r8, [r10, #dmar_LCB]            ; r8->logical channel block
+        BIC     lr, lr, #dmarf_Suspended        ; Mark as not suspended.
+        TST     lr, #dmarf_Blocking             ; If blocking then
+        BICNE   lr, lr, #dmarf_Blocking         ;   clear blocking bit
+        STR     lr, [r10, #dmar_Flags]
+        LDRNE   lr, [r8, #lcb_Flags]            ;   and unblock logical channel.
+        BICNE   lr, lr, #lcbf_Blocked
+        STRNE   lr, [r8, #lcb_Flags]
+
+        IOMDBase r11
+        BL      DMAActivate
+        MOVVS   lr, #0                          ; If Start callback returned error then
+        STRVS   lr, [r9, #dmaq_Active]          ;   unblock channel
+        BLVS    DMAUnlinkRequest                ;   and delete request.
+        BLVS    DMAFreeRequestBlock
+        EXIT
+
+        MakeErrorBlock  DMA_NotSuspended
+
+;---------------------------------------------------------------------------
+; SWIExamineTransfer
+;
+;       In:     r0  = flags
+;                       bit     meaning
+;                       0-31    reserved (set to 0)
+;               r1  = DMA tag
+;
+;       Out:    r0  = number of bytes transferred so far
+;               All other registers preserved
+;
+;       Examine the progress of an active DMA transfer.
+;
+SWIExamineTransfer
+        ENTRY   "r1,r7-r10"
+
+        Debug   swi,"SWIExamineTransfer",r1
+
+        BL      DMAFindTag
+        EXIT    VS
+
+        IRQOff  r7                              ; Stop interrupt routine finishing transfer.
+
+        LDR     lr, [r10, #dmar_Tag]            ; Make sure it's still there.
+        TEQ     lr, r1
+        ADRNE   r0, ErrorBlock_DMA_BadTag
+        BNE     %FT10
+
+        LDR     r1, [r10, #dmar_Done]           ; Get amount of transfer done.
+        LDR     r8, [r10, #dmar_LCB]            ; r8->logical channel block
+        LDR     lr, [r10, #dmar_Flags]
+        TST     lr, #dmarf_Completed + dmarf_Suspended
+        MOVNE   r0, #0                          ; If completed or suspended then just return dmar_Done.
+        BNE     %FT05
+
+        LDR     r0, [r9, #dmaq_Active]
+        CMP     r0, r10                         ; If transfer is active then
+        BLEQ    DMAActiveDone                   ;   get amount of active buffer done.
+05
+        SetPSR  r7
+        ADD     r0, r0, r1                      ; Return total.
+        EXIT
+10
+        SetPSR  r7
+        PullEnv
+        DoError
+
+
+        END

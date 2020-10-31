@@ -1,0 +1,383 @@
+
+/* softload.c - soft load a RISC OS ROM */
+
+/*
+   MJS 08-Sep-96 Derived from SoftLoad9 BASIC code, but:
+                 - updated for RISC OS 3.7 and StrongARM
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#define Version "1.00"
+
+/* ------------------------------------------------------------------------ */
+
+#define DefaultROMDir  "<Boot$Dir>.SoftLoad."
+#define DefaultROMName "4MEG"
+
+#define AppSpaceStart   0x8000
+#define ROMsize       0x400000
+#define ROMlogaddr   0x3800000
+#define ROMcheckaddr 0x3bffff4
+
+#define MyMinAppSpaceTop 0xa8000
+
+#define PageSize        0x1000
+#define Log2PageSize    12
+
+/* Level 1 Page table */
+#define L1PT            0x2c0c000
+
+/* kernel workspace address, changed at 3.70 */
+#define PhysMemAddr_350 0x170
+#define PhysMemAddr_370 0x180
+
+#define ErrorReturnCode 257
+
+/* ------------------------------------------------------------------------ */
+
+typedef struct
+{
+  unsigned int pagenumber;
+  unsigned int logaddress;
+  unsigned int PPL;
+  int          terminator;
+} prequest_t;
+
+typedef struct
+{
+  unsigned int address;
+  unsigned int size;
+} physmemtable_t;
+
+
+/* ------------------------------------------------------------------------ */
+
+static char         ROMfname[256];
+static int          verbose,fakeit,ROMversion,firstpage_rom,firstpage_code;
+static unsigned int physaddr_rom,physaddr_code,firstaddr_rom,firstaddr_code;
+
+extern void startnew(unsigned int, unsigned int, unsigned int, char *);
+
+/* ------------------------------------------------------------------------ */
+
+static void error_noslot(char *code)
+{
+  fprintf(stderr,"Could not find slot (%s)\n",code);
+  exit(ErrorReturnCode);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void find_ROMfname(int argc, char *argv[])
+{
+  int narg;
+
+  verbose = 0;
+  fakeit  = 0;
+
+  narg = 2;
+  if ((argc > 1) && (argv[1][0] == '-'))
+  {
+    /* -v means verbose, or -f means verbose and fake it (don't really load) */
+    narg++;
+    verbose = 1;
+    if (argv[1][1] == 'f') fakeit = 1;
+  }
+
+  if (argc < narg)
+    strcpy(ROMfname,DefaultROMDir DefaultROMName);
+  else
+  {
+    ROMfname[0] = '\0';
+    if ((strchr(argv[narg-1],'.') == NULL) && 
+        (strchr(argv[narg-1],'<') == NULL)    )
+      strcpy(ROMfname,DefaultROMDir);
+    strcat(ROMfname,argv[narg-1]);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int is_same_ROM(void)
+{
+  /* compare checksum word */
+
+  unsigned int    fw, *rw = (unsigned int *)ROMcheckaddr;
+  FILE            *fp;
+
+  fp = fopen(ROMfname,"rb");
+  if (fp == NULL)
+  {
+    fprintf(stderr,"Could not open '%s'\n",ROMfname);
+    exit(ErrorReturnCode);
+  }
+
+  fseek(fp,(long int)ROMsize-12,SEEK_SET);
+  fread(&fw,4,1,fp);
+  fclose(fp);
+
+  return (fw == *rw);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void find_ROMversion(void)
+{
+  _kernel_oserror *e;
+  float           v;
+
+  e = _swix(OS_Byte,_INR(0,1),0,0);
+  sscanf(e->errmess,"RISC OS %f",&v);
+  ROMversion = (int)(v*100.0F + 0.5F);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static unsigned int findpage(unsigned int logaddr)
+{
+  prequest_t p = {0,0,0,-1};
+
+  p.logaddress = logaddr;
+  _swix(OS_FindMemMapEntries,_IN(0),&p);
+  return p.pagenumber;
+}
+
+static unsigned int findaddr(unsigned int page)
+{
+  prequest_t p = {0,0,0,-1};
+
+  p.pagenumber = page;
+  _swix(OS_ReadMemMapEntries,_IN(0),&p);
+  return p.logaddress;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void find_firstaddr(physmemtable_t *physmem, int chunk,
+                           unsigned int physaddr, unsigned int addr,
+                           int pagesneeded, char *ecode,
+                           int *firstpage, unsigned int *firstaddr)
+{
+  int          i,chunk2,fpage;
+  unsigned int faddr;
+
+  chunk2 = 0;
+  fpage  = 0;
+  while (chunk2 < chunk)
+  {
+    fpage += physmem[chunk2].size >> Log2PageSize;
+    chunk2++;
+  }
+  fpage += (physaddr - addr) >> Log2PageSize;
+
+  /* fpage is now first page at physaddr */
+  faddr = findaddr(fpage);
+  for (i=fpage; i<fpage+pagesneeded; i++)
+  {
+    /* check contiguous physical pages for contiguous logical mapping */
+    if (findaddr(i) != faddr + (i-fpage)*PageSize) error_noslot(ecode);
+  }
+
+  *firstpage = fpage; /* page number of first page of slot */
+  *firstaddr = faddr; /* logical address of first page */
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void find_slots(void)
+{
+  /* find slots for ROM and (1 page) for starter code; assumes we are
+     run early in boot sequence, outside desktop, such that much of
+     memory (up to 28 Mb limit) will be mapped into appication space */
+
+  physmemtable_t *physmem;
+
+  int          found,chunk,chunk_code,max_chunk,chunk_maxpage,chunk_rom;
+  int          maxpage,currentpage,Npages;
+  int          pagesneeded_rom,pagesneeded_code;
+  unsigned int size,size_maxpage,addr_rom,addr_code;
+
+  /* kernel's table of physical RAM chunks */
+  physmem = (physmemtable_t *)PhysMemAddr_350;
+  if (ROMversion >= 370) physmem = (physmemtable_t *)PhysMemAddr_370;
+
+  /* no. of RAM pages in machine */
+  _swix(OS_ReadMemMapInfo,_OUT(1),&Npages);
+ 
+  if (Npages*PageSize < ROMsize + 0x200000) error_noslot("3");
+
+  /* find maxpage, the page no. of last page in 'wimp slot' ie. app space */
+  _swix(Wimp_SlotSize,_INR(0,1)|_OUT(0),-1,-1,&size);
+  maxpage = findpage(size + AppSpaceStart - PageSize);
+
+  if (verbose) printf("Npages=%1d Apptoppage=%1d(%8.8x)\n",
+                       Npages,maxpage,findaddr(maxpage));
+
+  pagesneeded_rom  = ROMsize >> Log2PageSize;
+  pagesneeded_code = 1;
+
+  /* find end of physical memory chunk list */
+  if (verbose)
+    printf("physmem @ %8.8x\nchunk addr chunk size\n",(unsigned int)physmem);
+  chunk = 0;
+  while(physmem[chunk].size)
+  { 
+    if (verbose)
+      printf("  %8.8x   %8.8x\n",physmem[chunk].address,physmem[chunk].size);
+    chunk++;
+  }
+  max_chunk = chunk - 1;
+
+  /* start at last physical memory chunk */
+  chunk       = max_chunk;
+  addr_rom    = physmem[chunk].address;
+  size        = physmem[chunk].size;
+  currentpage = Npages - 1;
+
+  /* walk back over physical memory chunks to page 'maxpage' */
+  while(currentpage > maxpage)
+  {
+    if (size <= (currentpage-maxpage)*PageSize)
+    {
+      /* walk back over whole chunk */
+      currentpage -= size >> Log2PageSize;
+      chunk--;
+      if (chunk < 0) error_noslot("1");
+      addr_rom = physmem[chunk].address;
+      size     = physmem[chunk].size;
+    }
+    else
+    {
+      /* walk back over part of chunk */
+      size -= (currentpage-maxpage)*PageSize;
+      currentpage = maxpage;
+    }
+  }
+  chunk_maxpage = chunk;
+  size_maxpage  = size;
+
+  /* now find large enough slot for ROM, starting at top of app space */
+  found = 0;
+  do
+  {
+    /* possible phys address of ROM, 1 Mb aligned  */
+    physaddr_rom = (addr_rom + size - ROMsize) & ~0xfffff;
+    if (physaddr_rom < addr_rom)
+    {
+      /* no room for ROM in chunk */
+      chunk--;
+      if (chunk < 0) error_noslot("2a");
+      addr_rom = physmem[chunk].address;
+      size     = physmem[chunk].size;
+    }
+    else found = 1;
+  } while (!found);
+  chunk_rom = chunk;
+
+  if (verbose) printf("R %8.8x\n",physaddr_rom);
+
+  /* now find slot for code */
+  if (physaddr_rom >= physmem[chunk_rom].address + pagesneeded_code*PageSize)
+  {
+    /* code just below ROM in same chunk */
+    chunk_code     = chunk_rom;
+    addr_code      = physmem[chunk_code].address;
+    physaddr_code  = physaddr_rom - pagesneeded_code*PageSize;
+  }
+  else
+  {
+    /* code must go in another chunk */
+    chunk_code = chunk_maxpage;
+    size       = size_maxpage;
+    addr_code  = physmem[chunk_code].address;
+    found = 0;
+    do
+    {
+      if (chunk_code != chunk_rom)
+      {
+        /* possible phys address of code */
+        physaddr_code = (addr_code+size-pagesneeded_code*PageSize);
+        found = (physaddr_code >= addr_code);
+        if (!found)
+        {
+          /* no room for code in chunk */
+          chunk_code--;
+          if (chunk_code < 0) error_noslot("2b");
+          addr_code = physmem[chunk_code].address;
+          size      = physmem[chunk_code].size;
+        }
+      }
+    } while (!found);
+  }
+
+  if (verbose) printf("C %8.8x\n",physaddr_code);
+
+  /* find firstpage and firstaddr (logical address) for ROM */
+  find_firstaddr(physmem,chunk_rom,physaddr_rom,addr_rom,
+                 pagesneeded_rom,"4a",&firstpage_rom,&firstaddr_rom);
+
+  /* find firstpage and firstaddr (logical address) for code */
+  find_firstaddr(physmem,chunk_code,physaddr_code,addr_code,
+                 pagesneeded_code,"4b",&firstpage_code,&firstaddr_code);
+
+  if (verbose)
+  {
+    printf("ROM:  logaddr=%8.8x page=%5d physaddr=%8.8x\n",
+           firstaddr_rom,firstpage_rom,physaddr_rom);
+    printf("Code: logaddr=%8.8x page=%5d physaddr=%8.8x\n",
+           firstaddr_code,firstpage_code,physaddr_code);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void load_ROM_and_go(void)
+{
+  unsigned int firstaddr;
+  char         cmd[256];
+
+  firstaddr = firstaddr_rom;
+  if (firstaddr_code < firstaddr) firstaddr = firstaddr_code;
+
+  if (firstaddr < MyMinAppSpaceTop) error_noslot("5");
+
+  sprintf(cmd,"load %s %x",ROMfname,firstaddr_rom);
+
+  /* must never return! */
+  if (!fakeit) startnew(physaddr_rom,L1PT,physaddr_code,cmd);
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+
+  find_ROMversion();
+  if (ROMversion < 350)
+  {
+    fprintf(stderr,"softload only runs on RISC OS 3.5 or later\n");
+    exit(ErrorReturnCode);
+  }
+
+  find_ROMfname(argc,argv); /* also sets verbose */
+
+  if (is_same_ROM())
+  {
+    printf("Soft-loaded OS\n");
+  }
+  else
+  {
+    if (verbose) printf("Softload version %s\n",Version);
+    find_slots();
+    if (!fakeit) printf("Soft-loading ROM...\n");
+    load_ROM_and_go();
+  }
+
+  return 0;
+}

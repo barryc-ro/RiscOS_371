@@ -1,0 +1,175 @@
+/* > d_alloc.c
+
+ * © SJ Middleton, 1993
+
+ * Code to use dynamic areas as provided in RISC OS 3.X
+
+ * The function dynamicarea_init() can bs used to see if they exist.
+ * If they do then use d_alloc, d_free as the other memory allocators.
+ * Note that if alloc_nextiscalled() is called before the first creating
+ * area then that name will be used, otherwise wimot_programname() will
+ * be used.
+
+ * Remember, you can't execute code in a dynamic area !
+
+ */
+
+#include "os.h"
+#include "kernel.h"
+#include "swis.h"
+#include "werr.h"
+#include "wimpt.h"
+
+#include <stddef.h>
+
+#include "memalloc.h"
+#include "mem_int.h"
+
+#define OS_DynamicArea          0x66
+#define err_UnknownSWI          0x1E6
+
+#define MoveMemoryErrors_Val    0x1C0
+#define MoveMemoryErrors_Mask   0x003
+
+#define err_ChDynamCAO          0x1C0
+#define err_ChDynamNotAllMoved  0x1C1
+#define err_AplWSpaceInUse      0x1c2
+
+enum            /* Dynamic area reason codes */
+{
+    DynamicArea_Create,
+    DynamicArea_Remove,
+    DynamicArea_ReturnInfo,
+    DynamicArea_Enumerate,
+    DynamicArea_Renumber,
+    DynamicArea_ReturnApplSize
+};
+
+enum            /* user mode access rights */
+{
+    Access_UserReadWrite,
+    Access_UserReadOnly,
+    Access_UserNoAccess
+};
+
+enum
+{
+    Area_NotBufferable  = 0x10,
+    Area_NotCacheable   = 0x20,
+    Area_DoublyMapped   = 0x40,
+    Area_NotDraggable   = 0x80
+};
+
+struct dynamic_area         /* header stuck on allocated space */
+{
+    int area_number,
+        area_size;
+};
+
+#define get_dptr(ptr)   (&((struct dynamic_area *)(ptr))[-1])
+
+/* From c_alloc.c */
+
+BOOL d_alloc(void **anchor, size_t nbytes)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+
+    BOOL success = FALSE;
+
+    if (*anchor)
+    {
+        struct dynamic_area *d = get_dptr(*anchor);
+        int bytes_moved;
+
+        r.r[0] = d->area_number;
+        r.r[1] = nbytes - d->area_size;
+        e = _kernel_swi(OS_ChangeDynamicArea, &r, &r);
+        bytes_moved = r.r[1];
+
+        if (e)
+        {
+            if ((e->errnum &~ MoveMemoryErrors_Mask) != MoveMemoryErrors_Val)
+                os_err((os_error *)e);
+        }
+        else
+        {
+            if (nbytes < d->area_size)
+                d->area_size -= bytes_moved;
+            else
+                d->area_size += bytes_moved;
+            success = TRUE;
+        }
+    }
+    else
+    {
+        int allocated_number;
+        char *allocated_base;
+
+        r.r[0] = DynamicArea_Create;
+        r.r[1] = -1;                        /* number */
+        r.r[2] = nbytes + sizeof(struct dynamic_area);
+        r.r[3] = -1;                        /* logical address */
+        r.r[4] = Area_NotDraggable;         /* flags */
+        r.r[5] = -1;                        /* max size */
+        r.r[6] = 0;                         /* -> area handler */
+        r.r[7] = 0;                         /* -> workspace */
+        r.r[8] = (int) (memalloc__nextareaname != NULL ?
+                    memalloc__nextareaname :
+                    wimpt_programname());
+        e = _kernel_swi(OS_DynamicArea, &r, &r);
+        allocated_number = r.r[1];
+        allocated_base = (char *)r.r[3];
+
+/* if SWI doesn't exist just return FALSE */
+        if (e)
+        {
+            if (e->errnum != err_UnknownSWI &&
+                (e->errnum &~ MoveMemoryErrors_Mask) != MoveMemoryErrors_Val)
+                os_err((os_error *)e);
+        }
+        else
+        {
+            struct dynamic_area *d = (struct dynamic_area *)allocated_base;
+            d->area_number = allocated_number;
+            d->area_size = nbytes;
+            *anchor = &d[1];
+            success = TRUE;
+        }
+    }
+
+    alloc_nextiscalled(NULL);       /* clear name so it's not reused */
+
+    if (!success)
+        alloc__checkerror(nbytes);
+    return success;
+}
+
+void d_free(void **anchor)
+{
+    if (*anchor)
+    {
+        _kernel_swi_regs r;
+        struct dynamic_area *d = get_dptr(*anchor);
+        r.r[0] = DynamicArea_Remove;
+        r.r[1] = d->area_number;
+        os_err((os_error *)_kernel_swi(OS_DynamicArea, &r, &r));
+        *anchor = NULL;
+    }
+}
+
+static int exists = -1;
+
+BOOL dynamicarea_init(void)
+{
+    if (exists == -1)
+    {
+        void *p = NULL;
+        exists = d_alloc(&p, 1);
+        if (exists)
+            d_free(&p);
+    }
+    return exists;
+}
+
+/* eof d_alloc.c */

@@ -1,0 +1,700 @@
+/*
+ * module.c - the module wrapper and guts of RemotePrinterSupport
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <kernel.h>
+
+#include <swis.h>
+
+#include "Module.h"
+#include "Freeway.h"
+#include "Pollword.h"
+
+#include "Debug.h"
+#include "Msgs.h"
+#include "StrExtra.h"
+#include "EventQueue.h"
+
+/***********************************************************************\
+**                                                                     **
+** Nasty old global variables                                          **
+**                                                                     **
+\***********************************************************************/
+
+/*
+ * Used when we want to kill the module
+ */
+
+char module_name[] = "RemotePrinterSupport" ;
+
+/*
+ * Use to kill the messages module, and th check for
+ * its presence
+ */
+
+char messagesmod_name[] = "RemotePrinterMessages" ;
+
+/*
+ * The string that gets stored in PrinterType$n
+ */
+
+static char printer_type[256] ;
+
+/*
+ * Somewhere to hold the name of the remote printer we're dealing with
+ */
+
+static char printer_name[15] ;
+
+/*
+ * The current job number
+ */
+
+static int job_no = 0 ;
+
+/* 
+ * A temporary array used for forming rename pathnames.
+ * Could allocate it on the fly, but the less chances
+ * for things to go wrong the better.
+ */
+
+static char tmp[256] ;
+   
+/*
+ * A copy of the private word
+ */
+
+void *private_word_pointer ;
+
+/*
+ * The string that represents the unique hardware address
+ * of the ethernet hardware in this machine
+ */
+
+char unique_address[11] ;
+
+/*
+ * The IP address of the remote printer we're dealing with,
+ * used if !Printers is quitting to allow the module to
+ * function on its own
+ */
+
+int ip_address ;
+
+/*
+ * The pollword used by !Printers
+ */
+
+int poll_word = 0 ;
+
+/*
+ * An often used structre
+ */
+
+struct _Event event ;
+
+/*
+ * Keep a record of what printer: was pointing to before we
+ * mangled it.
+ */
+
+int old_printer_type = -1 ;
+
+/*
+ * Are we meant to be doing anything now?
+ */
+
+int rps_enabled = FALSE ;
+
+/*
+ * Is printers there? No? Then do file renaming.
+ */
+
+int do_rename = FALSE ;
+
+/*
+ * Has printers started yet? If so, return object changed/added/removed
+ * queue entries.
+ */
+
+int printers_started = FALSE ;
+
+/* 
+ * Global set of registers to use. 
+ * Less coming and going off stack each function entry
+ */
+
+_kernel_swi_regs r ;
+ 
+/*
+ * Global error block for constructing our own errors.
+ */
+
+_kernel_oserror err ;
+
+/*
+ * Global error block pointer for _kernel_* returns
+ */
+
+_kernel_oserror *e ;
+
+/*
+ * Trap upcall media not present
+ */
+
+int trap_upcalls = FALSE ;
+
+/* 
+ * Backend filetype for direct printing
+ */
+
+int filetype ;
+
+/***********************************************************************\
+**                                                                     **
+** Forward decls                                                       **
+**                                                                     **
+\***********************************************************************/
+
+/*
+ * Needed for passing to OS_Claim, sits on UpCallV
+ */
+
+extern int rps_entry (_kernel_swi_regs *r, void *pw) ;   
+
+/*
+ * For OS_AddCallBack, to do file renaming after an UpCall
+ */
+
+extern int rename_entry (_kernel_swi_regs *r, void *pw) ;
+
+
+/***********************************************************************\
+**                                                                     **
+** Functions                                                           **
+**                                                                     **
+\***********************************************************************/
+
+/*
+ * Finalisation handler
+ */
+
+void rps_modfinal (void)
+{
+#ifdef Messages
+    msgs_closefile () ;
+#endif
+
+    r.r[0] = UpCallV ;
+    r.r[1] = (int) rps_entry ;
+    r.r[2] = (int) private_word_pointer ;
+    _kernel_swi (OS_Release, &r, &r) ;
+
+debug dprintf ("rps: Dying\n\r") ;
+debug debug_stop () ;
+}
+
+/*
+ * Initialisation handler
+ */
+
+_kernel_oserror *rps_modinit (char *cmd_fail, int podule_base, void *pw)
+{
+    private_word_pointer = pw ;
+
+    /*
+     * Check that our messages module is loaded.
+     * Die if not
+     */
+#ifdef Messages
+#ifdef Disc
+    r.r[0] = 18 ;
+    r.r[1] = (int) messagesmod_name ;
+    if ((e = _kernel_swi (OS_Module, &r, &r)) != NULL)
+        return (e) ;
+#endif
+#endif
+    /*
+     * Open our messages file
+     */
+#ifdef Messages
+    if ((e = msgs_openfile (MESSAGES_FILE)) != NULL)
+        return (e) ;
+#endif
+    /*
+     * Hurray! It all worked, get local address
+     */
+
+    strncpy (unique_address, getenv ("Inet$LocalAddr"), 10) ;
+
+    /*
+     * Stuff a routine on UpCallV
+     */
+
+    r.r[0] = UpCallV ;
+    r.r[1] = (int) rps_entry ;
+    r.r[2] = (int) pw ;
+    if ((e = _kernel_swi (OS_Claim, &r, &r)) != NULL)
+    {
+        msgs_closefile () ;
+        return (e) ;
+    }
+
+    atexit (rps_modfinal) ;
+
+debug debug_start () ;
+debug dprintf ("rps: Initialising\n\r") ;
+
+    return ((_kernel_oserror *) 0) ;
+}
+
+void write_information_file (int ip_address, char *unique_address, int job_no)
+{
+  FILE *f ;
+
+  sprintf (tmp, "Share::_S%x.RemQueue.%s.R%dI",ip_address, unique_address, job_no) ;
+
+  debug dprintf ("Trying to open information file %s\n\r", tmp) ;
+
+  f = fopen (tmp, "ab+") ;
+  if (f == NULL)
+  {
+    /*
+     * Failed to write info file, delete spool file
+     */
+    sprintf (tmp, "Share::_S%x.RemQueue.%s.R%d",ip_address, unique_address, job_no) ;
+    
+debug dprintf ("Failed, deleting %s\n\r", tmp) ;
+
+    r.r[0] = 6 ; /* Delete object */
+    r.r[1] = (int) tmp ;
+    _kernel_swi (OS_File, &r, &r) ;
+
+    /*
+     * We don't particularly care if this goes wrong, difficult to
+     * do anything about it...
+     */
+  }
+  else
+  {
+    fprintf (f, "%s%c%s%c%s%c%s\n", printer_name, 0, unique_address, 0, msgs_lookup ("UNKN", 0), 0, msgs_lookup ("UNKN", 0)) ;
+
+    debug dprintf ("Succeeded, writing %s %s %s\n\r", printer_name, unique_address, msgs_lookup ("UNKN", 0)) ;
+
+    fclose (f) ;
+  }
+}
+  
+
+/*
+ * Rename callback handler
+ */
+
+int rename_handler (_kernel_swi_regs *lr, void *pw)
+{
+    _kernel_oserror *e ;
+    /*
+     * FIXME: Delete destination file just in case it exists?
+     */
+
+    write_information_file (ip_address, unique_address, job_no) ;
+
+    sprintf (tmp, "Share::_S%x.RemQueue.%s.R%d",ip_address, unique_address, job_no) ;
+
+debug dprintf ("Rename from %s to %s\n\r", printer_type, tmp) ;
+
+    r.r[0] = 25 ; /* rename */
+    r.r[1] = (int) printer_type ;
+    r.r[2] = (int) tmp ;
+    e = _kernel_swi (OS_FSControl, &r, &r) ;
+
+    if (e)
+    {
+debug dprintf ("Error is %d %s\n\r", (int *) e, (char *)e+4) ;
+    }
+    else
+    {
+      r.r[0] = 18 ; /* Settype */
+      r.r[1] = (int) tmp ;
+      r.r[2] = filetype ;
+      _kernel_swi (OS_File, &r, &r) ;
+    }
+
+    if (++job_no > 255)
+      job_no = 0 ;
+
+    return (1) ;
+}
+
+/*
+ * Queue handling thingy
+ */
+
+_kernel_oserror *add_to_queue (int type, char *object)
+{
+        event.type   = type ;
+        event.object = (char *) malloc (strlen (object) + 1) ;
+        strcpy (event.object, object) ;
+
+debug dprintf ("About to add to queue\n\r") ;
+
+        if ((e = Queue_Add (&event)) != NULL)
+                return (e)  ;
+
+debug dprintf ("Added to queue\n\r") ;
+
+        poll_word = POLLWORD_SOMETHING_HAPPENED ;
+
+        return ((_kernel_oserror *) NULL) ;
+}
+
+/*
+ * UpcallV handler
+ */
+
+int rps_handler (_kernel_swi_regs *lr, void *pw)
+{
+    char *s ;
+    char *sp ;
+    char *wscrap ;
+
+    /* 
+     * return 1 else it'll blow up
+     */
+
+    switch (lr->r[0]) 
+    {
+        case UpCall_MediaNotKnown:
+        case UpCall_MediaNotPresent:
+
+             if (trap_upcalls)
+                  return (-1) ; /* CLAIM! */
+             break ;
+
+        case UpCall_ModifyingFile:
+
+            if (lr->r[9] == 520)  /* Renaming file */
+            {
+                sp = getenv ("Wimp$ScrapDir") ;
+                /*
+                 * Get to $.blah
+                 */
+                wscrap = strchr (sp, ':') + 1 ;
+                debug dprintf ("Wimp Scrap path = %s\n\r", wscrap) ;                
+
+                if (strlen(wscrap) < strlen((char *)(lr->r[2])))
+                {
+                    s = (char *)(lr->r[2]) + strlen (wscrap) + 1 ;
+
+                    debug dprintf ("$.path = %s\n\r", s) ;
+                    /*
+                     * Get to blah
+                     */
+                    debug dprintf ("path = %s\n\r", s) ;
+                    s = strchr (s, '.') + 1;
+
+                    if ((int) s > 1)
+                    {
+                        debug dprintf ("match = %s\n\r", s) ;
+
+                        /*
+                         * TESTME! Seems to work
+                         */
+                        if (strincmp (s, "RemQueue", 8) == 0)
+                        {
+                            debug dprintf ("About to add file renamed to queue\n\r") ;                
+                            (void) add_to_queue (RPS_FILE_RENAMED, s) ;
+                        }
+                    }
+                }
+            }
+
+            if (lr->r[9] == 259)  /* Closing file */
+            {
+                r.r[0] = 7 ;
+                r.r[1] = lr->r[1] ;
+                r.r[2] = (int) tmp ;
+                r.r[5] = 257 ;
+                _kernel_swi (OS_Args, &r, &r) ;
+
+#ifdef OldPrinters
+                if (strncmp (tmp, "printer:", 8) == 0)
+#else
+                s = canon (getenv ("Printer$Path")) ;
+                debug dprintf ("Comparing %s with %s\n\r", tmp, s) ;
+                if (stricmp (tmp, s) == 0)
+#endif
+                {
+debug dprintf ("printer: is about to be closed\n\r") ;
+
+                    if (rps_enabled)
+                    {
+                        if (do_rename)
+                        {
+                            r.r[0] = 50 ; /* 2 seconds */
+                            r.r[1] = (int) rename_entry ;
+                            r.r[2] = (int) pw ;
+                            _kernel_swi (OS_CallAfter, &r, &r) ;
+                        }
+                        else
+                        {
+debug dprintf ("Adding printer closed event to the queue\n\r") ;
+                            if (rps_enabled)
+                                (void) add_to_queue (RPS_PRINTER_CLOSED, "") ;
+                        }
+                    }
+                }
+                free (s) ;
+            }
+            break ;
+
+        case UpCall_Freeway:
+
+debug dprintf ("UpCall_Freeway received object type %d reason %d object %s\n\r", 
+        lr->r[2], lr->r[1], lr->r[3]) ;
+
+            if ((lr->r[2] == FreewayType_Printers) && (printers_started))
+            {
+                switch (lr->r[1])
+                {
+                    case Freeway_ObjectAdded:
+                        (void) add_to_queue (RPS_PRINTER_ADDED, (char *)(lr->r[3])) ;
+                        break ;
+
+                    case Freeway_ObjectRemoved:
+                        (void) add_to_queue (RPS_PRINTER_DELETED, (char *)(lr->r[3])) ;
+                        break ;
+
+                    case Freeway_ObjectChanged:
+                        (void) add_to_queue (RPS_PRINTER_CHANGED, (char *)(lr->r[3])) ;
+                        break ;
+
+                    case Freeway_ObjectDeleted:
+                        (void) add_to_queue (RPS_LOCALPRINTER_DELETED, (char *)(lr->r[3])) ;
+                        break ;
+                    /*
+                     * Don't complain about unknown freeway reasons
+                     * else it'll go bang in the future
+                     */
+                }
+            }
+            break ;
+    }
+
+    return (1) ;
+}
+ 
+/*
+ * Service call handler
+ */
+
+void sc_handler (int service_number, _kernel_swi_regs *lr, void *pw)
+{
+    switch (service_number)
+    {
+        case Service_FreewayTerminating:
+            (void) add_to_queue (RPS_FREEWAY_TERMINATING, "") ;
+            rps_enabled = FALSE ;
+
+debug dprintf ("Service_FreewayTerminating received\n\r") ;
+
+            break ;
+
+        case Service_FreewayStarting:
+            (void) add_to_queue (RPS_FREEWAY_STARTING, "") ;
+            rps_enabled = FALSE ;
+
+debug dprintf ("Service_FreewayStarting received\n\r") ;
+
+            break ;
+    }
+}
+
+/*
+ * SWI Handler: 0 = ReadPollwordLocation
+ *              1 = GetNextEvent
+ *              2 = ReadUniqueAddress
+ *              3 = Enable
+ *              4 = Disable
+ */
+
+_kernel_oserror *rps_swi (int swi_number, _kernel_swi_regs *r, void *pw)
+{
+    char *s ;
+    _kernel_swi_regs rr ;
+    Event ev = NULL ;
+
+    switch (swi_number)
+    {
+        case 0:
+            r->r[0] = (int) &poll_word ;
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 1: /* FIXME */
+            e = Queue_Read (&ev) ;
+
+debug dprintf ("rps_swi: Just done queue_read, ev r = %d, obj = %d\n\r", ev->type, ev->object) ;
+debug dprintf ("rps_swi: Registers are r0 %d r1 %d r2 %d\n\r", r->r[0], r->r[1], r->r[2]) ;
+
+            if (e)
+                return (e) ; 
+
+            if (ev == NULL) /* Then there's nothing in the queue */
+            {
+debug dprintf ("rps_swi: Empty event queue - returning all -1\n\r") ;
+                r->r[0] = -1 ;
+                r->r[1] = -1 ;
+                r->r[2] = -1 ;
+            }
+            else
+            {
+              if (r->r[2] == -1) /* Read reqd buffer size */
+              {
+debug dprintf ("rps_swi: asked to return buffer size, %d\n\r", strlen (ev->object) + 1) ;
+                r->r[0] = ev->type ;
+                r->r[2] = strlen (ev->object) + 1 ;
+              }
+              else
+              {
+debug dprintf ("rps_swi: returning real data into buffer, r %d b %d l %d\n\r", ev->type, r->r[1], r->r[2]) ;
+                r->r[0] = ev->type ;
+                if (r->r[2])
+                  strncpy ((char *)(r->r[1]), ev->object, r->r[2]) ;
+                Queue_Remove () ; /* Frees string too if necessary */
+              }
+            }
+            return ((_kernel_oserror *) 0) ;
+
+            break ;
+
+        case 2:
+            r->r[0] = (int) unique_address ;
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 3:
+            /*
+             * Enable: R0 = flags
+             *         R1 = IP address of printer
+             *         R2 = printer name
+             *         R3 = significant backend filetype
+             */
+            rps_enabled = TRUE ;
+
+            ip_address = r->r[1] ;
+            strncpy (printer_name, (char *)(r->r[2]), 14) ;
+
+            if (r->r[0] & 1) /* Printers is present */
+                do_rename = FALSE ;
+            else /* Printers is quitting */
+            {
+                do_rename = TRUE ;
+                printers_started = FALSE ;
+            } 
+
+            if (r->r[0] & 2) /* Printers has started & is ready for messages */  
+            {
+debug dprintf ("Setting printers started flag") ;
+                printers_started = TRUE ;
+                break ;
+            }
+
+debug dprintf ("Setting up printer:\n\r") ;
+
+            /* 
+             * Make our directories, assumes it all exists up to
+             *   Share::_S<IPaddr>.RemSpool
+             */
+            if (!(r->r[0])) /* If printers is quitting */
+            {
+              /*
+               * Set up the appropriate PrinterType$ variable
+               */
+
+              printers_started = FALSE ;
+
+              filetype = r->r[3] ;
+
+              sprintf (printer_type, "Share::_S%x.RemSpool.%s.Rspool", 
+                  r->r[1], unique_address) ;
+
+              rr.r[0] = (int) "PrinterType$9" ;
+              rr.r[1] = (int) printer_type ;
+              rr.r[2] = strlen (printer_type) ;
+              rr.r[3] = 0 ;
+              rr.r[4] = 4 ; /* Literal String */
+              e = _kernel_swi (OS_SetVarVal, &rr, &rr) ;
+              if (e)
+                  return (e) ;
+
+              /*
+               * Write current printer type to be xx
+               */
+
+              rr.r[0] = 5 ;
+              rr.r[1] = 9 ; /* FIXME! Might not be right */
+              e = _kernel_swi (OS_Byte, &rr, &rr) ;
+              if (e)
+                  return (e) ;
+
+              /*
+               * Remember what it used to be
+               */
+
+              old_printer_type = rr.r[1] ;
+            }
+
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 4:
+            /*
+             * Change back to old printer driver
+             */
+
+debug dprintf ("Reverting to old printer:\n\r") ;
+
+            rps_enabled = FALSE ;       
+
+            if ((do_rename) && (old_printer_type != -1))
+            {
+                rr.r[0] = 5 ;
+                rr.r[1] = old_printer_type ;
+                _kernel_swi (OS_Byte, &rr, &rr) ;
+                old_printer_type = -1 ;
+            }
+
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 5:
+            /*
+             * Enable Upcalls again
+             */
+             trap_upcalls = FALSE ;
+             break ;
+
+        case 6:
+            /*
+             * Disable (claim) UpCall_MediaNotPresent
+             */
+             trap_upcalls = TRUE ;
+             break ;
+
+        default:
+            /*
+             * What silly bugger did this?
+             */
+
+            err.errnum = 1 ;
+            strcpy (err.errmess, (s = msgs_lookup ("BadSWI", 1, module_name))) ;
+            return (&err) ;          
+    }
+
+    /* NOTREACHED */
+    return ((_kernel_oserror *) 0) ;
+}

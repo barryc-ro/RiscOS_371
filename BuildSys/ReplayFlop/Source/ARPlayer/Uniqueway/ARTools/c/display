@@ -1,0 +1,875 @@
+/* > display.c
+
+ * © SJ Middleton, 1993
+
+ * This file contains the movie specific code for the display window.
+ * If the Multiple Windows option is selected from the iconbar menu then
+ * as many of these windows can be opened as there is memory for.
+
+ * The actual work of displaying the sprite is contained within spr_disp.c
+ * int the Spr library.
+
+ */
+
+#include "bbc.h"
+#include "clipboard.h"
+#include "coords.h"
+#include "event.h"
+#include "help.h"
+#include "msgs.h"
+#include "pane.h"
+#include "saveas.h"
+#include "visdelay.h"
+#include "werr.h"
+#include "wimpt.h"
+#include "wimpx.h"
+#include "xferrecv.h"
+#include "xfersend.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "macros.h"
+
+#include "file.h"
+#include "memalloc.h"
+#include "pane.h"
+#include "screenmode.h"
+#include "spr_disp.h"
+#include "strfn.h"
+#include "sys.h" 
+#include "wmisc.h"
+
+#include "armovie.h"
+
+#include "arinfo.h"
+#include "artools.h"
+#include "arutils.h"
+#include "display.h"
+
+static display_str  *display__base = NULL;          /* ptr to first window opened is stored here to use for operations on the iconbar */
+static int          display__opencontext = 0;       /* used to calculate open position with multiple windows */
+
+#define DISPLAY_MENUT       msgs_lookup("dmenu0t")
+#define DISPLAY_MENU        msgs_lookup("dmenu0")
+
+#define FILE_MENUT          msgs_lookup("dmenu1t")
+#define FILE_MENU           msgs_lookup("dmenu1")
+
+#define EDIT_MENUT          msgs_lookup("dmenu2t")
+#define EDIT_MENU           msgs_lookup("dmenu2")
+
+#define DISPLAY_HELP        msgs_lookup("dhelp")
+
+#define SPRITE_LEAFNAME     msgs_lookup("disp0")
+#define DEFAULT_TITLE       msgs_lookup("disp1")
+#define SPRITE_LEAFNAME2    msgs_lookup("disp2")
+#define EXTRACT_LEAFNAME    msgs_lookup("disp3")
+
+#define SPRITE_CORRUPTED    msgs_lookup("disp4")
+#define FOR_EXTRACT         msgs_lookup("disp5")    
+
+#define DISPLAY_MENU_HELP   "DHELP"
+
+#define filetype_Directory  0x1000
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Set up window title with the first line of the movie description (if there is one)
+ * else the filename of the movie.
+ */
+
+void display_settitle(display_str *dp)
+{
+    win_settitle(dp->window, dp->hdr && dp->hdr->name && dp->hdr->name[0] ? dp->hdr->name :
+                                dp->filename ? dp->filename : DEFAULT_TITLE);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Load some sort of initial sprite.
+ * Either the helpful sprite from the movie heaer, or if that fails
+ * the default sprite from within !ARMovie.
+ */
+
+static BOOL display__loadsprite(display_str *d)
+{
+    BOOL success = FALSE;
+    if (d->filename != NULL)
+    {
+        filehandle f;
+        if (os_err(file_open(fopt_Read, d->filename, &f)) == NULL)
+        {
+            int dummy;
+            sprite_info info;
+
+            success = os_err(spr_area_Reinit(d->spranchor)) == NULL &&
+                os_err(spr_ReadSprite(d->spranchor, f, d->hdr->sprite_offset+12, d->hdr->sprite_size-12)) == NULL &&
+                os_err(spr_ReturnName(d->spranchor, d->name, 1)) == NULL &&
+                os_err(spr_ReturnInfo_named(d->spranchor, d->name, &info)) == NULL &&
+                mode_var(info.mode, bbc_XEigFactor, &dummy);
+            file_close(f);
+        }
+        if (!success)
+            werr(0, SPRITE_CORRUPTED);
+    }
+
+    if (!success)
+        success = os_err(spr_area_Load(d->spranchor, ARMOVIE_DEFAULT_SPRITE)) == NULL &&
+                    os_err(spr_ReturnName(d->spranchor, d->name, 1)) == NULL;
+    d->grabbed_frame = -1;
+
+    return success;
+}
+
+BOOL display_loadsprite(display_str *d)
+{
+    if (display__loadsprite(d))
+    {
+        wimp_openstr o;
+        sprdisplay_update(d->viewer, d->spranchor, d->name);
+
+        o = window_state(d->window);
+        pane_check_open(&o);
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * When given a new file read out its vital statistics using the functions
+ * from ARLib. Then calculate its exact length (taking incomplete last chunks into account)
+ * If it is not a valid movie file then clear 'dp->filename' so a blank window will be opened.
+ */
+
+static BOOL scan_file(display_str *dp, const char *filename)
+{
+    armovie_hdr *hdr;
+
+    if (dp->hdr)
+    {
+        armovie_freehdr(dp->hdr);
+        dp->hdr = NULL;
+        arinfo_freeinfo(&dp->arinfo);
+    }
+
+    strrplc(&dp->filename, filename);
+    if (!armovie_identify(dp->filename, &dp->hdr))
+    {
+        c_free((mem_ptr)&dp->filename);
+        dp->nsoundtracks = 0;
+        return FALSE;
+    }
+
+    hdr = dp->hdr;
+
+    if (hdr->video_format == 0 && hdr->sound == NULL)
+    {
+        c_free((mem_ptr)&dp->filename);
+        armovie_freehdr(hdr);
+        dp->hdr = NULL;
+        return FALSE;
+    }
+
+    if (hdr->video_format)
+    {
+        arinfo_loadinfo(hdr->video_format, &dp->arinfo);
+
+        if (dp->arinfo.bpp)
+        {
+            hdr->nframes = (hdr->nchunks - 1)*hdr->frames_per_chunk;
+            hdr->nframes += hdr->video_chunks[hdr->nchunks-1].size / (hdr->xsize*hdr->ysize*dp->arinfo.bpp/8);
+        }
+        dp->length = (int)(hdr->nframes * 100.0 / hdr->fps);
+        dp->nframes = hdr->nframes;
+    }
+    else
+    {
+        armovie_soundstr *sp = hdr->sound;
+        int chunk_length = (int)(hdr->frames_per_chunk/hdr->fps*100);
+
+        dp->length = (hdr->nchunks - 1)*chunk_length;
+        dp->length += sp->chunks[hdr->nchunks-1].size*100/arsnd_bytes_per_sec(sp);
+
+        dp->nframes = hdr->nframes = (int)(dp->length*hdr->fps/100 + 0.5);
+    }
+
+    armovie_disposecataloguememory(hdr);
+    dp->nsoundtracks = hdr->sound && hdr->sound->format ? hdr->nsoundtracks : 0;
+
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Save frame either by RAM transfer or scrap file transfer.
+ * Also stores the task handle of the last receiver of a sprite so that selecting the
+ * 'Save frame' menu entry will pipe the frame direct to that task.
+ *
+ * Leaf name constructed from frame number.
+ */
+
+static wimp_t receiver_task = 0;
+
+static BOOL saveproc_sprite(char *filename, void *handle)
+{
+    display_str *t = handle;
+    return os_err(spr_area_Save(t->spranchor, filename)) == NULL;
+}
+
+static BOOL sendproc_sprite(void *handle, int *maxbuf)
+{
+    display_str *t = handle;
+    sprite_area *area = spr_area_Ptr(t->spranchor);
+    return xfersend_sendfile(&area->number, area->freeoff - 4, maxbuf);
+}
+
+static void save_frame(display_str *d, BOOL senddirect)
+{
+    if (d->spranchor)
+    {
+        char name[13];
+        if (d->grabbed_frame == -1)
+            strcpy(name, SPRITE_LEAFNAME2);
+        else
+            sprintf(name, SPRITE_LEAFNAME, d->grabbed_frame);
+
+        if (senddirect && receiver_task != 0)
+            xfersend_pipe(filetype_Sprite, name, spr_area_Ptr(d->spranchor)->freeoff, saveproc_sprite, sendproc_sprite, 0, d, receiver_task);
+        else
+        {
+            saveas(filetype_Sprite, name, spr_area_Ptr(d->spranchor)->freeoff, saveproc_sprite, sendproc_sprite, 0, d);
+            receiver_task = xfersend_receiver();
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+static char *extract_destination = NULL;
+
+/*
+ * Interface to '!ARMovie.Tools.Extract'
+ *
+ */
+
+enum
+{
+    extract_Images  = 0x01,
+    extract_Sound   = 0x02,
+    extract_Sprite  = 0x04,
+    extract_Keys    = 0x08,
+    extract_Header  = 0x10
+};
+
+static int  extract_flags = extract_Sound | extract_Sprite | extract_Header;
+
+static saveas_icons extract_icons[] =
+{
+    { 5, extract_Images, extract_Images, -1 },
+    { 6, extract_Sound, extract_Sound, -1 },
+    { 7, extract_Sprite, extract_Sprite, -1 },
+    { 8, extract_Keys, extract_Keys, -1 },
+    { 9, extract_Header, extract_Header, -1 },
+    { -1 }
+};
+
+#define EXTRACT_IDENT   "xferdata"
+
+static BOOL saveproc_extract(char *dirname, void *handle)
+{
+    display_str *dp = handle;
+    BOOL    success = FALSE;
+    char    buffer[1024];
+
+    cdir(dirname);
+
+    sprintf(buffer, "Run <ARMovie$Dir>.Tools.Extract -source %s -dest %s", dp->filename, dirname);
+
+    if (extract_flags & extract_Keys && dp->hdr->key_frame_offset > 0)
+        strcat(buffer, " -keys");
+
+    if (extract_flags & extract_Header)
+        strcat(buffer, " -header");
+
+    if (extract_flags & extract_Sprite)
+        strcat(buffer, " -sprite");
+
+    if (extract_flags & extract_Images && dp->hdr->video_format)
+        strcat(buffer, " -images");
+
+    if (extract_flags & extract_Sound && dp->nsoundtracks)
+    {
+        int i, n;
+        strcat(buffer, " -sound");
+        n = strlen(buffer);
+        for (i = 1; i <= dp->nsoundtracks; i++)
+            n += sprintf(buffer + n, " %d", i);
+    }
+
+    if (strlen(buffer) > 240)
+    {
+        setenv("Extract$ExtraArgs", &buffer[240], 0);
+        buffer[240] = '\0';
+    }
+    else
+        setenv("Extract$ExtraArgs", NULL, 0);
+
+    visdelay_begin();
+    if (setup_nextslot(128*1024, FOR_EXTRACT))
+        success = os_err(wimp_starttask(buffer)) == NULL;
+    visdelay_end();
+
+    if (xfersend_file_is_safe())
+        strrplc(&extract_destination, dirname);
+
+    return success;
+}
+
+static int extract_notify(int flags, void *handle)
+{
+    extract_flags = flags;
+    return 0;
+    UNUSED(handle);
+}
+
+static void save_extract(display_str *dp, BOOL savedirect)
+{
+    if (savedirect && extract_destination)
+        saveproc_extract(extract_destination, dp);
+    else
+    {
+        extract_icons[0].dependant_on = dp->hdr->video_format == 0 ? -2 : -1;
+        extract_icons[1].dependant_on = dp->nsoundtracks == 0 ? -2 : -1;
+        extract_icons[3].dependant_on = dp->hdr->key_frame_offset <= 0 ? -2 : -1;
+    
+        saveas_extended(EXTRACT_IDENT, filetype_Directory,
+            extract_destination ? extract_destination : EXTRACT_LEAFNAME,
+            0,
+            saveproc_extract, 0, 0,
+            extract_icons, extract_flags, extract_notify,
+            dp);
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Handle the display window menu.
+ */
+
+static menu dmenu = NULL, fmenu, emenu;
+
+enum
+{
+    dmenu_File = 1,
+    dmenu_Edit,
+    dmenu_Setup,
+    dmenu_Timebar,
+    dmenu_Tools,
+    dmenu_Play
+};
+
+enum
+{
+    fmenu_Info = 1,
+    fmenu_SaveSprite,
+    fmenu_SaveData
+};
+
+enum
+{
+    emenu_Copy = 1,
+    emenu_Clear
+};
+
+static void display_menu_events(void *handle, char *hit)
+{
+    display_str *dp = handle;
+    switch (hit[0])
+    {
+        case dmenu_File:
+            switch (hit[1])
+            {
+                case fmenu_Info:
+                    info_open(dp);
+                    break;
+
+                case fmenu_SaveSprite:
+                    save_frame(dp, wimpt_last_event()->e == wimp_EMENU);
+                    break;
+
+                case fmenu_SaveData:
+                    save_extract(dp, wimpt_last_event()->e == wimp_EMENU);
+                    break;
+            }
+            break;
+
+        case dmenu_Edit:
+            switch (hit[1])
+            {
+                case emenu_Copy:
+                {
+                    sprite_area *area = spr_area_Ptr(dp->spranchor);
+                    void *clip;
+                    if ((clip = clipboard_Create(filetype_Sprite, NULL, area->freeoff-4)) != NULL)
+                    {
+                        area = spr_area_Ptr(dp->spranchor);
+                        memcpy(clip, &area->number, area->freeoff-4);
+                    }
+                    break;
+                }
+
+                case emenu_Clear:
+                    clipboard_Destroy();
+                    break;
+            }
+            break;
+
+        case dmenu_Timebar:
+            dp->timebar_open = !dp->timebar_open;
+            cond_set_bit(dp->timebar_open, options.flags, option_Timebar);
+            tools_toggle(dp);
+            break;
+
+        case dmenu_Tools:
+            dp->tools_open = !dp->tools_open;
+            cond_set_bit(dp->timebar_open, options.flags, option_Toolbar);
+            tools_toggle(dp);
+            break;
+
+        case dmenu_Play:
+            play_start(dp, FALSE);
+            break;
+
+        case dmenu_Setup:
+            artoolsetup_popup(&dp->play, dp->nsoundtracks, dp->hdr ? dp->hdr->video_format : 0);
+            break;
+    }
+}
+
+static menu display_menu_maker(void *handle)
+{
+    display_str *d = handle;
+
+    menu_setflags(dmenu, dmenu_Timebar, d->timebar_open, FALSE);
+    menu_setflags(dmenu, dmenu_Tools, d->tools_open, FALSE);
+    menu_setflags(dmenu, dmenu_Setup, is_artoolsetup_open(), FALSE);
+
+    menu_setflags(fmenu, fmenu_Info, d->info != NULL, FALSE);
+    menu_setflags(fmenu, fmenu_SaveSprite, FALSE, d->spranchor == NULL);
+    menu_setflags(fmenu, fmenu_SaveData, FALSE, d->hdr == NULL);
+
+    menu_setflags(emenu, emenu_Copy, FALSE, d->spranchor == NULL);
+    menu_setflags(emenu, emenu_Clear, FALSE, !clipboard_Local());
+
+    help_register_handler(help_simplehandler, DISPLAY_MENU_HELP);
+
+    return dmenu;
+}
+
+static BOOL setup_menus(display_str *d)
+{
+    if (dmenu == NULL)
+    {
+        if ((dmenu = menu_new(DISPLAY_MENUT, DISPLAY_MENU)) == NULL ||
+            (fmenu = menu_new(FILE_MENUT, FILE_MENU)) == NULL ||
+            (emenu = menu_new(EDIT_MENUT, EDIT_MENU)) == NULL)
+            return FALSE;
+
+        menu_submenu(dmenu, dmenu_File, fmenu);
+        menu_submenu(dmenu, dmenu_Edit, emenu);
+    }
+    event_attachmenumaker(d->window, display_menu_maker, display_menu_events, d);
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Handle events on the display window
+ *
+ * If the tools window is not open then clicks on the display will start and stop
+ * playback.
+
+ * Otherwise just check for movie files dropped on display window
+ * and for help requests.
+ */
+
+static BOOL button_pressed(display_str *dp, wimp_mousestr *mp)
+{
+    switch (mp->bbits)
+    {
+        case wimp_BLEFT:
+            if ((options.flags & option_WindowButtons) != 0 || !dp->tools_open)
+                play_start(dp, FALSE);
+            return TRUE;
+
+        case wimp_BRIGHT:
+            if ((options.flags & option_WindowButtons) != 0 || !dp->tools_open)
+                play_stop(dp);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL display_events(wimp_eventstr *e, void *handle)
+{
+    display_str *d = handle;
+    switch (e->e)
+    {
+        case wimp_EOPEN:
+            pane_check_open(&e->data.o);
+            return TRUE;
+
+        case wimp_ECLOSE:
+            if (wmisc_CheckClose(d->filename))
+                display_dispose(&d);
+            return TRUE;
+
+        case wimp_EBUT:
+            return button_pressed(d, &e->data.but.m);
+
+        case wimp_ESEND:
+        case wimp_ESENDWANTACK:
+        {
+            char    *filename;
+            if (xferrecv_checkinsert(&filename) == filetype_ARMovie)
+            {
+                display_loadfile(d, filename);
+                xferrecv_insertfileok();
+            }
+            else if (e->data.msg.hdr.action == wimp_MHELPREQUEST)
+                help_reply(DISPLAY_HELP);
+            break;
+        }
+    }
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Purely used to ensure that window is updated when
+ * the mode or palette changes.
+ */
+
+static BOOL unknown_events(wimp_eventstr *e, void *handle)
+{
+    display_str *d = handle;
+    switch (e->e)
+    {
+        case wimp_ESEND:
+        case wimp_ESENDWANTACK:
+            switch (e->data.msg.hdr.action)
+            {
+                case wimp_PALETTECHANGE:
+                case wimp_MMODECHANGE:
+                    (void) screen_CurrentInfo();
+                    sprdisplay_modechange(d->viewer);
+                    break;
+            }
+            break;
+    }
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Dispose of display.
+ * Detach all handlers, free all workspace associated, and close
+ * all support windows.
+ */
+
+void display_dispose(display_str **pdp)
+{
+    display_str *dp = *pdp;
+    if (dp)
+    {
+        if (dp->state != play_Stopped)
+            armovie_stopsound();
+
+        if (dp->viewer)
+        {
+            event_attachmenumaker(dp->window, 0, display_menu_events, dp);
+            sprdisplay_dispose(&dp->viewer);
+            win_remove_unknown_event_processor(unknown_events, dp);
+        }
+
+
+        tools_dispose(dp);
+        info_dispose(dp);
+        artoolsetup_dispose(&dp->play);
+
+        dispose_playstr(&dp->play);
+
+        free(dp->filename);
+        spr_area_Dispose(&dp->spranchor);
+
+        arinfo_freeinfo(&dp->arinfo);
+
+        armovie_freehdr(dp->hdr);
+
+        c_free((void **)pdp);
+
+        if (dp == display__base)
+            display__base = NULL;
+    }
+}
+
+int display_checkonscreen(display_str *dp, BOOL check_iconbar)
+{
+    wimp_box    box;            /* total screen covered */
+    int         overhang,       /* how much the bottom overhangs the iconbar */
+                clearance,      /* space between top of title bar and top of screen */
+                moveby = 0;
+
+    pane_boundingbox(dp->window, &box);
+    overhang = 128 - box.y0;
+    clearance = screen_Vars.osheight - box.y1;
+
+/* if off top of screen */
+    if (clearance < 0)
+        moveby = clearance;
+    else if (check_iconbar && overhang > 0)
+        moveby = lowest(overhang, clearance);
+
+    if (moveby)
+    {
+        wimp_openstr o = window_state(dp->window);
+        coords_offsetbox(&o.box, 0, moveby, &o.box);
+        pane_check_open(&o);
+    }
+
+    return moveby;
+}
+
+
+/*
+ * Call this to open a new display, either blank or with a movie.
+ * If blank then load ARMovie$Dir default sprite.
+ */
+
+static display_str *display__open(const char *filename)
+{
+    display_str *dp = calloc(sizeof(display_str), 1);
+
+    if (dp)
+    {
+        copy_playstr(&options.play, &dp->play);
+
+        dp->timebar_open = (options.flags & option_Timebar) != 0;
+        dp->tools_open = (options.flags & option_Toolbar) != 0;
+        dp->sound_on = (options.flags & option_Sound) != 0;
+        dp->spranchor = spr_area_Init(f_alloc, f_free, wimpt_programname());
+        dp->info_soundtrack = 1;
+        dp->play.soundtrack = 1;
+        dp->time_mode = time_Decimal;
+
+        if (filename)
+            scan_file(dp, filename);
+
+        if (display__loadsprite(dp) &&
+            (dp->viewer = sprdisplay_open(dp->spranchor, dp->name)) != NULL)
+        {
+            dp->window = sprdisplay_syshandle(dp->viewer);
+            sprdisplay_eventhandler(dp->viewer, display_events, dp);
+
+            win_add_unknown_event_processor(unknown_events, dp);
+            setup_menus(dp);
+
+            tools_create(dp, dp->timebar_open, dp->tools_open);
+
+            display_settitle(dp);
+
+            if (display__base == NULL)
+                display__base = dp;
+
+            wmisc_openshifted(dp->window, &display__opencontext);
+
+            {
+                wimp_openstr o = window_state(dp->window);
+                o.behind = -1;
+                pane_check_open(&o);
+
+                if (display_checkonscreen(dp, TRUE))
+                    display__opencontext = 0;
+            }
+        }
+        else
+            display_dispose(&dp);
+    }
+
+    return dp;
+}
+
+/*
+ * Call this to change the movie displayed in a viewer.
+ * Updates the info window if it is open.
+ */
+
+void display_loadfile(display_str *d, const char *name)
+{
+    if (name)
+    {
+        if (d->state != play_Stopped)
+            play_stop(d);
+
+        d->current_frame = 0;
+
+        scan_file(d, name);
+        if (d->play.soundtrack > d->nsoundtracks)
+            d->play.soundtrack = 1;
+        if (d->info_soundtrack > d->nsoundtracks)
+            d->info_soundtrack = 1;
+
+        display_loadsprite(d);
+        display_settitle(d);
+        tools_refreshtime(d);
+        artoolsetup_refresh(&d->play, d->nsoundtracks, d->hdr ? d->hdr->video_format : 0);
+
+        info_update(d);
+    }
+
+    {
+        wimp_openstr o = window_state(d->window);
+        o.behind = -1;
+        pane_check_open(&o);
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * External functions
+ *
+ * Open a window with a given movie file.
+ * This may be a new window or the curently open window depending on
+ * the setting of Multiple Windows.
+ */
+
+display_str *display_open(const char *filename)
+{
+    if (options.flags & option_MultipleWindows || display__base == NULL)
+        return display__open(filename);
+    display_loadfile(display__base, filename);
+    return display__base;
+}
+
+/*
+ * Open a window and run a movie file.
+ */
+
+void display_runfile(const char *name)
+{
+    play_start(display_open(name), FALSE);
+}
+
+/*
+ * If only one window is in use then close the movie window.
+ * This is called from an Adjust click on the iconbar.
+ */
+
+void display_close(void)
+{
+    if ((options.flags & option_MultipleWindows) == 0 && display__base != NULL)
+        display_dispose(&display__base);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Write out the bottom LH corner position of the window for
+ * the playback command line
+ */
+
+int display_positions(display_str *d, char *buffer)
+{
+    wimp_openstr o = window_state(d->window);
+
+    return sprintf(buffer, " -at %d,%d", o.box.x0, o.box.y0);
+}
+
+/*
+ * Grab a sprite off screen.
+ * Position given by the ARMovie player, so should be last displayed frame
+ * Store the frame number of this image to use as a leaf name in the savebox.
+ * If the position data is not available return FALSE
+ */
+
+BOOL display_grabsprite(display_str *d, spr_box *box_out)
+{
+    char *s = getenv(ARMOVIE_POSITION);
+    if (s)
+    {
+        spr_box box;
+        sscanf(s, "%d %d %d %d", &box.corner[0].x, &box.corner[0].y, &box.corner[1].x, &box.corner[1].y);
+
+        if (box_out)
+            *box_out = box;
+
+        box.corner[1].x -= screen_Vars.dx;
+        box.corner[1].y -= screen_Vars.dy;
+
+        if (os_err(spr_GetSprite(d->spranchor, d->name, sprite_haspalette, &box)) == NULL)
+        {
+            sprdisplay_update(d->viewer, d->spranchor, d->name);
+
+            d->grabbed_frame = d->current_frame;
+
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Ensure that the window is aligned to a word boundary so that when a movie
+ * is played back it doesn't overwrite the edges.
+ * Also checks that window is completely on screen.
+ */
+
+void display_moveonscreen(wimp_w w)
+{
+    int             dx, dy, alignment, offby;
+    wimp_openstr    o = window_state(w);
+
+/* calculate movement for being off screen horizontally */
+    if ((dx = -o.box.x0) < 0 &&
+        (dx = screen_Vars.oswidth - screen_Vars.dx - o.box.x1) > 0)
+            dx = 0;
+
+/* round movement to nearest unless being moved on screen */
+    alignment = 32 >> screen_Vars.log2bpp;
+    offby = ((o.box.x0 + dx) >> screen_Vars.xeig) & (alignment - 1);
+    if (dx == 0)
+        dx = ((offby*2 >= alignment ? alignment : 0) - offby) << screen_Vars.xeig;
+    else
+        dx -= offby << screen_Vars.xeig;
+
+/* calculate movement for being off screen vertically */
+    if ((dy = -o.box.y0) < 0 &&
+        (dy = screen_Vars.osheight - screen_Vars.dy - o.box.y1) > 0)
+            dy = 0;
+
+    coords_offsetbox(&o.box, dx, dy, &o.box);
+
+    o.behind = -1;
+    pane_check_open(&o);
+
+    wmisc_flushevents_nomouse();
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+/* eof display.c */

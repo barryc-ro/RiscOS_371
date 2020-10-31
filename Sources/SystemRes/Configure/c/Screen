@@ -1,0 +1,1501 @@
+/*
+ * screen.c
+ *
+ * This is the module that handles the Screen window.
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+#include "help.h"
+#include "werr.h"
+#include "visdelay.h"
+
+#include "configure.h"
+#include "ConfigFile.h"
+#include "screen.h"
+#include "cmos.h"
+
+#ifndef OS_ScreenMode
+#define OS_ScreenMode 0x65
+#endif
+
+#define Service_ModeFileChanged         0x94    /* new for Medusa */
+#define LoadModeCmd "LoadModeFile "
+#define WimpModeCmd "WimpMode"
+#define BackdropCmd "Backdrop "
+#define RunCmd "Run "
+
+#define SCREENCHOICESFILE "<Choices$Write>.Boot.PreDesk.Configure.Bits.Screen"
+#define MONITORSDIRECTORY "BootResources:Configure.Monitors"
+#define TEXTURESDIRECTORY "BootResources:Configure.Textures"
+
+/*      monitor type label             0 */
+#define ScreenWindow_MonitorValue      1
+#define ScreenWindow_MonitorButton     2
+
+/*      colours label                  3 */
+#define ScreenWindow_ColoursValue      4
+#define ScreenWindow_ColoursButton     5
+
+/*      resolution label               6 */
+#define ScreenWindow_ResolutionValue   7
+#define ScreenWindow_ResolutionButton  8
+
+/*      blank delay label              9 */
+#define ScreenWindow_BlankDelayValue  10
+#define ScreenWindow_BlankDelayDown   11
+#define ScreenWindow_BlankDelayUp     12
+
+/*      TV label                      13 */
+#define ScreenWindow_TV               14
+#define ScreenWindow_TVDown           15
+#define ScreenWindow_TVUp             16
+
+/*      Background text section          */
+#define ScreenWindow_TextureNone      22
+#define ScreenWindow_Texture1         23
+#define ScreenWindow_Texture2         24
+#define ScreenWindow_Texture3         25
+#define ScreenWindow_Texture4         26
+#define ScreenWindow_Texture5         27
+#define ScreenWindow_Texture6         28
+#define ScreenWindow_Texture7         29
+#define ScreenWindow_TextureRandom    30
+#define ScreenWindow_LighterTexture   31
+#define ScreenWindow_TryTexture       32
+
+/*      Default, OK and Cancel           */
+#define ScreenWindow_Default          33
+#define ScreenWindow_Cancel           34
+#define ScreenWindow_OK               35
+
+
+#define FILEFORMAT "file_format:"
+#define MONITORTITLE "monitor_title:"
+
+typedef struct monitor_ref
+{
+        struct monitor_ref *next;
+        char *monitor_name;
+        char *file_name;
+}       monitor_ref;
+
+static int screen_window=0;
+
+/* Stuff for the monitors menu */
+static wimp_menustr *monitors_menu = NULL;
+static monitor_ref *monitors_list;
+static int monitor_count;
+static monitor_ref **monitors_list_tail;
+
+/* Stuff for the colours menu */
+static wimp_menustr *colours_menu = NULL;
+
+/* Stuff about the current configured value */
+static char *current_monitor_file = NULL;
+static int current_x_res;
+static int current_y_res;
+static int current_colours;     /* 0-7 as per the menu */
+static int current_flags;
+
+/* Stuff to do with ScreenModes module instantiations */
+static int my_screenmodes_instantiation;
+static char *desktop_instantiation;
+static int desktop_monitortype;
+
+/* Stuff to do with the resolutions menu */
+static char *modes_block = NULL;
+static int nummodes;
+static wimp_menustr *resolutions_menu = NULL;
+static int **modes_index;
+
+/* Make sure that this does not clash with any real flag in mode selector flags */
+#define flags_squarepixel ((unsigned)1<<31)
+
+static void select_texture( int which );
+
+static void rec_construct_monitors_list( char *dirname, char *bufend )
+{
+        _kernel_oserror *err;
+        char *dirname_end;
+        int pos;
+        int num;
+        FILE *ifile;
+
+        dirname_end = dirname + strlen( dirname );
+
+        pos = 0;
+        do
+        {
+                err = _swix( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                        9, dirname, dirname_end+1, 1, pos, bufend - (dirname_end+1), "*",
+                        &num, &pos );
+                if ( !err && num > 0 )
+                {
+                        *dirname_end = '.';
+                        err = _swix( OS_File, _IN(0)|_IN(1)|_OUT(0), 17, dirname, &num );
+                        if ( !err )
+                        {
+                                if ( (num & 2) != 0 )
+                                {
+                                        /*      directory or partition    */
+                                        rec_construct_monitors_list( dirname, bufend );
+                                }
+                                else
+                                {
+                                        /*      file    */
+                                        /*
+                                                Check for:
+                                                file_format:1
+                                                monitor_title:xxxx
+                                        */
+                                        char linebuf[256];
+                                        char *rover;
+                                        int match;
+                                        char *t;
+                                        int goodver = FALSE;
+                                        monitor_ref *newref;
+
+                                        /*
+                                                Check for:
+                                                file_format:1
+                                        */
+                                        ifile = fopen( dirname, "r" );
+                                        while ( !feof( ifile ))
+                                        {
+                                                fgets( linebuf, 256, ifile );
+                                                for ( rover=linebuf; *rover==' '; rover++ );
+                                                match = TRUE;
+                                                for ( t = FILEFORMAT; *t && match; t++, rover++ )
+                                                {
+                                                        if ( *t && *t != tolower( *rover ) ) match = FALSE;
+                                                }
+
+                                                if ( !match ) continue;
+
+                                                if ( rover[0] != '1' || rover[1] >= '0' ) break;
+
+                                                goodver = TRUE;
+                                                break;
+                                        }
+
+                                        /*
+                                                Find:
+                                                monitor_title:
+                                        */
+                                        while ( goodver && !feof( ifile ))
+                                        {
+                                                fgets( linebuf, 256, ifile );
+                                                for ( rover=linebuf; *rover==' '; rover++ );
+                                                match = TRUE;
+                                                for ( t = MONITORTITLE; *t && match; t++, rover++ )
+                                                {
+                                                        if ( *t && *t != tolower( *rover ) ) match = FALSE;
+                                                }
+
+                                                if ( !match ) continue;
+
+                                                /*
+                                                        Got:
+                                                        monitor_title:
+                                                        so let's add it to the list
+                                                */
+                                                for ( t=rover; *t>=' '; t++ );
+                                                *t='\0';
+
+                                                newref = malloc( sizeof( *newref ));
+                                                if ( !newref ) break;
+                                                newref->next = NULL;
+                                                newref->monitor_name = malloc( strlen( rover ) + 1 );
+                                                if ( !newref->monitor_name )
+                                                {
+                                                        free( newref );
+                                                        break;
+                                                }
+                                                newref->file_name = malloc( strlen( dirname ) + 1 );
+                                                if ( !newref->file_name )
+                                                {
+                                                        free( newref->monitor_name );
+                                                        free( newref );
+                                                        break;
+                                                }
+
+                                                strcpy( newref->monitor_name, rover );
+                                                strcpy( newref->file_name, dirname );
+                                                *monitors_list_tail = newref;
+                                                monitors_list_tail = &newref->next;
+                                        }
+
+                                        fclose( ifile );
+                                }
+                        }
+                        *dirname_end = '\0';
+                }
+        } while ( !err && pos != -1 );
+}
+
+static void finish_titivating_menu( wimp_menustr *m, int nitems )
+{
+        wimp_menuitem *menu_body;
+        int width;
+        int i;
+
+        menu_body = (wimp_menuitem *)((char *)m + sizeof( wimp_menuhdr ));
+
+        menu_body[nitems-1].flags |= wimp_MLAST;
+        menu_body[0].flags |= 0x100;            /* title indirected */
+        m->hdr.tit_fcol = 7;
+        m->hdr.tit_bcol = 2;
+        m->hdr.work_fcol = 7;
+        m->hdr.work_bcol = 0;
+        m->hdr.height = 44;
+        m->hdr.gap = 0;
+
+        width = strlen( *(char **)&m->hdr.title[0] )*16;
+        for ( i=0; i<nitems; i++ )
+        {
+                if ( width < strlen( menu_body[i].data.indirecttext.buffer )*16+12 )
+                        width = strlen( menu_body[i].data.indirecttext.buffer )*16+12;
+        }
+
+        m->hdr.width = width;
+}
+
+static void construct_monitors_list( void )
+{
+        char dirname_buffer[1024];
+        monitor_ref *rover;
+        wimp_menuitem *menu_body;
+
+        monitors_list = NULL;
+        monitors_list_tail = &monitors_list;
+        strcpy( dirname_buffer, MONITORSDIRECTORY );
+
+        rec_construct_monitors_list( dirname_buffer, dirname_buffer + sizeof(dirname_buffer) );
+
+        /*
+                Now have a list of monitors, so let's turn it into a menu
+        */
+        monitor_count = 0;
+        for ( rover=monitors_list; rover; rover=rover->next )
+        {
+                monitor_count++;
+        }
+
+        monitors_menu = malloc( sizeof( wimp_menuhdr ) + (monitor_count+1) * sizeof( wimp_menuitem ));
+        if ( !monitors_menu ) return;
+
+        menu_body = (wimp_menuitem *)((char *)monitors_menu + sizeof( wimp_menuhdr ));
+
+        monitor_count = 0;
+        for ( rover=monitors_list; rover; rover=rover->next )
+        {
+                menu_body[monitor_count].flags = 0;
+                menu_body[monitor_count].submenu = (void *)-1;
+                menu_body[monitor_count].iconflags = wimp_ITEXT | wimp_IFILLED | wimp_INDIRECT | (wimp_IFORECOL*7) | (wimp_IBACKCOL*0);
+                menu_body[monitor_count].data.indirecttext.buffer = rover->monitor_name;
+                menu_body[monitor_count].data.indirecttext.validstring = NULL;
+
+                monitor_count++;
+        }
+
+        menu_body[monitor_count].flags = 0;
+        menu_body[monitor_count].submenu = (void *)-1;
+        menu_body[monitor_count].iconflags = wimp_ITEXT | wimp_IFILLED | wimp_INDIRECT | (wimp_IFORECOL*7) | (wimp_IBACKCOL*0);
+        menu_body[monitor_count].data.indirecttext.buffer = msgs_lookup("MMAUTO");
+        menu_body[monitor_count].data.indirecttext.validstring = NULL;
+        monitor_count++;
+
+        *(char **)&monitors_menu->hdr.title[0] = msgs_lookup("MMHDR");
+
+        finish_titivating_menu( monitors_menu, monitor_count );
+}
+
+static void fill_in_conmode_fields( void )
+{
+        monitor_ref *rover;
+        int i;
+        wimp_menuitem *menu_body;
+
+        menu_body = (wimp_menuitem *)((char *)monitors_menu + sizeof( wimp_menuhdr ));
+        if ( !current_monitor_file )
+        {
+                changeicontext( screen_window, ScreenWindow_MonitorValue, menu_body[monitor_count-1].data.indirecttext.buffer );
+                changeicontext( screen_window, ScreenWindow_ColoursValue, menu_body[monitor_count-1].data.indirecttext.buffer );
+                changeicontext( screen_window, ScreenWindow_ResolutionValue, menu_body[monitor_count-1].data.indirecttext.buffer );
+                return;
+        }
+
+        for ( rover = monitors_list; rover; rover = rover->next )
+        {
+                if ( strcmp( current_monitor_file, rover->file_name )==0 )
+                {
+                        changeicontext( screen_window, ScreenWindow_MonitorValue, rover->monitor_name );
+                        break;
+                }
+        }
+        if ( !rover )
+        {
+                changeicontext( screen_window, ScreenWindow_MonitorValue, msgs_lookup( "MONUK" ));
+        }
+
+        menu_body = (wimp_menuitem *)((char *)colours_menu + sizeof( wimp_menuhdr ));
+
+        if ( current_colours >= 0 && current_colours < 8 )
+        {
+                changeicontext( screen_window, ScreenWindow_ColoursValue, menu_body[current_colours].data.indirecttext.buffer );
+        }
+        else
+        {
+                changeicontext( screen_window, ScreenWindow_ColoursValue, msgs_lookup( "COLUK" ));
+        }
+
+        menu_body = (wimp_menuitem *)((char *)resolutions_menu + sizeof( wimp_menuhdr ));
+
+        for ( i=0; i<nummodes; i++ )
+        {
+                if ( modes_index[i][2] == current_x_res &&
+                     modes_index[i][3] == current_y_res )
+                {
+                        if ( *(char *)&modes_index[i][6] == '\0' )
+                        {
+                                char text[16];
+                                sprintf( text, "%d x %d", current_x_res, current_y_res );
+                                changeicontext( screen_window, ScreenWindow_ResolutionValue, text);
+                        }
+                        else
+                        {
+                                changeicontext( screen_window, ScreenWindow_ResolutionValue, (char *)&modes_index[i][6] );
+                        }
+                        break;
+                }
+        }
+
+        if ( i == nummodes )
+        {
+                changeicontext( screen_window, ScreenWindow_ResolutionValue, msgs_lookup( "RESUK" ));
+        }
+}
+
+static void discard_monitors_list( void )
+{
+        monitor_ref *r;
+
+        if ( monitors_menu ) free( monitors_menu );
+        monitors_menu = NULL;
+
+        while( monitors_list )
+        {
+                r = monitors_list;
+                monitors_list = r->next;
+                free( r->monitor_name );
+                free( r->file_name );
+                free( r );
+        }
+}
+
+static void construct_colours_menu( void )
+{
+        wimp_menuitem *menu_body;
+        int i;
+        char tbuf[10];
+
+        colours_menu = malloc( sizeof( wimp_menuhdr ) + 8 * sizeof( wimp_menuitem ));
+        if ( !colours_menu ) return;
+
+        menu_body = (wimp_menuitem *)((char *)colours_menu + sizeof( wimp_menuhdr ));
+
+        for ( i=0; i<8; i++ )
+        {
+                sprintf( tbuf, "CME%d", i );
+
+                menu_body[i].flags = 0;
+                menu_body[i].submenu = (void *)-1;
+                menu_body[i].iconflags = wimp_ITEXT | wimp_IFILLED | wimp_INDIRECT | (wimp_IFORECOL*7) | (wimp_IBACKCOL*0);
+                menu_body[i].data.indirecttext.buffer = msgs_lookup( tbuf );
+                menu_body[i].data.indirecttext.validstring = NULL;
+        }
+
+        *(char **)&colours_menu->hdr.title[0] = msgs_lookup("CMHDR");
+
+        finish_titivating_menu( colours_menu, 8 );
+}
+
+static void discard_colours_menu( void )
+{
+        if ( colours_menu ) free( colours_menu );
+        colours_menu = NULL;
+}
+
+static void create_screenmodes_instantiation( void )
+{
+        int i;
+        char tbuf[256];
+
+        for ( i=0; i<1000; i++ )
+        {
+                sprintf( tbuf, "ScreenModes%%%d", i );
+                if ( _swix( OS_Module, _IN(0)|_IN(1), 18, tbuf ))
+                        break;
+        }
+
+        my_screenmodes_instantiation = i;
+
+        wimpt_noerr( (os_error *)_swix( OS_Module, _IN(0)|_IN(1)|_OUT(5), 18, "ScreenModes", &desktop_instantiation ));
+        sprintf( tbuf, "ScreenModes%%%d", my_screenmodes_instantiation );
+        wimpt_noerr( (os_error *)_swix( OS_Module, _IN(0)|_IN(1), 14, tbuf ));       /* create new instantiation */
+
+#if UseVIDCBandLimitAlias
+        /* issue VIDCBandLimit command, if Alias$VIDCBandLimit has been set (should be set by BandLimit app in
+           PreDesk.Configure, with VIDCBandwidthLimit parameters as appropriate, eg. for 7500FE with EDO) */
+        if (getenv("Alias$VIDCBandLimit")) (void)_swix( OS_CLI, _IN(0), "VIDCBandLimit");
+#else
+        /* Activate any VIDCBandwidthLimit command if its there */
+        (void)_swix( OS_CLI, _IN(0), "IfThere Choices:Boot.PreDesk.BandLimit then /Choices:Boot.PreDesk.BandLimit "
+                "else IfThere Boot:Utils.BandLimit then /Boot:Utils.BandLimit" );
+            /*Fix bug: JRC 26th Jan 1995*/
+#endif
+
+        /*
+                Now load our mode file
+        */
+        if ( current_monitor_file )
+        {
+                wimpt_noerr( (os_error *)_swix( OS_ReadSysInfo, _IN(0)|_OUT(1), 1, &desktop_monitortype ));
+                sprintf( tbuf, LoadModeCmd "%s", current_monitor_file );
+
+                /*
+                        Only complain if the LoadModeFile doesn't work
+                */
+                wimpt_complain( (os_error *)_swix( OS_CLI, _IN(0), tbuf ));
+        }
+
+        sprintf( tbuf, "ScreenModes%%%s", desktop_instantiation );
+        wimpt_noerr( (os_error *)_swix( OS_Module, _IN(0)|_IN(1), 16, tbuf ));      /* prefer instantiation */
+}
+
+static void choose_my_screenmodes_instantiation( void )
+{
+        char tbuf[256];
+
+        wimpt_noerr( (os_error *)_swix( OS_Module, _IN(0)|_IN(1)|_OUT(5), 18, "ScreenModes", &desktop_instantiation )); /* read current preferred */
+        wimpt_noerr( (os_error *)_swix( OS_ReadSysInfo, _IN(0)|_OUT(1), 1, &desktop_monitortype )); /* read current monitortype */
+
+        sprintf( tbuf, "ScreenModes%%%d", my_screenmodes_instantiation );
+        wimpt_noerr( (os_error *)_swix( OS_Module, _IN(0)|_IN(1), 16, tbuf ));                      /* switch to mine */
+}
+
+static void return_to_base_screenmodes_instantiation( void )
+{
+        char tbuf[256];
+
+        if ( !desktop_instantiation ) return;
+
+        wimpt_noerr( (os_error *)_swix( OS_ScreenMode, _IN(0)|_IN(1), 3, desktop_monitortype ));
+
+        sprintf( tbuf, "ScreenModes%%%s", desktop_instantiation );
+        wimpt_noerr( (os_error *)_swix( OS_Module, _IN(0)|_IN(1), 16, tbuf ));              /* switch instantiation */
+}
+
+static void discard_screenmodes_instantiation( void )
+{
+        char tbuf[256];
+
+        sprintf( tbuf, "ScreenModes%%%d", my_screenmodes_instantiation );
+        wimpt_noerr( (os_error *)_swix( OS_Module, _IN(0)|_IN(1), 4, tbuf ));       /* delete module */
+}
+
+static int mode_compare( const void *aa, const void *bb )
+{
+        const int *a = *(int **)aa;
+        const int *b = *(int **)bb;
+
+        if ( (a[1] & flags_squarepixel) != (b[1] & flags_squarepixel) )
+                return (a[1] & flags_squarepixel) ? 1 : -1 ;
+
+        if ( a[2] != b[2] ) return a[2] - b[2];         /* Xres */
+
+        if ( a[3] != b[3] ) return a[3] - b[3];         /* Yres */
+
+        if ( a[4] != b[4] ) return a[4] - b[4];         /* pixel depth */
+
+        return b[5] - a[5];                             /* frame rate */
+}
+
+/*
+        Assumes mode file already loaded
+*/
+static void create_resolutions_menu( void )
+{
+        int numdiffmodes;
+        int spaceformodes;
+        int i;
+        int c;
+        char *rover;
+        wimp_menuitem *menu_body;
+        int flag;
+
+        choose_my_screenmodes_instantiation();
+
+        wimpt_noerr( (os_error *)_swix( OS_ScreenMode, _IN(0)|_IN(2)|_IN(6)|_IN(7)|_OUT(2)|_OUT(7),
+                2, 0, 0, 0, &nummodes, &spaceformodes ));
+
+        if ( modes_block ) free ( modes_block );
+        modes_block = NULL;
+        if ( modes_index ) free ( modes_index );
+        modes_index = NULL;
+        if ( resolutions_menu ) free ( resolutions_menu );
+        resolutions_menu = NULL;
+
+        modes_block = malloc( -spaceformodes );
+        if ( !modes_block )
+        {
+                nummodes = 0;
+                return;
+        }
+
+        wimpt_noerr( (os_error *)_swix( OS_ScreenMode, _IN(0)|_IN(2)|_IN(6)|_IN(7),
+                2, 0, modes_block, -spaceformodes ));
+
+        nummodes = -nummodes;
+
+        return_to_base_screenmodes_instantiation();
+
+        modes_index = malloc( sizeof( *modes_index ) * nummodes );
+        if ( !modes_index )
+        {
+                nummodes = 0;
+                return;
+        }
+
+        rover = modes_block;
+        for ( i=0; i<nummodes; i++ )
+        {
+                int save,xeig,yeig;
+
+                save = ((int *)rover)[6];       /* convert into mode selector */
+                ((int *)rover)[6] = -1;
+                wimpt_noerr( (os_error *)_swix( OS_ReadModeVariable, _IN(0)|_IN(1)|_OUT(2), rover+4, 4, &xeig ));
+                wimpt_noerr( (os_error *)_swix( OS_ReadModeVariable, _IN(0)|_IN(1)|_OUT(2), rover+4, 5, &yeig ));
+                ((int *)rover)[6] = save;       /* put back what we corrupted */
+                /* naughty, naughty, we're changing mode selector flags! */
+                if ( xeig == yeig ) ((int *)rover)[1] |= flags_squarepixel;
+
+                modes_index[i] = (int *)rover;
+                rover = (char *)((int)(rover + 24 + strlen( rover+24 ) + 4) & ~3);
+        }
+
+        qsort( modes_index, nummodes, 4, mode_compare );
+
+        if ( nummodes == 0 )
+        {
+                numdiffmodes = 0;
+        }
+        else
+        {
+                numdiffmodes = ((char *)modes_index[0])[24] != '\0';
+                for ( i=1; i<nummodes; i++ )
+                {
+                        if ( (modes_index[i][2] != modes_index[i-1][2] ||
+                              modes_index[i][3] != modes_index[i-1][3]) &&
+                             ((char *)modes_index[i])[24] )
+                        {
+                                numdiffmodes++;
+                        }
+                }
+        }
+
+        if ( numdiffmodes == 0 )
+        {
+                return;
+        }
+
+        resolutions_menu = malloc( sizeof( wimp_menuhdr ) + numdiffmodes * sizeof( wimp_menuitem ));
+        if ( !resolutions_menu )
+        {
+                nummodes = 0;
+                return;
+        }
+
+        menu_body = (wimp_menuitem *)((char *)resolutions_menu + sizeof( wimp_menuhdr ));
+
+        c = 0;
+        flag = modes_index[0][1] & flags_squarepixel;
+        for ( i=0; i<nummodes; i++ )
+        {
+                if ( (i==0 ||
+                      modes_index[i][2] != modes_index[i-1][2] ||
+                      modes_index[i][3] != modes_index[i-1][3]) &&
+                     ((char *)modes_index[i])[24] )
+                {
+                        if (flag != (modes_index[i][1] & flags_squarepixel))
+                        {
+                                flag = modes_index[i][1] & flags_squarepixel;
+                                menu_body[c-1].flags = wimp_MSEPARATE;
+                        }
+                        menu_body[c].flags = 0;
+                        menu_body[c].submenu = (void *)-1;
+                        menu_body[c].iconflags = wimp_ITEXT | wimp_IFILLED | wimp_INDIRECT | (wimp_IFORECOL*7) | (wimp_IBACKCOL*0);
+                        menu_body[c].data.indirecttext.buffer = (char *)modes_index[i]+24;
+                        menu_body[c].data.indirecttext.validstring = NULL;
+
+                        c++;
+                }
+        }
+
+        *(char **)&resolutions_menu->hdr.title[0] = msgs_lookup("RMHDR");
+
+        finish_titivating_menu( resolutions_menu, numdiffmodes );
+}
+
+static void discard_resolutions_menu( void )
+{
+        if ( modes_block ) free ( modes_block );
+        modes_block = NULL;
+        if ( resolutions_menu ) free ( resolutions_menu );
+        resolutions_menu = NULL;
+        if ( modes_index ) free ( modes_index );
+        modes_index = NULL;
+}
+
+static int cmenutodepth[8] = {0,1,2,2,3,3,4,5};
+
+static void read_current_mode_settings( void )
+{
+        char res0[256];
+        char res1[256];
+        char res2[256];
+        char res3[256];
+        char *rover;
+        char *line_buffer;
+
+        if ( current_monitor_file ) free( current_monitor_file );
+        current_monitor_file = NULL;
+        current_x_res = -1;
+        current_y_res = -1;
+        current_colours = -1;
+        current_flags = 0;
+        select_texture( 0 );
+
+        /*
+                Process the LoadModeFile line
+        */
+        line_buffer = configfile_readline( PreDeskConfigFile, PreDeskMonitorLine );
+        if ( !line_buffer ) return;
+
+        if ( strncmp( line_buffer, LoadModeCmd, strlen( LoadModeCmd )) == 0 )
+        {
+                /*
+                        This file starts with a LoadModeFile, hence we'll
+                        assume it's also got the *WimpMode too
+                */
+
+                line_buffer[ strlen( line_buffer )-1 ] = '\0';
+                rover = strrchr( line_buffer, ' ' );
+                if ( rover == NULL ) return;
+
+                current_monitor_file = malloc( strlen( rover ) );
+                if ( !current_monitor_file ) return;
+
+                strcpy( current_monitor_file, rover+1 );
+        }
+
+        /*
+                Process the WimpMode line
+        */
+        line_buffer = configfile_readline( PreDeskConfigFile, PreDeskModeLine );
+        if ( !line_buffer ) return;
+
+        /*
+                *WimpMode Xnnnn Ynnnn Cnnnn
+                OR
+                *WimpMode Xnnnn Ynnnn Gnnnn
+
+                Yeah, OK this code is really easy to fool, but it's designed
+                to distinguish between the OK cases, not to reject duff files.
+        */
+        if ( sscanf( line_buffer, "%s %s %s %s", res0, res1, res2, res3 ) == 4 &&
+             strcmp( res0, WimpModeCmd ) == 0 &&
+             res1[0] == 'X' &&
+             res2[0] == 'Y' &&
+             (res3[0] == 'C' || res3[0] == 'G' ) )
+        {
+                current_x_res = atoi( res1+1 );
+                current_y_res = atoi( res2+1 );
+
+                if ( strcmp( res3, "C2" ) == 0 )
+                {
+                        current_colours = 0;
+                }
+                else if ( strcmp( res3, "C4" ) == 0 )
+                {
+                        current_colours = 1;
+                }
+                else if ( strcmp( res3, "G16" ) == 0 )
+                {
+                        current_colours = 2;
+                }
+                else if ( strcmp( res3, "C16" ) == 0 )
+                {
+                        current_colours = 3;
+                }
+                else if ( strcmp( res3, "G256" ) == 0 )
+                {
+                        current_colours = 4;
+                }
+                else if ( strcmp( res3, "C256" ) == 0 )
+                {
+                        current_colours = 5;
+                }
+                else if ( strcmp( res3, "C32T" ) == 0 || strcmp( res3, "C32K" ) == 0 )
+                {
+                        current_colours = 6;
+                }
+                else if ( strcmp( res3, "C16M" ) == 0 )
+                {
+                        current_colours = 7;
+                }
+        }
+
+        /*
+                Now work out the flags
+        */
+        if ( current_x_res != -1 && current_y_res != -1 && current_colours != -1 )
+        {
+                int modeblock[6];
+                int xeig;
+                int yeig;
+
+                modeblock[0] = 1;
+                modeblock[1] = current_x_res;
+                modeblock[2] = current_y_res;
+                modeblock[3] = cmenutodepth[ current_colours ];
+                modeblock[4] = -1;
+                modeblock[5] = -1;
+
+                wimpt_noerr( (os_error *)_swix( OS_ReadModeVariable, _IN(0)|_IN(1)|_OUT(2), modeblock, 4, &xeig ));
+                wimpt_noerr( (os_error *)_swix( OS_ReadModeVariable, _IN(0)|_IN(1)|_OUT(2), modeblock, 5, &yeig ));
+
+                if ( xeig == yeig ) current_flags |= flags_squarepixel;
+        }
+
+        /*
+                Process the Backdrop line
+        */
+        line_buffer = configfile_readline( PostDeskConfigFile, PostDeskBackdropLine );
+        if ( !line_buffer ) return;
+
+        if ( strncmp( line_buffer, BackdropCmd, strlen(BackdropCmd) ) == 0 )
+        {
+                rover = line_buffer + strlen( line_buffer ) - 2;
+                wimpt_noerr( wimp_set_icon_state( screen_window, ScreenWindow_LighterTexture, rover[0] == 'L' ? wimp_ISELECTED:0, wimp_ISELECTED ));
+                select_texture( rover[-1]-'0' );
+        }
+        else if ( strncmp( line_buffer, RunCmd, strlen(RunCmd) ) == 0 )
+        {
+                rover = line_buffer + strlen( line_buffer ) - 2;
+                wimpt_noerr( wimp_set_icon_state( screen_window, ScreenWindow_LighterTexture, rover[0] == 'L' ? wimp_ISELECTED:0, wimp_ISELECTED ));
+                select_texture( 8 );    /* random */
+        }
+        else
+        {
+                wimpt_noerr( wimp_set_icon_state( screen_window, ScreenWindow_LighterTexture, 0, wimp_ISELECTED ));
+                select_texture( 0 );    /* none */
+        }
+
+}
+
+static void screen_setblank(void)
+{
+        int delay=(cmos_get(CMOS_BlankDelay)>>3) & 7;
+        wimp_icon i;
+
+        wimp_get_icon_info(screen_window,ScreenWindow_BlankDelayValue,&i);
+        switch (delay)
+        {
+        case 0:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("Off"));
+                break;
+        case 1:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("BLT0"));
+                break;
+        case 2:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("BLT1"));
+                break;
+        case 3:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("BLT2"));
+                break;
+        case 4:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("BLT3"));
+                break;
+        case 5:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("BLT4"));
+                break;
+        case 6:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("BLT5"));
+                break;
+        case 7:
+                sprintf(i.data.indirecttext.buffer,msgs_lookup("BLT6"));
+                break;
+        }
+        wimp_set_icon_state(screen_window,ScreenWindow_BlankDelayValue,0,0);
+}
+
+static int blanktimes[]={0,30,60,120,300,600,900,1800};
+
+static void change_blank(int by)
+{
+        int byte=cmos_get(CMOS_BlankDelay);
+        int delay=(byte>>3) & 7;
+
+        delay+=by;
+        if ( (delay>=0) && (delay<=7) )
+        {
+                char command[256];
+
+                sprintf(command,"%%BlankTime %i",blanktimes[delay]);
+                _kernel_oscli(command);
+                cmos_set(CMOS_BlankDelay,(byte & ~(7<<3)) | (delay<<3));
+        }
+        screen_setblank();
+}
+
+static void screen_settv(void)
+{
+        int tv=(cmos_get(CMOS_TV)>>5) & 7;
+        wimp_icon i;
+        wimp_caretstr c;
+
+        if (tv>3) tv-=8;
+        wimp_get_icon_info(screen_window,ScreenWindow_TV,&i);
+        wimp_get_caret_pos(&c);
+        sprintf(i.data.indirecttext.buffer,"%i",tv);
+        c.index=-1;
+        wimp_set_caret_pos(&c);
+        wimp_set_icon_state(screen_window,ScreenWindow_TV, 0 , 0);
+}
+
+static void do_tv(int value)
+{
+        _kernel_swi_regs r;
+
+        if (value>3) value-=8;
+        r.r[0]=144;
+        r.r[1]=value;
+        r.r[2]=(cmos_get(CMOS_Interlace) >> 4) & 1;
+        _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+        r.r[0]=135;
+        _kernel_swi(XOS_Bit | OS_Byte,&r,&r);
+        r.r[0]=r.r[2];
+        _kernel_swi(XOS_Bit | Wimp_SetMode,&r,&r);
+}
+
+static void change_tv(int value)
+{
+        int byte=cmos_get(CMOS_TV);
+        int tv=(byte>>5) & 7;
+
+        if (tv>3) tv-=8;
+        value+=tv;
+        if ((value >=-4) && (value <= 3))
+        {
+                if (value<0) value += 8;
+                do_tv(value);
+                cmos_set(CMOS_TV,(byte & (~(7<<5))) | (value<<5));
+        }
+        screen_settv();
+}
+
+static void switch_colour( int menusel );
+
+static void switch_monitor( int menusel )
+{
+        monitor_ref *rover;
+        int i;
+        char tbuf[256];
+
+        if ( current_monitor_file ) free( current_monitor_file );
+        current_monitor_file = NULL;
+        discard_resolutions_menu();
+
+        i = 0;
+        for ( rover = monitors_list; rover; rover = rover->next )
+        {
+                if ( i == menusel ) break;
+                i++;
+        }
+
+        if ( rover )
+        {
+                /*
+                        Record the file name we're interested in
+                */
+                current_monitor_file = malloc( strlen( rover->file_name ) + 1 );
+                if ( !current_monitor_file ) return;
+                strcpy( current_monitor_file, rover->file_name );
+
+                /*
+                        Load that file into our ScreenModes incarnation
+                */
+                choose_my_screenmodes_instantiation();
+
+                sprintf( tbuf, LoadModeCmd "%s", rover->file_name );
+                wimpt_complain( (os_error *)_swix( OS_CLI, _IN(0), tbuf ));
+
+                return_to_base_screenmodes_instantiation();
+
+                /*
+                        After switching instantiation need to re-inform the world that
+                        the current monitor has changed too.
+                */
+                wimpt_noerr( (os_error *)_swix( OS_ServiceCall, _IN(1), Service_ModeFileChanged ));
+
+                create_resolutions_menu();
+        }
+
+        fill_in_conmode_fields();
+
+        if ( rover )
+                switch_colour( current_colours );
+}
+
+static char cdepth[8]={0,1,2,2,3,3,4,5};        /* menu entry->colour depth */
+static char cdeptht[8]={0,0,0,1,0,1,1,1};       /* menu entry->colour/black and white */
+static char cdepthc[6]={0,1,3,5,6,7};           /* colour depth->colour menu entry */
+static char cdepthg[6]={0,1,2,4,6,7};           /* colour depth->grey menu entry */
+
+static void tickup_colours_menu( void )
+{
+        int depths[6];
+        int i;
+        wimp_menuitem *menu_body;
+
+        if ( !colours_menu ) return;
+
+        for ( i=0; i<6; i++ )
+        {
+                depths[i] = 0;
+        }
+
+        /*
+                Work out which depths are possible (only allow those on resolution menu)
+        */
+        for ( i=0; i<nummodes; i++ )
+        {
+                if ( ((char *)modes_index[i])[24] != '\0' )
+                        depths[ modes_index[i][4] ] = 1;
+        }
+
+        /*
+                Tick the allowable depths
+        */
+        menu_body = (wimp_menuitem *)((char *)colours_menu + sizeof( wimp_menuhdr ));
+
+        for ( i=0; i<sizeof( cdepth )/sizeof( cdepth[0] ); i++ )
+        {
+                if ( depths[cdepth[i]] )
+                {
+                        menu_body[i].iconflags &= ~wimp_INOSELECT;
+                }
+                else
+                {
+                        menu_body[i].iconflags |= wimp_INOSELECT;
+                }
+        }
+}
+
+static void switch_colour( int menusel )
+{
+        int i;
+        int bestmatch;
+        int limit_x_res = current_x_res;
+        int limit_y_res = current_y_res;
+
+        /*
+                If unknown resolution then limit to mode 27
+        */
+        if ( limit_x_res < 0 ) limit_x_res = 640;
+        if ( limit_y_res < 0 ) limit_y_res = 480;
+
+        bestmatch = -1;
+        for ( i=0; i<nummodes; i++ )
+        {
+                if ( modes_index[i][4] == cdepth[menusel] )
+                {
+                        /*
+                                This mode has the right colour depth
+                        */
+                        if ( bestmatch >= 0 )
+                        {
+                                /*
+                                        We already have a match so test for being in menu
+                                */
+                                char c1 = *(char *)&modes_index[bestmatch][6];
+                                char c2 = *(char *)&modes_index[i][6];
+                                if ( (c1 != '\0') && (c2 == '\0') ) continue;
+                                if ( (c1 != '\0') || (c2 == '\0') )
+                                {
+                                        /*
+                                                Either both are not in the menu or both are in the menu so test pixel shape
+                                        */
+                                        int f1 = modes_index[bestmatch][1] & flags_squarepixel;
+                                        int f2 = modes_index[i][1] & flags_squarepixel;
+                                        if ( f1 == f2 )
+                                        {
+                                                /*
+                                                        Both the same pixel shape so test x resolution
+                                                */
+                                                if ( (modes_index[i][2] > limit_x_res) || (modes_index[i][2] < modes_index[bestmatch][2]) )
+                                                        continue;
+                                        }
+                                        else
+                                        {
+                                                if ( f2 != current_flags ) continue;
+                                        }
+                                }
+                        }
+                        bestmatch = i;
+                }
+        }
+
+        /* if didn't find any suitable mode... */
+        if ( bestmatch < 0 ) return;
+
+        /* found a bestmatch, so switch to that */
+        current_colours = menusel;
+        current_flags = modes_index[bestmatch][1] & flags_squarepixel;
+        current_x_res = modes_index[bestmatch][2];
+        current_y_res = modes_index[bestmatch][3];
+
+        fill_in_conmode_fields();
+}
+
+static void switch_resolution( int menusel )
+{
+        int i;
+        int bestmatch;
+        wimp_menuitem *menu_body;
+        int x_to_find;
+        int y_to_find;
+
+        menu_body = (wimp_menuitem *)((char *)resolutions_menu + sizeof( wimp_menuhdr ));
+
+        for ( i=0; i<nummodes; i++ )
+        {
+                if ( (char *)&modes_index[i][6] == menu_body[menusel].data.indirecttext.buffer )
+                {
+                        break;
+                }
+        }
+        /*
+                Make sure we found the menu entry!
+        */
+        if ( i == nummodes )
+                return;
+
+        x_to_find = modes_index[i][2];
+        y_to_find = modes_index[i][3];
+
+        bestmatch = -1;
+        for ( i=0; i<nummodes; i++ )
+        {
+                if ( modes_index[i][2] == x_to_find && modes_index[i][3] == y_to_find )
+                {
+                        /*
+                                This mode has the right colour depth
+                        */
+
+                        /* check for going past the current colour depth */
+                        if ( modes_index[i][4] > cdepth[current_colours] ) break;
+
+                        /* check if this is a better mode than bestmatch */
+                        if ( bestmatch < 0 ||
+                             modes_index[bestmatch][4] != modes_index[i][4] )
+                        {
+                                bestmatch = i;
+                        }
+                }
+        }
+
+        /* if didn't find any suitable mode... */
+        if ( bestmatch < 0 ) return;
+
+        /* found a bestmatch, so switch to that */
+        if ( modes_index[bestmatch][4] != cdepth[current_colours] )
+        {
+                /*
+                        Basically this goes:
+                        Lookup the colour depth we can achieve in one of the colour
+                        or grey downgrade tables. We choose which based on whether
+                        the old current_colours was colour or greys.
+                */
+                current_colours = (cdeptht[current_colours]?cdepthc:cdepthg)[ modes_index[bestmatch][4] ];
+        }
+        current_flags = modes_index[bestmatch][1] & flags_squarepixel;
+        current_x_res = modes_index[bestmatch][2];
+        current_y_res = modes_index[bestmatch][3];
+
+        fill_in_conmode_fields();
+}
+
+static void select_texture( int which )
+{
+        int i;
+
+        which += ScreenWindow_TextureNone;
+
+        for ( i=ScreenWindow_TextureNone; i<=ScreenWindow_TextureRandom; i++ )
+        {
+                wimpt_noerr( wimp_set_icon_state( screen_window, i, i==which?wimp_ISELECTED:0, wimp_ISELECTED ));
+        }
+}
+
+static int current_texture( void )
+{
+        int i;
+        wimp_icon icon;
+
+        for ( i=ScreenWindow_TextureNone; i<=ScreenWindow_TextureRandom; i++ )
+        {
+                wimpt_noerr( wimp_get_icon_info( screen_window, i, &icon ));
+                if ( icon.flags & wimp_ISELECTED )
+                {
+                        return i-ScreenWindow_TextureNone;
+                }
+        }
+
+        return 0;       /* none */
+}
+
+static int texture_is_lighter( void )
+{
+        wimp_icon icon;
+
+        wimpt_noerr( wimp_get_icon_info( screen_window, ScreenWindow_LighterTexture, &icon ));
+
+        return (icon.flags & wimp_ISELECTED) != 0;
+}
+
+static void try_texture( void )
+{
+        char tbuf[256];
+        char ct = current_texture();
+
+        switch( ct )
+        {
+        case 0:
+                wimpt_complain( (os_error *)_swix( OS_CLI, _IN(0), BackdropCmd "-remove" ));
+                break;
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+                sprintf( tbuf, BackdropCmd "-tile " TEXTURESDIRECTORY ".T%d%c", ct, texture_is_lighter()?'L':'\0' );
+                wimpt_complain( (os_error *)_swix( OS_CLI, _IN(0), tbuf ));
+                break;
+        case 8:
+                sprintf( tbuf, BackdropCmd "-tile " TEXTURESDIRECTORY ".T%d%c", (rand() % 7) + 1, texture_is_lighter()?'L':'\0' );
+                wimpt_complain( (os_error *)_swix( OS_CLI, _IN(0), tbuf ));
+                break;
+        }
+}
+
+static int screen_unknown_event_handler( wimp_eventstr *e, void *handle )
+{
+        wimp_mousestr p;
+
+        wimp_get_point_info(&p);
+
+        handle=handle;
+        switch (e->e)
+        {
+        case wimp_EMENU:
+                switch( current_menu )
+                {
+                case Menu_ML:
+                        /*
+                                Monitors list
+                        */
+                        switch_monitor( e->data.menu[0] );
+                        if ( p.bbits & wimp_BRIGHT ) (void)wimp_create_menu( monitors_menu, p.x, p.y );
+                        break;
+
+                case Menu_CL:
+                        /*
+                                Colours list
+                        */
+                        switch_colour( e->data.menu[0] );
+                        if ( p.bbits & wimp_BRIGHT ) (void)wimp_create_menu( colours_menu, p.x, p.y );
+                        break;
+
+                case Menu_RL:
+                        /*
+                                Resolutions list
+                        */
+                        switch_resolution( e->data.menu[0] );
+                        if ( p.bbits & wimp_BRIGHT ) (void)wimp_create_menu( resolutions_menu, p.x, p.y );
+                        break;
+                }
+                break;
+        }
+        return FALSE;
+}
+
+static void take_screen_window_down( void )
+{
+        wimp_mousestr m;
+
+        wimp_get_point_info(&m);
+        if (m.bbits==wimp_BRIGHT)
+        {
+                wimp_wstate s;
+
+                wimp_get_wind_state(screen_window,&s);
+                reopen_main_window(s.o.box.x0,s.o.box.y1);
+        }
+        delete_window( &screen_window );
+        discard_monitors_list();
+        discard_colours_menu();
+        discard_screenmodes_instantiation();
+        discard_resolutions_menu();
+        win_remove_unknown_event_processor(screen_unknown_event_handler,NULL);
+}
+
+static char *cmenutotext[8] = {"C2","C4","G16","C16","G256","C256","C32K","C16M"};
+
+static void screen_event_handler(wimp_eventstr *e,void *handle)
+{
+        int sign;
+        int ct;
+        char line1[256];
+        char line2[256];
+        char line3[256];
+
+        handle=handle;
+
+        switch (e->e)
+        {
+        case wimp_EOPEN:
+                wimp_open_wind(&e->data.o);
+                break;
+
+        case wimp_ECLOSE:
+                take_screen_window_down();
+                break;
+
+        case wimp_EBUT:
+                sign=(e->data.but.m.bbits == wimp_BRIGHT) ? 1 : -1;
+
+                switch( e->data.but.m.bbits | e->data.but.m.i*4096 )
+                {
+                case wimp_BRIGHT | ScreenWindow_TVUp*4096:
+                case wimp_BLEFT  | ScreenWindow_TVUp*4096:
+                        change_tv(-sign);
+                        break;
+                case wimp_BRIGHT | ScreenWindow_TVDown*4096:
+                case wimp_BLEFT  | ScreenWindow_TVDown*4096:
+                        change_tv(sign);
+                        break;
+                case wimp_BRIGHT | ScreenWindow_BlankDelayUp*4096:
+                case wimp_BLEFT  | ScreenWindow_BlankDelayUp*4096:
+                        change_blank(-sign);
+                        break;
+                case wimp_BRIGHT | ScreenWindow_BlankDelayDown*4096:
+                case wimp_BLEFT  | ScreenWindow_BlankDelayDown*4096:
+                        change_blank(sign);
+                        break;
+                case wimp_BLEFT  | ScreenWindow_MonitorButton*4096:
+                case wimp_BMID   | ScreenWindow_MonitorButton*4096:
+                        if ( monitors_menu )
+                        {
+                                open_button_menu( Menu_ML, screen_window, ScreenWindow_MonitorButton, monitors_menu, "MHML" );
+                        }
+                        break;
+                case wimp_BLEFT  | ScreenWindow_ColoursButton*4096:
+                case wimp_BMID   | ScreenWindow_ColoursButton*4096:
+                        if ( current_monitor_file && colours_menu )
+                        {
+                                tickup_colours_menu();
+                                open_button_menu( Menu_CL, screen_window, ScreenWindow_ColoursButton, colours_menu, "MHSMCM" );
+                        }
+                        break;
+                case wimp_BLEFT  | ScreenWindow_ResolutionButton*4096:
+                case wimp_BMID   | ScreenWindow_ResolutionButton*4096:
+                        if ( current_monitor_file && resolutions_menu )
+                        {
+                                open_button_menu( Menu_RL, screen_window, ScreenWindow_ResolutionButton, resolutions_menu, "MHRM" );
+                        }
+                        break;
+                case wimp_BRIGHT | ScreenWindow_TextureNone*4096:
+                case wimp_BLEFT  | ScreenWindow_TextureNone*4096:
+                case wimp_BRIGHT | ScreenWindow_Texture1*4096:
+                case wimp_BLEFT  | ScreenWindow_Texture1*4096:
+                case wimp_BRIGHT | ScreenWindow_Texture2*4096:
+                case wimp_BLEFT  | ScreenWindow_Texture2*4096:
+                case wimp_BRIGHT | ScreenWindow_Texture3*4096:
+                case wimp_BLEFT  | ScreenWindow_Texture3*4096:
+                case wimp_BRIGHT | ScreenWindow_Texture4*4096:
+                case wimp_BLEFT  | ScreenWindow_Texture4*4096:
+                case wimp_BRIGHT | ScreenWindow_Texture5*4096:
+                case wimp_BLEFT  | ScreenWindow_Texture5*4096:
+                case wimp_BRIGHT | ScreenWindow_Texture6*4096:
+                case wimp_BLEFT  | ScreenWindow_Texture6*4096:
+                case wimp_BRIGHT | ScreenWindow_Texture7*4096:
+                case wimp_BLEFT  | ScreenWindow_Texture7*4096:
+                case wimp_BRIGHT | ScreenWindow_TextureRandom*4096:
+                case wimp_BLEFT  | ScreenWindow_TextureRandom*4096:
+                        select_texture( e->data.but.m.i - ScreenWindow_TextureNone );
+                        break;
+                case wimp_BRIGHT | ScreenWindow_LighterTexture*4096:
+                case wimp_BLEFT  | ScreenWindow_LighterTexture*4096:
+                        wimpt_noerr( wimp_set_icon_state( screen_window, ScreenWindow_LighterTexture, wimp_ISELECTED, 0 ));
+                        break;
+                case wimp_BRIGHT | ScreenWindow_TryTexture*4096:
+                case wimp_BLEFT  | ScreenWindow_TryTexture*4096:
+                        try_texture();
+                        break;
+                case wimp_BRIGHT | ScreenWindow_Default*4096:
+                case wimp_BLEFT  | ScreenWindow_Default*4096:
+                        /*
+                                Switch to auto monitor and noe texture
+                        */
+                        switch_monitor( monitor_count-1 );
+                        select_texture( 3 );
+                        wimpt_noerr( wimp_set_icon_state( screen_window, ScreenWindow_LighterTexture, 0, wimp_ISELECTED ));
+                        break;
+                case wimp_BRIGHT | ScreenWindow_Cancel*4096:
+                        read_current_mode_settings();
+                        discard_screenmodes_instantiation();
+                        create_screenmodes_instantiation();
+                        create_resolutions_menu();
+                        fill_in_conmode_fields();
+                        screen_settv();
+                        screen_setblank();
+                        break;
+                case wimp_BLEFT  | ScreenWindow_Cancel*4096:
+                        take_screen_window_down();
+                        break;
+                case wimp_BRIGHT | ScreenWindow_OK*4096:
+                case wimp_BLEFT  | ScreenWindow_OK*4096:
+                        ct = current_texture();
+
+                        if ( current_monitor_file &&
+                                (current_x_res < 0 || current_y_res < 0 || current_colours < 0) )
+                        {
+                                werr( 0, msgs_lookup( "BADSM" ));
+                                break;
+                        }
+
+                        /*
+                                Store the monitor and mode information
+                        */
+                        if ( current_monitor_file )
+                        {
+                                sprintf( line1, LoadModeCmd "%s", current_monitor_file );
+                                sprintf( line2, WimpModeCmd " X%d Y%d %s", current_x_res, current_y_res, cmenutotext[current_colours] );
+                        }
+                        else
+                        {
+                                line1[0] = '\0';
+                                line2[0] = '\0';
+
+                                /*
+                                        Set auto monitor type (whatever's in CMOS)
+                                */
+                                (void)_swix( OS_ScreenMode, _IN(0)|_IN(1), 3, -1 );
+                                (void)_swix( Wimp_SetMode, _IN(0), 27 );
+                        }
+                        configfile_writeline( PreDeskConfigFile, PreDeskMonitorLine, line1 );
+                        configfile_writeline( PreDeskConfigFile, PreDeskModeLine, line2 );
+
+                        /*
+                                Store backdrop information
+                        */
+                        if ( ct == 0 )
+                        {
+                                line3[0] = '\0';
+                                (void)_swix( OS_CLI, _IN(0), BackdropCmd "-remove" );
+                        }
+                        else if ( ct > 0 && ct < 8 )
+                        {
+                                sprintf( line3, BackdropCmd "-tile " TEXTURESDIRECTORY ".T%d%c", ct, texture_is_lighter()?'L':' ' );
+                        }
+                        else if ( ct == 8 )
+                        {
+                                sprintf( line3, RunCmd TEXTURESDIRECTORY ".RTexture %c", texture_is_lighter()?'L':' ' );
+                        }
+                        configfile_writeline( PostDeskConfigFile, PostDeskBackdropLine, line3 );
+
+                        /*
+                                Don't take window down if problem with stored info
+                        */
+                        if ( (e->data.but.m.bbits & wimp_BRIGHT) == 0 )
+                        {
+                                take_screen_window_down();
+                        }
+
+                        /*
+                                Do these at the end to ensure there's no hidden restoration going
+                                on when the screenmodes instantiation is taken down
+                        */
+                        (void)_swix( OS_CLI, _IN(0), line1 );
+                        (void)_swix( OS_CLI, _IN(0), line2 );
+                        (void)_swix( Wimp_StartTask, _IN(0), line3 );
+                        break;
+                }
+                break;
+        }
+}
+
+int screen_create_window(void)
+{
+        int create_new_window = !screen_window;
+
+        visdelay_begin();
+        if ( create_new_window )
+        {
+                screen_window = create_window( "Screen", screen_event_handler, "SC" );
+                win_add_unknown_event_processor( screen_unknown_event_handler, NULL );
+        }
+
+        read_current_mode_settings();
+
+        construct_monitors_list();
+        construct_colours_menu();
+        create_screenmodes_instantiation();
+        create_resolutions_menu();
+
+        fill_in_conmode_fields();
+        screen_settv();
+        screen_setblank();
+        visdelay_end();
+
+        return screen_window;
+}
+
+void screen_update_window(void)
+{
+        if (screen_window) screen_create_window();
+}

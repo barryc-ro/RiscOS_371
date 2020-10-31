@@ -1,0 +1,259 @@
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  FSOp.c                                                                           ***/
+/***                                                                                   ***/
+/***  Application:   PCMCIA_Support Code Module                                        ***/
+/***  Version:       0.001                                                             ***/
+/***                                                                                   ***/
+/***  By:            William Turner, Acorn Computers Ltd.                              ***/
+/***  Date:          11th March 1994                                                   ***/
+/***                                                                                   ***/
+/***  Purpose:       Contains the routines used by the PCMCIA_FSOp SWI                 ***/
+/***                                                                                   ***/
+/***  History:       0.01 11th March 1994 - Original version                           ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  Routines:-                                                                       ***/
+/***            FSOp_PartitionInfo                                                     ***/
+/***            FSOp_GetNumberOfCardDrives                                             ***/
+/***            FSOp_SizeCard                                                          ***/
+/***            FSOp_UpdatePartitionInfo                                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "Defs.h"
+#include "Structs.h"
+#include "Variables.h"
+#include "Error.h"
+#include "Swi.h"
+
+#include "Debug.h"
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  FSOp_PartitionInfo(regs)                                                         ***/
+/***                                                                                   ***/
+/***  Entry:                                                                           ***/
+/***    R0  = Reason Code (0)                                                          ***/
+/***    R1  = Card drive                                                               ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    R0  = Start Address of partition                                               ***/
+/***    R1  = Length of partition                                                      ***/
+/***    R2  = Partition type (0=PCCardFS, 1=Driver, 2=Driver in Attribute memory)      ***/
+/***                                                                                   ***/
+/***    PCMCIAManager_ErrorCode. NO_ERROR if successful.                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode FSOp_PartitionInfo(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode error = NO_ERROR;
+
+    #if Debug == TRUE
+        DebugMessage("gK","Entered PCMCIA_FSOp reason code 0\n");
+        DebugMessage("gK","        reg ->r[1] on entry is %d\n", reg ->r[1]);
+    #endif
+
+    reg ->r[0] = CardDrive[reg ->r[1]].PartitionStart;
+    reg ->r[2] = CardDrive[reg ->r[1]].Status;
+    reg ->r[1] = CardDrive[reg ->r[1]].PartitionLength;
+
+    #if Debug == TRUE
+        DebugMessage("gK","    PartitionStart relayed as &%08X\n", reg ->r[0]);
+        DebugMessage("gK","    PartitionLength relayed as &%08X\n", reg ->r[1]);
+        DebugMessage("gK","    PartitionType relayed as &%08X\n", reg ->r[2]);
+        DebugMessage("gK","Exiting PCMCIA_FSOp reason code 0\n");
+    #endif
+
+    return(error);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  FSOp_GetNumberOfCardDrives(regs)                                                 ***/
+/***                                                                                   ***/
+/***  Entry:                                                                           ***/
+/***    R0  = Reason Code (0)                                                          ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    R0  = Number of card drives supported by the Manager for FS use.               ***/
+/***                                                                                   ***/
+/***    PCMCIAManager_ErrorCode. NO_ERROR if successful.                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode FSOp_GetNumberOfCardDrives(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode error = NO_ERROR;
+    int                     ndrv = 0;
+    int                     loop;
+
+    #if Debug == TRUE
+        DebugMessage("gK","Entered PCMCIA_FSOp reason code 1\n");
+    #endif
+
+    reg ->r[0] = IO_CARDDRIVE - MEM_CARDDRIVE; /* ie 8-0 = 8 */
+    /** To find the number of drives, scan the NumDrives field in the hardware driver block **/
+    for(loop=0;((loop < MAX_HARDWARE_DRIVERS) && (HardwareDriver[loop].Functions != 0));loop++)
+        ndrv = ndrv + HardwareDriver[loop].NumberOfSlots;
+    reg ->r[0] = ndrv;
+
+    #if Debug == TRUE
+        DebugMessage("gK","    Number of drives is &%08X\n", reg ->r[0]);
+        DebugMessage("gK","Exiting PCMCIA_FSOp reason code 0\n");
+    #endif
+
+    return(error);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  FSOp_SizeCard(regs)                                                              ***/
+/***                                                                                   ***/
+/***  Entry:                                                                           ***/
+/***    R0  = Reason Code (2)                                                          ***/
+/***    R1  = Carddrive                                                                ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***    R0  = Size of card in bytes (may not be 100% optimal).                         ***/
+/***                                                                                   ***/
+/***    PCMCIAManager_ErrorCode. NO_ERROR if successful.                               ***/
+/***                                                                                   ***/
+/***  WARNING: This routine is going to be messy - NOT FOR THE FAINT HEARTED! :-)      ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode FSOp_SizeCard(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode     error = NO_ERROR;
+    int                         intercheck_gap = 16*1024; /** initially, go up in 16K steps **/
+    int                         checkpoint = 16*1024; /** Do the first check on the 16K boundary **/
+    int                         checkstodo = 128;  /** Doing max 128 checks (every 16k up to 1Mb, every 1Mb thereafter **/
+    _kernel_swi_regs            callregs;
+    char                        dump[8]; /** Space to dump the stuff read off the **/
+    char                        write[8];
+    char                        loop;
+
+    #if Debug == TRUE
+        DebugMessage("gK","Entered PCMCIA_FSOp reason code 2\n");
+    #endif
+
+    callregs.r[0] = 0; /** Physical, no scatter, common **/
+    callregs.r[1] = reg ->r[1]; /** Carddrive **/
+    do {
+        /** Read the memory at the checkpoint                 **/
+        #if Debug == TRUE
+            DebugMessage("gK","Reading checkpoint at &%08X\n", checkpoint);
+        #endif
+        callregs.r[2] = checkpoint; /** Src addr **/
+        callregs.r[3] = (int)dump;
+        callregs.r[4] = 8;
+        error = PCMCIA_Read(&callregs);
+        if(error == NO_ERROR) {
+            /** Bung a different, but known value into location 0 **/
+            for(loop=0; loop<8; loop++) write[loop] = dump[loop] + 5;
+            #if Debug == TRUE
+                DebugMessage("gK","%02X%02X%02X%02X%02X%02X%02X%02X\n",dump[0],dump[1],dump[2],dump[3],dump[4],dump[5],dump[6],dump[7]);
+                DebugMessage("gK","Writing at 0\n", checkpoint);
+                DebugMessage("gK","%02X%02X%02X%02X%02X%02X%02X%02X\n",write[0],write[1],write[2],write[3],write[4],write[5],write[6],write[7]);
+            #endif
+            callregs.r[2] = 0;
+            callregs.r[3] = (int)write;
+            callregs.r[4] = 8;
+            error = PCMCIA_Write(&callregs);
+            if(error == NO_ERROR) {
+                /** Read the memory at the checkpoint                 **/
+                #if Debug == TRUE
+                    DebugMessage("gK","Reading checkpoint at &%08X\n", checkpoint);
+                #endif
+                callregs.r[2] = checkpoint; /** Src addr **/
+                callregs.r[3] = (int)dump;
+                callregs.r[4] = 8;
+                error = PCMCIA_Read(&callregs);
+                if(error == NO_ERROR) {
+                    #if Debug == TRUE
+                        DebugMessage("gK","%02X %02X %02X %02X %02X %02X %02X %02X\n",dump[0],dump[1],dump[2],dump[3],dump[4],dump[5],dump[6],dump[7]);
+                    #endif
+                    /** Do they match?                                    **/
+                    if(memcmp(dump, write, 8) == 0) checkstodo = 1; /** If so, we know it is this size **/
+                    else {
+                        /** else increment the checkpoint & do it all again...**/
+                        #if Debug == TRUE
+                            DebugMessage("gK","Didn't match - what a shame...\n");
+                        #endif
+                        if(checkpoint == (1024*1024)) intercheck_gap = (1024*1024); /** Go up in 1Mb steps now.... **/
+                        checkpoint = checkpoint + intercheck_gap;
+                    }
+                    checkstodo--;
+                    #if Debug == TRUE
+                        DebugMessage("gK","Checks to do = %d\n",checkstodo);
+                    #endif
+                }
+            }
+        }
+        else {
+            #if Debug == TRUE
+                DebugMessage("gK","Erk! The PCMCIA_Read failed with error %d\n",(int)error);
+            #endif
+        }
+    } while((checkstodo > 0) && (error == NO_ERROR));
+    if(error != NO_ERROR) reg ->r[0] = 0;
+    else {
+        if(memcmp(dump, write, 8) == 0) reg ->r[0] = checkpoint;
+        else reg ->r[0] = 0; /** ie couldn't guess :-( **/
+    }
+    #if Debug == TRUE
+        DebugMessage("gK","Exiting PCMCIA_FSOp reason code 2\n");
+        DebugMessage("gK","with R0 = &%08X\n",reg ->r[0]);
+    #endif
+    return(error);
+}
+
+
+
+/*****************************************************************************************/
+/***                                                                                   ***/
+/***  FSOp_UpdatePartitionInfo(regs)                                                   ***/
+/***                                                                                   ***/
+/***  Entry:                                                                           ***/
+/***    R0  = Reason Code (2)                                                          ***/
+/***    R1  = Carddrive                                                                ***/
+/***    R2  = Partition start address                                                  ***/
+/***    R3  = Partition length                                                         ***/
+/***    R4  = pointer to partition id string                                           ***/
+/***    R5  = Partition type on the card (same format as returned from FSOp 0)         ***/
+/***                                                                                   ***/
+/***  Return:                                                                          ***/
+/***                                                                                   ***/
+/***    PCMCIAManager_ErrorCode. NO_ERROR if successful.                               ***/
+/***                                                                                   ***/
+/*****************************************************************************************/
+PCMCIAManager_ErrorCode FSOp_UpdatePartitionInfo(_kernel_swi_regs *reg)
+    {
+    PCMCIAManager_ErrorCode error = NO_ERROR;
+
+    #if Debug == TRUE
+        DebugMessage("gK","Entered PCMCIA_FSOp reason code 3\n");
+    #endif
+
+    CardDrive[reg ->r[1]].PartitionStart = reg ->r[2];
+    CardDrive[reg ->r[1]].PartitionLength= reg ->r[3];
+    strcpy(CardDrive[reg ->r[1]].PartitionDataId, (char *)reg ->r[4]);
+    CardDrive[reg ->r[1]].Status = reg ->r[5];
+
+    #if Debug == TRUE
+        DebugMessage("gK","Exiting PCMCIA_FSOp reason code 3\n");
+    #endif
+    return(error);
+}
+

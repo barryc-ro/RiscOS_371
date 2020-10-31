@@ -1,0 +1,369 @@
+/* Title:   show.c
+ * Purpose: show a Window Object
+ * Author:  IDJ
+ * History: 14-Jan-94: IDJ: created
+ *           9-Feb-95: IDJ: bug-fix AQU-01205
+ *
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "const.h"
+#include "macros.h"
+#include "services.h"
+#include "debug.h"
+#include "mem.h"
+#include "string32.h"
+#include "messages.h"
+
+#include "objects.toolbox.h"
+#include "objects.window.h"
+
+#include "object.h"
+#include "task.h"
+#include "hide.h"
+#include "gadgets.h"
+
+#include "show.h"
+#include "toolbar.h"
+
+/* keep track of showing something as a menu, so that we can send has_been_hidden */
+
+WindowInternal *ShowingAsMenu = 0;
+
+/*  NB have to remember how the show was done, so we can hide it appropriately */
+
+
+static _kernel_oserror *show__raise_about_to_be_shown (WindowInternal *window, int r0, int r2, void *r3)
+{
+    WindowAboutToBeShownEvent        event;
+    _kernel_swi_regs                 regs;
+
+    event.hdr.size = sizeof(WindowAboutToBeShownEvent);
+    event.hdr.event_code = window->show_event;
+    event.hdr.flags = r0;
+
+    event.r2 = r2;
+
+    switch (r2)
+    {
+        case Toolbox_ShowObject_Default:
+            /* just use old coords of window */
+            break;
+
+        case Toolbox_ShowObject_FullSpec:
+            event.r3.full_spec = *((WindowShowObjectBlock *)r3);
+            break;
+
+        case Toolbox_ShowObject_TopLeft:
+            event.r3.top_left = *((TopLeft *)r3);
+            break;
+
+        default:
+            break;
+    }
+
+    regs.r[0] = 0;
+    regs.r[1] = (int)window->id;  /* object id of this window */
+    regs.r[2] = -1;              /* no component id */
+    regs.r[3] = (int)&event;
+
+    _kernel_swi (Toolbox_RaiseToolboxEvent, &regs, &regs);
+
+    if (event.hdr.event_code == Window_AboutToBeShown) return 0;
+    event.hdr.event_code = Window_AboutToBeShown;
+
+    return (_kernel_swi (Toolbox_RaiseToolboxEvent, &regs, &regs));
+
+}
+
+
+_kernel_oserror *show__open_window (int r0, wimp_OpenWindow *open,WindowInternal *w)
+{
+    _kernel_oserror *e = NULL;
+    wimp_OpenWindow open2;
+
+    /*
+     *
+     *    R0 flags tell us whether to open as Menu or SubMenu, using
+     *    Wimp_CreateMenu and Wimp_CreateSubMenu, else we use
+     *    Wimp_OpenWindow.
+     *
+     */
+
+    DEBUG debug_output ("show","Window: about to show 0x%x as type %d\n", open->window_handle,r0);
+
+    switch (r0)
+    {
+        case Toolbox_ShowObject_AsMenu:
+        case Toolbox_ShowObject_AsSubMenu:
+            {                            
+#ifdef DIALOGUESGOCREAM
+                set_window_focus_colour(w->wimp_window_handle,2);
+#endif
+                set_window_flags(w->wimp_window_handle,wimp_WINDOWFLAGS_HAS_BACK_ICON,0);
+                if(r0 == Toolbox_ShowObject_AsMenu)
+                   e = wimp_create_menu((void *) open->window_handle,open->visible_area.xmin,open->visible_area.ymax);
+                else
+                   e = wimp_create_submenu((void *) open->window_handle,open->visible_area.xmin,open->visible_area.ymax);
+
+                /* this will cause any transient window currently showing to go */
+                if (ShowingAsMenu && !e) {
+                   _hide_raise_hidden(ShowingAsMenu);
+                   ShowingAsMenu = NULL;
+                }
+
+                if((!e) && (w->flags & Window_GenerateHasBeenHidden)) ShowingAsMenu = w;
+            }
+            break;
+
+        default:
+            open2 = *open;
+#ifdef DIALOGUESGOCREAM
+            set_window_focus_colour(w->wimp_window_handle,w->window.colours[6]);
+#endif
+            set_window_flags(w->wimp_window_handle,wimp_WINDOWFLAGS_HAS_BACK_ICON,w->window.flags);
+
+            if (w->panes) open->behind = open_panes(w,open);
+            e = wimp_open_window(open);
+
+            /* its possible that the window hasn't opened where we 
+               expected it to be... */
+            if (memcmp(open,&open2,20) && w->panes) {
+               /* they're different */
+               open->behind = open2.behind;
+               open->behind = open_panes(w,open);
+               e = wimp_open_window(open);
+            }
+            if(w == ShowingAsMenu) ShowingAsMenu = 0;  
+            break;
+
+    }
+
+    if (!e) {
+
+        DEBUG debug_output ("show","Window: show with default focus %d\n", w->default_focus);
+
+        /* need to put the caret somewhere according to default_focus */
+
+        if (w->default_focus == DontSetFocus) return NULL;                /* no focus */
+
+        if (w->default_focus == SetFocusToWindow) 
+           wimp_set_caret_position(open->window_handle,-1,0,0,1<<25,0); /*ignore errors */
+        else {
+           GadgetInternal *g = w->gadgets;
+
+           while (g != NULL)
+           {
+             if (g->gadget_hdr.component_id == w->default_focus)
+             break;
+
+             g = g->next;
+           }
+           if(g) e = gadgets_set_focus(g,w->wimp_window_handle,1);
+        }
+
+    }
+
+    return e;
+}
+
+
+extern _kernel_oserror *show_do_the_show (WindowInternal *w, int r0, int r2, void *r3)
+{
+    /*
+     * Function to actually show the window.  This may have been
+     * deferred til after a warning has been received by the
+     * client.
+     *
+     * Showing a Window is easy :-)
+     *    If show in default place:
+     *            if already shown, show again
+     *            else show where template tells you
+     *
+     *    If show top left:
+     *            if already shown, get state, and set xmin, ymax
+     *            else get template and set xmin, ymax
+     *
+     *    If show full info:
+     *            use supplied block:
+     *               window show type == 0, show as rest of block
+     *                                == 1, bring to top
+     *                                == 2, stagger
+     */
+
+    /* R0 is flags word
+     * R2 is generic "show type"
+     * R3 is block of data for fully-specified show
+     */
+
+    wimp_OpenWindow     open;
+    wimp_GetWindowState state;
+    _kernel_oserror    *e = NULL;
+
+    /*
+     * Get Window's current state, for use in opening it
+     */
+
+    state.open.window_handle = w->wimp_window_handle;
+
+    if ((e = wimp_get_window_state(&state)) != NULL) return e;
+#if 0
+    if (state.flags & wimp_WINDOWFLAGS_OPEN) 
+       open = state.open;
+    else {
+       wimp_GetWindowInfo info;
+       info.window_handle = w->wimp_window_handle;
+       wimp_get_window_info((void *) (((int) &info) +1));
+       memcpy (&open,&info,sizeof(open));
+    } 
+#else
+    open = state.open;
+#endif
+    open.behind = wimp_OpenWindow_TopOfStack;
+
+    /*
+     * Set up a wimp open window block, from user info
+     */
+
+    switch (r2)
+    {
+        case Toolbox_ShowObject_Default:
+            /* just use old coords of window */
+
+            if (w->flags & Window_IsToolBar) {
+               _kernel_swi_regs regs;
+               /* is it one of the toolbars for its parent ? */
+               WindowInternal *parent = w->parent;
+
+               regs.r[3] = (int) w->id;
+               remove_pane(parent,&regs);
+                            
+               regs.r[4] = 0;
+                  
+               regs.r[5] = 0;
+               regs.r[6] = 0;
+               if (parent->ibl == w->id) regs.r[4] = 17;
+               if (parent->itl == w->id) regs.r[4] = 19;
+               if (parent->ebl == w->id) regs.r[4] = 16;
+               if (parent->etl == w->id) regs.r[4] = 18;
+
+               if (regs.r[4]) set_pane(parent,&regs);
+               else return make_error(Window_NotToolbar,0);
+
+               return NULL;
+
+            }
+            break;
+
+        case Toolbox_ShowObject_FullSpec:
+            memcpy ((void *)&open.visible_area, r3, sizeof(WindowShowObjectBlock));
+            break;
+
+        case Toolbox_ShowObject_TopLeft:
+            {
+            int xoff = -open.visible_area.xmin + ((TopLeft *)r3)->x;
+            int yoff = -open.visible_area.ymax + ((TopLeft *)r3)->y;
+            open.visible_area.xmin = ((TopLeft *)r3)->x;
+            open.visible_area.ymax = ((TopLeft *)r3)->y;           
+            open.visible_area.xmax += xoff;
+            open.visible_area.ymin += yoff;
+            break;                                      
+            }
+
+        default:
+            break;
+    }
+
+
+    /*
+     * Get the Wimp to actually open the window (finally!)
+     */
+
+    /* IDJ: 9-Feb-95: bug-fix AQU-01205: must remember the way the window was shown if error
+     *                is due to no unfaded writables left to put caret into, since
+     *                window will have been shown, despite error!
+     */
+
+    if ((e = show__open_window (r0 & (Toolbox_ShowObject_AsMenu|Toolbox_ShowObject_AsSubMenu), &open, w)) != NULL)
+    {
+        if (e->errnum != Window_NoGadgetsLeft)
+            return e;
+    }
+
+
+    /*
+     * remember how it was shown, so we know how to hide it!
+     */
+
+    w->state = ((w->state) & ~ (Toolbox_ShowObject_AsMenu|Toolbox_ShowObject_AsSubMenu)) |
+                (r0 & (Toolbox_ShowObject_AsMenu|Toolbox_ShowObject_AsSubMenu));
+
+
+    return e;
+}
+
+
+extern _kernel_oserror *show_object (_kernel_swi_regs *r, TaskDescriptor *t)
+{
+
+    /*
+     * request to show an object
+     * R0 = 3
+     * R1 = Object ID
+     * R2 = internal handle returned when Object was created
+     * R3 = wimp task handle of caller (use to identify task descriptor)
+     * R4 -> user regs R0-R9
+     *      R0 =  flags
+     *      R1 =  Object ID
+     *      R2 =  "show type"
+     *            0 => default place
+     *            1 => R3 points to buffer with full data for showing
+     *            2 => R3 points to buffer with coordinates
+     *      R3 = 0
+     *   OR R3 -> buffer giving Object-specific data for showing this
+     *            Object
+     *      R4 =  Parent Object ID
+     *      R5 =  Parent Component ID
+     */
+
+    /*
+     * Function to "display" an Object on the screen.  If R2 == 0, then
+     * display in default place.
+     * If Object has bit set to say warn before show, then we should just
+     * send Toolbox Event, and wait for the next call to Wimp_Poll after
+     * the event is delivered before the Object is actually shown
+     * (ie catch it in the prefilter).
+     *
+     */
+
+    _kernel_swi_regs *user_regs = (_kernel_swi_regs *)r->r[4];
+    _kernel_oserror  *e         = NULL;
+    WindowInternal   *window    = (WindowInternal *)r->r[2];
+
+    /*
+     * If a Window_AboutToBeShown needs to be sent, we defer the show til
+     * later, and just cache the parameters passed to this SWI.
+     */
+
+    IGNORE(t);
+
+    if (window->flags & Window_GenerateAboutToBeShown)
+    {
+        e = show__raise_about_to_be_shown (window,user_regs->r[0], user_regs->r[2], (void *)user_regs->r[3]);
+    }
+    else
+    {
+        /* no event to be raised, so just do the show */
+
+        e = show_do_the_show (window, user_regs->r[0], user_regs->r[2], (void *)user_regs->r[3]);
+    }
+
+    return e;
+}
+

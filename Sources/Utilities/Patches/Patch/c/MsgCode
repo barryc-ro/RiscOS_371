@@ -1,0 +1,295 @@
+#include "Patch.h"
+
+
+/* SWI numbers with the X bit set. */
+
+#define XMessageTrans_FileInfo          (0x41500 | XOS_Bit)
+#define XMessageTrans_OpenFile          (0x41501 | XOS_Bit)
+#define XMessageTrans_Lookup            (0x41502 | XOS_Bit)
+#define XMessageTrans_MakeMenus         (0x41503 | XOS_Bit)
+#define XMessageTrans_CloseFile         (0x41504 | XOS_Bit)
+#define XMessageTrans_EnumerateTokens   (0x41505 | XOS_Bit)
+#define XMessageTrans_ErrorLookup       (0x41506 | XOS_Bit)
+#define XMessageTrans_GSLookup          (0x41507 | XOS_Bit)
+
+
+
+/* Structure for each member of a linked list of MessageTrans files. This
+   allows us to close them all whenever exit() is called. I'm not sure if
+   this is strictly necessary, but it may well be in the future. It is not
+   defined whether MessageTrans actually has the real file on disk open
+   or not, so you have to close it.
+
+   The list is also used when doing lookups for Transforms. The pointer to
+   the file_buffer is only for the sake of completeness. */ 
+
+typedef struct msg_trans_link
+{
+    struct msg_trans_link *             next;
+    char *                              file_desc;
+    char *                              file_buffer;
+    int                                 file_open_flag : 1;
+} MSG_TRANS_LINK;
+
+/* Global head of the list. */
+
+static MSG_TRANS_LINK * msg_trans_root = NULL;
+
+
+
+/* Function to open a MessageTrans file. Will also put the file onto
+   the linked list of open message files. Returns the MessageTrans
+   handle for the file, so that for the main Messages file we can look
+   in just that one and not have to go through all the Transforms message
+   files. */
+
+char * open_msgtrans_file
+(
+    char const * const                  filename
+)
+{
+    MSG_TRANS_LINK *                    msg_trans;
+    _kernel_swi_regs                    regs;
+
+
+    /* Get the linked list member. */
+
+    msg_trans = calloc_noerr(sizeof(*msg_trans), 1);
+
+
+    /* Find out the size of the file, and allocate the buffer. */
+
+    regs.r[1] = (int) filename;
+    NOERR(_kernel_swi(XMessageTrans_FileInfo, &regs, &regs));
+    msg_trans->file_buffer = malloc_noerr(regs.r[2]);
+
+
+    /* Claim some memory to pass to MessageTrans (spot the silly interface)
+       for its magic 16 bytes and for the filename. */
+
+    msg_trans->file_desc = malloc_noerr(16 + strlen(filename) + 1);
+    strcpy(msg_trans->file_desc + 16, filename);
+
+
+    /* Now that we have some memory with legal contents, put it on the
+       list. */
+
+    msg_trans->next = msg_trans_root;
+    msg_trans_root = msg_trans;
+
+
+    /* Open the file - causes it to get read into our buffer. */
+
+    regs.r[0] = (int) msg_trans->file_desc;
+    regs.r[1] = (int) msg_trans->file_desc + 16;
+    regs.r[2] = (int) msg_trans->file_buffer;
+
+    NOERR(_kernel_swi(XMessageTrans_OpenFile, &regs, &regs));
+
+
+    /* The file is now open, so mark it as so in the list. */
+
+    msg_trans->file_open_flag = TRUE;
+
+
+    /* Return the descriptor for doing lookups. */
+
+    return msg_trans->file_desc;
+}
+
+
+
+/* Function to close all MessageTrans files. This function is called when
+   exit() is called. */
+
+void close_all_mgstrans_files
+(
+    void
+)
+{
+    MSG_TRANS_LINK *                    msg_trans;
+    _kernel_swi_regs                    regs;
+    _kernel_oserror *                   error;
+
+
+    /* Close all the files. Do NOTHING else in this loop as closing the
+       files is the important action which restores global machine state.
+
+       There is no point freeing up the application memory with free(),
+       because we are quitting the application anyway so it will all get
+       blown away. Calling free() is also dubious in the case that we are
+       going down due to a memory shortage - although it ought to be safe,
+       I don't trust it.
+
+       Errors are reported, but they are not allowed to terminate the
+       program (we are terminating anyway). */
+
+    for (msg_trans = msg_trans_root;
+         msg_trans != NULL;
+         msg_trans = msg_trans->next)
+    {
+        if (msg_trans->file_open_flag)
+        {
+            /* Close the file. */
+
+            regs.r[0] = (int) msg_trans->file_desc;
+
+            error = _kernel_swi(XMessageTrans_CloseFile, &regs, &regs);
+            msg_trans->file_open_flag = FALSE;
+
+            if (error != NULL)
+            {
+                /* Need to do my own error reporting here, as
+                   report_error() looks our name up in the messages
+                   files (ie. the ones we are closing) and may also
+                   call exit(), which we are already inside. */
+
+                regs.r[0] = (int) error;
+                regs.r[1] = wimp_EOK;
+                regs.r[2] = (int) "Patcher";
+
+                /* Ignore errors from Wimp_ReportError. */
+
+                _kernel_swi(XWimp_ReportError, &regs, &regs);
+            }
+        }
+
+    } /* End for all message files on the list */
+}
+
+
+
+/* Function to do a MessageTrans_GSLookup in the file specfied.
+
+   The lookup is performed into the buffer passed, which must be big
+   enough. 256 bytes is the usual number. The buffer is the return value. */
+
+char * msgtrans_lookup
+(
+    char const * const                  file_desc,
+    char * const                        buffer,
+    int                                 buffer_size,
+    char const * const                  token,
+    char const * const                  parm1,
+    char const * const                  parm2,
+    char const * const                  parm3,
+    char const * const                  parm4
+)
+{
+    _kernel_swi_regs                    regs;
+
+    regs.r[0] = (int) file_desc;
+    regs.r[1] = (int) token;
+    regs.r[2] = (int) buffer;
+    regs.r[3] = (int) buffer_size;
+    regs.r[4] = (int) parm1;
+    regs.r[5] = (int) parm2;
+    regs.r[6] = (int) parm3;
+    regs.r[7] = (int) parm4;
+
+    NOERR(_kernel_swi(XMessageTrans_GSLookup, &regs, &regs));
+
+    return buffer;
+}
+
+
+
+/* Function to do a MessageTrans_GSLookup in all of the files, until
+   we don't get a Token Not Found error.
+
+   The lookup is performed into the buffer passed, which must be big
+   enough. 256 bytes is the usual number. The buffer is the return value. */
+
+char * msgtrans_lookup_all
+(
+    char * const                        buffer,
+    int                                 buffer_size,
+    char const * const                  token,
+    char const * const                  parm1,
+    char const * const                  parm2,
+    char const * const                  parm3,
+    char const * const                  parm4
+)
+{
+    MSG_TRANS_LINK const *              msg_trans;
+    _kernel_oserror *                   error;
+    _kernel_swi_regs                    regs;
+
+
+    /* Run down the list of files, doing the lookup in each one. I
+       would load up preserved registers outside the loop, but the
+       documentation only says that R0 and R1 are preserved. Since
+       R0 changes each time, R1 really isn't worth the effort.
+       Besides, the complier may do a large STM. */
+
+    for (msg_trans = msg_trans_root;
+         msg_trans != NULL;
+         msg_trans = msg_trans->next)
+    {
+        regs.r[0] = (int) msg_trans->file_desc;
+        regs.r[1] = (int) token;
+        regs.r[2] = (int) buffer;
+        regs.r[3] = (int) buffer_size;
+        regs.r[4] = (int) parm1;
+        regs.r[5] = (int) parm2;
+        regs.r[6] = (int) parm3;
+        regs.r[7] = (int) parm4;
+
+        error = _kernel_swi(XMessageTrans_GSLookup, &regs, &regs);
+
+        if (error == NULL)
+        {
+            /* We got a successful lookup. */
+
+            return buffer;
+        }
+
+        if (error->errnum != ErrorNumber_TokenNotFound)
+        {
+            /* Something went seriously wrong. */
+
+            report_error(error, wimp_ECANCEL);
+        }
+    }
+
+    /* If we get here, then we failed to find it so fatal on the last
+       TokenNotFound error. */
+
+    report_error(error, wimp_ECANCEL);
+
+
+    /* Stop the compiler warning about non-void function. */
+
+    return NULL;
+}
+
+
+
+/* Function to do a MessagTrans_ErrorLookup in the main Messages file.
+   Returns the error buffer return by MessageTrans ie. in the RMA. */
+
+_kernel_oserror * msgtrans_error_lookup
+(
+    char const * const                  error_token,
+    char const * const                  parm1,
+    char const * const                  parm2,
+    char const * const                  parm3,
+    char const * const                  parm4
+)
+{
+    _kernel_swi_regs                    regs;
+
+    regs.r[0] = (int) error_token;
+    regs.r[1] = (int) msgs_file_desc;
+    regs.r[2] = NULL;                   /* Use MessageTrans buffer. */
+    regs.r[3] = 0;
+    regs.r[4] = (int) parm1;
+    regs.r[5] = (int) parm2;
+    regs.r[6] = (int) parm3;
+    regs.r[7] = (int) parm4;
+
+    /* Always sets V bit, so the lookup result will always come out
+       as an error. */
+
+    return _kernel_swi(XMessageTrans_ErrorLookup, &regs, &regs);
+}

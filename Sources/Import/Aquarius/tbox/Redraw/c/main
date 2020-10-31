@@ -1,0 +1,1019 @@
+/* Title:   main.c
+ * Purpose: main module of Redraw module
+ * Author:  NK
+ * History: 23-Nov-94: NK: created
+ *
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "string.h"
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "rmensure.h"
+#include "wimplib.h"
+
+#define IGNORE(a) a=a
+
+extern int register_rect(void);
+extern int register_post(void);
+static _kernel_oserror *set_clipping(int flags, BBox *clip, void *pw);
+static _kernel_oserror *remove_clipping(int flags, void *pw);
+static void* my_pw;
+
+static BBox intersect;
+
+#define min(a,b) ((a>b) ? b:a)
+#define max(a,b) ((a>b) ? a:b)
+
+/* convert work area coords to screen coords */
+
+void work_to_screen(BBox *wa, WimpGetWindowStateBlock *state)
+{
+    wa->xmin += state->visible_area.xmin - state->xscroll;
+    wa->xmax += state->visible_area.xmin - state->xscroll;
+
+    wa->ymin += state->visible_area.ymax - state->yscroll;
+    wa->ymax += state->visible_area.ymax - state->yscroll;
+
+}
+
+/* convert screen coords to work area */
+
+void screen_to_work(BBox *wa, WimpGetWindowStateBlock *state)
+{
+    wa->xmin -= state->visible_area.xmin - state->xscroll;
+    wa->xmax -= state->visible_area.xmin - state->xscroll;
+
+    wa->ymin -= state->visible_area.ymax - state->yscroll;
+    wa->ymax -= state->visible_area.ymax - state->yscroll;
+
+}
+
+/* set up a graphics clipping rectangle */
+
+void clipping_rectangle(BBox *area)
+{
+   unsigned short str[] = {0x1805,0,0,0,0};
+   if (!area) return;
+
+#if 0
+   _swix(OS_WriteI+5,0);
+   _swix(OS_WriteI+24,0);
+   _swix(OS_WriteI+((area->xmin) & 255),0);
+   _swix(OS_WriteI+(((area->xmin) >> 8) & 255),0);
+   _swix(OS_WriteI+((area->ymin) & 255),0);
+   _swix(OS_WriteI+(((area->ymin) >> 8) & 255),0);
+   _swix(OS_WriteI+((area->xmax -1) & 255),0);
+   _swix(OS_WriteI+((( area->xmax -1) >> 8) & 255),0);
+   _swix(OS_WriteI+((area->ymax -1) & 255),0);
+   _swix(OS_WriteI+(((area->ymax -1) >> 8) & 255),0);
+#else
+   str[1] = area->xmin;
+   str[2] = area->ymin;
+   str[3] = area->xmax-1;
+   str[4] = area->ymax-1;
+   _swix(OS_WriteN,_IN(0) |_IN(1) ,str,10);
+#endif
+}
+
+/* set up a graphics clip for work area */
+
+void graphics_rectangle(WimpGetWindowStateBlock *state,BBox *area)
+{
+   unsigned short str[] = {0x1805,0,0,0,0};
+   if (!area) return;
+
+#if 0
+   _swix(OS_WriteI+5,0);
+   _swix(OS_WriteI+24,0);
+   _swix(OS_WriteI+((state->visible_area.xmin - state->xscroll + area->xmin) & 255),0);
+   _swix(OS_WriteI+(((state->visible_area.xmin - state->xscroll + area->xmin) >> 8) & 255),0);
+   _swix(OS_WriteI+((state->visible_area.ymax - state->yscroll + area->ymin) & 255),0);
+   _swix(OS_WriteI+(((state->visible_area.ymax - state->yscroll + area->ymin) >> 8) & 255),0);
+   _swix(OS_WriteI+((state->visible_area.xmin - state->xscroll + area->xmax -1) & 255),0);
+   _swix(OS_WriteI+(((state->visible_area.xmin - state->xscroll + area->xmax -1) >> 8) & 255),0);
+   _swix(OS_WriteI+((state->visible_area.ymax - state->yscroll + area->ymax -1) & 255),0);
+   _swix(OS_WriteI+(((state->visible_area.ymax - state->yscroll + area->ymax -1) >> 8) & 255),0);
+#else
+   str[1] = state->visible_area.xmin - state->xscroll + area->xmin;
+   str[2] = state->visible_area.ymax - state->yscroll + area->ymin;
+   str[3] = state->visible_area.xmin - state->xscroll + area->xmax-1;
+   str[4] = state->visible_area.ymax - state->yscroll + area->ymax-1;
+   _swix(OS_WriteN,_IN(0) |_IN(1) ,str,10);
+#endif
+}
+
+/* return the intersection of two rectangles */
+
+BBox *intersection(BBox *a, BBox *b)
+{
+   if ((a->xmin >= b->xmax) || (a->xmax <= b->xmin) || (a->ymin >= b->ymax) || (a->ymax <= b->ymin)) return 0;
+   intersect.xmin = max(a->xmin,b->xmin);
+   intersect.xmax = min(a->xmax,b->xmax);
+   intersect.ymin = max(a->ymin,b->ymin);
+   intersect.ymax = min(a->ymax,b->ymax);
+
+   return &intersect;
+}
+
+typedef struct _rects {
+  struct _rects *next;
+  BBox box;
+  int data;
+  int extra;
+} Rectangles;
+
+typedef struct _winctrl {
+  struct _winctrl *next;
+  unsigned int handle;
+  Rectangles *rects;
+  BBox visible;
+} WindowsToRedraw;
+
+typedef struct _taskctrl {
+  struct _taskctrl *next;
+  unsigned int th;
+  WindowsToRedraw *windows;
+} TaskControl;
+
+TaskControl *all_tasks = 0;
+
+#define NOP                  (0)
+#define ALLOCATE_IFNOT_THERE (1)
+
+int *windows_of_interest = 0;
+int num_windows_of_interest;
+#define ALLOC_BLOCK 32
+
+static TaskControl *find_task(unsigned int th,int cmd)
+{
+  TaskControl *list = all_tasks;
+  while (list) {
+    if (list->th == (th & 0xffff)) return list;
+    list = list->next;
+  }
+  if (cmd == ALLOCATE_IFNOT_THERE) {
+    list = malloc (sizeof(TaskControl));
+    if (list) {
+      WimpSendMessageBlock blk;
+      list->windows = 0;
+      list->th      = th & 0xffff;
+      list->next    = all_tasks;
+      all_tasks     = list;
+
+      blk.hdr.action_code = 0;
+      blk.hdr.your_ref    = 0xDEADDEAD;
+      blk.hdr.size        = 24;
+      blk.data.words[0]	  = (int )list;
+      if (wimp_send_message(17,&blk,th,0,0)) {
+        /* as an error has ocurred, the memory block wont get freed */
+        /* This has probably happened due to low memory, so best free it now */
+        /* ought to have some panic redraw mechanism */
+        free(list);
+        list = NULL;
+      }
+
+    }
+    return list;
+  }
+
+  return NULL;
+}
+
+static WindowsToRedraw *find_window(unsigned int win,int cmd, WindowsToRedraw **all_windows)
+{
+  WindowsToRedraw *list = *all_windows;
+  while (list) {
+    if (list->handle == win) return list;
+    list = list->next;
+  }
+  if (cmd == ALLOCATE_IFNOT_THERE) {
+    list = malloc (sizeof(WindowsToRedraw));
+    if (list) {
+      WimpGetWindowStateBlock state;
+      list->rects      = 0;
+      list->handle     = win;
+      list->next       = *all_windows;
+      *all_windows     = list;
+      state.window_handle = win;
+      wimp_get_window_state(&state);
+      list->visible.xmin = state.visible_area.xmin - state.xscroll;
+      list->visible.xmax = state.visible_area.xmax - state.xscroll;
+      list->visible.ymin = state.visible_area.ymin - state.yscroll;
+      list->visible.ymax = state.visible_area.ymax - state.yscroll;
+    }
+    return list;
+  }
+
+  return NULL;
+}
+
+static void add_rectangle(WindowsToRedraw *win,BBox *area)
+{
+  Rectangles *new = malloc(sizeof(Rectangles));
+
+  if (new) {
+    new->next = win->rects;
+    win->rects = new;
+    new->box = *area;
+    new->box.xmin -= win->visible.xmin;
+    new->box.xmax -= win->visible.xmin;
+
+    new->box.ymin -= win->visible.ymax;
+    new->box.ymax -= win->visible.ymax;
+
+  }
+}
+
+extern int copy_filter(_kernel_swi_regs *r)
+{
+   /* Copy Filter, coords (%d,%d) - (%d,%d)
+      r->r[6],r->r[7],r->r[8],r->r[9]  */
+
+   return 1;
+}
+
+static void debug_string(char *s)
+{
+   while (*s) _swix(0x40102,_IN(0),*s++);
+   _swix(0x40102,_IN(0),'\n');
+   _swix(0x40102,_IN(0),'\r');
+}
+
+int last_window = -1;
+int clip_to_win =0;
+int clipped_win =0;
+int clipping_to_a_win=0;
+
+extern int rect_filter(_kernel_swi_regs *r)
+{
+
+   /* TASK = %08x  coords (%d,%d) - (%d,%d)
+      r->r[2],r->r[6],r->r[7],r->r[8],r->r[9]
+
+      window handle = r->r[0]
+    */
+   TaskControl *task;
+   WindowsToRedraw *window;
+   int *interest = windows_of_interest;
+
+   if (r->r[0] == clipped_win) {
+     if (!clipping_to_a_win) {
+        WimpGetWindowStateBlock state;
+        state.window_handle = clip_to_win;
+        wimp_get_window_state(&state);
+        clipping_to_a_win =1;
+        clipping_rectangle(&state.visible_area);
+        set_clipping(0,&state.visible_area,my_pw);
+     }
+   } else {
+      if (clipping_to_a_win) {
+         clipping_to_a_win =0;
+         remove_clipping(0,my_pw);
+     }
+   }
+
+   while (*interest != r->r[0]) {
+     if (*interest++ == -1) return 1;
+   }
+
+   if (last_window == r->r[0]) {
+      /* we're still in a redraw loop for the last window so
+         to improve efficiency, make the call... */
+
+
+
+   }
+
+   last_window = r->r[0];
+
+   if ((task = find_task(r->r[2],ALLOCATE_IFNOT_THERE)) != NULL) {
+     if ((window = find_window(r->r[0],ALLOCATE_IFNOT_THERE,&task->windows)) != NULL) {
+       add_rectangle(window,(BBox *) &r->r[6]);
+     }
+   }
+   return 1;
+
+}
+
+typedef struct _swctr {
+  struct _swctr *next;
+  Rectangles *rects;
+  int SWI;
+} SWIList;
+
+typedef struct _winct {
+  struct _winct *next;
+  int handle;
+  SWIList *swis;
+} WinCtrl;
+
+WinCtrl *all_windows = 0;
+
+/* returns -1 -> no intersection
+           0  -> intersection
+           1  -> area totally inside bound
+           */
+
+static int check_bounds(BBox *bound, BBox *area)
+{
+  if ((bound->xmin >= area->xmax) || (bound->xmax <= area->xmin) ||
+        (bound->ymin >= area->ymax) || (bound->ymax <= area->ymin)) return -1;
+
+  if (bound->xmin <= area->xmin && bound->xmax >= area->xmax && bound->ymin <= area->ymin && bound->ymax >= area->ymax) return 1;
+
+  return 0;
+
+}
+
+static void callout(BBox *warea, WimpGetWindowStateBlock *state,int flags)
+{
+   WinCtrl *winlist = all_windows;
+   _kernel_swi_regs regs;
+   Rectangles *rects;
+   int bound=-1;
+   BBox wa,*wap;
+
+   while (winlist) {
+     if (winlist->handle == state->window_handle) {
+       SWIList *swis = winlist->swis;
+       regs.r[0] = flags;
+       regs.r[2] = (int) state;
+       while (swis) {
+         rects = swis->rects;
+         while (rects) {
+           if (rects->extra & 1)  {
+               /* only wants work area, ie. not window furniture */
+               wa = *warea;
+
+               work_to_screen(&wa,state);
+               wap = intersection(&wa,&state->visible_area);
+               if (wap) screen_to_work(wap,state);
+
+           } else wap = warea;
+
+           if (wap && (bound = check_bounds(wap,&rects->box))>= 0) {
+             if (rects->extra &2)
+                graphics_rectangle(state,intersection(wap,&rects->box));
+             if (rects->extra &4) {
+                wa = *wap;
+                work_to_screen(&wa,state);
+                regs.r[1] = (int) &wa;
+             } else regs.r[1] = (int) wap;
+             regs.r[3] = (int) &rects->box;
+             regs.r[4] = rects->data;
+             regs.r[0] = (regs.r[0] & 254) | (bound ?  1:0);
+
+             _kernel_swi(swis->SWI,&regs,&regs);
+           }
+           rects = rects->next;
+         }
+         swis = swis->next;
+       }
+       return;
+     }
+     winlist = winlist ->next;
+   }
+}
+
+static void make_callbacks(TaskControl *task, int death)
+{
+   Rectangles *rects,*lr;
+   WindowsToRedraw *lw,*windows = task->windows;
+   TaskControl *list=all_tasks;
+   WimpGetWindowStateBlock state;
+   int vdu[] = {128,129,130,131,4,5-1};
+   BBox clip[2];
+
+   /* preserve graphics window */
+
+   if (!death) {
+      _swix(OS_ReadVduVariables,_IN(0) | _IN(1),&vdu,&clip);
+      clip[0].xmin = clip[0].xmin << clip[1].xmin;
+      clip[0].ymin = clip[0].ymin << clip[1].ymin;
+      clip[0].xmax = clip[0].xmax << clip[1].xmin;
+      clip[0].ymax = clip[0].ymax << clip[1].ymin;
+   }
+   while (windows) {
+     lw = windows;
+     rects = windows->rects;
+     state.window_handle = windows->handle;
+     if (!death) wimp_get_window_state(&state);
+
+     while (rects) {
+       lr = rects;
+       rects = rects->next;
+       if (!death) callout(&lr->box,&state,0);
+       free (lr);
+     }
+     windows = windows->next;
+     free(lw);
+   }
+   if (list == task) {
+     all_tasks = task->next;
+   } else {
+     while (list->next != NULL && list->next != task) list = list->next;
+     if (list) list->next = task->next;
+   }
+   free (task);
+
+   if (!death) clipping_rectangle(&clip[0]);
+}
+
+extern int post_filter(_kernel_swi_regs *r)
+{
+  WimpSendMessageBlock *blk = (WimpSendMessageBlock *)r->r[1];
+  if (blk->hdr.your_ref == 0xDEADDEAD) {
+     make_callbacks((TaskControl *) blk->data.words[0],0);
+     r->r[0] = -1;      /* claim it */
+  }
+  return 1;
+}
+
+void *working_alloc(int size)
+{
+   _kernel_swi_regs regs;
+   regs.r[0] = 6;
+   regs.r[3] = size;
+   if (_kernel_swi(OS_Module,&regs,&regs)) return 0;
+   return (void *) regs.r[2];
+
+}
+
+void *working_realloc(void *ptr, int change)
+{
+   _kernel_swi_regs regs;
+   regs.r[0] = 13;
+   regs.r[2] = (int) ptr;
+   regs.r[3] = change;
+   if (_kernel_swi(OS_Module,&regs,&regs)) return 0;
+   return (void *) regs.r[2];
+}
+
+static void task_death (int th)
+{
+   TaskControl *task= find_task(th,NOP);
+
+   if (task) make_callbacks(task,1);
+
+}
+
+char RectFilterName[] = "Redraw Manager rectangle filter";
+char PostFilterName[] = "Redraw Manager post filter";
+
+/* +++++++++++++++++++++++++++++++++ service handler code ++++++++++++++++++++++++++++++ */
+
+static _kernel_oserror *register_filters(void *pw)
+{
+    _kernel_oserror *e;
+    _kernel_swi_regs regs;
+
+    /* register rectangle filter */
+    regs.r[0] = (int) RectFilterName;
+    regs.r[1] = (int) register_rect;
+    regs.r[2] = (int) pw;
+    regs.r[3] = 0;
+
+    e = _kernel_swi(0x42644,&regs,&regs);
+
+    if (!e) {
+      /* register post filter to catch 'redraw message' */
+      regs.r[0] = (int) PostFilterName;
+      regs.r[1] = (int) register_post;
+      regs.r[2] = (int) pw;
+      regs.r[3] = 0;
+      regs.r[4] = (0xffffffffU - (1<<17));
+
+      e = _kernel_swi(Filter_RegisterPostFilter,&regs,&regs);
+    }
+    return e;
+}
+
+extern void Redraw_services(int service_number, _kernel_swi_regs *r, void *pw)
+{
+    switch (service_number)
+    {
+        case 0x53:
+            if (r->r[0] == 0) task_death(r->r[2]);
+            break;
+        case 0x87:
+            register_filters(pw);
+            break;
+        default:
+            break;
+    }
+}
+
+/* If low memory, then some blocks can remain allocated */
+
+static _kernel_oserror *add_interest(int flags,int win, int SWI, BBox *area,int data)
+{
+    int *list = windows_of_interest;
+    WinCtrl *window=all_windows;
+    SWIList *swil;
+    Rectangles *rects;
+
+    while (*list != -1 && *list !=win) list++;
+
+    if (*list == -1) {
+       if (num_windows_of_interest%ALLOC_BLOCK == 0) {
+         windows_of_interest = working_realloc (windows_of_interest,4 * ALLOC_BLOCK);
+
+         if (!windows_of_interest) return (_kernel_oserror *) "    out of memory";
+       }
+       windows_of_interest[num_windows_of_interest-1] = win;
+       windows_of_interest[num_windows_of_interest] = -1;
+       num_windows_of_interest++;
+    }
+
+    while (window) {
+      if (window->handle== win) break;
+      window = window->next;
+    }
+    if (!window) {
+      window = malloc(sizeof(WinCtrl));
+      if (!window) return (_kernel_oserror *) "    out of memory";
+      window->next = all_windows;
+      window->handle = win;
+      window->swis = 0;
+      all_windows = window;
+    }
+
+    swil = window->swis;
+    while (swil) {
+      if (swil->SWI == SWI) break;
+      swil = swil->next;
+    }
+    if (!swil) {
+      swil = malloc(sizeof(SWIList));
+      if (!swil) return (_kernel_oserror *) "    out of memory";
+      swil->next = window->swis;
+      window->swis = swil;
+      swil->SWI = SWI;
+      swil->rects = 0;
+    }
+    rects = malloc(sizeof(Rectangles));
+    if (!rects) return (_kernel_oserror *) "    out of memory";
+    rects->next = swil->rects;
+    swil->rects = rects;
+    rects->data = data;
+    rects->extra = flags;
+    rects->box = *area;
+
+    return NULL;
+}
+
+static _kernel_oserror *remove_interest(int win, int SWI, BBox *area, int data)
+{
+    int *list = windows_of_interest;
+    WinCtrl *lw,*window = all_windows;
+    SWIList *swil,*ls;
+    Rectangles *rects,*lr;
+    int done=0;
+
+    /* remove this instance */
+    while (window && !done) {
+       if (window->handle == win) {
+          swil = window->swis;
+          while (swil && !done) {
+             if (swil->SWI == SWI) {
+                 rects = swil->rects;
+                 while (rects && !done) {
+                    if (!memcmp(area,&rects->box,sizeof(BBox))) {
+                       /* got there remove it */
+                       if (swil->rects == rects) swil->rects = rects->next;
+                       else lr->next = rects->next;
+                       free (rects);
+
+                       if (swil->rects == 0) {
+                          /* no more regions for this SWI - remove it */
+                          if (window->swis == swil) window->swis = swil->next;
+                          else ls->next = swil->next;
+                          free (swil);
+
+                          if (window->swis == 0) {
+                             /* no more swis for this window... */
+                             if (all_windows == window) all_windows = window->next;
+                             else lw->next = window->next;
+                             free (window);
+
+                          }
+                       }
+                       done = 1;
+                    }
+                    lr = rects;
+                    rects = rects->next;
+                 }
+             }
+             ls = swil;
+             swil = swil->next;
+          }
+       }
+       lw = window;
+       window = window->next;
+    }
+
+    /* if window is NULL, then couldn't find - raise error */
+
+    /* possibly remove from interest list */
+    window = all_windows;
+    while (window) {
+       if (window->handle == win) break;
+       window = window->next;
+    }
+    if (!window) {
+       while (*list != -1) {
+          if (*list == win) {
+             int *copy = list+1;
+             while ((*list++ = *copy++) !=-1);
+             num_windows_of_interest--;
+             if (num_windows_of_interest%ALLOC_BLOCK == 0) {
+                windows_of_interest = working_realloc (windows_of_interest,-4 * ALLOC_BLOCK);
+             }
+             break;
+          }
+          list++;
+       }
+    }
+
+    return NULL;
+}
+
+/* ++++++++++++++++++++++++++++++++++++++ SWI code +++++++++++++++++++++++++++++++++++++ */
+
+static _kernel_oserror *clip_windows(int flags, int win1,int win2);
+
+extern _kernel_oserror *Redraw_SWI_handler(int swi_no, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *e = NULL;
+
+    switch (swi_no) {
+        case 0:
+            return add_interest(r->r[0],r->r[1],r->r[2],(BBox *) r->r[3],r->r[4]);
+        case 1:
+            return remove_interest(r->r[1],r->r[2],(BBox *) r->r[3],r->r[4]);
+        case 2:
+            return set_clipping(r->r[0],(BBox *) r->r[1],pw);
+        case 3:
+            return remove_clipping(r->r[0],pw);
+        case 4:
+            return clip_windows(r->r[0], r->r[1],r->r[2]);
+        default:
+            break;
+    }
+
+    return e;
+}
+
+static BBox Clipper;
+static int clipping =0;
+extern void register_writec(void);
+static int seen_vdu24=0;
+static int ignore_next=0;
+static int x1,y1,x2,y2,type;
+static int seen_plot=0;
+
+extern writec_vector(_kernel_swi_regs *r)
+{
+   int needs=0;
+
+   if (ignore_next) {
+      ignore_next--;
+      return 1;
+   }
+
+   if (seen_plot) {
+      switch (seen_plot) {
+         case 1:
+           type = r->r[0];
+           break;
+         case 2:
+           x1=r->r[0];
+           break;
+         case 3:
+           x1 = x1 | (r->r[0] <<8);
+           break;
+         case 4:
+           y1=r->r[0];
+           break;
+         case 5:
+           y1 = y1 | (r->r[0] <<8);
+           seen_plot = -1;
+           { char buf[128];
+             sprintf(buf,"Type %d plot for pos %d,%d",type,x1,y1);
+             debug_string(buf);
+           }
+           break;
+      }
+      seen_plot++;
+      return 1;
+   }
+
+   if (seen_vdu24) {
+      switch (seen_vdu24) {
+         case 1:
+           x1=r->r[0];
+           break;
+         case 2:
+           x1 = x1 | (r->r[0] <<8);
+           break;
+         case 3:
+           y1=r->r[0];
+           break;
+         case 4:
+           y1 = y1 | (r->r[0] <<8);
+           break;
+         case 5:
+           x2=r->r[0];
+           break;
+         case 6:
+           x2 = x2 | (r->r[0] <<8);
+           break;
+         case 7:
+           y2=r->r[0];
+           break;
+         case 8:
+           y2 = y2 | (r->r[0] <<8);
+
+           if (x1 < Clipper.xmin) {
+             x1 = Clipper.xmin;
+             needs =1;
+           }
+           if (x2 < Clipper.xmin) {
+             x2 = Clipper.xmin;
+             needs =1;
+           }
+           if (y1 < Clipper.ymin) {
+             y1 = Clipper.ymin;
+             needs =1;
+           }
+           if (y2 < Clipper.ymin) {
+             y2 = Clipper.ymin;
+             needs =1;
+           }
+           if (x1 > Clipper.xmax) {
+             x1 = Clipper.xmax;
+             needs =1;
+           }
+           if (x2 > Clipper.xmax) {
+             x2 = Clipper.xmax;
+             needs =1;
+           }
+           if (y1 > Clipper.ymax) {
+             y1 = Clipper.ymax;
+             needs =1;
+           }
+           if (y2 > Clipper.ymax) {
+             y2 = Clipper.ymax;
+             needs =1;
+           }
+           if (needs) {
+             /* reentrancy */
+             char buf[9];
+             ignore_next = 9;
+             r->r[0] = y2 >>8;       /* last byte goes back out */
+             buf[0] = 0;
+             buf[1] = 24;
+             buf[2] = x1 & 255;
+             buf[3] = x1 >>8;
+             buf[4] = y1 & 255;
+             buf[5] = y1 >>8;
+             buf[6] = x2 & 255;
+             buf[7] = x2 >>8;
+             buf[8] = y2 & 255;
+             _swix(OS_WriteN, _IN(0) | _IN(1) ,buf,9);
+           }
+           seen_vdu24 = -1;
+           break;
+      }
+      seen_vdu24++;
+      return 1;
+   }
+
+   if (r->r[0] <32) switch (r->r[0]) {
+      case 24:
+         seen_vdu24 =1;
+         break;
+      case 1:
+      case 17:
+      case 22:
+         ignore_next =1;
+         break;
+      case 18:
+      case 31:
+         ignore_next =2;
+         break;
+      case 19:
+         ignore_next =5;
+         break;
+      case 25:
+         seen_plot =1;
+         break;
+      case 23:
+         ignore_next =9;
+         break;
+      case 28:
+      case 29:
+         ignore_next =4;
+         break;
+   }
+   return 1;
+}
+
+static _kernel_oserror *clip_windows(int flags, int win1,int win2)
+{
+   clipped_win = win1;
+   clip_to_win = win2;
+   return NULL;
+}
+
+static _kernel_oserror *set_clipping(int flags, BBox *clip, void *pw)
+{
+   _kernel_swi_regs regs;
+
+   Clipper = *clip;
+   if (!clipping) {
+      regs.r[0] = 0x3;
+      regs.r[1] = (int) register_writec;
+      regs.r[2] = (int) pw;
+      clipping = 1;
+      _kernel_swi(OS_Claim,&regs,&regs);
+   }
+
+   return NULL;
+}
+
+static _kernel_oserror *remove_clipping(int flags, void *pw)
+{
+   _kernel_swi_regs regs;
+
+   if (!clipping) return NULL;  /* should error */
+
+   regs.r[0] = 0x3;
+   regs.r[1] = (int) register_writec;
+   regs.r[2] = (int) pw;
+   clipping = 0;
+
+   _kernel_swi(OS_Release,&regs,&regs);
+
+   return NULL;
+}
+
+#ifdef HAS_CMDS
+
+void print_list(void)
+{
+   WinCtrl *win = all_windows;
+   SWIList *swis;
+   Rectangles *rects;
+   int *list = windows_of_interest;
+
+   while(win) {
+     printf("Interests in window %x\n",win->handle);
+     swis = win->swis;
+     while(swis) {
+        printf("    For SWI %x\n",swis->SWI);
+        rects = swis->rects;
+        while(rects) {
+           printf("        Region (%d,%d) to (%d,%d)\n",rects->box.xmin,rects->box.ymin,rects->box.xmax,rects->box.ymax);
+           rects=rects->next;
+        }
+        swis=swis->next;
+     }
+     win=win->next;
+   }
+   printf("Summary: No. windows of interest %d\n",num_windows_of_interest -1);
+   while (*list != -1) printf("    handle = %x\n",*list++);
+
+}
+
+void print_clip(void)
+{
+   if (clipping) printf("Currently clipping region (%d,%d) to (%d,%d)\n",Clipper.xmin,Clipper.ymin,Clipper.xmax,Clipper.ymax);
+   if (clipped_win) printf("Clipping window %x to window %x\n",clipped_win,clip_to_win);
+
+}
+
+
+/* ++++++++++++++++++++++++++++++++++++++ star commands ++++++++++++++++++++++++++++++++++++*/
+
+extern _kernel_oserror *Redraw_commands(char *arg_string, int argc, int cmd_no, void *pw)
+{
+    IGNORE(argc);
+    IGNORE(pw);
+    IGNORE(arg_string);
+
+    switch (cmd_no)
+    {
+        case 0:
+            print_list();
+            break;
+        case 1:
+            print_clip();
+            break;
+        default:
+            break;
+    }
+
+    return NULL;
+}
+#endif
+
+extern _kernel_oserror *Redraw_final (int fatal, int podule, void *pw)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *e;
+
+    IGNORE(fatal);
+    IGNORE(podule);
+
+    regs.r[0] = (int) RectFilterName;
+    regs.r[1] = (int) register_rect;
+    regs.r[2] = (int) pw;
+    regs.r[3] = 0;
+
+    e = _kernel_swi(0x42645,&regs,&regs);
+
+    if (!e) {
+      regs.r[0] = (int) PostFilterName;
+      regs.r[1] = (int) register_post;
+      regs.r[2] = (int) pw;
+      regs.r[3] = 0;
+      regs.r[4] = (0xffffffffU - (1<<17));
+
+      e = _kernel_swi(Filter_DeRegisterPostFilter,&regs,&regs);
+    }
+
+    remove_clipping(0,pw);
+
+    if (e) return e;
+
+#ifdef COPY
+    regs.r[0] = 2;
+    regs.r[1] = (int) 0;
+    regs.r[2] = (int) pw;
+
+    _kernel_swi(Wimp_RegisterFilter,&regs,&regs);
+#endif
+
+    if (windows_of_interest) free (windows_of_interest);
+
+    return NULL;
+}
+
+
+/* ++++++++++++++++++++++++++++++++ initialisation code +++++++++++++++++++++++++++++++ */
+
+int issue_service(void)
+{
+  _swix(OS_ServiceCall,_IN(1),0x82d00);
+  return 1;
+}
+
+extern void register_cb(void);
+
+extern _kernel_oserror *Redraw_init(char *cmd_tail, int podule_base, void *pw)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *e;
+    IGNORE(cmd_tail);
+    IGNORE(podule_base);
+
+    /* need filter manager with Rectangle filter capability */
+
+    e = rmensure("FilterManager","FilterMgr","0.12");
+    if (e) return e;
+
+    if ((windows_of_interest = working_alloc (4*ALLOC_BLOCK)) == NULL) return
+      (_kernel_oserror *) "    out of memory";
+
+    windows_of_interest[0] = -1;
+    num_windows_of_interest = 1;
+
+    my_pw = pw;
+    debug_string("starting...");
+
+    e = register_filters(pw);
+    if (e) return e;
+
+#ifdef COPY
+    regs.r[0] = 2;
+    regs.r[1] = (int) register_copy;
+    regs.r[2] = (int) pw;
+
+    _kernel_swi(Wimp_RegisterFilter,&regs,&regs);
+#endif
+    /* all's well! */
+
+    regs.r[0] = (int) register_cb;
+    regs.r[1] = (int) pw;
+
+    _kernel_swi(OS_AddCallBack,&regs,&regs);
+
+    return NULL;
+}

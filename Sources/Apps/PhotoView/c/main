@@ -1,0 +1,644 @@
+/*
+ *  c.main
+ *
+ *  Main WIMP shell for PhotoView
+ *  PhotoCD Toolkit example application
+ *
+ *
+ */
+
+
+
+#include <stdlib.h>
+#include <string.h>
+
+
+#include "os.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "res.h"
+#include "resspr.h"
+#include "template.h"
+#include "dbox.h"
+#include "visdelay.h"
+#include "msgs.h"
+#include "werr.h"
+#include "flex.h"
+#include "swis.h"
+#include "help.h"
+#include "kernel.h"
+#include "sprite.h"
+#include "menu.h"
+#include "xferrecv.h"
+
+
+#include "pcdovervw.h"
+#include "image.h"
+#include "misc.h"
+
+
+
+
+#define  WIMP_INIT_STRING     "PhotoView"
+#define  WIMP_RES_STRING      "PhotoView"
+#define  WIMP_RES_VAR         "PhotoView$Dir"
+#define  WIMP_ICONBAR_SPRITE  "!photoview"
+#define  WIMP_ICONIZE_SPRITE  "photovw"
+
+
+#define proginfo_purp_field  2
+#define proginfo_auth_field  3
+#define proginfo_vers_field  4
+
+
+
+
+/******************************** GLOBAL DATA *******************************/
+
+
+
+/* ProgInfo box field data */
+static char *prog_Purpose_String = "PhotoCD Toolkit example app";
+static char *prog_Author_String = "© Acorn Computers Ltd, 1993";
+static char *prog_Version_String = "0.10 (31 Mar 1995)";
+
+
+
+static menu  iconbar_menu;
+static menu  source_subm;
+
+
+wimp_w  main_handle;
+
+int     main_open = FALSE;
+
+
+static char  desksave_startup_string[256];
+
+static int   num_cdrom_drives;
+
+#define  MAX_PATHS  16
+static char  paths[MAX_PATHS][256];
+static int   num_paths = 0;
+
+static int   path_selected = 0;
+
+
+/******************************* MISCELLANEA *******************************/
+
+
+
+os_error *main_save_desktop(int handle)
+{
+   char     *ptr;
+
+   for (ptr = desksave_startup_string; *ptr; ptr++)
+   {
+      os_error *error = os_swi2(os_X|OS_BPut, *ptr, handle);
+      if (error) return error;
+   }
+
+   return os_swi2(os_X|OS_BPut, 10, handle);    /* line terminator */
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL main_processhelpevent(char *helpbase)
+{
+   wimp_eventstr *e = wimpt_last_event();
+
+
+   if (
+        (e->e == wimp_ESEND || e->e == wimp_ESENDWANTACK)
+        &&
+        e->data.msg.hdr.action == wimp_MHELPREQUEST
+      )
+   {
+      wimp_i icon = e->data.msg.data.helprequest.m.i;
+      char tag[32];
+      int taglen = strlen(helpbase);
+      char *message;
+      char c;
+
+
+      strcpy(tag, helpbase);
+
+      /* encode icon number as a character */
+      if (icon <= 9) c = '0' + icon;
+      else if (icon <= 35) c = 'a' + icon - 10;
+      else c = 'z';
+
+      tag[taglen] = c;
+      tag[taglen + 1] = 0;
+      message = msgs_lookup(tag);
+      if (strcmp(message, tag) != 0) help_reply(message);
+      else
+      {
+         /* icon token not found, use window default instead */
+         tag[taglen] = 0;
+         message = msgs_lookup(tag);
+         if (strcmp(message, tag) != 0) help_reply(message);
+      }
+      return(TRUE); /* message has been handled. */
+   }
+   else
+      return(FALSE);
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL  main_add_path(char *path)
+{
+   char   *s;
+   int     n, r0;
+
+
+   if (num_paths == 0)     /* accept unconditionally the first one ("CDFS::0.$") */
+   {
+      strcpy(paths[num_paths], path);
+      num_paths++;
+      return TRUE;
+   }
+
+   /* complain if there is not enough room for this one */
+   if (num_paths >= MAX_PATHS)
+   {
+      werr(FALSE, "Too many paths - could not add this one");
+      return FALSE;
+   }
+
+   /* we only want the path location containing the
+      'PHOTO_CD' directory, so if it is in the string
+      truncate it */
+   s = strstr(path, ".PHOTO_CD");
+   if (s == NULL)
+      n = strlen(path);
+   else
+      n = s - path;
+
+   if (n >= 255)
+      n = 255;
+
+   strncpy(paths[num_paths], path, n);
+   paths[num_paths][n] = '\0';         /* (just in case) */
+
+
+   /* if this is not a directory containg 'PHOTO_CD'
+      then make sure that it is a directory */
+   if (s == NULL)
+   {
+      _kernel_osfile_block  osf;
+
+      if ((r0 = _kernel_osfile(5, paths[num_paths], &osf)) < 0)
+         return FALSE;
+
+      switch (r0)
+      {
+         case 0: /* file not found */
+            return FALSE;
+
+         case 1: /* file found */
+            /* drop leafname to leave directory */
+            s = paths[num_paths];
+            while ((n > 0) && (s[n] != '.'))
+               n--;
+            if (n == 0)
+               return FALSE;
+            s[n] = '\0';   /* terminate at directory name */
+            break;
+
+         case 2: /* directory found */
+         case 3: /* image found */
+            break;
+      }
+   }
+
+
+   /* finally, check that the path isn't already in the menu */
+   n = 0;
+   while (n < num_paths)
+   {
+      if (strcmp(paths[n], paths[num_paths]) == 0)
+         return TRUE;
+      n++;
+   }
+
+   /* OK, accept the path */
+   num_paths++;
+
+   return TRUE;        /* successfully added */
+}
+
+
+
+/****************************** EVENT HANDLERS ******************************/
+
+
+
+static void main_info_about_program(void)
+/* Display the program info box - called from the menu processor. */
+{
+   dbox  d;  /* Dialogue box handle */
+
+
+   /* Create the dialogue box */
+   if (d = dbox_new("ProgInfo"), d != NULL)
+   {
+      /* Fill in the version number */
+      dbox_setfield(d, proginfo_purp_field, prog_Purpose_String);
+      dbox_setfield(d, proginfo_auth_field, prog_Author_String);
+      dbox_setfield(d, proginfo_vers_field, prog_Version_String);
+
+      dbox_raw_eventhandler(d, help_dboxrawevents, (void *)"PROGINFO");   /* the only events we are interested in
+                                                                             are interactive help messages        */
+      /* Show the dialogue box */
+      dbox_show(d);
+
+      /* Keep it on the screen as long as needed */
+      dbox_fillin(d);
+
+      /* Dispose of the dialogue box */
+      dbox_dispose(&d);
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void prog_iconbar_events(wimp_eventstr *e, void *handle)
+/* Event handler for icon bar (and other unknown events). */
+{
+
+   handle = handle;
+
+
+   /* Deal with event */
+   switch (e->e)
+   {
+
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+         {
+
+            if (help_process(e))    /* if this is a menu-interactive-help message then */
+               return;              /* arrange for it to be handled */
+
+
+            switch (e->data.msg.hdr.action)
+            {
+
+               case wimp_MDATALOAD:   /* insert data */
+
+                  /* User has dragged on a file object..
+                     add it's name to the Source menu */
+                  {
+                     char   *filename;
+
+                     /* get the name of the file */
+                     xferrecv_checkinsert(&filename);
+
+                     if (main_add_path(filename))
+                     {
+                        /* remake 'Source' submenu */
+                        int     i;
+
+                        menu_submenu(iconbar_menu, 2, 0);
+                        menu_dispose(&source_subm, TRUE);
+
+                        source_subm = menu_new(msgs_lookup("MEicbar2T:Source"), paths[0]);
+                        i = 1;
+                        while (i < num_paths)
+                           menu_extend(source_subm, paths[i++]);
+
+                        /* make the newly-added path, the currently selected one */
+                        path_selected = num_paths;
+
+                        /* grey out the (always present) 'CDFS::0.$' if no drives are present */
+                        if (num_cdrom_drives == 0)
+                           menu_setflags(source_subm, 1, 0, 1);
+
+                        /* tick the currently selected */
+                        if (path_selected != 0)
+                           menu_setflags(source_subm, path_selected, 1, 0);
+
+                        menu_submenu(iconbar_menu, 2, source_subm);
+                     }
+
+                     /* indicate load is completed */
+                     xferrecv_insertfileok();
+
+                     pcdovervw_popup(paths[path_selected-1], TRUE, image_openimage, 0);
+                  }
+                  break;
+
+               /*----------*/
+
+               case wimp_PALETTECHANGE:   /* palette has changed */
+                  pcdovervw_palettechange();
+                  image_palettechange();
+                  break;
+
+               /*----------*/
+
+               case wimp_SAVEDESK: /* desktop save message */
+                  {
+                     os_error  *err;
+
+                     if ((err = main_save_desktop(e->data.msg.data.savedesk.filehandle)) != NULL)
+                     {
+                        /* error has occurred - acknowledge the message (to stop it going further)
+                           and report the error */
+
+                        e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+                        wimp_sendmessage(wimp_EACK, &e->data.msg, e->data.msg.hdr.task);
+
+                        werr(0, "deskboot:'%s' error occurred whilst attempting to make Desktop boot file",
+                               err->errmess);
+                     }
+                  }
+                  break;
+
+               /*----------*/
+
+               case wimp_MINITTASK: /* task init */
+                  {
+                     /* refuse to allow another one of me to load */
+
+                     if ( (strcmp(&e->data.msg.data.chars[8], WIMP_INIT_STRING) == 0) &&
+                          (e->data.msg.hdr.task != wimpt_task()) )
+                     {
+                        e->data.msg.hdr.your_ref = 0;
+                        e->data.msg.hdr.action   = 0;
+                        e->data.msg.hdr.size     = 20;
+                        wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task);
+                     }
+                  }
+                  break;
+
+               /*----------*/
+
+               case wimp_MHELPREQUEST:   /* interactive help request */
+                  /* Are we over the iconbar icon? */
+                  if(e->data.msg.data.helprequest.m.w == -2)
+                     help_reply(msgs_lookup("IHELPI"));
+                  break;
+
+               /*----------*/
+
+               case 0x400cc:   /* 'wimp_MWINDINFO' (for iconizing windows) */
+
+                  /*--- Return some info back to the pinboard ---*/
+
+                  /* Sprite name to use */
+                  strncpy(&e->data.msg.data.chars[8], WIMP_ICONIZE_SPRITE, 8);
+                  e->data.msg.data.chars[15] = '\0';
+
+                  /* Text to use */
+                  strncpy(&e->data.msg.data.chars[16], msgs_lookup("MEicbarT:PhotoView"), 20);
+                  e->data.msg.data.chars[35] = '\0';
+
+                  /* Reply */
+                  e->data.msg.data.words[1] = 0;
+
+                  e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+                  e->data.msg.hdr.size     = ((36 + strlen(&e->data.msg.data.chars[16]) + 1) + 3) & ~3;
+                  wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task);
+
+                  break;
+
+               /*----------*/
+
+               default:
+                  break;        /* ignore other messages */
+            }
+         }
+
+         break;
+
+      /*----------*/
+
+      default:   /* Ignore any other event */
+         break;
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void iconbar_click(wimp_i  i)
+/* called when muggins clicks SELECT on iconbar icon */
+{
+
+   if (path_selected > 0)
+      pcdovervw_popup(paths[path_selected-1], TRUE, image_openimage, 0);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static menu  main_menumaker(void *handle)
+{
+   /* Controls the making of the menus.
+      This is needed if menu help is wanted. */
+
+
+   help_register_handler(help_simplehandler, "IHELP");    /* help for the iconbar menu */
+
+   return iconbar_menu;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  iconbar_menuproc(void *handle, char *hit)
+{
+   /*--- Event handler for the menu ---*/
+
+   /* Find which menu item was hit and take action as appropriate */
+   switch (hit[0])
+   {
+      case 1: /* info */
+              if (hit[1] != 0)       /* only open if crossed over submenu arrow */
+                 main_info_about_program();
+              break;
+
+      /*--------*/
+
+      case 2: /* source */
+              if (hit[1] != 0)
+              {
+                 if (path_selected != 0)
+                    menu_setflags(source_subm, path_selected, 0, 0);
+                 path_selected = hit[1];
+                 menu_setflags(source_subm, path_selected, 1, 0);
+
+                 pcdovervw_popup(paths[path_selected-1], TRUE, image_openimage, 0);
+              }
+              break;
+
+      /*--------*/
+
+      case 3: /* quit */
+              exit(0);
+              break;
+   }
+}
+
+
+
+/****************************** INITIALISATION ******************************/
+
+
+
+static BOOL main_initialise(void)
+/* Initialise the program, returning TRUE if it was all OK. */
+{
+   int             i;
+   wimp_msgaction  mess_wanted[] = { 1,        /* DataSave        */
+                                     2,        /* DataSaveAck     */
+                                     3,        /* DataLoad        */
+                                     4,        /* DataLoadAck     */
+                                     8,        /* PreQuit         */
+                                     9,        /* PaletteChange   */
+                                     10,       /* SaveDesk        */
+                                     0x502,    /* HelpRequest     */
+                                     0x400c0,  /* MenuWarning     */
+                                     0x400c1,  /* ModeChanged     */
+                                     0x400c2,  /* Task Init       */
+                                     0x400cc,  /* Wind Info (for iconizations) */
+                                     0 };
+
+   /* RISCOSLib initialisation */
+
+   wimpt_wimpversion(300);           /* RISC-OS 3.00 aware */
+   wimpt_messages(mess_wanted);      /* tell wimp (RO3) what messages we would like to receive */
+   wimpt_init(WIMP_INIT_STRING);     /* Main wimp initialisation */
+
+   res_init(WIMP_RES_STRING);        /* Resources */
+   flex_init();                      /* Flexible store allocation */
+   resspr_init();                    /* application sprites */
+   template_init();                  /* Templates */
+   dbox_init();                      /* Dialogue boxes */
+   visdelay_init();                  /* Hourglass */
+   msgs_init();
+
+
+   /* put the icon on the icon bar */
+   baricon(WIMP_ICONBAR_SPRITE, 1, iconbar_click);
+
+   /* attach a menu to the icon bar */
+   event_attachmenumaker(win_ICONBAR, main_menumaker, iconbar_menuproc, NULL);
+
+   /* catch load events on icon bar */
+   win_register_event_handler(win_ICONBARLOAD, prog_iconbar_events, 0);
+
+   /* catch 'double click' and other events */
+   win_claim_unknown_events(win_ICONBARLOAD);
+
+
+   /* set up the string used if a desktop save is done later.  This value
+      is set up in case a different version of application is run later (in which
+      case DrawCompress$Dir will change) */
+   strcpy(desksave_startup_string, "Run ");
+   strcat(desksave_startup_string, getenv(WIMP_RES_VAR));
+
+
+   if (!pcdovervw_init())
+   {
+      werr(FALSE, msgs_lookup("badinit:Could not initialise %s"), WIMP_INIT_STRING);
+      return FALSE;
+   }
+
+   if (!image_init())
+   {
+      werr(FALSE, msgs_lookup("badinit:Could not initialise %s"), WIMP_INIT_STRING);
+      return FALSE;
+   }
+
+
+   num_cdrom_drives = count_cdrom_drives();
+
+   /* always add at least the first possible CD-ROM drive
+      - it may end up being greyed out if no drives are
+      actually available though. */
+   main_add_path("CDFS::0.$");
+   {
+      char    str[12];
+
+      i = 1;
+      while (i < num_cdrom_drives)
+      {
+         sprintf(str, "CDFS::%d.$", i);
+         main_add_path(str);
+         i++;
+      }
+   }
+
+   path_selected = (num_cdrom_drives > 0) ? 1 : 0;
+
+   /*--- make icon bar menu structure ---*/
+   iconbar_menu = menu_new(msgs_lookup("MEicbarT:PhotoView"),
+                           msgs_lookup("MEicbarB:>Info,Source,Quit"));
+
+   source_subm = menu_new(msgs_lookup("MEicbar2T:Source"), paths[0]);
+   i = 1;
+   while (i < num_paths)
+      menu_extend(source_subm, paths[i++]);
+
+   /* grey out the (always present) 'CDFS::0.$' if no drives are present */
+   if (num_cdrom_drives == 0)
+      menu_setflags(source_subm, 1, 0, 1);
+   else
+      /* tick the default entry */
+      menu_setflags(source_subm, path_selected, 1, 0);
+
+   menu_submenu(iconbar_menu, 2, source_subm);
+
+
+   /* All went ok */
+   return TRUE;
+}
+
+
+
+/******************************* MAIN PROGRAM ********************************/
+
+
+
+int main(void)
+{
+
+   if (main_initialise())
+   {
+
+      /* The main event loop */
+      while (TRUE)
+         event_process();
+   }
+
+   return 0;
+}

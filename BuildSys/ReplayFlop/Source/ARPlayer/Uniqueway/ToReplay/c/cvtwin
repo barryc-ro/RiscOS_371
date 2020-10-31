@@ -1,0 +1,475 @@
+/* > cvtwin.c
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "bbc.h"
+#include "dboxes.h"
+#include "msgs.h"
+#include "saveas.h"
+#include "swis.h"
+#include "visdelay.h"
+#include "werr.h"
+#include "wimpt.h"
+#include "wimpx.h"
+#include "xferrecv.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "dboxinc.h"
+#include "file.h"
+#include "fileract.h"
+#include "iconmenu.h"
+#include "macros.h"
+#include "popup.h"
+#include "strfn.h"
+#include "wmisc.h"
+
+#include "compress.h"
+
+#define CVT_IDENT           "cvtwin"
+
+#define DEFAULT_FIELD       0
+#define CANCEL_FIELD        1
+#define OK_FIELD            2
+
+#define START_AT_FIELD      26
+#define START_AT_VAL_FIELD  27
+
+#define INDEX_FIELD         31
+#define INDEX_VAL_FIELD     32
+
+#define BASE_RATE_FIELD     14
+
+#define RATE_FIELD          16
+#define FPC_FIELD           20
+
+#define JOIN_KEYS_FIELD     35
+
+#define NFRAMES_FIELD       24
+
+#define filetype_Directory  0x1000
+
+static dbox cvt_d = NULL;
+
+static void cvt_refresh(dbox d, const compress_str *cp);
+static BOOL file_within(const char *filename, const char *dir);
+
+/*-------------------------------------------------------------------------------------------- */
+
+static void notify_ratechange(int newrate, void *handle)
+{
+    compress_str *cp = handle;
+    dbox_setnumeric(cvt_d, FPC_FIELD, (int)((cp->hdr ? cp->hdr->fps : 12.5)/newrate*2 + 0.5));
+
+    if (dbox_getnumeric(cvt_d, INDEX_FIELD))
+        dbox_setnumeric(cvt_d, INDEX_VAL_FIELD, newrate);
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+static dbox_incstr  startat_inc =
+{
+    1, 10,
+    0, 99999,
+    0, 0, 0,
+    dboxinc_NoFullIcons
+},                  fpc_inc =
+{
+    1, 10,
+    1, 200,
+    0, 0, 0,
+    dboxinc_NoFullIcons
+},                  rate_inc =
+{
+    1, 0,
+    1, 8,
+    0, 0, notify_ratechange
+},                  index_inc =
+{
+    1, 0,
+    0, 9,
+    0, 0, 0
+};
+
+/*-------------------------------------------------------------------------------------------- */
+
+static void set_startat_fade(dbox d)
+{
+    dboxinc_fade(d, START_AT_VAL_FIELD, !dbox_getnumeric(d, START_AT_FIELD), FALSE);
+}
+
+static void set_index_fade(dbox d)
+{
+    dboxinc_fade(d, INDEX_VAL_FIELD, !dbox_getnumeric(d, INDEX_FIELD), FALSE);
+}
+
+static void set_fields(dbox d, const compress_str *cp)
+{
+    dbox_setfieldf(d, BASE_RATE_FIELD, "%g", cp->hdr ? cp->hdr->fps : 12.5);
+    dbox_setnumeric(d, FPC_FIELD, cp->o.frames_per_chunk);
+    dbox_setnumeric(d, RATE_FIELD, cp->o.frame_rate_divisor);
+
+    dbox_setnumeric(d, START_AT_VAL_FIELD, cp->o.start_at);
+    dbox_setnumeric(d, START_AT_FIELD, (cp->o.flags & compress_StartAt) != 0 && cp->input_file);
+
+    dbox_setnumeric(d, INDEX_VAL_FIELD, cp->o.index);
+    dbox_setnumeric(d, INDEX_FIELD, cp->o.flags & compress_UseIndex);
+
+    dbox_setnumeric(d, JOIN_KEYS_FIELD, cp->o.flags & compress_JoinKeyFrames);
+
+    if (cp->hdr == NULL)
+        dbox_setfield(d, NFRAMES_FIELD, "");
+    else
+        dbox_setnumeric(d, NFRAMES_FIELD, cp->hdr->nframes);
+
+    if (cp->input_file == NULL)
+    {
+        dboxinc_fade(d, FPC_FIELD, TRUE, FALSE);
+        dboxinc_fade(d, RATE_FIELD, TRUE, FALSE);
+        dbox_fadefield(d, START_AT_FIELD);
+    }
+}
+
+static void get_fields(dbox d, compress_str *cp)
+{
+    cp->o.frames_per_chunk = dboxinc_getfield(d, FPC_FIELD, &fpc_inc);
+    cp->o.frame_rate_divisor = dboxinc_getfield(d, RATE_FIELD, &rate_inc);
+
+    cp->o.start_at = dboxinc_getfield(d, START_AT_VAL_FIELD, &startat_inc);
+    cp->o.index = dbox_getnumeric(d, INDEX_VAL_FIELD);
+
+    cp->o.flags &= ~(compress_StartAt | compress_UseIndex | compress_JoinKeyFrames);
+    cp->o.flags |= (dbox_getnumeric(d, INDEX_FIELD) ? compress_UseIndex : 0) |
+                (dbox_getnumeric(d, START_AT_FIELD) ? compress_StartAt : 0) |
+                (dbox_getnumeric(d, JOIN_KEYS_FIELD) ? compress_JoinKeyFrames : 0);
+}
+
+static void set_defaults(dbox d, const compress_str *cp)
+{
+    dbox_setnumeric(d, RATE_FIELD, 1);
+    dbox_setnumeric(d, START_AT_FIELD, FALSE);
+    dbox_setnumeric(d, INDEX_FIELD, FALSE);
+    dbox_setnumeric(d, JOIN_KEYS_FIELD, TRUE);
+    if (cp->hdr)
+        dbox_setnumeric(d, FPC_FIELD, (int)(cp->hdr->fps*2 + 0.5));
+    else
+        dbox_setnumeric(d, FPC_FIELD, 25);
+    set_startat_fade(d);
+    set_index_fade(d);
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+static BOOL process_action(dbox d, dbox_field action, compress_str *cp)
+{
+    switch (action)
+    {
+        case dbox_CLOSE:
+            return TRUE;
+
+        case CANCEL_FIELD:
+            if (dbox_persist())
+                cvt_refresh(d, cp);
+            else
+                return TRUE;
+            break;
+
+        case DEFAULT_FIELD:
+            set_defaults(d, cp);
+            break;
+
+        case OK_FIELD:
+        {
+            int new_index, old_index;
+
+            old_index = cp->o.flags & compress_UseIndex ? cp->o.index : -1;
+            get_fields(d, cp);
+            new_index = cp->o.flags & compress_UseIndex ? cp->o.index : -1;
+
+            if (old_index != new_index)
+            {
+                cvt_scan(cp);
+                hdr_open(cp);
+            }
+            else
+                hdr_refresh(cp);
+
+            if (!dbox_persist())
+                return TRUE;
+
+            set_fields(d, cp);
+            break;
+        }
+
+        case START_AT_FIELD:
+            set_startat_fade(d);
+            break;
+
+        case INDEX_FIELD:
+            set_index_fade(d);
+            break;
+
+        default:
+            (void) (dboxinc_processinc(d, START_AT_VAL_FIELD, action, &startat_inc, cp) ||
+                    dboxinc_processinc(d, INDEX_VAL_FIELD, action, &index_inc, cp) ||
+                    dboxinc_processinc(d, FPC_FIELD, action, &fpc_inc, cp) ||
+                    dboxinc_processinc(d, RATE_FIELD, action, &rate_inc, cp));
+            break;
+    }
+    return FALSE;
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+#if 0
+
+static void cvt_events(dbox d, void *handle)
+{
+    compress_str *cp = handle;
+    if (process_action(d, dbox_get(d), cp))
+        cvt_dispose();
+}
+
+void cvt_refresh(const compress_str *cp)
+{
+    dbox d = cvt_d;
+    if (d)
+    {
+        set_fields(d, cp);
+        set_index_fade(d);
+        set_startat_fade(d);
+    }
+}
+
+void cvt_dispose(void)
+{
+    if (cvt_d)
+    {
+        dbox_dispose(&cvt_d);
+        cvt_d = NULL;
+    }
+}
+
+void cvt_open(compress_str *cp)
+{
+    dbox    d = cvt_d;
+    if (d)
+        bring_to_front(dbox_syshandle(d));
+
+    else if ((d = dbox_new(CVT_IDENT)) != NULL)
+    {
+        cvt_d = d;
+
+        dbox_eventhandler(d, cvt_events, cp);
+        dbox_showstatic(d);
+        cvt_refresh(cp);
+    }
+}
+
+BOOL is_cvt_open(void)
+{
+    return cvt_d != NULL;
+}
+
+#endif
+
+static void cvt_refresh(dbox d, const compress_str *cp)
+{
+    startat_inc.max = cp->hdr ? cp->hdr->nframes-1 : 99999;
+
+    set_fields(d, cp);
+    set_index_fade(d);
+    set_startat_fade(d);
+}
+
+void cvt_popup(compress_str *cp)
+{
+    dbox d;
+    if ((d = dbox_new(CVT_IDENT)) != NULL)
+    {
+        dbox_field action;
+
+        cvt_d = d;
+
+        dbox_show(d);
+
+        cvt_refresh(d, cp);
+        dbox_setcaret(d, RATE_FIELD);
+
+        do
+            action = dbox_fillin_fixedcaret(d);
+        while (!process_action(d, action, cp));
+
+        dbox_dispose(&d);
+    }
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+/*
+ * This is called from the task event handler when joining finishes.
+ * It has to move the movie to a new location.
+
+ * If the files were created by AREncode (ie there is an input file)
+ * and the flag is set and the output movie is not still in the
+ * work directory then delete the work files now.
+ */
+
+static saveas_box   join_saveas = NULL;
+static BOOL         join_deleteoutput;
+
+static BOOL join_saveproc(char *filename, void *handle)
+{
+    compress_str    *cp = handle;
+    BOOL            success;
+
+    visdelay_begin();
+    success = os_err(file_move(cp->output_file, filename)) == NULL;
+    visdelay_end();
+
+    if (success && cp->input_file != NULL &&
+        (cp->o.flags & compress_DeleteFiles) != 0 &&
+        !file_within(filename, cp->work_dir))
+    {
+        delete_files(cp->work_dir);
+    }
+
+    join_deleteoutput = FALSE;
+
+    return success;
+}
+
+/*
+ * If saving is aborted then remove the output file
+ */
+
+static void join_saveas_events(dbox d, void *handle)
+{
+    compress_str    *cp = handle;
+    BOOL            close = FALSE;
+    dbox_field      action = dbox_get(d);
+    saveas_processevents(d, action, join_saveas, &close);
+
+    if (close)
+        saveas_dispose(&join_saveas);
+
+    if (join_deleteoutput)
+        remove(cp->output_file);
+}
+
+/*
+ * Open a static saveas box
+ */
+
+BOOL cvtwin_saveas(compress_str *cp)
+{
+    int ftype, fsize = file_size(cp->output_file, &ftype);
+    if (fsize > 0 && ftype == filetype_ARMovie)
+    {
+        join_deleteoutput = TRUE;
+        join_saveas = saveas_new("xfersend", filetype_ARMovie,
+            cp->output_file, fsize,
+            join_saveproc, 0, 0, cp);
+
+        if (join_saveas)
+        {
+            dbox d = saveas_syshandle(join_saveas);
+            dbox_showstatic(d);
+            dbox_eventhandler(d, join_saveas_events, cp);
+            dbox_raw_eventhandler(d, saveas_defaultrawevents, join_saveas);
+            dbox_setcaret(d, 2);
+        }
+    }
+    return FALSE;
+}
+
+void cvtwin_saveas_dispose(compress_str *cp)
+{
+    saveas_dispose(&join_saveas);
+    if (join_deleteoutput)
+        remove(cp->output_file);
+}
+
+BOOL unsaved_movie_exists(void)
+{                     
+    return join_saveas != NULL;
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+/*
+ * This is called when a join started by the code below has finished.
+ * It should delete the working files if appropriate.
+ */
+
+void cvtwin_joined(compress_str *cp, const char *joined_file)
+{
+    int ftype, fsize = file_size(joined_file, &ftype);
+    if (fsize > 0 &&
+        ftype == filetype_ARMovie &&
+        cp->input_file != NULL &&
+        (cp->o.flags & compress_DeleteFiles) != 0 &&
+        !file_within(joined_file, cp->work_dir))
+    {
+        delete_files(cp->work_dir);
+    }
+}
+
+/*
+ * This is called from the menu entry in hdrwin.
+ * It has to join the movie to a new location.
+ */
+
+static BOOL join_saveproc2(char *filename, void *handle)
+{
+    compress_str *cp = handle;
+    if (!calljoiner_start(cp, filename))
+    {
+        hdr_dispose();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL cvtwin_saveandjoin(compress_str *cp)
+{
+    return saveas(filetype_ARMovie, cp->output_file, 0, join_saveproc2, 0, 0, cp);
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+void delete_files(const char *root)
+{
+    visdelay_begin();
+    if (fileract_Interactive())
+        fileract_delete(root, -1);
+    else
+        os_err(file_wipe(root, FALSE, TRUE));
+    visdelay_end();
+}
+
+/*
+ * Return TRUE if filename is in the directory dir
+ * or a subdirectory thereof.
+ */
+
+static BOOL file_within(const char *filename, const char *dir)
+{
+    char *f = strupr(strdup_gstrans(filename)),
+         *d = strupr(strdup_gstrans(dir));
+    BOOL success;
+
+    success = strncmp(d, f, strlen(d)) == 0;
+
+    free(f);
+    free(d);
+    return success;
+}
+
+/*-------------------------------------------------------------------------------------------- */
+
+/* eof cvtwin.c */

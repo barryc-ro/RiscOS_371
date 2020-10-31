@@ -1,0 +1,1226 @@
+/*
+  Merlyn Kline, 1995
+
+:NOTES
+
+  Image manager for browser
+
+  Images are stored in a flex block which contains a list of
+  image_info structures, followed by a list of image data
+  structures. Each image data consists of a url in a word-aligned
+  space followed by the image data as fetched until redirects etc
+  have been handled.
+
+  images are numbered from 1 to b->nimages
+
+:END
+
+:MESSAGES
+sprfile:SpriteFile
+:END
+
+:HISTORY
+:END
+
+*/
+
+#define NOITRACE /* show trace messages */
+#define NOIDTRACE /* dump images to disc as they are received */
+
+#include "stdio.h"
+#include "string.h"
+
+#ifdef IDTRACE
+#include "stdio.h"
+#endif
+
+/*----------------------------------------------------------------------*/
+#include "os.h"
+/*----------------------------------------------------------------------*/
+#include "wimp.h"
+#include "wimpt.h"
+#include "sprite.h"
+#include "bbc.h"
+#include "kernel.h"
+#include "coords.h"
+#include "font.h"
+#include "msgs.h"
+#include "win.h" /* fixes problem caused by incorrect header for iconbar.c since Acorn had a go at it */
+#include "resspr.h"
+
+/*----------------------------------------------------------------------*/
+#include "Defs.h"
+/*----------------------------------------------------------------------*/
+#include "Browser.h"
+#include "Images.h"
+#include "ErrorGen.h"
+#include "mflex.h"
+#include "URLv.h"
+#include "Iconbar.h"
+#include "Reformat.h"
+#include "Main.h"
+#include "PlotSpr.h"
+#include "FontManage.h"
+#include "Redraw.h"
+#include "Redraw1.h"
+#include "Status.h"
+#include "Save.h"
+#include "Button.h"
+#include "Status.h"
+
+#include "Utils.h"
+#include "Printing.h"
+
+#include "imagetrans.h"
+
+#define I_BLOCKSIZE 1024
+
+#define USEHTMLGET
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+typedef struct image_info
+{
+  unsigned int handle;     /* URL fetch handle for this image */
+  int          alloc;      /* total space allocated in flex block */
+  int          ualloc;     /* space allocated to url in flex block */
+  int          isize;      /* size of image storage used */
+  int          token;      /* token number this image appears in */
+  int          lastw;      /* width at last update */
+  int          lasth;      /* height at last update */
+  BOOL         fetched;    /* flag indicating the image is fetched */
+  BOOL         delayed;    /* flag indicating the image is delayed (by delayimages option) */
+  BOOL         success;    /* this image completed fetching without errors */
+  int          xref;       /* cross-reference to image record with same url */
+  Image        *istore;    /* imagetrans pointer */
+  BOOL         fixedsize;  /* the size has been fixed in the html */
+  int          bytesgot;   /* total bytes fetched for this image so far */
+#ifdef USEHTMLGET
+  BOOL         started;    /* the fetch has started to happen */
+#else
+  BOOL         identified; /* the main fetch has started, re-directs are done */
+#endif
+} image_info;
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static image_info* image_info_addr(browser *b,int image)
+{
+  image_info *ip;
+
+  ip=(image_info*)b->idata;
+  ip+=(image-1);
+  return(ip);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static char *image_data_addr(browser *b,int image)
+{
+  image_info *ip;
+  char       *dp;
+  int        n;
+
+  ip=image_info_addr(b,1);
+  dp=0;
+  n=image-1;
+  while(n--)
+  {
+    dp+=ip->alloc;
+    ip++;
+  }
+  dp+=((int)b->idata)+sizeof(image_info)*b->nimages;
+  return(dp);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static int image_count_fetches(browser *b)
+{
+  int        i,c=0;
+  image_info *ip;
+
+  ip=image_info_addr(b,1);
+  for(i=1;i<=b->nimages;i++)
+  {
+    if(ip->handle) c++;
+    ip++;
+  }
+  return(c);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *image_update_area(browser *b,int x,int y,wimp_box *ubox,image_info *ip,BOOL redraw)
+{
+  /* update a part of an image. x,y are window OS coords for bottom left
+     corner of image. ubox is the part of the image to update (relative
+     to x,y). */
+  wimp_redrawstr r;
+  int            more,sx,sy;
+
+  r.w=b->w;
+  r.box=*ubox;
+  r.box.x0+=x;
+  r.box.y0+=y;
+  r.box.x1+=x;
+  r.box.y1+=y;
+  r.box.y1+=4;
+  if(ip->istore->mutable_mask || redraw)
+    wimp_force_redraw(&r);
+  else
+  {
+    wimp_update_wind(&r,&more);
+    sx=coords_x_toscreen(x,CVTSTR(&r));
+    sy=coords_y_toscreen(y,CVTSTR(&r));
+
+    if(more) redraw_draw(b,&r,TRUE,TRUE);
+/*
+    while(more)
+    {
+      ip->istore->Render(ip->istore,sx,sy,100);
+      wimp_get_rectangle(&r,&more);
+    }
+*/
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *image_update_image(browser *b,int image,wimp_box *box)
+{
+  /* Update the specified image number on the screen, including all
+     which xref to it. If the image has changed size on screen then start
+     a reformat from the first occurrence (ie the smallest token number),
+     otherwise just to an update of the relevant rectangle for each
+     occurrence. */
+  int         i;
+  image_info  *ip,*cip;
+  wimp_wstate state;
+  wimp_box    whole;
+  BOOL        firstchunk;
+
+  wimp_get_wind_state(b->w,&state);
+  ip=image_info_addr(b,1);
+  cip=image_info_addr(b,image);
+  if(image==b->backimage)
+  {
+    if(cip->fetched) return(browser_update_bottom(b,0));
+    return(NULL);
+  }
+  if(!cip->istore || cip->istore->width<1) return(NULL);
+  firstchunk=FALSE;
+  if(cip->istore->width_os!=cip->lastw || cip->istore->height_os!=cip->lasth)
+  {
+    cip->lastw=cip->istore->width_os;
+    cip->lasth=cip->istore->height_os;
+    firstchunk=TRUE;
+  }
+  whole.x0=whole.y0=0;
+  whole.x1=cip->istore->width_os+1;
+  whole.y1=cip->istore->height_os+1;
+  if(!box) box=&whole;
+  for(i=1;i<=b->nimages;i++)
+  {
+   if(i==image || ip->xref==image)
+    {
+      int                 l,x,y,i1,o;
+      reformat_line       *lp;
+      reformat_line_chunk *cp;
+      HStream             *tp;
+      wimp_box            ibox;
+
+      l=browser_token_to_line(b,ip->token);
+      if(l<=0) break;
+      lp=reformat_line_address(b,l);
+      cp=reformat_line_chunk_address(lp,0);
+      tp=fetch_token_address(b,cp->t);
+      y=lp->y;
+      x=redraw_start_x(b,tp,lp,cp);
+      convert_pair_to_points(x,y,&x,&y);
+      for(i1=0;i1<lp->n && cp->t!=ip->token;x+=cp->w,i1++,cp++);
+      convert_pair_to_os(x,y,&x,&y);
+      y+=lp->b;
+      tp=fetch_token_address(b,ip->token);
+      if(!reformat_get_image_size(b,ip->token,tp,&ibox))
+      {
+        o=0;
+        if(ISLINK(tp)) o=tp->maxlen*2;
+        x+=o;
+        y+=ibox.y0+o;
+        if(firstchunk)
+        {
+          if(cip->fixedsize)
+            image_update_area(b,x,y,&whole,cip,TRUE);
+          else
+            return(reformat_format_from(b,l-1));
+        }
+        else if(box->y1<box->y0)
+        {
+          wimp_box ubox=*box;
+
+          ubox.y0=box->y0;
+          ubox.y1=cip->istore->height_os;
+          image_update_area(b,x,y,&ubox,cip,FALSE);
+          ubox.y1=box->y1;
+          ubox.y0=0;
+          image_update_area(b,x,y,&ubox,cip,FALSE);
+        }
+        else if(box->x1<box->x0)
+        {
+          wimp_box ubox=*box;
+
+          ubox.x0=box->x0;
+          ubox.x1=cip->istore->width_os;
+          image_update_area(b,x,y,&ubox,cip,FALSE);
+          ubox.x1=box->x1;
+          ubox.x0=0;
+          image_update_area(b,x,y,&ubox,cip,FALSE);
+        }
+        else
+        {
+          image_update_area(b,x,y,box,cip,FALSE);
+        }
+      }
+    }
+    ip++;
+  }
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static image_info *image_get_token_image(browser *b,int token)
+{
+  image_info *ip;
+  int        i,found;
+
+  found=0;
+  ip=NULL;
+  if(b->nimages)
+  {
+    ip=image_info_addr(b,1);
+    for(i=1;i<=b->nimages;i++)
+    {
+      if(ip->token==token) {found=i; break;}
+      ip++;
+    }
+    if(found)
+    {
+      while(ip->xref)
+      {
+        i=ip->xref;
+        ip=image_info_addr(b,i);
+      }
+    }
+    else ip=NULL;
+  }
+  return(ip);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void image_get_broken_sprite(sprite_area **sa,sprite_id *sid)
+{
+  *sa=resspr_area();
+  sid->tag=sprite_id_name;
+  sid->s.name="missing";
+  plotspr_locate_sprite(*sa,sid);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *image_get_image_size(image_info *ip, wimp_box *box)
+{
+  memset(box,0,sizeof(wimp_box));
+  if(ip && ip->istore)
+  {
+    box->x1=ip->istore->width_os&~(Wimpt_dx-1);
+    box->y1=ip->istore->height_os&~(Wimpt_dy-1);
+  }
+  if(box->x1<1)
+  {
+    sprite_area *sa;
+    sprite_id   sid;
+    sprite_info info;
+
+    image_get_broken_sprite(&sa,&sid);
+    ERROUT(sprite_readsize(sa,&sid,&info));
+    box->x1=info.width<<bbc_modevar(info.mode,bbc_XEigFactor);
+    box->y1=info.height<<bbc_modevar(info.mode,bbc_YEigFactor);
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_get_token_image_size(browser *b,int token, wimp_box *box)
+{
+  image_info *ip;
+
+  ip=image_get_token_image(b,token);
+  return(image_get_image_size(ip,box));
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_new_image(browser *b,char *url,int token,BOOL background)
+{
+  /* Start fetching a new image. Creates a record in the flex block
+     and increments the image counter. If we are already fetching an
+     image with the same URL then the xref is set up to point to that,
+     otherwise a fetch is initiated.
+  */
+  int        size,ok,ulen,xref,ilen;
+  image_info *ip;
+  HStream    *tp;
+
+  if(!url) return(NULL);
+  xref=0;
+  tp=fetch_token_address(b,token);
+  if(b->nimages>0)
+  {
+    int i;
+
+    for(i=1;i<=b->nimages;i++) /* see if any existing image has the same URL */
+    {
+      ip=image_info_addr(b,i);
+      if(ip->alloc && !strcmp(url,image_data_addr(b,i)) &&
+         (tp->cols>0 && tp->rows>0)==!!(ip->fixedsize) &&
+         (tp->cols<1 || tp->cols*2==ip->istore->width_os) &&
+         (tp->rows<1 || tp->rows*2==ip->istore->height_os))
+      {
+        xref=i;
+        i=b->nimages;
+      }
+    }
+  }
+  if(xref)
+    ilen=ulen=0;
+  else
+  {
+    ilen=0; /* I_BLOCKSIZE; */
+    ulen=WORDALIGN(strlen(url)+1);
+  }
+  size=sizeof(image_info)+ulen+ilen;
+  if(b->idata)
+  {
+    char *p;
+    int  olddatasize;
+
+    olddatasize=mflex_size(&b->idata);
+    size+=olddatasize;
+    ok=mflex_extend(&b->idata,size);
+    p=(char*)b->idata;
+    p+=b->nimages*sizeof(image_info);
+    memmove(p+sizeof(image_info),p,olddatasize-b->nimages*sizeof(image_info));
+  }
+  else
+    ok=mflex_alloc(&b->idata,size);
+  if(!ok) return(errorgen(2));
+  b->nimages++;
+  ip=image_info_addr(b,b->nimages);
+  tp=fetch_token_address(b,token);
+  memset(ip,0,sizeof(image_info));
+  ip->alloc=ilen+ulen;
+  ip->ualloc=ulen;
+  ip->token=token;
+  ip->xref=xref;
+  ip->isize=0;
+  ip->delayed=b->delayimages;
+  if(ulen)
+  {
+    Image *p;
+
+#ifdef ITRACE
+trace_printf("Calling NewImage...");
+#endif
+    p=NewImage(NULL,background?IMAGE_FAST:0);
+#ifdef ITRACE
+trace_printf("Called NewImage");
+#endif
+    ip=image_info_addr(b,b->nimages);
+    ip->istore=p;
+    if(!background)
+    {
+      if(tp->cols>0) p->width_os=tp->cols*2;
+      if(tp->rows>0) p->height_os=tp->rows*2;
+      if(tp->cols>0 && tp->rows>0) ip->fixedsize=TRUE;
+    }
+    strcpy(image_data_addr(b,b->nimages),url);
+    status_new_status(b);
+    button_set_states(b);
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_discard(browser *b)
+{
+  /* Discard all the images in this view, free the memory and close the
+     URL handles if still open */
+  if(b->nimages)
+  {
+    int        i;
+    image_info *p;
+
+    for(i=1;i<=b->nimages;i++)
+    {
+      p=image_info_addr(b,i);
+      if(p->handle)
+      {
+#ifdef USEHTMLGET
+        html_close(p->handle);
+#else
+        url_stop(p->handle,0);
+        url_deregister(p->handle,0);
+#endif
+        p->handle=0;
+      }
+#ifdef ITRACE
+trace_printf("Calling Delete Image");
+#endif
+      if(p->istore) p->istore->Delete(p->istore);
+#ifdef ITRACE
+trace_printf("Called Delete Image");
+#endif
+    }
+    b->nimages=b->lastimage=0;
+  }
+  if(b->idata) mflex_free(&b->idata);
+  b->idata=NULL;
+  return(NULL);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void image_load_chunk(browser *b,int image,char *buffer,int bytes)
+{
+  wimp_box   box;
+  image_info *ip;
+
+  ip=image_info_addr(b,image);
+#ifdef ITRACE
+trace_printf("Calling Load Image");
+#endif
+#ifdef IDTRACE
+{FILE *f; char j[30]; sprintf(j,":4.Trace.Image%03d",image); f=fopen(j,"ab"); fwrite(buffer,1,bytes,f); fclose(f);}
+#endif
+  if(ip->istore) ip->istore->Load(ip->istore,buffer,bytes,&box);
+#ifdef ITRACE
+trace_printf("Called Load Image");
+#endif
+  image_update_image(b,image,&box);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void image_remove_data(browser *b,int image)
+{
+  char       *p;
+  int        oldsize,remove;
+  image_info *ip;
+
+  oldsize=mflex_size(&b->idata);
+  ip=image_info_addr(b,image);
+  p=image_data_addr(b,image);
+  remove=ip->alloc-ip->ualloc;
+  p+=ip->alloc;
+  ip->alloc-=remove;
+  ip->isize=0;
+  memmove(p-remove,p,oldsize-(((int)p)-(int)b->idata));
+  mflex_extend(&b->idata,oldsize-remove);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static void image_abandon(browser *b,int image)
+{
+  image_info *ip;
+
+  ip=image_info_addr(b,image);
+  if(ip->handle)
+#ifdef USEHTMLGET
+    html_close(ip->handle);
+#else
+    url_deregister(0,ip->handle);
+#endif
+  ip->handle=0;
+  ip->fetched=TRUE;
+  if(image==b->backimage) b->aacol=redraw_backcol(b);
+  if(ip->istore)
+  {
+    ip->istore->EndLoad(ip->istore);
+    image_update_image(b,image,NULL);
+  }
+  status_new_status(b);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_process_null(browser *b)
+#ifdef USEHTMLGET
+{
+  /* Allow up to params.maximages images to be fetched simultaneously.
+     If there are not this many images being fetched and there are still
+     images which have not started fetching, then start a fetch for one.
+     Then do a 'get next chunk' on the next image with a fetch going
+     on (ie get from one image in each null event). Cause a screen update
+     as appropriate. */
+  if(b->nimages && b->status_fetch!=BS_DATAFETCH)
+  {
+    int        image,fetches;
+    image_info *ip;
+
+    fetches=image_count_fetches(b);
+    if(b->lastimage<1 || b->lastimage>b->nimages) b->lastimage=b->nimages;
+    image=b->lastimage;
+    do
+    {
+      image++;
+      if(image>b->nimages) image=1;
+      ip=image_info_addr(b,image);
+      if(!ip->handle && !ip->fetched && !ip->delayed && !ip->xref && fetches<params.maximages)
+      {
+        if(html_get(image_data_addr(b,image),NULL,(int*)&ip->handle,URL_Method_http_GET,user.name,FALSE,!b->reloading))
+          ip->handle=0;
+      }
+    } while(image!=b->lastimage && ip->handle==0);
+    ip=image_info_addr(b,image);
+    b->lastimage=image;
+    if(ip->handle)
+    {
+      char buffer[10240];
+
+      if(ip->started)
+      {
+        int done,bytes;
+
+        if(html_get_next_chunk(ip->handle,buffer,sizeof(buffer),&done,&bytes))
+        {
+          image_abandon(b,image);
+          return(NULL);
+        }
+        ip=image_info_addr(b,image);
+        ip->bytesgot+=bytes;
+        if(bytes)
+        {
+          image_load_chunk(b,image,buffer,bytes);
+          status_show_progress(b);
+        }
+        if(done)
+        {
+          html_close(ip->handle);
+          ip=image_info_addr(b,image);
+          ip->handle=0;
+          ip->fetched=TRUE;
+          ip->success=TRUE;
+          if(ip->istore) ip->istore->EndLoad(ip->istore);
+          if(image==b->backimage)
+          {
+            if(ip->istore->width>0)
+              ip->istore->BGCol(ip->istore,&b->aacol);
+            else
+              b->aacol=redraw_backcol(b);
+          }
+          image_update_image(b,image,NULL);
+          status_new_status(b);
+        }
+      }
+      else
+      {
+        int     remn,sofar,waiting;
+        HStream *tptr;
+        void    *store;
+
+        store=NULL;
+        if(ip->isize)
+        { /* if we've already got some data for this image, get it into the local store */
+          /* OK so this is a hideous bodge but it means the flex anchor for the image is
+             nice and solid for the duration of the call to html_get_next_token() */
+          if(!mflex_alloc(&store,ip->isize)) {image_abandon(b,image); return(errorgen(2));}
+          ip=image_info_addr(b,image);
+          memcpy(store,image_data_addr(b,image)+ip->ualloc,ip->isize);
+        }
+        if(html_get_next_token(ip->handle,&remn,&sofar,&tptr,&waiting,&store,image_data_addr(b,image)))
+        {
+          if(store) mflex_free(&store);
+          image_abandon(b,image);
+          return(NULL);
+        }
+        ip=image_info_addr(b,image);
+        if(store && mflex_size(&store)!=ip->isize)
+        { /* if we've got data in the local store, copy it to the image store */
+          int  size,oldsize;
+          char *p;
+
+          oldsize=mflex_size(&b->idata);
+          size=oldsize-WORDALIGN(ip->isize)+WORDALIGN(mflex_size(&store));
+          if(!mflex_extend(&b->idata,size)) {mflex_free(&store); image_abandon(b,image); return(errorgen(2));}
+          ip=image_info_addr(b,image);
+          p=image_data_addr(b,image);
+          p+=ip->alloc;
+          memmove(p+(size-oldsize),p,oldsize-(((int)p)-(int)b->idata));
+          p-=ip->alloc;
+          ip->alloc+=size-oldsize;
+          p+=ip->ualloc;
+          memcpy(p,store,mflex_size(&store));
+          ip->isize=mflex_size(&store);
+        }
+        switch(waiting)
+        {
+          case 1: break; /* nothing happened yet */
+          case 2: break; /* redirected, we can ignore and wait for the library to cope */
+          case 0: /* this shouldn't happen but we'll put it here with no break just in case */
+          case 3: /* we got some data */
+          {
+            int  i,n,n1;
+            char *p;
+
+            ip->started=TRUE;
+            n=0; if(store) n=mflex_size(&store);
+            ip->bytesgot+=n;
+            i=0;
+            while(n>0)
+            {
+              p=(char*)store;
+              n1=n;
+              if(n1>sizeof(buffer)) n1=sizeof(buffer);
+              memcpy(buffer,p+i,n1);
+              i+=n1;
+              n-=n1;
+              image_load_chunk(b,image,buffer,n1);
+            }
+            image_remove_data(b,image);
+            status_show_progress(b);
+          } break;
+        }
+        if(store) mflex_free(&store);
+      }
+    }
+  }
+  return(NULL);
+}
+#else
+{
+  if(b->nimages && b->status_fetch!=BS_DATAFETCH)
+  {
+    int        image,fetches;
+    image_info *ip;
+
+    fetches=image_count_fetches(b);
+    if(b->lastimage<1 || b->lastimage>b->nimages) b->lastimage=b->nimages;
+    image=b->lastimage;
+    do
+    {
+      image++;
+      if(image>b->nimages) image=1;
+      ip=image_info_addr(b,image);
+      if(!ip->handle && !ip->fetched && !ip->xref && fetches<params.maximages)
+      {
+        if(!url_register(0,&ip->handle))
+        {
+          char *url;
+          char userid[100];
+
+          sprintf(userid,"Mailserv-User: %s\n",user.name);
+          url=image_data_addr(b,image);
+          if(url_get_url(0,ip->handle,URL_Method_http_GET,url,userid,NULL,2)) image_abandon(b,image);
+        }
+        else ip->handle=0;
+      }
+    } while(image!=b->lastimage && ip->handle==0);
+    ip=image_info_addr(b,image);
+    b->lastimage=image;
+    if(ip->handle)
+    {
+      int status;
+
+      url_status(0,ip->handle,&status,NULL,NULL);
+      if(status&URL_Status_Done)
+      {
+        url_deregister(0,ip->handle);
+        ip->handle=0;
+        ip->fetched=TRUE;
+        if(ip->istore) ip->istore->EndLoad(ip->istore);
+        if(image==b->backimage)
+        {
+          if(ip->istore->width>0)
+            ip->istore->BGCol(ip->istore,&b->aacol);
+          else
+            b->aacol=redraw_backcol(b);
+        }
+        image_update_image(b,image,NULL);
+        status_new_status(b);
+      }
+      else
+      {
+        int      read;
+        char     buffer[10240];
+
+        if(url_read_data(0,ip->handle,buffer,sizeof(buffer),&status,&read,NULL))
+          image_abandon(b,image);
+        else
+        {
+          if(read>0)
+          {
+            if(ip->identified)
+              image_load_chunk(b,image,buffer,read);
+            else
+            {
+              int  oldsize,size,code,o;
+              char *p;
+              char *redirect;
+              int  type;
+              int  parseable;
+
+              oldsize=mflex_size(&b->idata);
+              size=WORDALIGN(oldsize+read);
+              if(!mflex_extend(&b->idata,size)) {image_abandon(b,image); return(errorgen(2));}
+              ip=image_info_addr(b,image);
+              p=image_data_addr(b,image);
+              p+=ip->alloc;
+              memmove(p+(size-oldsize),p,oldsize-(((int)p)-(int)b->idata));
+              p-=ip->alloc;
+              ip->alloc+=size-oldsize;
+              p+=ip->ualloc;
+              memcpy(p+ip->isize,buffer,read);
+              ip->isize+=read;
+              o=code=0;
+              o=HttpStripHeaders(p,ip->isize);
+              if(o>0) code=HtmlIdentify(p,ip->isize,0,&redirect,&type,&parseable);
+              switch(code)
+              {
+                case 302: /* redirect */
+                {
+                  char userid[100];
+
+                  sprintf(userid,"Mailserv-User: %s\n",user.name);
+                  url_stop(0,ip->handle);
+                  ERROUT((os_error*)url_get_url(0,ip->handle,URL_Method_http_GET,redirect,userid,NULL,2));
+                  image_remove_data(b,image);
+                } break;
+                case 401: /* authenticate */
+                  image_abandon(b,image);
+                  break;
+                default:
+                case 200: /* ordinary URL */
+                {
+                  int n,n1,i;
+
+                  p=image_data_addr(b,image);
+                  ip->identified=TRUE;
+while(o<=ip->isize && (p[o+ip->ualloc]=='\n' || p[o+ip->ualloc]=='\r')) o++; /* ;{{ skip cr's after headers */
+                  n=ip->isize-o;
+                  i=ip->ualloc+o;
+                  while(n>0)
+                  {
+                    n1=n;
+                    if(n1>sizeof(buffer)) n1=sizeof(buffer);
+                    memcpy(buffer,p+i,n1);
+                    i+=n1;
+                    n-=n1;
+                    image_load_chunk(b,image,buffer,n1);
+                    p=image_data_addr(b,image);
+                  }
+                  image_remove_data(b,image);
+                } break;
+                case 0: break; /* couldn't id yet */
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return(NULL);
+}
+#endif
+
+/*----------------------------------------------------------------------*/
+int image_count_pending(browser *b)
+{
+  int        i,c=0;
+  image_info *ip;
+
+  ip=image_info_addr(b,1);
+  for(i=1;i<=b->nimages;i++)
+  {
+    if(!ip->fetched && !ip->xref && !ip->delayed) c++;
+    ip++;
+  }
+  return(c);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_mode_change(browser *b)
+{
+  /* Discard all the images in this view, free the memory and close the
+     URL handles if still open */
+  if(b->nimages)
+  {
+    int        i;
+    image_info *p;
+
+    for(i=1;i<=b->nimages;i++)
+    {
+      p=image_info_addr(b,i);
+#ifdef ITRACE
+trace_printf("Calling ModeChange Image");
+#endif
+      if(p && p->istore && p->istore->width>0) p->istore->ModeChange(p->istore);
+#ifdef ITRACE
+trace_printf("Called ModeChange Image");
+#endif
+    }
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_redraw(browser *b,int token,int x,int y)
+{
+  image_info *ip;
+
+  ip=image_get_token_image(b,token);
+  if(ip && ip->istore && ip->istore->width>0 && ip->istore->height>0)
+  {
+    if(ip->istore->Render(ip->istore,x,y,100))
+    {
+      wimp_setcolour(2);
+      bbc_rectanglefill(x,y,ip->istore->width_os-1,ip->istore->height_os-1);
+    }
+  }
+  else
+  {
+    sprite_area *sa;
+    sprite_id   sid;
+    wimp_box    box;
+
+    image_get_image_size(ip,&box);
+    box.x0+=x;
+    box.y0+=y;
+    box.x1+=x;
+    box.y1+=y;
+    image_get_broken_sprite(&sa,&sid);
+    plotspr_plot_box(sa,&sid,8,&box);
+  }
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+BOOL image_tile_window(browser *b,wimp_redrawstr *r,int xorigin,int yorigin)
+{ /* tile a window with an image, return success flag */
+  image_info *ip;
+  int        x,y,w,h,x0,y1;
+
+  if(b->backimage<1) return(FALSE);
+  ip=image_info_addr(b,b->backimage);
+  if(!ip || !ip->fetched) return(FALSE);
+  w=ip->istore->width_os&~(Wimpt_dx-1);
+  h=ip->istore->height_os&~(Wimpt_dy-1);
+  if(w<1 || h<1) return(FALSE);
+  x0=coords_x_toworkarea(r->g.x0,CVTSTR(r));
+  y1=coords_y_toworkarea(r->g.y1,CVTSTR(r));
+  x0=x0-((x0-xorigin)%w);
+  y1=y1-((y1-yorigin)%h)+1;
+  x0=coords_x_toscreen(x0,CVTSTR(r));
+  y1=coords_y_toscreen(y1,CVTSTR(r));
+  if(ip->istore->transparent)
+  {
+    redraw_set_colour(redraw_backcol(b));
+    bbc_rectanglefill(-16000,-16000,32000,32000);
+  }
+  for(y=y1;y>=r->g.y0-h;y-=h)
+    for(x=x0;x<=r->g.x1;x+=w)
+      if(ip->istore->Render(ip->istore,x,y,100)) return(FALSE);
+  return(TRUE);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static os_error *image_savesprite_start_save1(image_info *ip,int *isize)
+{
+  int        size;
+
+  *isize=-1;
+  if(ip && ip->istore && ip->istore->width>0)
+  {
+    ERROUT((os_error*)ip->istore->StartExport(ip->istore,&size));
+    size-=12; /* subtract the size of the sprite area header */
+  }
+  else
+  {
+    sprite_header *p;
+    sprite_area   *sa;
+    sprite_id     sid;
+
+    image_get_broken_sprite(&sa,&sid);
+    p=(sprite_header*)sid.s.addr;
+    size=WORDALIGN(p->next);
+  }
+  *isize=size;
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_savesprite_start_save(browser *b,int token,int *isize)
+{
+  image_info *ip;
+
+  ip=image_get_token_image(b,token);
+  return(image_savesprite_start_save1(ip,isize));
+}
+
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL image_savesprite_save_image1(image_info *ip)
+{
+  sprite_header *p;
+  sprite_area   *sa;
+  sprite_id     sid;
+
+  if(ip && ip->istore && ip->istore->width>0)
+  {
+    int  len;
+    char buffer[2048];
+    int  skip=12; /* skip first 12 bytes (sprite area header) */
+
+    do
+    {
+      len=sizeof(buffer);
+      if(wimpt_complain((os_error*)ip->istore->Export(ip->istore,buffer,&len))) return(FALSE);
+      if(len-skip>0 && !save_write_bytes(buffer+skip,len-skip)) return(FALSE);
+      skip-=len;
+      if(skip<0) skip=0;
+    } while(len);
+    return(TRUE);
+  }
+  image_get_broken_sprite(&sa,&sid);
+  p=(sprite_header*)sid.s.addr;
+  return(save_write_bytes((void*)p,WORDALIGN(p->next)));
+}
+
+/*----------------------------------------------------------------------*/
+BOOL image_savesprite_save_image(browser *b,int token)
+{
+  image_info    *ip;
+
+  ip=image_get_token_image(b,token);
+  return(image_savesprite_save_image1(ip));
+}
+
+/*----------------------------------------------------------------------*/
+void image_savesprite_end_save(browser *b,int token)
+{
+  image_info *ip;
+
+  ip=image_get_token_image(b,token);
+  if(ip && ip->istore && ip->istore->width>0) ip->istore->EndExport(ip->istore);
+}
+
+/*- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+static BOOL image_picture_saver(void *handle,char *pathname)
+{
+  browser       *b;
+  int           *si,token;
+  image_info    *ip;
+
+  pathname=pathname;
+  si=(int*)handle;
+  b=(browser*)si[0];
+  token=si[1];
+  ip=NULL;
+  if(token>0) ip=image_get_token_image(b,token);
+  else if(b->backimage>0) ip=image_info_addr(b,b->backimage);
+  if(ip && ip->istore && ip->istore->width>0)
+  {
+    int  len;
+    char buffer[2048];
+
+    do
+    {
+      len=sizeof(buffer);
+      if(wimpt_complain((os_error*)ip->istore->Export(ip->istore,buffer,&len))) return(FALSE);
+      if(len && !save_write_bytes(buffer,len)) return(FALSE);
+    } while(len);
+  }
+  else
+  {
+    sprite_area   area,*sa;
+    sprite_id     sid;
+    sprite_header *p;
+
+    image_get_broken_sprite(&sa,&sid);
+    p=(sprite_header*)sid.s.addr;
+    area.size=sizeof(sprite_area)+p->next;
+    area.number=1;
+    area.sproff=sizeof(sprite_area);
+    area.freeoff=area.size;
+    if(!save_write_bytes((void*)(&area.number),sizeof(area)-4)) return(FALSE);
+    return(save_write_bytes((void*)p,p->next));
+  }
+  return(TRUE);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_save_picture(browser *b,int token)
+{
+  int        size,saveinfo[2];
+  char       pathname[256];
+  image_info *ip;
+
+  ip=NULL;
+  if(token && fetch_token_address(b,token)->style&IMG) ip=image_get_token_image(b,token);
+  if(!ip && b->backimage>0)
+  {
+    ip=image_info_addr(b,b->backimage);
+    token=0;
+  }
+  if(ip && ip->istore && ip->istore->width>0) ip->istore->StartExport(ip->istore,&size);
+  else
+  {
+    sprite_area   *sa;
+    sprite_id     sid;
+    sprite_header *p;
+
+    image_get_broken_sprite(&sa,&sid);
+    p=(sprite_header*)sid.s.addr;
+    size=sizeof(sprite_area)+p->next-4;
+  }
+  saveinfo[0]=(int)b;
+  saveinfo[1]=token;
+  strcpy(pathname,msgs_lookup("sprfile:SpriteFile"));
+  save_saveas(FILETYPE_SPRITE,pathname,size,image_picture_saver,NULL,(void*)saveinfo);
+  if(ip && ip->istore && ip->istore->width>0) ip->istore->EndExport(ip->istore);
+  return(NULL);
+}
+
+/*----------------------------------------------------------------------*/
+BOOL image_fetched(browser *b,int image)
+{
+  if(image>0)
+  {
+    image_info *ip;
+
+    ip=image_info_addr(b,image);
+    if(ip && ip->fetched) return(TRUE);
+  }
+  return(FALSE);
+}
+
+/*----------------------------------------------------------------------*/
+void image_convert_to_pixels(browser *b,int token,int *x,int *y)
+{
+  image_info *ip;
+
+  ip=image_get_token_image(b,token);
+  if(ip && ip->istore->width>0)
+  {
+    *x=*x*ip->istore->width/ip->istore->width_os;
+    *y=*y*ip->istore->height/ip->istore->height_os;
+  }
+}
+
+/*----------------------------------------------------------------------*/
+void image_delay_fetches(browser *b)
+{
+  if(b->nimages)
+  {
+    int        image;
+    image_info *ip;
+
+    for(image=1;image<=b->nimages;image++)
+    {
+      ip=image_info_addr(b,image);
+      if(!ip->handle)
+      {
+        image_abandon(b,image);
+        ip=image_info_addr(b,image);
+        ip->delayed=TRUE;
+      }
+    }
+  }
+}
+
+/*----------------------------------------------------------------------*/
+void image_restart_fetches(browser *b)
+{
+  if(b->nimages)
+  {
+    int        image;
+    image_info *ip;
+
+    for(image=1;image<=b->nimages;image++)
+    {
+      ip=image_info_addr(b,image);
+      if((!ip->fetched && ip->delayed) || (ip->fetched && !ip->success && !ip->istore))
+      {
+        ip->success=FALSE;
+        ip->delayed=FALSE;
+        ip->fetched=FALSE;
+      }
+    }
+    browser_use_idle_events(b);
+  }
+}
+
+/*----------------------------------------------------------------------*/
+int image_count_delayed(browser *b)
+{
+  int count=0;
+
+  if(b->nimages)
+  {
+    int        image;
+    image_info *ip;
+
+    for(image=1;image<=b->nimages;image++)
+    {
+      ip=image_info_addr(b,image);
+      if((!ip->fetched && ip->delayed) || (ip->fetched && !ip->success && !ip->istore)) count++;
+    }
+  }
+  return(count);
+}
+
+/*----------------------------------------------------------------------*/
+int image_total_bytes_fetched(browser *b)
+{
+  int count=0;
+
+  if(b->nimages)
+  {
+    int        image;
+    image_info *ip;
+
+    for(image=1;image<=b->nimages;image++)
+    {
+      ip=image_info_addr(b,image);
+      count+=ip->bytesgot;
+    }
+  }
+  return(count);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_saveback_start_save(browser *b,int *isize)
+{
+  image_info *ip;
+
+  ip=image_info_addr(b,b->backimage);
+  return(image_savesprite_start_save1(ip,isize));
+}
+
+/*----------------------------------------------------------------------*/
+BOOL image_saveback_save_image(browser *b)
+{
+  image_info    *ip;
+
+  ip=image_info_addr(b,b->backimage);
+  return(image_savesprite_save_image1(ip));
+}
+
+/*----------------------------------------------------------------------*/
+void image_saveback_end_save(browser *b)
+{
+  image_info *ip;
+
+  ip=image_info_addr(b,b->backimage);
+  if(ip && ip->istore && ip->istore->width>0) ip->istore->EndExport(ip->istore);
+}
+
+/*----------------------------------------------------------------------*/
+os_error *image_get_back_image_size(browser *b,wimp_box *box)
+{
+  image_info *ip;
+
+  ip=image_info_addr(b,b->backimage);
+  return(image_get_image_size(ip,box));
+}
+

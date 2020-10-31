@@ -1,0 +1,216 @@
+/* > replayhdr.c
+
+ * © SJ Middleton, 1993
+
+ */
+
+#include "msgs.h"
+#include "spr.h"
+#include "werr.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "file.h"
+#include "strfn.h"
+
+#include "arvid.h"
+#include "replay/replayhdr.h"
+#include "replay/replaymsgs.h"
+
+#define CATSIZE_GRANULARITY (5*1024)
+
+static os_error *write_soundline(filehandle f, armovie_hdr *hdr, int line)
+{
+    static armovie_soundstr no_sound = { 0 };
+    int                 i, n = hdr->nsoundtracks;
+    armovie_soundstr    *sp = hdr->sound;
+    os_error            *e = NULL;
+    if (sp == NULL || n == 0)
+    {
+        sp = &no_sound;
+        n = 1;
+    }
+    for (i = 1; i <= n && e == NULL; i++, sp++)
+    {
+        if (i != 1)
+            file_writef(f, " |%d ", i);
+        switch (line)
+        {
+            case 0:
+                e = file_writef(f, "%d %s", sp->format,
+                    sp->format == 2 ? sp->filename :
+                    i == 1 ? SOUND_FORMAT : "");
+                break;
+            case 1:
+                e = file_writef(f, "%g %s %s", sp->rate, sp->rate < 256 ? "µs" : "Hz", SAMPLES);
+                break;
+            case 2:
+                e = file_writef(f, "%d %s %s", sp->channels, CHANNELS,
+                    sp->sflags & armovie_ReversedStereo ? " Reversed" : "");
+                break;
+            case 3:
+                e = file_writef(f, "%d %s %s", sp->precision, BITS_PER_SAMPLE,
+                    sp->format == 1 ? msgs_lookup(sp->filename) : "");
+                break;
+        }
+    }
+    if (e == NULL)
+        e = file_writef(f, "\n");
+    return e;
+}
+
+/*
+ * Ensure that if the field sizes are changed this function is updated.
+ */
+
+int replay_cataloguesize(const armovie_hdr *hdr)
+{
+    int n = hdr->nsoundtracks;
+    return hdr->nchunks*((hdr->video_chunks ? 17 : 12) + (n == 0 ? 1 : n*9 - 3) + 1);
+}
+
+os_error *replay_writechunksize(filehandle f, const armovie_hdr *hdr)
+{
+    return file_writef(f, CHUNKSIZE_FMT" %s\n"CHUNKSIZE_FMT" %s\n",
+                            hdr->even_chunksize, EVEN_CHUNK_SIZE,
+                            hdr->odd_chunksize, ODD_CHUNK_SIZE);
+}
+
+os_error *replay_writecatalogue(unsigned int f, const armovie_hdr *hdr)
+{
+    const armovie_soundstr  *sp = hdr->sound;
+    int                     chunk;
+    os_error                *e;
+
+    if ((e = replay_writechunksize(f, hdr)) == NULL &&
+        (e = file_setpos(f, hdr->catalogue_offset)) == NULL)
+    {
+        for (chunk = 0; chunk < hdr->nchunks && e == NULL; chunk++)
+        {
+            if (hdr->video_chunks)
+            {
+                const armovie_catentry *cp_v = &hdr->video_chunks[chunk];
+                e = file_writef(f, "%09u,%06u;", cp_v->offset, cp_v->size);
+            }
+            else
+                e = file_writef(f, "%09u,0;", sp[0].chunks[chunk].offset);
+    
+            if (e == NULL)
+            {
+                if (sp && sp->format)
+                {
+                    int track;
+                    for (track = 1; track <= hdr->nsoundtracks && e == NULL; track++)
+                    {
+                        int size = sp[track-1].chunks[chunk].size;
+                        if (track == 1)
+                            e = file_writef(f, "%06u", size);
+                        else
+                            e = file_writef(f, "|%u %06u", track, size);
+                    }
+                    if (e == NULL)
+                        e = file_writef(f, "\n");
+                }
+                else
+                    e = file_writef(f, "0\n");
+            }
+        }
+    }
+    return e;
+}
+
+os_error *replay_writetexthdr(unsigned int f, armovie_hdr *hdr)
+{
+    os_error *e;
+/* write text header first */
+
+    if ((e = file_writef(f, "ARMovie\n%-80s\n%-80s\n%-80s\n",
+                    strsafe(hdr->name), strsafe(hdr->date),
+                    strsafe(hdr->author))) == NULL &&
+
+/* write video information */
+        (e = file_writef(f, "%d %s\n"
+                    "%d %s\n%d %s\n"
+                    "%d %s (%s)\n"
+                    "%g %s\n",
+                    hdr->video_format, VIDEO_FORMAT,
+                    hdr->xsize, PIXELS, hdr->ysize, PIXELS,
+                    hdr->bpp, BITS_PER_PIXEL, arvid_colourspace(hdr->flags),
+                    hdr->fps, FRAMES_PER_SECOND)) == NULL &&
+
+/* write sound data lines for all channels */
+        (e = write_soundline(f, hdr, 0)) == NULL &&
+        (e = write_soundline(f, hdr, 1)) == NULL &&
+        (e = write_soundline(f, hdr, 2)) == NULL &&
+        (e = write_soundline(f, hdr, 3)) == NULL &&
+
+/* write chunk information */
+        (e = file_writef(f, "%d %s\n", hdr->frames_per_chunk, FRAMES_PER_CHUNK)) == NULL)
+            ;
+
+    return e;
+}
+
+os_error *replay_writehdr(unsigned int f, armovie_hdr *hdr, sprite_area *sprite)
+{
+    os_error *e = NULL;
+
+    if ((e = replay_writetexthdr(f, hdr)) == NULL &&
+        (e = file_writef(f, NCHUNKS_FMT" %s\n", hdr->nchunks - 1, NUMBER_OF_CHUNKS)) == NULL &&
+        (e = replay_writechunksize(f, hdr)) == NULL)
+    {
+        int pos, data_pos,
+            catsize = replay_cataloguesize(hdr);
+
+        if (hdr->video_format != 0)
+            catsize = catsize + CATSIZE_GRANULARITY - (catsize % CATSIZE_GRANULARITY);
+
+        hdr->sprite_size = sprite ? sprite->freeoff - 4 : hdr->xsize*hdr->ysize*4 + sizeof(sprite_header) + sizeof(sprite_area) - 4 + 256*4*2;
+
+/* write dummy ptrs to advance past */
+        if ((e = file_getpos(f, &pos)) == NULL &&
+            (e = file_writef(f, "XXXXXX %s\nXXXXXX %s\n"
+                        "XXXXXXX %s\nXXXXXX %s\n",
+                        CHUNK_CAT_OFFSET,
+                        SPRITE_OFFSET,
+                        SPRITE_SIZE,
+                        KEY_OFFSET)) == NULL &&
+
+/* make space for catalogue */
+            (e = file_getpos(f, &hdr->catalogue_offset)) == NULL &&
+            (e = file_setpos(f, hdr->catalogue_offset + catsize)) == NULL &&
+
+/* write out sprite if there is one */
+            (e = file_getpos(f, &hdr->sprite_offset)) == NULL &&
+            (sprite ? 
+                (e = file_write(f, (char *)sprite + 4, hdr->sprite_size)) == NULL : 
+                (e = file_setpos(f, hdr->sprite_offset + hdr->sprite_size)) == NULL) &&
+
+/* make space for key frames here if there are any */
+            (hdr->key_frame_offset != -1 ?
+                (e = file_getpos(f, &hdr->key_frame_offset)) == NULL &&
+                (e = file_setpos(f, hdr->key_frame_offset + (hdr->nchunks-1)*arvid_keyframesize(hdr))) == NULL :
+                TRUE) &&
+
+/* record end of header */
+            (e = file_getpos(f, &data_pos)) == NULL &&
+
+/* go back and write ptrs */
+            (e = file_setpos(f, pos)) == NULL &&
+            (e = file_writef(f, "%d %s\n%d %s\n%07d %s\n%d %s\n",
+                        hdr->catalogue_offset, CHUNK_CAT_OFFSET,
+                        hdr->sprite_offset, SPRITE_OFFSET,
+                        hdr->sprite_size, SPRITE_SIZE,
+                        hdr->key_frame_offset, KEY_OFFSET)) == NULL)
+        {
+/* queue up for chunk data to be written */
+            e = file_setpos(f, data_pos);
+        }
+    }
+    return e;
+}
+
+/* --------------------------------------------------------------------------------------- */
+
+/* eof replayhdr.c */

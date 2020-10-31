@@ -1,0 +1,444 @@
+/*
+ * HardDiscs.c
+ *
+ * This is the module that handles the HardDiscs window.
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+#include "visdelay.h"
+
+#include "configure.h"
+#include "HardDiscs.h"
+#include "cmos.h"
+#include "filer.h"
+
+/* Define this to it impossible to set IDE spindown on non-portable machines */
+#define SPINDOWN_ONLY_ON_PORTABLE 1
+
+/* Due to the way wimp_set_icon_state is used to clear/display
+ * the number of disc icons required, it would be a bad idea to
+ * have the numerically LAST icon in the template be one of these.
+ * Currently the OK button comes afterwards, so we're OK
+ */
+
+#define HardDiscsWindow_FirstST506   2
+#define HardDiscsWindow_FirstIDE     8
+#define HardDiscsWindow_FirstSCSI    18
+#define HardDiscsWindow_FirstCD      27
+
+#define HardDiscsWindow_ST506Up     4
+#define HardDiscsWindow_ST506Down   5
+#define HardDiscsWindow_IDEUp       10
+#define HardDiscsWindow_IDEDown     11
+#define HardDiscsWindow_SCSIUp      22
+#define HardDiscsWindow_SCSIDown    23
+#define HardDiscsWindow_CDUp        31
+#define HardDiscsWindow_CDDown      32
+
+#define HardDiscsWindow_SpindownLabel 12
+#define HardDiscsWindow_SpindownDown  13  /* These three must be contiguous */
+#define HardDiscsWindow_SpindownValue 14  /* These three must be contiguous */
+#define HardDiscsWindow_SpindownUp    15  /* These three must be contiguous */
+
+#define HardDiscsWindow_SCSILabel   17
+
+#define HardDiscsWindow_OK          24
+
+/* These should correspond to the number of icons in the template */
+#define Max_ST506_Drives            2
+#define Max_IDE_Drives              2
+#define Max_SCSI_Drives             4
+#define Max_CD_Drives               4
+
+static struct {
+  int value;
+  char *tag;
+} spindown_info [] = {
+  0,  "SPIN0",
+  12, "SPIN1",   /* should this be 65 sec (13)? */
+  24, "SPIN2",
+  60, "SPIN5",
+};
+#define spindown_info_size (sizeof(spindown_info) / sizeof(spindown_info[0]))
+
+#ifndef SCSI_Version
+#define SCSI_Version 0x403c0 /* SCSI driver SWI */
+#endif
+
+#ifndef ATAPI_GetDrives
+#define ATAPI_GetDrives 0x4A740
+#endif
+
+static int harddiscs_window=0;
+
+static wimp_icreate st506_icons[Max_ST506_Drives];
+static wimp_icreate ide_icons[Max_IDE_Drives];
+static wimp_icreate scsi_icons[Max_SCSI_Drives];
+static wimp_icreate cd_icons[Max_CD_Drives];
+static int st506_discs=0, o_st506_discs=0;
+static int ide_discs=0, o_ide_discs=0;
+static int scsi_discs=0,o_scsi_discs=0;
+static int cd_discs=0,o_cd_discs=0;
+static int spindown=0;
+
+static int st506drives=Max_ST506_Drives;
+static int idedrives=Max_IDE_Drives;
+static int scsidrives=Max_SCSI_Drives;
+static int cddrives=Max_CD_Drives;
+
+static int max_ide_discs=2;
+
+static void harddiscs_geticoninfo(wimp_icreate *icons, int first, int max)
+{
+ int i;
+
+ for (i=0;i<max;i++)
+ {
+  wimp_get_icon_info(harddiscs_window,i+first,&icons[i].i);
+  icons[i].w=harddiscs_window;
+ }
+}
+
+static void harddiscs_geticons(void)
+{
+ harddiscs_geticoninfo(st506_icons, HardDiscsWindow_FirstST506, Max_ST506_Drives);
+ harddiscs_geticoninfo(ide_icons, HardDiscsWindow_FirstIDE, Max_IDE_Drives);
+ harddiscs_geticoninfo(scsi_icons, HardDiscsWindow_FirstSCSI, Max_SCSI_Drives);
+ harddiscs_geticoninfo(cd_icons, HardDiscsWindow_FirstCD, Max_CD_Drives);
+}
+
+static void harddiscs_setdrives(int *drives, int discs, wimp_icreate *icons, int first, int max)
+{
+ int number=discs > max ? max : discs;
+ int i;
+
+ if (number > *drives)
+ {
+  for (i=*drives ; i <= (number-1) ; i++)
+  {
+   wimp_set_icon_state(harddiscs_window,first + i,0,wimp_IDELETED);
+  }
+ }
+ else
+ {
+  for (i=*drives-1 ; i >= number ; i--)
+  {
+   redraw_icon(harddiscs_window,&icons[i].i);
+   wimp_set_icon_state(harddiscs_window,first + i,wimp_IDELETED,wimp_IDELETED);
+  }
+ }
+ *drives=number;
+}
+
+#if SPINDOWN_ONLY_ON_PORTABLE
+
+/* Check whether the Portable module is loaded.  If not, then
+ * grey out the spindown icons, as they are not appropriate.
+ */
+
+#if HardDiscsWindow_SpindownValue != HardDiscsWindow_SpindownDown + 1 || HardDiscsWindow_SpindownUp != HardDiscsWindow_SpindownValue + 1
+#error Spindown icons not contiguous
+#endif
+
+static void harddiscs_check_portable (void)
+{
+  int value, i;
+
+  if (check_portable())
+    value = 0;
+  else
+    value = wimp_INOSELECT;
+
+  for (i = HardDiscsWindow_SpindownDown; i <= HardDiscsWindow_SpindownUp; i++)
+    wimp_set_icon_state(harddiscs_window, i, value, wimp_INOSELECT);
+}
+
+#endif /* SPINDOWN_ONLY_ON_PORTABLE */
+
+/* If configured value is not in our list, then pick the
+ * next higher value that we know, but if configured value
+ * is greater than our highest value, then use our highest
+ * value (not "never").
+ */
+
+static int get_spindown (void)
+{
+  int i, nexthighestind = -1;
+  int spin = cmos_get(CMOS_ADFSSpinDown);
+  for (i = 0; i < spindown_info_size; i++)
+  {
+    if (spindown_info[i].value == spin)
+    {
+      return i;
+    } else if (nexthighestind == -1 && spindown_info[i].value > spin)
+    {
+      nexthighestind = i;
+    }
+  }
+  if (nexthighestind == -1)
+    nexthighestind = spindown_info_size - 1;
+  return nexthighestind;
+}
+
+
+/* spindown must be in the valid range 0..spindown_info_size-1 */
+
+static void harddiscs_setspindown()
+{
+  wimp_icon i;
+  wimp_get_icon_info(harddiscs_window,HardDiscsWindow_SpindownValue,&i);
+  sprintf(i.data.indirecttext.buffer,msgs_lookup(spindown_info[spindown].tag));
+  wimp_set_icon_state(harddiscs_window,HardDiscsWindow_SpindownValue,0,0);
+}
+
+static void change_spindown(int by)
+{
+  int new = spindown + by;
+  if (new < 0) new = 0;
+  if (new >= spindown_info_size) new = spindown_info_size - 1;
+  spindown = new;
+  harddiscs_setspindown();
+}
+
+static void restart_filers(void)
+{
+ visdelay_begin();
+
+ _kernel_oscli("RMReinit ADFS");
+ _kernel_oscli("RMReinit ADFSFiler");
+ _kernel_oscli("RMReinit SCSIFS");
+ _kernel_oscli("RMReinit SCSIFiler");
+ _kernel_oscli("RMReinit CDFSDriver");
+ _kernel_oscli("RMReinit CDFS");
+ _kernel_oscli("RMReinit CDFSFiler");
+ filer_restart_filers();
+
+ visdelay_end();
+}
+
+
+/* Return 1 if user chose OK, 0 if user cancelled */
+
+static int set_filers(void)
+{
+        int byte;
+        _kernel_swi_regs r;
+        os_error e;
+
+#if SPINDOWN_ONLY_ON_PORTABLE
+        if (portable)
+#endif
+                cmos_set(CMOS_ADFSSpinDown, spindown_info[spindown].value);
+
+        if (cd_discs == o_cd_discs &&
+            scsi_discs == o_scsi_discs &&
+            st506_discs == o_st506_discs &&
+            ide_discs == o_ide_discs)
+                return 1;
+
+        strcpy(e.errmess,msgs_lookup("DiscConf"));
+        e.errnum=0;
+        r.r[0]=(int)&e;
+        r.r[1]=3 + (1<<4);
+        r.r[2]=(int)msgs_lookup("Warn");
+        _kernel_swi(Wimp_ReportError,&r,&r);
+        if (r.r[1]==1)
+        {
+                byte=cmos_get(CMOS_ADFSHardDiscs);
+                cmos_set(CMOS_ADFSHardDiscs,(byte & ~(31<<3)) | (st506_discs <<3) | (ide_discs << 6));
+                byte=cmos_get(CMOS_SCSIHardDiscs);
+                cmos_set(CMOS_SCSIHardDiscs,(byte & ~7) | scsi_discs);
+                byte=cmos_get(CMOS_CDFS);
+                cmos_set(CMOS_CDFS,(byte & 0xE0) | cd_discs);
+                restart_filers();
+                return 1;
+        }
+        else
+        {
+                return 0;
+        }
+}
+
+static int atapi_drives(void)
+{
+        _kernel_swi_regs r;
+
+        return _kernel_swi(ATAPI_GetDrives, &r, &r) == NULL ? r.r[0] : 0;
+}
+
+static void harddiscs_readcmos(void)
+{
+        o_st506_discs = st506_discs = (cmos_get(CMOS_ADFSHardDiscs) >> 3) & 7;
+        o_ide_discs = ide_discs   = (cmos_get(CMOS_ADFSHardDiscs) >> 6) & 3;
+        o_scsi_discs = scsi_discs  = (cmos_get(CMOS_SCSIHardDiscs)  & 7);
+        o_cd_discs = cd_discs = (cmos_get(CMOS_CDFS) & 0x1F);
+        spindown = get_spindown();
+        max_ide_discs = 2 - atapi_drives();
+}
+
+static void change_drives(int *drives, int *discs, int dir, wimp_icreate *icons, int first, int max)
+{
+        int current = *discs;
+        if (current > max) current=max;
+        current += dir;
+        if ((current < 0) || (current > max)) return;
+        *discs=current;
+        harddiscs_setdrives(drives, *discs, icons, first, max);
+}
+
+static void harddiscs_event_handler(wimp_eventstr *e,void *handle)
+{
+        handle=handle;
+
+        switch (e->e)
+        {
+        case wimp_EOPEN:
+                wimp_open_wind(&e->data.o);
+                break;
+        case wimp_ECLOSE:
+               {
+                wimp_mousestr m;
+                wimp_get_point_info(&m);
+                if (m.bbits==wimp_BRIGHT)
+                {
+                        wimp_wstate s;
+                        wimp_get_wind_state(harddiscs_window,&s);
+                        reopen_main_window(s.o.box.x0,s.o.box.y1);
+                }
+                delete_window( &harddiscs_window );
+                st506drives=Max_ST506_Drives;
+                idedrives=Max_IDE_Drives;
+                scsidrives=Max_SCSI_Drives;
+                cddrives=Max_CD_Drives;
+               }
+                break;
+        case wimp_EBUT:
+                if ( (e->data.but.m.bbits == wimp_BLEFT) ||
+                     (e->data.but.m.bbits == wimp_BRIGHT)
+                   )
+                {
+                        int sign=(e->data.but.m.bbits == wimp_BRIGHT) ? 1 : -1;
+                        switch (e->data.but.m.i)
+                        {
+                        case HardDiscsWindow_ST506Up:
+                                sign = -sign;
+                                /* Drop into... */
+                        case HardDiscsWindow_ST506Down:
+                                change_drives(&st506drives,&st506_discs,sign,st506_icons,HardDiscsWindow_FirstST506,Max_ST506_Drives);
+                                break;
+                        case HardDiscsWindow_IDEUp:
+                                sign = -sign;
+                                /* Drop into... */
+                        case HardDiscsWindow_IDEDown:
+                                change_drives(&idedrives,&ide_discs,sign,ide_icons,HardDiscsWindow_FirstIDE,max_ide_discs);
+                                break;
+                        case HardDiscsWindow_SCSIUp:
+                                sign = -sign;
+                                /* Drop into... */
+                        case HardDiscsWindow_SCSIDown:
+                                change_drives(&scsidrives,&scsi_discs,sign,scsi_icons,HardDiscsWindow_FirstSCSI,Max_SCSI_Drives);
+                                break;
+                        case HardDiscsWindow_CDUp:
+                                sign = -sign;
+                                /* Drop into... */
+                        case HardDiscsWindow_CDDown:
+                                change_drives(&cddrives,&cd_discs,sign,cd_icons,HardDiscsWindow_FirstCD,Max_CD_Drives);
+                                break;
+                        case HardDiscsWindow_OK:
+                                if (set_filers() == 0)
+                                        break;     /* user cancelled, leave window up */
+                                if (sign == -1)
+                                {
+                                        st506drives=Max_ST506_Drives;
+                                        idedrives=Max_IDE_Drives;
+                                        scsidrives=Max_SCSI_Drives;
+                                        cddrives=Max_CD_Drives;
+                                        delete_window( &harddiscs_window );
+                                }
+                                else
+                                {
+                                        harddiscs_readcmos();
+                                }
+                                break;
+                        case HardDiscsWindow_SpindownDown:
+                                change_spindown(sign);
+                                break;
+                        case HardDiscsWindow_SpindownUp:
+                                change_spindown(-sign);
+                                break;
+                        }
+                }
+                break;
+        }
+}
+
+
+#if 0
+static void state(wimp_i icon, int onoff)
+{
+        wimp_iconflags value = onoff ? 0 : wimp_INOSELECT;
+        wimp_set_icon_state(harddiscs_window, icon, value, wimp_INOSELECT);
+}
+#endif
+
+int harddiscs_create_window(void)
+{
+        if (! harddiscs_window)
+        {
+                harddiscs_window=create_window("HardDiscs",harddiscs_event_handler,"HD");
+                harddiscs_geticons();
+                harddiscs_readcmos();
+        }
+#if SPINDOWN_ONLY_ON_PORTABLE
+        harddiscs_check_portable();
+#endif
+        harddiscs_setdrives(&st506drives, st506_discs, st506_icons, HardDiscsWindow_FirstST506, Max_ST506_Drives);
+        harddiscs_setdrives(&idedrives, ide_discs, ide_icons, HardDiscsWindow_FirstIDE, Max_IDE_Drives);
+        harddiscs_setdrives(&scsidrives, scsi_discs, scsi_icons, HardDiscsWindow_FirstSCSI, Max_SCSI_Drives);
+        harddiscs_setdrives(&cddrives, cd_discs, cd_icons, HardDiscsWindow_FirstCD, Max_CD_Drives);
+        harddiscs_setspindown();
+
+#if 0
+        /* This is silly.  Leave it out since we don't do the same for
+         * other filing systems.
+         */
+        {
+                _kernel_swi_regs r;
+                int scsi_exists, i;
+                r.r[0]=r.r[1]=r.r[2]=r.r[3]=r.r[4]=r.r[5]=0;
+                scsi_exists = (_kernel_swi(XOS_Bit | SCSI_Version,&r,&r) == NULL);
+
+                state(HardDiscsWindow_SCSILabel, scsi_exists);
+                state(HardDiscsWindow_SCSIUp, scsi_exists);
+                state(HardDiscsWindow_SCSIDown, scsi_exists);
+                for (i = HardDiscsWindow_FirstSCSI; i < HardDiscsWindow_FirstSCSI + Max_SCSI_Drives; i++)
+                        state(i, scsi_exists);
+        }
+#endif
+
+        return harddiscs_window;
+}
+
+void harddiscs_update_window(void)
+{
+        if (harddiscs_window) harddiscs_create_window();
+}

@@ -1,0 +1,956 @@
+/* > spr.c
+
+ * © SJ Middleton, 1993
+
+ * New interface to OS_SpriteOp with the following features
+
+ * - No support for user sprite areas
+ * - two sets of routines for most functions
+ *      spr_xxx(area, name, ...)
+ *      spr_xxx(ptr, ...)
+ * - routines that require that requires the sprite area take a
+ *      new sprite area ptr that contains mem_alloc functions and
+ *      will do their own memory manipulation.
+ * - transparent support for new sprite formats in 3.X and 3.1
+ * - transparent calls to ColourTrans where necessary
+ * - support for squashed sprite files
+ * - support for iconsprites filename suffix
+ */
+
+#include "file.h"
+#include "msgtrans.h"
+#include "swis.h"
+#include "werr.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "screenmode.h"
+#include "spr_intern.h"
+
+#define err_NoSpriteFile    133
+
+/* ------------------------------------------------------------------------------------ */
+
+static int count_sprites(sprite_area *area)
+{
+    char    *cp = (char *)area + area->sproff,
+            *end = (char *)area + area->freeoff;
+
+    int     nsprites = 0;
+
+    while (cp < end)
+    {
+        int nextoffset = ((sprite_header *)cp)->next;
+        if (nextoffset <= sizeof(sprite_header))
+            break;
+
+        cp += nextoffset;
+        nsprites ++;
+    }
+    return nsprites;
+}
+
+/*
+ * For functions that take wimp_spriteanchor as an acceptable area
+ */
+
+static void decode_anchor(spr_area anchor, int *swi, int *op, sprite_area **area)
+{
+    switch ((int)anchor)
+    {
+        case 0:
+            *swi = OS_SpriteOp;
+            *op = 512;
+            *area = (sprite_area *)0xff;
+            break;
+
+        case (int)wimp_spriteanchor:
+            *swi = Wimp_SpriteOp;
+            *op = 256;
+            break;
+
+        default:
+            *swi = OS_SpriteOp;
+            *op = 256;
+            *area = anchor->area;
+            break;
+    }
+}
+
+static void init_area2(spr_area anchor)
+{
+    sprite_area *area = anchor->area;
+    area->freeoff = sizeof(sprite_area);
+    area->number = 0;
+    area->sproff = sizeof(sprite_area);
+}
+
+static BOOL init_area(spr_area anchor)
+{
+    if (anchor->alloc((mem_ptr)&anchor->area, sizeof(sprite_area)))
+    {
+        anchor->area->size = sizeof(sprite_area);
+        init_area2(anchor);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+os_error *spr_OutOfMemory(void)
+{
+    extern os_error OutOfMemoryMsg;
+    return _swix(MessageTrans_ErrorLookup, _IN(0)|_IN(1)|_IN(2),
+        &OutOfMemoryMsg, messagesFileDesc, 0);
+}
+
+os_error *spr_AnchorIsNull(void)
+{
+    extern os_error NullAnchorMsg;
+    return _swix(MessageTrans_ErrorLookup, _IN(0)|_IN(1)|_IN(2),
+        &NullAnchorMsg, messagesFileDesc, 0);
+}
+
+os_error *spr_CheckAnchor(spr_area anchor)
+{
+    return anchor == NULL ? spr_AnchorIsNull() : NULL;
+}
+
+BOOL extendto(spr_area anchor, int size, os_error **e)
+{
+    if (anchor->alloc((mem_ptr)&anchor->area, size))
+    {
+        anchor->area->size = size;
+        return TRUE;
+    }
+    else if (e)
+        *e = spr_OutOfMemory();
+    return FALSE;
+}
+
+BOOL extendby(spr_area anchor, int by, os_error **e)
+{
+    return extendto(anchor, anchor->area->freeoff + by, e);
+}
+
+/* ------------------------------------------------------------------------------------ */
+/* Area functions - no sprite ptr needed */
+
+spr_area spr_area_Init(mem_allocfn salloc, mem_freefn sfree, const char *area_name)
+{
+    spr_area anchor = calloc(sizeof(struct spr__area), 1);
+    if (anchor)
+    {
+        anchor->alloc = salloc;
+        anchor->free = sfree;
+        anchor->name = area_name;
+        alloc_nextiscalled(area_name);
+        if (!init_area(anchor))
+        {
+            free(anchor);
+            anchor = NULL;
+        }
+    }
+    return anchor;
+}
+
+os_error *spr_area_Reinit(spr_area anchor)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+        init_area(anchor);
+    return e;
+}
+
+os_error *spr_area_Reinit_noshrink(spr_area anchor)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+        init_area2(anchor);
+    return e;
+}
+
+void spr_area_Dispose(spr_area *panchor)
+{
+    spr_area anchor = *panchor;
+    if (anchor)
+    {
+        anchor->free((mem_ptr)&anchor->area);
+        free(anchor);
+        *panchor = NULL;
+    }
+}
+
+os_error *spr_area_Save(spr_area anchor, const char *filename)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+        e = sprop3(256 + 12, anchor, (void *)filename);
+    return e;
+}
+
+os_error *spr_area_Load(spr_area anchor, const char *filename)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        int size = file_size(filename, NULL);
+        if (size == -1 || extendto(anchor, size + 4, &e))
+            e = sprop3(256 + 10, anchor, (void *)filename);
+    }
+    return e;
+}
+
+os_error *spr_area_Merge(spr_area anchor, const char *filename)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        int size = file_size(filename, NULL);
+        if (size == -1 || extendby(anchor, size + 4, &e))
+        {
+            e = sprop3(256 + 11, anchor, (void *)filename);
+            extendby(anchor, 0, NULL);
+        }
+    }
+    return e;
+}
+
+sprite_area *spr_area_Ptr(spr_area anchor)
+{
+    return anchor ? anchor->area : NULL;
+}
+
+sprite_area **spr_area_Anchor(spr_area anchor)
+{
+    return anchor ? &anchor->area : NULL;
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+/* Functions to ease importing of sprites via RAM transfer */
+
+#define IMPORT_GRANULARITY  (10*1024)
+
+/*
+ * On the first call of this function we set the area size to area->freeoff
+ * (which should be the amount of space needed after all). If for some reason
+ * it still needs more then allocate in GRANULARITY blocksizes.
+ */
+
+BOOL spr_area_ImportProcessor(char **buffer, int *size, void *handle)
+{
+    spr_area    anchor = handle;
+    os_error    *e = NULL;
+    int         current_size = anchor->area->size,
+                freeoff_size = anchor->area->freeoff,
+                newsize;
+
+    newsize = current_size < freeoff_size ?
+                freeoff_size :
+                current_size + IMPORT_GRANULARITY;
+
+    if (extendto(anchor, newsize, &e))
+    {
+        *buffer = (char *)anchor->area + current_size;
+        *size = newsize - current_size;
+        return TRUE;
+    }
+    os_err(e);
+    return FALSE;
+}
+
+os_error *spr_area_ImportInit(spr_area anchor, char **buf, int estsize)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        if (extendto(anchor, estsize + 4, &e))
+        {
+            if (buf)
+                *buf = (char *)(&anchor->area->number);
+           }
+    }
+    return e;
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+/* Individual sprite functions */
+
+os_error *spr_ReadPalette_named(spr_area anchor, const char *name, void **pbuffer)
+{
+    os_error *e = NULL;
+    int         flags, size;
+    sprite_area dummyarea, *area;
+    dummyarea.size = 0;
+    area = anchor == NULL ? &dummyarea : anchor->area;
+    flags = anchor == NULL ? 1 : 0;
+
+    if ((e = _swix(ColourTrans_ReadPalette,
+                _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4) |
+                _OUT(3),
+                area, name, 0, 0, flags, &size)) != NULL)
+        return e;
+
+    if ((*pbuffer = malloc(size)) != NULL)
+    {
+        if ((e = _swix(ColourTrans_ReadPalette,
+                _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4),
+                area, name, *pbuffer, size, flags)) != NULL)
+            free(*pbuffer);
+    }
+    return e;
+}
+
+os_error *spr_ReadPalette(sprite_ptr sptr, void **pbuffer)
+{
+    return spr_ReadPalette_named(NULL, sptr, pbuffer);
+}
+
+/*
+ * This function does a number of things
+ *  - If no sprite area is given it passes a pointer to a zero word so that
+ *      ColourTrans can tell it isn't getting a mode-specifier.
+ *  - It first asks the size of the table needed, then reallocs the pointer passed in
+ *  - If no table is required (size == 0) is returns with no error having freed the old table
+ *      and set its pointer to NULL.
+ *  - If the size of the table == (1 << bpp_destinationmode) then it fills the table first
+ *      and checks it afterwards to see if the table is actually needed. If it isn't it
+ *      frees the old table and sets the pointer to NULL.
+ *  - I dunno what to do about word sized pixtrans table.
+
+ * will use current palette for sprite mode if sprite has no palette except
+ *   when def_palette == 1, or
+ */
+
+os_error *spr_GenerateTableForModePal_named(spr_area anchor, const char *name, int def_palette, int dest_mode, void *dest_palette, void **pbuffer)
+{
+    os_error *e = NULL;
+
+    int         flags, size;
+    void        *newbuf;
+    sprite_area dummyarea, *area;
+
+    dummyarea.size = 0;
+    area = anchor == NULL ? &dummyarea : anchor->area;
+    flags = (anchor == NULL ? 1 : 0) | (def_palette == 0 ? 2 : 0);
+
+    if ((e = _swix(ColourTrans_GenerateTable,
+                _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4) | _IN(5) |
+                _OUT(4),
+                area, name, dest_mode, dest_palette, 0, flags, &size)) != NULL)
+        return e;
+
+    newbuf = realloc(*pbuffer, size);
+    if (newbuf)
+    {
+        int i, ncolours = 1 << mode_bpp(dest_mode);
+
+        if (size == ncolours)
+        {
+            char *pixtrans;
+            for (pixtrans = newbuf, i = 0; i < ncolours; i++)
+                pixtrans[i] = i;
+        }
+
+        e = _swix(ColourTrans_GenerateTable,
+                _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4) | _IN(5),
+                area, name, dest_mode, dest_palette, newbuf, flags);
+
+        if (e == NULL && size == ncolours)
+        {
+            char *pixtrans;
+            for (pixtrans = newbuf, i = 0; i < ncolours; i++)
+                if (pixtrans[i] != i)
+                    break;
+
+            if (i == ncolours)
+            {
+                free(newbuf);
+                newbuf = NULL;
+            }
+        }
+
+        *pbuffer = newbuf;
+    }
+    else if (size == 0)
+        *pbuffer = NULL;
+    else
+        e = spr_OutOfMemory();
+
+    return e;
+}
+
+os_error *spr_GenerateTableForModePal(sprite_ptr sptr, int def_palette, int dest_mode, void *dest_palette, void **pbuffer)
+{
+    return spr_GenerateTableForModePal_named(NULL, sptr, def_palette, dest_mode, dest_palette, pbuffer);
+}
+
+
+os_error *spr_GenerateTableForMode_named(spr_area anchor, const char *name, int dest_mode, void *dest_palette, void **pbuffer)
+{
+    return spr_GenerateTableForModePal_named(anchor, name, 1, dest_mode, dest_palette, pbuffer);
+}
+
+os_error *spr_GenerateTableForMode(sprite_ptr sptr, int dest_mode, void *dest_palette, void **pbuffer)
+{
+    return spr_GenerateTableForModePal_named(NULL, sptr, 1, dest_mode, dest_palette, pbuffer);
+}
+
+
+os_error *spr_GenerateTable(sprite_ptr sptr, void **pbuffer)
+{
+    return spr_GenerateTableForModePal_named(NULL, sptr, 1, -1, (void *)-1, pbuffer);
+}
+
+os_error *spr_GenerateTable_named(spr_area anchor, const char *name, void **pbuffer)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+        e = spr_GenerateTableForModePal_named(anchor, name, 1, -1, (void *)-1, pbuffer);
+    return e;
+}
+
+/* ------------------------------------------------------------------------------------ */
+/* Sprite functions where area may change size */
+
+/* must give name */
+
+os_error *spr_CreateSprite(spr_area anchor, const char *name, sprite_palflag palflag, int width, int height, int mode, sprite_ptr *sptr /* out */)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        int size_needed, bpp = mode_bpp(mode);
+
+        if (bpp > 8)
+            palflag = sprite_nopalette;
+
+        size_needed = spr_sizeof(width, height, mode) +
+                (palflag == sprite_haspalette ? MAX_PALETTE_SIZE : 0);
+
+        if (extendby(anchor, size_needed, &e))
+        {
+            e = _swix(OS_SpriteOp, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_IN(7),
+                    256 + 15, anchor->area, name, palflag, width, height, mode);
+            if (e != NULL)
+            {
+                if (e->errnum == err_InvalidSpriteMode)
+                {
+                    e = _swix(OS_SpriteOp, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_IN(7),
+                            256 + 15, anchor->area, name, sprite_nopalette,
+                            bpp >= 8 ? width*(bpp/8) : (width + (8/bpp) - 1) / (8/bpp),
+                            height, 28);
+                    if (e == NULL)
+                    {
+                        sprite_header *shdr = spr_Ptr(anchor, name);
+                        shdr->mode = mode;
+                        if (sptr)
+                            *sptr = shdr;
+                    }
+                }
+            }
+            else if (sptr)
+                *sptr = spr_Ptr(anchor, name);
+        }
+    }
+    return e;
+}
+
+/* must give name */
+
+os_error *spr_GetSprite(spr_area anchor, const char *name, sprite_palflag palflag, const spr_box *box)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        int width = ((box->corner[1].x - box->corner[0].x) >> screen_Vars.xeig) + 1,
+            height = ((box->corner[1].y - box->corner[0].y) >> screen_Vars.yeig) + 1,
+            size = sizeof(sprite_header) + ((width*screen_Vars.bpp + 31*2) &~ 31)/8*height;
+
+        if (extendby(anchor, size, &e))
+        {
+            e = _swix(OS_SpriteOp, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_IN(7),
+                    256 + 16, anchor->area, name, sprite_nopalette,
+                    box->corner[0].x, box->corner[0].y, box->corner[1].x, box->corner[1].y);
+
+            if (e == NULL && palflag == sprite_haspalette && screen_Vars.bpp <= 8)
+            {
+                void *palette = NULL;
+                if ((e = screen_ReadPalette(&palette, NULL)) == NULL)
+                    e = spr_AddPalette(anchor, name, palette);
+                free(palette);
+            }
+            else
+                extendby(anchor, 0, NULL);
+        }
+    }
+    return e;
+}
+
+os_error *spr_ReadSprite(spr_area anchor, unsigned int file, int offset, int length)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL && length != 0)
+    {
+        if (extendby(anchor, length, &e))
+        {
+            sprite_area *area = anchor->area;
+            if (offset != -1)
+                e = file_setpos(file, offset);
+            if (e == NULL)
+                e = file_read(file, (char *)area + area->freeoff, length);
+
+            if (e == NULL)
+            {
+                area->freeoff += length;
+                area->number = count_sprites(area);
+            }
+            else
+                extendby(anchor, 0, NULL);
+        }
+    }
+    return e;
+}
+
+os_error *spr_ReadSpriteFromFile(spr_area anchor, const char *filename, int offset, int length)
+{
+    os_error    *e;
+    filehandle  f;
+    if ((e = file_open(fopt_Read, filename, &f)) == NULL)
+    {
+        e = spr_ReadSprite(anchor, f, offset, length);
+
+        file_close(f);
+    }
+    return e;
+}
+
+os_error *spr_ReadSpriteFromMem(spr_area anchor, void *data, int length)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL && length != 0)
+    {
+        if (extendby(anchor, length, &e))
+        {
+            sprite_area *area = anchor->area;
+            memcpy((char *)area + area->freeoff, data, length);
+            area->freeoff += length;
+            area->number = count_sprites(area);
+        }
+    }
+    return e;
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+static os_error *spr__ExtendAfterOp(spr_area anchor, void *name, int op)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        if ((e = sprop3(op, anchor, name)) == NULL)
+            extendby(anchor, 0, NULL);
+    }
+    return e;
+}
+
+os_error *spr_DeleteSprite_named(spr_area anchor, const char *name)
+{
+    return spr__ExtendAfterOp(anchor, (void *)name, 256+25);
+}
+
+os_error *spr_DeleteSprite(spr_area anchor, sprite_ptr sptr)
+{
+    return spr__ExtendAfterOp(anchor, sptr, 512+25);
+}
+
+os_error *spr_RemoveMask_named(spr_area anchor, const char *name)
+{
+    return spr__ExtendAfterOp(anchor, (void *)name, 256+30);
+}
+
+os_error *spr_RemoveMask(spr_area anchor, sprite_ptr sptr)
+{
+    return spr__ExtendAfterOp(anchor, sptr, 512+30);
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+os_error *spr_CopySprite(spr_area anchor, const char *name, const char *newname)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        sprite_header *shdr = spr_Ptr(anchor, name);
+        if (shdr == NULL || extendby(anchor, shdr->next, &e))
+            e = sprop4(256 + 27, anchor, (void *)name, newname);
+    }
+    return e;
+}
+
+os_error *spr_CopySpriteToArea(spr_area anchor_from, const char *name, spr_area anchor_to)
+{
+    os_error *e = spr_CheckAnchor(anchor_from);
+    if (e == NULL)
+        e = spr_CheckAnchor(anchor_to);
+    if (e == NULL)
+    {
+        sprite_header   *shdr;
+        int             size;
+        if ((e = spr_Ptr_error(anchor_from, name, (sprite_ptr *)&shdr)) != NULL)
+            return e;
+
+        size = shdr->next;
+
+/* try and delete any duplicate */
+        spr_DeleteSprite_named(anchor_to, name);
+
+        if (extendby(anchor_to, size, &e))
+        {
+            sprite_area *area_to = anchor_to->area;
+            shdr = spr_Ptr(anchor_from, name);
+            memcpy((char *)area_to + area_to->freeoff, shdr, shdr->next);
+            area_to->freeoff += shdr->next;
+            area_to->number++;
+        }
+    }
+    return e;
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+os_error *spr_SaveSprite(sprite_ptr sptr, const char *filename)
+{
+    os_error    *e;
+    filehandle  f;
+    if ((e = file_open(fopt_Write, filename, &f)) == NULL)
+    {
+        sprite_header   *shdr = sptr;
+        sprite_area     area;
+        area.number = 1;
+        area.sproff = 16;
+        area.freeoff = shdr->next + 16;
+        if ((e = file_write(f, &area.number, 12)) == NULL)
+            e = file_write(f, shdr, shdr->next);
+        file_close(f);
+        file_settype(filename, filetype_Sprite);
+    }
+    return e;
+}
+
+os_error *spr_SaveSprite_named(spr_area anchor, const char *sprname, const char *filename)
+{
+    os_error    *e;
+    sprite_ptr  sptr;
+    if ((e = spr_Ptr_error(anchor, sprname, &sptr)) == NULL)
+        e = spr_SaveSprite(sptr, filename);
+    return e;
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+os_error *spr_CreateMask(spr_area anchor, const char *name)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        sprite_info info;
+        if ((e = spr_ReturnInfo_named(anchor, name, &info)) == NULL)
+        {
+            int sizeofmask = spr_sizeof_mask(info.width, info.height, info.mode);
+            if (extendby(anchor, sizeofmask, &e))
+            {
+                if (mode_Type(info.mode) == mode_IsModeNumber)
+                    e = sprop3(256 + 29, anchor, (void *)name);
+                else
+                {
+                    sprite_header *shdr = spr_Ptr(anchor, name);
+                    shdr->image = shdr->mask + sizeofmask;
+                    memmove((char *)shdr + shdr->image,
+                        (char *)shdr + shdr->mask,
+                        ((char *)anchor->area + anchor->area->freeoff) - ((char *)shdr + shdr->mask));
+                }
+            }
+        }
+    }
+    return e;
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+os_error *spr_AddPalette(spr_area anchor, const char *name, void *palette)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL && palette != NULL)
+    {
+        if (extendby(anchor, MAX_PALETTE_SIZE, &e))
+            e = _swix(ColourTrans_WritePalette,
+                        _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4),
+                        anchor->area, name, palette, 0, 0);
+        extendby(anchor, 0, NULL);
+    }
+    return e;
+}
+
+os_error *spr_AddGreyPalette(spr_area anchor, const char *name)
+{
+    sprite_info info;
+    os_error *e = spr_ReturnInfo_named(anchor, name, &info);
+    if (e == NULL)
+    {
+        int ncols = 1 << mode_bpp(info.mode);
+        if (ncols <= 256)
+        {
+            int i, palette[256],
+                inc = 0x00FFFFFF / (ncols-1),
+                val = 0;
+
+            for (i = 0; i < ncols; i++, val += inc)
+                palette[i] = val << 8;
+
+            e = spr_AddPalette(anchor, name, palette);
+        }
+    }
+    return e;
+}
+
+static os_error *spr__RemovePalette(spr_area anchor, void *ptr, int reason)
+{
+    os_error *e = spr_CheckAnchor(anchor);
+    if (e == NULL)
+    {
+        if ((e = sprop4(reason, anchor, ptr, 0)) == NULL)
+            extendby(anchor, 0, NULL);
+    }
+    return e;
+}
+
+os_error *spr_RemovePalette_named(spr_area anchor, const char *name)
+{
+    return spr__RemovePalette(anchor, (void *)name, 256+37);
+}
+
+os_error *spr_RemovePalette(spr_area anchor, sprite_ptr sptr)
+{
+    return spr__RemovePalette(anchor, sptr, 512+37);
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+os_error *spr_ReturnInfo_named(spr_area anchor, const char *name, sprite_info *info)
+{
+    os_error *e;
+    int swi, op;
+    sprite_area *area;
+
+    decode_anchor(anchor, &swi, &op, &area);
+
+    e = _swix(swi, _IN(0)|_IN(1)|_IN(2)|
+                            _OUT(3)|_OUT(4)|_OUT(5)|_OUT(6),
+            op + 40, area, name,
+            &info->width, &info->height, &info->mask, &info->mode);
+
+    if (e && e->errnum == err_InvalidSpriteMode)
+    {
+        sprite_header *shdr = anchor == NULL ? (sprite_header *)name : spr_Ptr(anchor, name);
+        if ((unsigned)shdr->mode > 255)
+        {
+            info->mode = shdr->mode;
+            info->mask = shdr->image != shdr->mask ? 1 : 0;
+            info->width = (shdr->width*32 + shdr->rbit+1) >> (((unsigned)shdr->mode >> 27) - 1);
+            info->height = shdr->height + 1;
+            e = NULL;
+        }
+    }
+    return e;
+}
+
+os_error *spr_ReturnInfo(sprite_ptr sptr, sprite_info *info)
+{
+    return spr_ReturnInfo_named(NULL, (const char *)sptr, info);
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+static int spr_sizeof_data(int x, int y, int bpp)
+{
+    return ((x*bpp + 31) &~ 31)/8*y;
+}
+
+int spr_sizeof_mask(int x, int y, int mode)
+{
+    return spr_sizeof_data(x, y, ((unsigned)mode > 255) ? 1 : mode_bpp(mode));
+}
+
+int spr_sizeof(int x, int y, int mode)
+{
+    return sizeof(sprite_header) + spr_sizeof_data(x, y, mode_bpp(mode));
+}
+
+void *spr_DataPtr(sprite_ptr sptr)
+{
+    return sptr ? (char *)sptr + ((sprite_header *)sptr)->image : NULL;
+}
+
+void *spr_MaskPtr(sprite_ptr sptr)
+{
+    sprite_header *shdr = sptr;
+    return shdr && shdr->image != shdr->mask ? (char *)shdr + shdr->mask : NULL;
+}
+
+sprite_ptr spr_area_FirstSprite(spr_area anchor)
+{
+    if (anchor)
+    {
+        sprite_area *area = anchor->area;
+        if (area->number > 0)
+            return (char *)area + area->sproff;
+    }
+    return NULL;
+}
+
+int spr_bpptype(int bpp)
+{
+    switch (bpp)
+    {
+        case 1:
+            return sprite_1bpp;
+        case 2:
+            return sprite_2bpp;
+        case 4:
+            return sprite_4bpp;
+        case 8:
+            return sprite_8bpp;
+        case 16:
+            return sprite_16bpp;
+        case 24:
+            return sprite_24bpp;
+        case 32:
+            return sprite_32bpp;
+    }
+    return 31;
+}
+
+/*
+ * This gives the right result but is totally wrong formula so don;t try and
+ * generalise any further.
+ */
+
+int spr_EquivalentMode(int bpp, int xppi, int yppi)
+{
+    if ((xppi == 90 || xppi == 45) && (yppi == 90 || yppi == 45))
+        return mode_EquivalentMode(bpp, 90/xppi, 90/yppi);
+    return -1;
+}
+
+/*
+ * Returns a canonical mode number (using EquivalentMode)
+ * if one exists.
+ * Otherwise if bpp <= 8 and we were given a mode number, then
+ * return that mode number.
+ * Otherwise return a sprite type.
+ */
+
+int spr_CanonicaliseType(int mode)
+{
+    int bpp = mode_bpp(mode),
+        xppi = mode_xppi(mode),
+        yppi = mode_yppi(mode),
+        type = spr_EquivalentMode(bpp, xppi, yppi);
+
+    if (type == -1)
+    {
+        if (/*bpp <= 8 && */mode_Type(mode) == mode_IsModeNumber)
+            type = mode;
+        else
+            type = sprite_typeword(spr_bpptype(bpp), xppi, yppi);
+    }
+
+    return type;
+}
+
+int spr_CanonicaliseSprite(sprite_ptr sptr)
+{
+    if (sptr)
+    {
+        sprite_header *shdr = sptr;
+        shdr->mode = spr_CanonicaliseType(shdr->mode);
+        return shdr->mode;
+    }
+    return -1;
+}
+
+int spr_CurrentScreenMode(void)
+{
+    mode_specifier spec = screen_ReturnSpecifier();
+    if (spec.mode < 128)
+        return spec.mode;
+
+    return sprite_typeword(spec.specifier->depth + 1, mode_xppi(-1), mode_yppi(-1));
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+BOOL spr_GetScaling_info(sprite_info *ip_in, sprite_info *ip_out, sprite_factors *factors, spr_coord *coord)
+{
+    int xsize_out, ysize_out, xsize_in, ysize_in;
+    int xeig_in, yeig_in, xeig_out, yeig_out;
+    int mag, div;
+
+    xeig_in = mode_xeig(ip_in->mode);
+    yeig_in = mode_yeig(ip_in->mode);
+    xeig_out = mode_xeig(ip_out->mode);
+    yeig_out = mode_yeig(ip_out->mode);
+
+    xsize_out = ip_out->width << xeig_out;
+    ysize_out = ip_out->height << yeig_out;
+    xsize_in = ip_in->width << xeig_in;
+    ysize_in = ip_in->height << yeig_in;
+
+    if (xsize_out*ysize_in < xsize_in*ysize_out)
+    {
+        mag = xsize_out;
+        div = xsize_in;
+    }
+    else
+    {
+        mag = ysize_out;
+        div = ysize_in;
+    }
+
+    if (mag == 0 || div == 0)
+        mag = div = 1;
+
+    if (factors)
+    {
+        factors->xmag = mag >> xeig_out;
+        factors->ymag = mag >> yeig_out;
+        factors->xdiv = div >> xeig_in;
+        factors->ydiv = div >> yeig_in;
+    }
+
+    if (coord)
+    {
+        coord->x = (xsize_out - xsize_in*mag/div) / 2;
+        coord->y = (ysize_out - ysize_in*mag/div) / 2;
+    }
+
+    return mag < div;
+}
+
+BOOL spr_GetScaling(sprite_ptr sptr_in, sprite_ptr sptr_out, sprite_factors *factors, spr_coord *coord)
+{
+    sprite_info info_in, info_out;
+
+    spr_ReturnInfo(sptr_in, &info_in);
+    spr_ReturnInfo(sptr_out, &info_out);
+
+    return spr_GetScaling_info(&info_in, &info_out, factors, coord);
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+/* eof spr.c */

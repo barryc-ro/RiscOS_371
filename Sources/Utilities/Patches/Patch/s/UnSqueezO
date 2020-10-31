@@ -1,0 +1,511 @@
+; > UnSqueeze
+
+; Unsqueezes a file that has had squeeze applied to it. Works on both
+; AIF and non AIF images. Note that the AIF stuff is more gaurunteed
+; than the non AIF stuff (since the AIF header is documented), which is
+; why we don't treat AIF images in the same manner as non AIF images
+; even though we could (with very minor tweaks).
+
+; Change List
+
+; 21 Aug 91  0.01  OSS  File created. Does not need Risc OS 3.
+
+; 11 Sep 91  0.02  OSS  Converted from application to module with
+;                       a command.
+
+; 11 Oct 91  1.04  OSS  Updated version number here to match that used
+;                       by the module and on the SrcFiler.
+
+; 15 Oct 91  1.05  OSS  Version number only increment.
+
+; 30 Oct 91  1.06  OSS  Removed unecessary NOP after SWI OS_EnterOS.
+
+; 04 Nov 91  1.07  OSS  Version number only increment.
+
+; 07 Jan 92  1.08  OSS  Version number only increment.
+
+; 24 Feb 92  1.09  OSS  Version number only increment.
+
+; 25 Feb 92  1.10  OSS  Version number only increment.
+
+; 02 Mar 92  1.11  OSS  Version number only increment.
+
+; 05 Mar 92  1.12  OSS  Version number only increment.
+
+; 06 Mar 92  1.13  OSS  Version number only increment.
+
+; 01 Apr 92  1.14  OSS  Version number only increment.
+
+; 08 Apr 92  1.15  CSDM Version number only increment.
+
+; 14 Apr 92  1.16  OSS  Version number only increment.
+
+; 08 May 92  1.17  OSS  Version number only increment.
+
+; 14 May 92  1.21  OSS  Version number only increment (Chris missed some
+;                       out).
+
+; 14 May 92  1.22  OSS  Version number only increment.
+
+; 19 May 92  1.23  OSS  Version number only increment.
+
+; --------------------------------------------------------------------------
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Tokens
+
+        GET     Hdr:Proc
+        GET     Hdr:FSNumbers
+        GET     Hdr:HighFSI
+        GET     Hdr:FileTypes
+        GET     Hdr:ModHand
+        GET     Hdr:Wimp
+
+; --------------------------------------------------------------------------
+
+Module_BaseAddr
+        DCD     0                       ; No start entry
+        DCD     0                       ; No init entry
+        DCD     0                       ; No die entry
+        DCD     0                       ; No service entry
+        DCD     UnSqueeze_Title    - Module_BaseAddr
+        DCD     UnSqueeze_HelpStr  - Module_BaseAddr
+        DCD     UnSqueeze_HC_Table - Module_BaseAddr
+        DCD     0                       ; No SWI Chunk
+
+UnSqueeze_HC_Table
+        Command UnSqueeze, 2, 1         ; Name, Max, Min
+        DCB     0
+
+UnSqueeze_Title
+        DCB     "UnSqueeze", 0
+
+UnSqueeze_HelpStr
+        DCB     "UnSqueeze", 9, "1.23 (19 May 1992)", 0
+
+        GET     s.TokHelpSrc
+
+        ALIGN
+
+; --------------------------------------------------------------------------
+
+; Workspace relative to r11, which contains &8000 ie. our workspace is
+; in application space.
+
+; It is used to hold various things across decompression, since we have to
+; assume that the decompression code trashes ALL registers.
+
+; The first two items (ldr_pc_return_address and return_address) must
+; be at &8000 and &8004 or else.
+
+                        ^       0, r11
+ldr_pc_return_address   #       4       ; LDR pc, [pc, #-4]
+return_address          #       4       ; Address of after_decomp
+user_stack_ptr          #       4       ; Pointer to user stack
+
+real_bl_selfreloc       #       4       ; 0 after decompression -> not AIF.
+output_file             #       4       ; Pointer to filename.
+output_length           #       4       ; Length of decompressed image.
+end_data                #       0
+
+; This is where we load the image to be unsqueezed ie. on the end.
+; Note that this is not always an AIF image.
+
+image_start             #       0
+bl_decompress           #       4
+bl_selfreloc            #       4
+bl_zeroinit             #       4
+bl_imageentry           #       4
+aif_swi_exit            #       4
+
+; --------------------------------------------------------------------------
+
+; The command tail is in r0, so keep it safe.
+
+UnSqueeze_Code ENTRY "r7-r11"
+        MOV     r11, #&8000                     ; Workspace pointer
+        MOV     r10, r0
+
+; Get current memory limit and put it in r9.
+
+        SWI     XOS_GetEnv
+        EXIT    VS
+        MOV     r9, r1
+
+; Check that we have enough memory for our workspace usage against
+; the current memory limit.
+
+        ADR     r5, end_data
+        CMP     r5, r9                         ; Check if will already fit
+        BLO     workspace_valid
+
+; Allocate slot size we need (in r0) and check it robustly (by using
+; OS_GetEnv) rather than trusting returned slot size, in case we are
+; outside the wimp altogether.
+
+        MOV     r0, #(:INDEX: end_data)
+        MOV     r1, #-1
+        SWI     XWimp_SlotSize
+        SWIVC   XOS_GetEnv
+        EXIT    VS
+
+        CMP     r5, r1
+        ADRHS   r0, error_block_no_memory
+        BHS     error_exit
+        MOV     r9, r1                          ; Remember new memory limit
+
+workspace_valid
+
+; Need to check whether there are one or two filenames present.
+; Get the first name back from r10, and also put it in the output name
+; in case we don't find a second name.
+
+        MOV     r0, r10
+        STR     r0, output_file
+name_loop
+        LDRB    r1, [r0], #1
+        CMP     r1, #" "
+        BHI     name_loop
+        BLO     end_names
+
+; We have found the space(s) preceding the second name.
+
+space_loop
+        LDRB    r1, [r0], #1
+        CMP     r1, #" "
+        BEQ     space_loop
+
+; We have found the second name. r0 is in fact one greater than we want.
+
+        SUBHI   r0, r0, #1
+        STRHI   r0, output_file
+
+end_names
+
+; Read the length of the input file, and verify file type.
+
+        MOV     r0, #OSFile_ReadInfo            ; Uses File$Path
+        MOV     r1, r10                         ; Input file
+        SWI     XOS_File
+        EXIT    VS
+
+; Check that it is a file.
+
+        TEQ     r0, #object_file
+        BNE     input_file_error                ; Not found/is a directory
+
+; Check that it has a filetype of Application (FF8)
+
+        LDR     r7, =FileType_Application
+        MOV     r6, r2, LSL #12                 ; r2 is load address
+        MOV     r6, r6, LSR #20                 ; Get filetype into r6
+        TEQ     r6, r7
+        ADRNE   r0, error_block_not_app
+        BNE     error_exit
+
+; Check that we have enough memory to load it - length is in r4.
+; Get size of slot we need in r0, get top of memory we need (ie.
+; r0 + &8000) in r5.
+
+        ADD     r0, r4, #(:INDEX: image_start)
+        ADD     r5, r0, #&8000
+        CMP     r5, r9                         ; Check if will already fit
+        BLO     load_slot_ok
+
+; Allocate slot size we need (in R0) and check it robustly (by using
+; OS_GetEnv) rather than trusting returned slot size, in case we are
+; outside the wimp altogether.
+
+        MOV     r1, #-1
+        SWI     XWimp_SlotSize
+        SWIVC   XOS_GetEnv
+        EXIT    VS
+
+        CMP     r5, r1
+        ADRHS   r0, error_block_no_memory
+        BHS     error_exit
+        MOV     r9, r1                          ; Remember new memory limit
+
+load_slot_ok
+
+; Load the image into memory.
+
+        MOV     r0, #OSFile_Load                ; Use File$Path
+        MOV     r1, r10                         ; Input file
+        ADR     r2, image_start                 ; Load it here
+        MOV     r3, #0                          ; Pay attention to R2
+        SWI     XOS_File
+        EXIT    VS
+
+; Check if it is an AIF image. Note that r4 is still the length of the
+; image from the OS_File, and this is used in not_aif_image.
+
+        LDR     r0, aif_swi_exit
+        LDR     r1, my_swi_exit
+        TEQ     r0, r1
+        BNE     not_aif_image
+
+; Check if it is squeezed.
+
+        LDR     r0, bl_decompress               ; Instruction
+        TEQ     r0, #&FB000000                  ; Code if not squeezed
+        BEQ     error_not_squeezed
+
+; Check if it is a BL instruction.
+
+        AND     r0, r0, #&FF000000
+        TEQ     r0, #&EB000000
+        ADRNE   r0, error_block_weird_image
+        BNE     error_exit
+
+; Copy the real value of the second instruction, and put our value in
+; instead so that control returns to us.
+
+        LDR     r0, bl_selfreloc
+        STR     r0, real_bl_selfreloc
+        LDR     r0, mov_pc_8000
+        STR     r0, bl_selfreloc
+
+; Remember that size is 6 words before the code, and remember that the
+; 32 words of AIF header needs adding in to the size, and go to the
+; size evaluation code.
+
+        MOV     r10, #-(6 * 4)                  ; Offset backwards
+        MOV     r8, #(32 * 4)                   ; Amount to add
+        B       evaluate_size
+
+; For a non AIF image, the first word should be a branch instruction.
+
+not_aif_image
+        LDR     r0, image_start
+        AND     r0, r0, #&FF000000
+        TEQ     r0, #&EA000000
+        BNE     error_not_squeezed
+
+; Now scan backwards from the end of the file looking for "rcc " as
+; a word. r4 contains the file length from the OS_File load.
+
+        ADR     r2, image_start
+        ADD     r0, r2, r4                      ; End of file.
+        BIC     r0, r0, #3                      ; Round down to word.
+        SUB     r1, r0, #64                     ; Limit we will search,
+        CMP     r1, r2                          ; or stop at start of
+        MOVLO   r1, r2                          ; image if higher.
+        LDR     r2, rcc_string                  ; "rcc "
+rcc_loop
+        LDR     r3, [r0], #-4                   ; Write back
+        TEQ     r3, r2                          ; Check if "rcc "
+        BEQ     found_rcc
+        TEQ     r0, r1                          ; Check if hit limit
+        BNE     rcc_loop
+
+; We hit the limit, so it ain't squeezed.
+
+error_not_squeezed
+        ADR     r0, error_block_not_squeezed
+        B       error_exit
+
+; Now check if the word before the "rcc " is a MOV PC, R8. If it is,
+; then we are in luck.
+
+found_rcc
+        LDR     r1, [r0]
+        LDR     r2, mov_pc_r8
+        TEQ     r1, r2
+        BNE     error_not_squeezed              ; "rcc " was a fluke
+
+; OK we are certain. Replace the MOV PC, R8 (which jumps to the start
+; of the newly decompressed non AIF image to run it) with the instruction
+; to return control to us. We don't even have to put anything back later.
+; However, this instruction MUST be absolute not relative, as it gets
+; moved during the decompression by the decompress code (confused? - you
+; will be!).
+
+        LDR     r1, mov_pc_8000
+        STR     r1, [r0]
+
+; Remember that size is 9 words before the code, and remember that nothing
+; needs adding to the size,  and go to the size evaluation code.
+
+        MOV     r10, #-(9 * 4)                  ; Offset backwards
+        MOV     r8, #0                          ; Amount to add
+
+; Flag that there is no instruction to put back.
+
+        MOV     r0, #0
+        STR     r0, real_bl_selfreloc
+
+; ** Drop through **
+
+; Work out how big it will be when unsqueezed. This is the size in r8
+; (AIF header of 32 words or zero) plus the contents of the location
+; r10 (six or nine) words before the start of the decompression code.
+; This sometimes results in four extra bytes of zeros on the end of
+; the file.
+
+evaluate_size
+        LDR     r0, bl_decompress
+        LDR     r1, =&03FFFFFC                  ; Addr bits shifted 2
+        AND     r0, r1, r0, LSL #2              ; Get addr bits and shift 2
+        ADR     r1, bl_zeroinit                 ; Add 8 for pipeline in BL
+        ADD     r0, r1, r0                      ; Add address where loaded
+        LDR     r0, [r0, r10]                   ; Load XX words previous
+        ADD     r0, r0, r8                      ; Add YY words on
+        STR     r0, output_length               ; Save output file length
+
+; Now make sure we have got enough memory for the job. Need to add 24K
+; for un-squeezing workspace.
+
+        ADD     r0, r0, #(:INDEX: image_start)
+        ADD     r0, r0, #(24 * 1024)
+        ADD     r5, r0, #&8000
+        CMP     r5, r9                         ; Check if will already fit
+        BLO     decomp_slot_ok
+
+; Allocate slot size we need (in R0) and check it robustly (by using
+; OS_GetEnv) rather than trusting returned slot size, in case we are
+; outside the wimp altogether.
+
+        MOV     r1, #-1
+        SWI     XWimp_SlotSize
+        SWIVC   XOS_GetEnv
+        EXIT    VS
+
+        CMP     r5, r1
+        ADRHS   r0, error_block_no_memory
+        BHS     error_exit
+
+decomp_slot_ok
+
+; Drop into user mode - the unsqueezing code assumes that it is in user
+; mode and anyway it is better to be in user mode (memory protection).
+; Put a NOP after the mode change, as the following code access R11
+; which is a banked register.
+
+        TEQP    pc, #0
+        NOP
+
+; Put the return instruction and return address into our workspace, along
+; with the user mode stack pointer which must also be preserved, and call
+; the relocatable decompression code.
+
+        LDR     r0, ldr_pc_pc_minus_4
+        STR     r0, ldr_pc_return_address
+        ADR     r1, after_decomp
+        STR     r1, return_address
+        STR     sp, user_stack_ptr
+
+        ADR     pc, bl_decompress
+
+; --------------------------------------------------------------------------
+
+; Files must be of type Application to be unsqueezable.
+
+error_block_not_app
+        DCD     0
+        DCB     "UnSqueeze: "
+        DCB     "Input file must be of type Application", 0
+        ALIGN
+
+; --------------------------------------------------------------------------
+
+; Couldn't get enough application space.
+
+error_block_no_memory
+        DCD     0
+        DCB     "UnSqueeze: "
+        DCB     "Failed to allocate sufficient Application memory", 0
+        ALIGN
+
+; --------------------------------------------------------------------------
+
+; RunImage not squeezed.
+
+error_block_not_squeezed
+        DCD     0
+        DCB     "UnSqueeze: "
+        DCB     "Input file is not squeezed", 0
+        ALIGN
+
+; --------------------------------------------------------------------------
+
+; Not a RunImage at all.
+
+error_block_weird_image
+        DCD     0
+        DCB     "UnSqueeze: "
+        DCB     "Input file is not a valid AIF run image", 0
+        ALIGN
+
+; --------------------------------------------------------------------------
+
+; Serious error situation - input file problem. Use the FileSwitch
+; facility to generate a "File 'foo' not found" type error.
+
+; Input - r0 = Object type (None/File/Dir/Image)
+;         r1 = File name
+
+input_file_error
+        MOV     r2, r0
+        MOV     r0, #OSFile_MakeError
+        SWI     XOS_File
+error_exit                                      ; Jumped to with r0 -> error
+        SETV
+        EXIT
+
+; --------------------------------------------------------------------------
+
+; This is where we return to after the decompression code has run.
+; Restore the user mode stack pointer, get back into SVC mode (which gets
+; us the SVC stack pointer back), and restore our workspace pointer.
+; Use non X form - if X form failed we couldn't return anyway.
+
+after_decomp
+        MOV     r11, #&8000                     ; Workspace
+        LDR     sp, user_stack_ptr
+
+; We don't use the X form of the SWI. If it returned an error we couldn't
+; do anything with it, as our return address is on the SVC stack.
+
+        SWI     OS_EnterOS
+
+; Put the second instruction back if non zero.
+
+        LDR     r0, real_bl_selfreloc
+        TEQ     r0, #0
+        STRNE   r0, bl_selfreloc
+
+; Save the resulting file out.
+
+        MOV     r0, #OSFile_SaveStamp
+        LDR     r1, output_file
+        LDR     r2, =FileType_Application
+        ADR     r4, image_start
+        LDR     r10, output_length
+        ADD     r5, r4, r10
+        SWI     XOS_File
+
+; Terminate, either with or without error.
+
+        EXIT
+
+; --------------------------------------------------------------------------
+
+; Some static data.
+
+rcc_string
+        DCB     "rcc "                  ; Searched for if not AIF image
+mov_pc_r8
+        MOV     pc, r8                  ; Before "rcc " - used if not AIF
+mov_pc_8000
+        MOV     pc, #&8000              ; Used to get control back to us
+ldr_pc_pc_minus_4
+        LDR     pc, [pc, #-4]           ; Gets us back into module code
+my_swi_exit
+        SWI     OS_Exit                 ; Checked against in AIF image
+
+; --------------------------------------------------------------------------
+
+        END

@@ -1,0 +1,221 @@
+
+/* prpalgen.c - generate printer palettes for Black2 PdumperSpt */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "prtablegen.h"
+#include "udpalette.h"
+
+#define OS_CLI        0x05
+#define OS_ReadVarVal 0x23
+#define OS_Find       0x0d
+#define OS_FSControl  0x29
+
+#define Version "0.0beta"
+
+static int verbose = 0;
+
+/* ------------------------------------------------------------------------ */
+
+static void give_up(_kernel_oserror *error)
+{
+  fprintf(stderr,"%s\n",error->errmess);
+  exit(1);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void swi(uint32 swicode, _kernel_swi_regs *regs)
+{
+  _kernel_oserror *error;
+
+  error = _kernel_swi(swicode, regs, regs);
+  if (error) give_up(error);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void os_cli(char *cmd)
+{
+  _kernel_swi_regs r;
+
+  if (verbose) fprintf(stderr,"os_cli: |%s|\n",cmd);
+
+  r.r[0] = (int)cmd;
+  swi(OS_CLI,&r);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void readvar(char *name, char *value, int valsize)
+{
+  _kernel_oserror *error;
+  _kernel_swi_regs r;
+
+  r.r[0] = (int)name;
+  r.r[1] = (int)value;
+  r.r[2] = valsize;
+  r.r[3] = 0;
+  r.r[4] = 0;
+  error =  _kernel_swi(OS_ReadVarVal, &r, &r);
+  if (error) value[0] = '\0'; else value[r.r[2]] = '\0';
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void update_cached_palette(char *resname, tables_t *tables, int taboff)
+{
+  /* only updates the new-tables part */
+
+  _kernel_swi_regs r;
+  int              handle,syshandle,fsno;
+  uint32           *u, pv,hdr;
+  tables_t         *t;
+
+  r.r[0] = 0x43;
+  r.r[1] = (int)resname;
+  swi(OS_Find,&r);
+  handle = r.r[0];
+
+  if (verbose) fprintf(stderr,"'%s' opened handle = %1d\n",resname,handle);
+
+  if (handle != 0)
+  {
+    r.r[0] = 21; /* return filing system file handle */
+    r.r[1] = handle;
+    swi(OS_FSControl,&r);
+    syshandle = r.r[1];
+    fsno = r.r[2] & 255;
+    if (verbose) fprintf(stderr,"syshandle=%8.8x fsno=%1d\n",syshandle,fsno);
+    if (fsno == 46) /* ResourceFS */
+    {
+      u = (uint32 *)syshandle;
+      pv = *u;
+      u = (uint32 *)(syshandle - ((strlen(resname)-strlen("Resources:")+4) & ~3) - 28);
+      hdr = *u;
+
+      if (verbose) fprintf(stderr,"word @ syshandle = %8.8x\n"
+                                  "hdr word         = %8.8x\n"
+                                  "table offset = %1d\n",pv,hdr,taboff);
+
+      if ((pv == 2) && (hdr == 0x48434143))
+      {
+        t = (tables_t *)(syshandle + taboff);
+        *t = *tables;
+      }
+      else
+        fprintf(stderr,"wrong version of palette cached "
+                       "- restart !Printers to fix this\n");
+      r.r[0] = 0;
+      r.r[1] = handle;
+      swi(OS_Find,&r); /* close */
+    }
+  }
+}                                         
+
+/* ------------------------------------------------------------------------ */
+
+static FILE *do_fopen(char *name, char *mode)
+{
+  FILE *fp = fopen(name,mode);
+
+  if (verbose) fprintf(stderr,"fopen |%s| |%s|\n",name,mode);
+
+  if (fp == NULL)
+  {
+    fprintf(stderr,"failed to open '%s'\n",name);
+    exit(1);
+  }
+  return fp;
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+  int      oldv, taboff;
+  calib_t  calib;
+  tables_t tables;
+  char     fname[256], readpath[256], writepath[256], cmd[256];
+  FILE     *pal,*params;
+
+  if ( (argc != 3) || (argv[1][0] != '-') ||
+       ((argv[1][1] != 'u') && (argv[1][1] != 'r')) )
+  {
+    fprintf(stderr,"usage - update: prpalgen -u <palette>\n"
+                   "      - read:   prpalgen -r <palette>\n");
+    exit(1);
+  }
+
+  verbose = (argv[1][2] == 'v');
+
+  if (verbose) fprintf(stderr,"prpalgen version " Version "\n");
+
+  readvar("Printers$Path",readpath,256);
+  readvar("PrinterChoices$Path",writepath,256);
+
+  if (verbose)
+  {
+    fprintf(stderr,"Printers$Path: |%s|\n",readpath);
+    fprintf(stderr,"PrinterChoices$Path: |%s|\n",writepath);
+  }
+
+  if ((readpath[0] == '\0') || (writepath[0] == '\0'))
+  {
+    fprintf(stderr,"Path Printers: and/or PrinterChoices: not set"
+                   " - please run !Printers first\n");
+    exit(1);
+  }
+
+  sprintf(cmd,"cdir %s",writepath);
+  cmd[strlen(cmd)-1] = '\0'; /* zap '.' */
+  os_cli(cmd);
+  sprintf(cmd,"cdir %sPalettes",writepath);
+  os_cli(cmd);
+  sprintf(cmd,"cdir %sPalettes.Params",writepath);
+  os_cli(cmd);
+
+  if (argv[1][1] == 'u')
+  {
+    sprintf(fname,"%sPalettes.%s",writepath,argv[2]);
+    pal = fopen(fname,"r");
+    if (pal == NULL)
+    {
+      sprintf(cmd,"copy Printers:Palettes.%s %sPalettes.%s ~c~v",
+              argv[2],writepath,argv[2] );
+      os_cli(cmd);
+    }
+    else fclose(pal);
+    sprintf(cmd,"access %s RW",fname);
+    os_cli(cmd);
+    pal = do_fopen(fname,"r+");
+    sprintf(fname,"%sPalettes.Params.%s",writepath,argv[2]);
+    params = do_fopen(fname,"r");
+
+    prtablegen(params,&calib,&tables);
+    oldv = udpalette(pal,&tables,&taboff);
+    sprintf(fname,"Resources:Resources.Printers.Palettes.%s",argv[2]);
+    update_cached_palette(fname,&tables,taboff);
+    fprintf(stderr,"updated: '%sPalettes.%s'\n",writepath,argv[2]);
+  }
+  else /* argv[1][1] == 'r' */
+  {
+    sprintf(fname,"Printers:Palettes.%s",argv[2]);
+    pal = do_fopen(fname,"r");
+    sprintf(fname,"%sPalettes.Params.%s",writepath,argv[2]);
+    params = do_fopen(fname,"w");
+
+    oldv = readback_params(pal,&calib);
+    write_calib(&calib,params);
+    fprintf(stderr,"updated: '%sPalettes.Params.%s'\n",writepath,argv[2]);
+    if (oldv == 1) fprintf(stderr,"  old palette format => default parameters only\n");
+  }
+
+  fclose(pal);
+  fclose(params);
+
+  return 0;
+}

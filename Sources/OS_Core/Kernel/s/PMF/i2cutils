@@ -1,0 +1,843 @@
+; > $.Source.PMF.i2cutils
+
+; Authors JBiggs (m2), PFellows, TDobson, AGodwin
+
+PhysChecksum    *       (((CheckSumCMOS + &30) :MOD: &F0) + &10)
+
+; *****************************************************************************
+;
+;       HexToBCD - Convert byte in hex to BCD
+;
+; in:   R0 = byte in hex
+;
+; out:  R0 = byte in BCD (ie R0 := (R0 DIV 10)*16 + R0 MOD 10)
+;       All other registers preserved
+;
+
+HexToBCD ROUT
+        Push    "R1,R2, R14"
+        MOV     R1, #10
+        DivRem  R2, R0, R1, R14                 ; R2=R0 DIV 10; R0=R0 MOD 10
+        ADD     R0, R0, R2, LSL #4
+        Pull    "R1,R2, PC"
+
+; *****************************************************************************
+;
+;       BCDToHex - Convert byte in BCD to hex
+;
+; in:   R0 = byte in BCD (ie x*16 + y)
+;
+; out:  R0 = byte in hex (ie x*10 + y)
+;       All other registers preserved
+;
+
+BCDToHex ROUT
+        Push    "R14"
+        MOV     R14, R0, LSR #4         ; R14 := x
+        ADD     R14, R14, R14, LSL #1   ; R14 := x*3
+        SUB     R0, R0, R14, LSL #1     ; R0 := R0 - x*6 = x*10
+        Pull    "PC"
+
+; *****************************************************************************
+;
+;       SetC1C0 - Set clock and data lines to values in R1 and R0 respectively
+;
+; out:  All registers preserved, including PSR
+;
+
+SetC1C0 ROUT
+        Push    "R0-R2,R14"
+        ADD     R0, R0, R1, LSL #1              ; R0 := C0 + C1*2
+
+        [ AssemblingArthur :LOR: Module
+        MOV     R2, #0                          ; prepare to index soft copy
+        LDRB    R1, [R2, #IOCControlSoftCopy]   ; read soft copy
+        BIC     R1, R1, #&03                    ; clear clock and data
+        ORR     R0, R1, R0                      ; put in new clock and data
+        ORR     R0, R0, #&C0                    ; make sure two test bits are
+                                                ; always set to 1 !
+        STRB    R0, [R2, #IOCControlSoftCopy]   ; store back to soft copy
+        |
+        ORR     R0, R0, #&FC                    ; set other bits to 1
+        ]
+
+        MOV     R2, #IOC
+        STRB    R0, [R2, #IOCControl]
+
+        MOV     R0, #10                         ; delay for >= 10/2 microsecs
+        BL      DoMicroDelay
+
+        Pull    "R0-R2,PC",,^
+
+; *****************************************************************************
+;
+;       DoMicroDelay - Delay for >= R0/2 microseconds
+;
+; in:   R0 = time delay in 1/2 microsecond units
+;       R2 -> IOC
+;       On ARM600, we may or may not be in a 32-bit mode
+;
+; out:  R0,R1 corrupted
+;
+
+DoMicroDelay ROUT
+        Push    R14
+
+        STRB    R0, [R2, #Timer0LR]     ; copy counter into output latch
+        LDRB    R1, [R2, #Timer0CL]     ; R1 := low output latch
+10
+        STRB    R0, [R2, #Timer0LR]     ; copy counter into output latch
+        LDRB    R14, [R2, #Timer0CL]    ; R14 := low output latch
+        TEQ     R14, R1                 ; unchanged ?
+        BEQ     %BT10                   ; then loop
+        MOV     R1, R14                 ; copy anyway
+        SUBS    R0, R0, #1              ; decrement count
+        BNE     %BT10                   ; loop if not finished
+
+        Pull    PC
+
+        LTORG
+
+; *****************************************************************************
+;
+;       ClockData - Clock a bit of data down the IIC bus
+;
+; in:   R0 = data bit
+;
+; out:  All registers preserved, including PSR
+;
+
+ClockData ROUT
+        Push    "R1, R14"
+
+        MOV     R1, #0                  ; Clock lo
+        BL      SetC1C0
+
+ [ {TRUE}
+; Disable interrupts to ensure clock hi with data hi is only transient
+; This allows BMU to detect idle condition by polling
+
+        MOV     R1,PC
+        ORR     R1,R1,#I_bit
+        TEQP    PC,R1
+ ]
+        MOV     R1, #1                  ; Clock hi
+        BL      SetC1C0
+
+; Delay here must be >= 4.0 microsecs
+
+        MOV     R1, #0                  ; Clock lo
+        BL      SetC1C0
+
+        Pull    "R1, PC",,^
+
+ClockData0 ROUT                                 ; Clock a zero bit
+        Push    "R0, R14"
+        MOV     R0, #0
+        BL      ClockData
+        Pull    "R0, PC",,^
+
+; *****************************************************************************
+;
+;       Start - Send the Start signal
+;
+; out:  All registers preserved, including PSR
+;
+
+Start   ROUT
+        Push    "R0-R2,R14"
+
+        MOV     R0, #1                  ; clock HI, data HI
+        MOV     R1, #1
+        BL      SetC1C0
+
+; Delay here must be >= 4.0 microsecs
+
+        MOV     R0, #0                  ; clock HI, data LO
+        MOV     R1, #1
+        BL      SetC1C0
+
+ [ {TRUE}
+; Hold start condition for BMU
+
+        MOV     R2, #IOC
+        MOV     R0,#10
+        BL      DoMicroDelay
+ ]
+
+; Delay here must be >= 4.7 microsecs
+
+        MOV     R0, #0                  ; clock LO, data LO
+        MOV     R1, #0
+        BL      SetC1C0
+
+        Pull    "R0-R2,PC",,^
+
+; *****************************************************************************
+;
+;       Acknowledge - Check acknowledge after transmitting a byte
+;
+; out:  All registers preserved
+;       V=0 => acknowledge received
+;       V=1 => no acknowledge received
+;
+
+Acknowledge ROUT
+        Push    "R0-R2,R14"
+
+        MOV     R0, #1                  ; clock LO, data HI
+        MOV     R1, #0
+        BL      SetC1C0
+
+ [ {TRUE}
+; Disable interrupts to ensure clock hi with data hi is only transient
+; This allows BMU to detect idle condition by polling
+
+        MOV     R1,PC
+        Push    "R1"
+        ORR     R1,R1,#I_bit
+        TEQP    PC,R1
+ ]
+        MOV     R0, #1                  ; clock HI, data HI
+        MOV     R1, #1
+        BL      SetC1C0
+
+; Delay here must be >= 4.0 microsecs
+
+        MOV     R2, #IOC
+        LDRB    R2, [R2, #IOCControl]   ; get the data from IOC
+
+        MOV     R0, #0
+        MOV     R1, #0                  ; clock lo
+        BL      SetC1C0
+
+ [ {TRUE}
+        Pull    "R1"
+        TEQP    PC,R1
+ ]
+
+        TST     R2, #1                  ; should be LO for correct acknowledge
+        MOV     R2, PC
+        BICEQ   R2, R2, #V_bit          ; clear V if correct acknowledge
+        ORRNE   R2, R2, #V_bit          ; set V if no acknowledge
+        TEQP    R2, #0
+
+        Pull    "R0-R2,PC"
+
+; *****************************************************************************
+;
+;       Stop - Send the Stop signal
+;
+; out:  All registers preserved, including PSR
+;
+
+Stop    ROUT
+        Push    "R0,R1,R14"
+
+        MOV     R0, #0                  ; clock HI, data LO
+        MOV     R1, #1
+        BL      SetC1C0
+
+; Delay here must be >= 4.0 microsecs
+
+        MOV     R0, #1                  ; clock HI, data HI
+        MOV     R1, #1
+        BL      SetC1C0
+
+        Pull    "R0,R1,PC",,^
+
+; *****************************************************************************
+;
+;       TXByte - Transmit a byte
+;
+; in:   R0 = byte to be transmitted
+;
+; out:  All registers preserved, including PSR
+;
+
+TXByte  ROUT
+        Push    "R0-R2,R14"
+        MOV     R2, R0                  ; byte goes into R2
+        MOV     R1, #&80                ; 2^7   the bit mask
+10
+        ANDS    R0, R2, R1              ; zero if bit is zero
+        MOVNE   R0, #1
+        BL      ClockData               ; send the bit
+        MOVS    R1, R1, LSR #1
+        BNE     %BT10
+        Pull    "R0-R2,PC",,^
+
+; *****************************************************************************
+;
+;       RXByte - Receive a byte
+;
+; out:  R0 = byte received
+;       All other registers preserved, including PSR
+;
+
+RXByte  ROUT
+        Push    "R1-R4, R14"
+        MOV     R3, #0                  ; byte:=0
+        MOV     R2, #IOC
+        MOV     R4, #7
+
+        MOV     R0, #1                  ; clock LO, data HI
+        MOV     R1, #0
+        BL      SetC1C0
+10
+ [ {TRUE}
+; Disable interrupts to ensure clock hi with data hi is only transient
+; This allows BMU to detect idle condition by polling
+
+        MOV     R1,PC
+        Push    "R1"
+        ORR     R1,R1,#I_bit
+        TEQP    PC,R1
+ ]
+        MOV     R0, #1                  ; pulse clock HI
+        MOV     R1, #1
+        BL      SetC1C0
+
+        LDRB    R1, [R2, #IOCControl]   ; get the data from IOC
+        AND     R1, R1, #1
+        ADD     R3, R1, R3, LSL #1      ; byte:=byte*2+(IOC?0)AND1
+
+        MOV     R0, #1                  ; return clock LO
+        MOV     R1, #0
+        BL      SetC1C0
+
+ [ {TRUE}
+        Pull    "R1"
+        TEQP    PC,R1
+ ]
+        SUBS    R4, R4, #1
+        BCS     %BT10
+
+        MOV     R0, R3                  ; return the result in R0
+        Pull    "R1-R4, PC",,^
+
+; *****************************************************************************
+;
+;       Write - Write a byte of CMOS RAM specified by logical address
+;
+; in:   R0 = address in CMOS RAM
+;       R1 = data
+;
+; out:  All registers preserved
+;
+
+Write   ROUT
+        Push    "R0-R4, R14"
+        BL      MangleCMOSAddress
+        Pull    "R0-R4, PC", CS        ; if invalid, then exit
+
+        MOV     R2, R0
+        MOV     R3, R1
+    [ ChecksumCMOS
+        BL      ReadStraight            ; calculate new checksum :
+        MOV     R4, R0
+        MOV     R0, #PhysChecksum
+        BL      ReadStraight
+        SUB     R0, R0, R4              ; = oldsum - oldcontents
+        ADD     R4, R0, R3              ;          + newcontents
+
+        AND     R4, R4, #&FF
+        CMPS    R2, #PhysChecksum       ; don't write new checksum ...
+        ORREQ   R4, R4, #&100           ; if checksum is being written
+    ]
+10
+ [ CacheCMOSRAM
+        ADR     R0, CMOSRAMCache-16     ; update cache, but always write to
+        STRB    R3, [R0, R2]            ; real hardware as well
+ ]
+        BL      Start
+
+        MOV     R0, #&A0
+        BL      TXAck
+
+        MOV     R0, R2                  ; address
+        BL      TXAck
+
+        MOV     R0, R3                  ; data
+        BL      TXAck
+
+        BL      Stop
+    [ ChecksumCMOS
+        TST     R4, #&100               ; loop again to write new checksum
+        MOV     R3, R4
+        MOV     R2, #PhysChecksum
+        ORR     R4, R4, #&100           ; but ensure it only happens once
+        BEQ     %BT10
+    ]
+        Pull    "R0-R4, PC"
+
+; *****************************************************************************
+;
+;       Read - Read a byte of CMOS RAM specified by logical address
+;       ReadStraight - Read a byte of CMOS RAM specified by physical address
+;
+; in:   R0 = address in CMOS RAM
+;
+; out:  R0 = data (illegal address return 0)
+;       All other registers preserved
+;
+
+ReadStraight ROUT
+        Push    "R1,R2,R14"
+        B       %FT10
+
+Read
+        Push    "R1,R2,R14"
+        BL      MangleCMOSAddress
+        MOVCS   R0, #0          ; pretend illegal addresses contain 0
+        Pull    "R1,R2,PC", CS
+10
+ [ CacheCMOSRAM
+        TEQ     R0, #&40                ; is it Econet station number
+        BEQ     %FT15                   ; if so then don't use cache
+  [ {FALSE}                             ; CMOS read debugging
+        MOV     R1, #0
+        LDR     R1, [R1]                ; if !0 < &100 then it's a handle to bput to
+        CMP     R1, #&100
+        SWICC   XOS_BPut
+  ]
+        CMP     R0, #&10                ; only cache values &10..&3F,&41..&FF
+        ADRCS   R2, CMOSRAMCache-&10    ; if in range
+        LDRCSB  R0, [R2, R0]            ; read from cache
+        Pull    "R1,R2,PC", CS          ; and exit
+15
+
+; else drop thru into real CMOS reading code
+ ]
+
+        MOV     R2,R0           ; save the address
+
+        BL      Start
+
+        MOV     R0, #&A0
+        BL      TXAck
+
+        MOV     R0, R2          ; address
+        BL      TXAck
+
+        BL      Start
+
+        MOV     R0, #&A1
+        BL      TXAck
+
+        BL      RXByte          ; returned in R0
+        MOV     R2, R0          ; copy to R2 for now
+
+        MOV     R0, #1
+        BL      ClockData
+
+        BL      Stop
+
+        MOV     R0, R2          ; return the result
+
+        Pull    "R1,R2,PC"
+
+; *****************************************************************************
+;
+;       MangleCMOSAddress - Convert from logical to physical CMOS address
+;
+; in:   R0 = logical address (&00..&FF)
+;
+; out:  C=0 => valid logical address (ie &00..&EF)
+;       R0 = physical address (&40..&FF,&10..&3F)
+;
+;       C=1 => invalid logical address (ie &F0..&FF)
+;       R0 preserved
+;
+
+MangleCMOSAddress ROUT
+        CMP     R0, #&F0
+        ORRCSS  PC, R14, #C_bit         ; indicate invalid
+        ADD     R0, R0, #&40            ; now in range &40..&13F
+        CMP     R0, #&100
+        SUBCS   R0, R0, #(&100-&10)     ; now in range &40..&FF, &10..&3F
+        BICS    PC, R14, #C_bit         ; indicate valid
+
+; *****************************************************************************
+
+HTBTA   ROUT
+        Push    R14
+        BL      HexToBCD
+        BL      TXAck
+        Pull    PC
+
+TXAck   ROUT
+        Push    R14
+        BL      TXByte
+        BL      Acknowledge
+        Pull    PC
+
+CD0RBTH ROUT
+        Push    R14
+        BL      ClockData0
+        BL      RXByte
+        BL      BCDToHex
+        Pull    PC
+
+; *****************************************************************************
+;
+;       ValChecksum - test to see if the CMOS checksum is OK
+;       This routine performs MangleCMOSAddress inherently, and
+;       assumes the checksum is the last logical location.
+;
+; in:   none
+;
+; out:  R0 = calculated checksum
+;       Z    set if checksum is valid
+;       All other registers preserved
+;
+
+    [ ChecksumCMOS
+
+ValChecksum     ROUT
+        Push    "R1,R2,R3,R14"
+
+        MOV     R2, #&40
+        MOV     R3, #CMOSxseed
+;
+; Write a memory word address to the 8583
+10
+        BL      Start
+
+        MOV     R0, #&A0        ; 8583 write address
+        BL      TXAck
+
+        MOV     R0, R2          ; memory word address
+        BL      TXAck
+
+        BL      Start
+
+        MOV     R0, #&A1        ; 8583 read address
+        BL      TXAck
+;
+; Read data from the 8583 from locations &40 through &FF, then
+; loop back to &10 (we have to write the address again) and read
+; on until &3E .. thus missing out the checksum location.
+;
+20
+        BL      RXByte          ; returned in R0
+        ADD     R3, R3, R0      ; accumulate into R3
+
+        ADD     R2, R2, #1      ; increment R2 to phys. address
+        TST     R2, #&100       ; limit, or until checksum.
+        BNE     %30
+        CMPS    R2, #PhysChecksum
+        BEQ     %30
+
+        MOV     R0, #0          ; not done .. ACK that byte
+        BL      ClockData
+        B       %BT20           ; .. and continue reading
+30
+        MOV     R0, #1          ; finish off reading block
+        BL      ClockData
+        BL      Stop
+        TST     R2, #&100       ; either go back for bytes 10 - 3f
+        MOVNE   R2, #&10        ; or finish up completely.
+        BNE     %BT10
+
+;
+; R3 contains the actual checksum. Compare it with the recorded checksum
+;
+        MOV     R0, #PhysChecksum
+        BL      ReadStraight
+        AND     R2, R0, #&FF    ; value from checksum location
+        AND     R0, R3, #&FF    ; calculated value into R0
+        CMPS    R0, R2
+
+        Pull    "R1,R2,R3,PC"
+    ]                                 
+
+; *****************************************************************************
+;
+;       MakeChecksum - calculate and write a correct checksum
+;
+; in:   none
+;
+; out:  R0 = calculated checksum
+;       All other registers preserved
+;
+
+    [ ChecksumCMOS
+
+MakeChecksum    ROUT
+        Push    R14
+        BL      ValChecksum
+        MOV     R1, R0
+        MOV     R0, #CheckSumCMOS
+        BL      Write
+        Pull    PC
+    ]
+
+; *****************************************************************************
+;
+;       SetTime - Write the CMOS clock time
+;
+; in:   R0 = hours
+;       R1 = minutes
+;       R2 = day of month
+;       R3 = month
+;       R5 = year (lo)
+;       R6 = year (hi)
+;       R7 = seconds
+;       R8 = centiseconds
+;
+;       Any of the above, if -1, will not be written to
+;
+
+SetTime ROUT
+        Push    "R4, R14"               ; save registers
+
+        [ :LNOT: NewClockChip
+        CMP     R1, #-1                 ; test if setting mins
+        BEQ     %FT10                   ; [no, then skip]
+
+        Push    R0
+        MOV     R7, #0                  ; zero seconds and centiseconds
+        MOV     R8, #0
+        STRB    R8, CentiTime
+        STRB    R7, SecondsTime
+        STRB    R7, SecondsDirty        ; seconds are in sync now
+
+        BL      Start
+        MOV     R0, #&D0
+        BL      TXAck
+        MOV     R0, #&20                ; zero the seconds on the chip
+        BL      TXAck
+        BL      Stop
+        Pull    R0
+10
+        CMP     R3, #-1                 ; test if setting months
+        BEQ     %FT20                   ; [no, then skip]
+
+        Push    "R0,R1"
+        MOV     R1, R3
+        MOV     R0, #MonthCMOS
+        BL      Write                   ; remember last updated months
+
+        CMP     R3, #2                  ; if Jan
+        CMPEQ   R2, #28                 ; or Feb 1..28
+        MOVLS   R1, #0                  ; not had 29th of Feb
+        MOVHI   R1, #1                  ; have had 29th of Feb
+        MOV     R0, #LeapCMOS
+        BL      Write                   ; set 29thFeb flag
+        Pull    "R0,R1"
+20
+        ]
+
+; write year to CMOS RAM
+
+        Push    "R0,R1"
+        MOVS    R1, R5
+        MOVPL   R0, #YearCMOS
+        BLPL    Write
+        MOVS    R1, R6
+        MOVPL   R0, #YearCMOS+1
+        BLPL    Write
+        Pull    "R0,R1"
+
+        MOV     R4, R0                  ; save hours in R4
+        CMP     R4, #-1                 ; are we writing time ?
+        BEQ     %FT30                   ; [no, then skip]
+
+        [ NewClockChip
+        BL      Start
+        MOV     R0, #&A0
+        BL      TXAck
+        MOV     R0, #1                  ; start at address 1
+        BL      TXAck
+        MOV     R0, R8                  ; centiseconds
+        BL      HTBTA
+        MOV     R0, R7                  ; seconds
+        BL      HTBTA
+        MOV     R0, R1                  ; minutes
+        BL      HTBTA
+        MOV     R0, R4                  ; hours
+        BL      HTBTA
+        BL      Stop
+        |
+        BL      Start
+        MOV     R0, #&D0
+        BL      TXAck
+        MOV     R0, #0                  ; start at address 0
+        BL      TXAck
+        MOV     R0, R4                  ; hours
+        BL      HTBTA
+        MOV     R0, R1                  ; minutes
+        BL      HTBTA
+        BL      Stop
+        ]
+30
+        CMP     R2, #-1                 ; are we writing date ?
+        BEQ     %FT40                   ; [no, then skip]
+
+        [ NewClockChip
+        BL      Start
+        MOV     R0, #&A0
+        BL      TXAck
+        MOV     R0, #5                  ; start at address 5
+        BL      TXAck
+        MOV     R0, R2                  ; day of month
+        BL      HexToBCD
+        ORR     R0, R0, R5, LSL #6      ; year in bits 6,7; day in bits 0..5
+        BL      TXAck
+        MOV     R0, R3                  ; months
+        BL      HTBTA
+        BL      Stop
+        |
+        BL      Start
+        MOV     R0, #&D0
+        BL      TXAck
+        MOV     R0, #2                  ; start at address 2
+        BL      TXAck
+        MOV     R0, R2                  ; days
+        BL      HTBTA
+        MOV     R0, R3                  ; months
+        BL      HTBTA
+        BL      Stop
+        ]
+40
+        MOV     R0, R4                  ; put hours back in R0
+        BL      RTCToRealTime
+
+        Pull    "R4, PC"
+
+; *****************************************************************************
+;
+;       ReadTime - Read the CMOS clock time
+;
+; in:   -
+;
+; out:  R0 = hours
+;       R1 = minutes
+;       R2 = days
+;       R3 = months
+;       R5 = year (lo)
+;       R6 = year (hi)
+;       R7 = seconds
+;       R8 = centiseconds
+;
+
+ReadTime ROUT
+        Push    "R4, R14"
+
+        [ NewClockChip
+        BL      Start
+        MOV     R0, #&A0
+        BL      TXAck
+        MOV     R0, #&01                ; start at address 1
+        BL      TXAck
+        BL      Start
+        MOV     R0, #&A1
+        BL      TXAck
+        BL      RXByte
+        BL      BCDToHex
+        MOV     R8, R0                  ; centiseconds
+        BL      CD0RBTH
+        MOV     R7, R0                  ; seconds
+        BL      CD0RBTH
+        MOV     R1, R0                  ; minutes
+        BL      CD0RBTH
+        MOV     R4, R0                  ; hours
+        BL      ClockData0
+        BL      RXByte
+        AND     R0, R0, #&3F            ; day of month (clear year bits)
+        BL      BCDToHex
+        MOV     R2, R0
+        BL      ClockData0
+        BL      RXByte
+        AND     R0, R0, #&1F            ; month (clear day of week bits)
+        BL      BCDToHex
+        MOV     R3, R0
+        MOV     R0, #1
+        BL      ClockData
+        BL      Stop
+        |
+        BL      Start
+        MOV     R0, #&D0
+        BL      TXAck
+        MOV     R0, #&00                ; start at address 0
+        BL      TXAck
+        BL      Start
+        MOV     R0, #&D1
+        BL      TXAck
+        BL      RXByte
+        BL      BCDToHex
+        MOV     R4, R0          ; hours
+        BL      CD0RBTH
+        MOV     R1, R0          ; minutes
+        BL      CD0RBTH
+        MOV     R2, R0          ; days
+        BL      CD0RBTH
+        MOV     R3, R0          ; months
+        MOV     R0, #1
+        BL      ClockData
+        BL      Stop
+        LDRB    R7, SecondsTime
+        LDRB    R8, CentiTime
+        ]
+
+        MOV     R0, #YearCMOS
+        BL      Read
+        MOV     R5, R0          ; year (lo)
+
+        MOV     R0, #YearCMOS+1
+        BL      Read
+        MOV     R6, R0          ; year (hi)
+
+        MOV     R0, R4          ; put hours in R0
+
+; Ensure day/month are non-zero, fixes RTCToRealTime
+ [ {TRUE}                               ; LRust, fix RP-0370
+        TEQ     R2, #0                  ; Valid day?
+        MOVEQ   R2, #1                  ; No then force 1st
+        TEQ     R3, #0                  ; Invalid month?
+        MOVEQ   R3, #1                  ; Yes then force Jan
+ ]
+        Pull    "R4, PC"
+
+; *****************************************************************************
+;
+;       InitCMOSCache - Initialise cache of CMOS RAM
+
+ [ CacheCMOSRAM
+
+InitCMOSCache   ENTRY "r0-r3"
+        MOV     R2, #16
+        ADR     R3, CMOSRAMCache-16
+
+        BL      Start
+
+        MOV     R0, #&A0        ; 8583 write address
+        BL      TXAck
+
+        MOV     R0, R2          ; memory word address
+        BL      TXAck
+
+        BL      Start
+
+        MOV     R0, #&A1        ; 8583 read address
+        BL      TXAck
+
+10
+        BL      RXByte          ; returned in R0
+        STRB    R0, [R3, R2]
+        ADD     R2, R2, #1      ; increment R2 to phys. address
+        CMP     R2, #&100
+        BEQ     %FT20
+
+        MOV     R0, #0          ; not done .. ACK that byte
+        BL      ClockData
+        B       %BT10           ; .. and continue reading
+20
+        MOV     R0, #1          ; finish off reading block
+        BL      ClockData
+        BL      Stop
+        EXIT
+
+ ]
+        END

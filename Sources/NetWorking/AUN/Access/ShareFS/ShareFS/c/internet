@@ -1,0 +1,1584 @@
+/* -*-C-*-
+ *
+ * $Header: /ax/networking:Starling/ShareFS/ShareFS/internet.c:networking  1.15  $
+ * $Source: /ax/networking:Starling/ShareFS/ShareFS/internet.c: $
+ *
+ * Copyright (c) 1995 ANT Ltd., Cambridge, England
+ *
+ * $Log:	internet.c,v $
+ * Revision 1.15  95/05/25  09:23:11  pwain
+ * Changed default Access+ windowsize to 2 for final build
+ * 
+ * Revision 1.14  95/05/24  13:39:46  pwain
+ * Fixed CDRom logons to use "Discs" window. Login directory still created
+ * but not used.
+ * 
+ * Rework of repeat logins to use the same code as a "find". This means an
+ * additional call to FreewayEnumerate, but has the advantage of opening
+ * correct window when it is a CD in question.
+ * 
+ * Revision 1.13  95/05/16  10:38:40  pwain
+ * Fixed problem where a *sharefslogoff did not shut down
+ * directory view windows associated with the share.
+ * ,
+ * 
+ * Revision 1.12  95/05/09  15:46:32  pwain
+ * Added an extra check at the end of the loop looking for authenticated
+ * obects in "owner_logon". This should fix the RPC client problem (I hope!)
+ * 
+ * Revision 1.11  95/05/04  16:14:53  pwain
+ * Fixed minor niggle where if a user logs onto a previously
+ * mounted share, nothing seemed to happen. Now if the share
+ * is already logged on, the window of the shares is redisplayed
+ * 
+ * Revision 1.10  95/05/04  15:41:21  pwain
+ * Change to the way that logon for Access+ is done. If no user name
+ * is specified, an immediate error is produced rather than waiting
+ * for a timeout to occur.
+ * 
+ * 
+ * Revision 1.9  95/03/15  14:43:44  pwain
+ * Opps, Access was still using windowsize of 4. Fixed.
+ * Setwindowsize slight reformatted to keep Kevin happy.
+ * 
+ * Revision 1.8  95/03/15  14:14:53  pwain
+ * Added a statement in setwindowsize to suppress warnings
+ * about the cmd variable.
+ * 
+ * Revision 1.7  95/03/15  14:10:49  pwain
+ * Added conditional statements so that by default
+ * Access uses a WINDOWSIZE of 2 and Access+ uses 4.
+ * Also put in upperbound on WINDOWSIZE of 32.
+ * 
+ * Revision 1.6  95/03/15  11:46:34  pwain
+ * Fixed the share::.boot.!shareboot not working for AccessPlus.
+ * Upped WINDOWSIZE to 4 for all versions. Added *sharefswindow
+ * command to view WINDOWSIZE and set WINDOWSIZE (in internet.c)
+ * Version number changed to x.33
+ * 
+ * Revision 1.5  95/03/08  15:45:49  pwain
+ * ShareFS 2.x now uses the CD share icon if a
+ * disc is exported -cdrom. ShareFS 3.x version
+ * updated to keep both versions in line.
+ * 
+ * Revision 1.4  95/02/27  16:41:52  pwain
+ * All existing malloc() calls changed to use rmalloc().
+ * This is because ShareFS uses a different module entry
+ * code which means that its stack is kept in RMA. DO NOT
+ * USE MALLOC IN ShareFS CODE.
+ * 
+ * Revision 1.3  95/02/02  09:58:20  pwain
+ * Moved definition of lastopen to only be in Access+ code
+ * (Compiler warning)
+ * 
+ * Revision 1.2  95/01/17  09:03:41  pwain
+ * Removed compilation warning messages.
+ * 
+ * Revision 1.1  95/01/09  13:53:06  kwelton
+ * Initial revision
+ * 
+ */
+
+/* $Id: internet.c 2.20 93/11/16 11:16:41 brian Exp $ */
+
+/*{{{  compile options*/
+#define MAXDATA (1024*1024)
+/* #define UNIX */
+#ifndef MINIMAL_INET
+#define SERVERLIST		/* maintain list of servers for
+				 * TransportEnumerate */
+#define CLIENTLIST		/* maintain list of clients and call
+				 * _Msg 0 */
+#define TRANSPORTLIST		/* respond to TransportEnumerate at
+				 * all */
+#endif
+/* #define FIXINETBUG */
+
+/*{{{  includes*/
+#include "debug.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdarg.h>
+#ifdef __riscos
+# include "ker.h"
+# include "swis.h"
+#endif
+#ifdef __unix
+# include "unistd.h"
+#endif
+#include "interface.h"
+#include "ModuleWrap.h"
+#include "util.h"
+#include "fscore.h"
+#include "esc.h"
+#include "ralloc.h"
+#include "remswis.h"
+#include "ticker.h"
+#include "window.h"
+#include "freeway.h"
+#include "resourcefs.h"
+#include "modface.h"
+int CHUNKSIZE = 8192;
+
+#ifdef AACLIENT
+int WINDOWSIZE = 16;		/* <= 32 */
+#else
+
+#ifdef ACCESSPLUS
+int WINDOWSIZE = 2;		/* <= 32 */
+#else 
+int WINDOWSIZE = 2;		/* <= 32 */
+#endif /* WINDOWSIZE */
+
+#endif /* AACLIENT */
+
+#define MYSWI RemoteInternet_Msg/* swi to use */
+
+#include "tcplibs.h"
+
+/*{{{  errors*/
+#ifndef LOOKUPERR
+static DEFERR(NoMem, ERRNoMem, MSGNoMem);
+static DEFERR(InActive, ERRInActive, MSGInActive);
+#endif /* LOOKUPERR */
+
+/*{{{  vars*/
+static int weareon = 0;
+static struct
+{
+    int key;
+    char name[30];
+} host;
+#define hostname host.name
+static char clientname[30];	/* our unique name as a client.
+				 * =hostname if available at start */
+#ifdef SERVERLIST
+static char *servername;	/* name of first export or 0 */
+#endif
+#define BUFSIZE (8192+128)
+static int *buf;		/* incoming packet buffer, allocated
+				 * in turnon() */
+static int oursocket;
+static int ourport;
+static long ourinetaddr;
+#define BROADCASTDELAY 3000
+
+#ifdef SERVERLIST
+#define MAXSERVERS 100
+static long *servers;		/* array of addresses of servers that
+				 * we've collected. */
+static char **servernames;	/* corresponding broadcast names */
+static int serversmax = 0;
+#endif
+#ifdef CLIENTLIST
+#define MAXCLIENTS 100
+static struct
+{
+    long addr;
+    int when;
+} *clients;
+static int clientsmax;		/* clients we are serving */
+#endif
+#define UpCallV 0x1d
+#ifdef USEFREEWAY
+static int numdiscs = 0;
+static time_t starttime;
+#ifdef ACCESSPLUS
+static int lastopen = 0;
+#endif /* ACCESSPLUS */
+#endif /* USEFREEWAY */
+
+/*{{{  prototypes*/
+extern void event(void);
+extern void fwupcall(void);
+extern void restore_irqs(int s);
+extern int ensure_irqs_on(void);
+extern void visdelay_begin(void);
+extern void visdelay_end(void);
+
+error *setwindowsize(int cmd, int argc, char **argv) {
+
+    int size;
+
+    cmd = cmd; /* supress warnings */
+
+    if (argc==0) {
+        printf("Current ShareFS window size: %d\n",WINDOWSIZE);
+        }
+    else {
+        size=atoi(argv[1]);
+        if (size<=0) {
+	    printf("Must set a size greater than 0.\n");
+	    }
+        else if (size>=33) {
+	    printf("Must set a size less than 33. Setting to 32\n"); 
+            WINDOWSIZE=32;
+            printf("ShareFS window size is now: %d\n",WINDOWSIZE);
+	    }
+        else {
+            WINDOWSIZE=size;
+            printf("ShareFS window size is now: %d\n",WINDOWSIZE);
+	    }
+        }
+
+    return (error *)0;
+
+} /* setwindowsize */
+
+#ifdef ACCESSPLUS
+#include <ctype.h>
+static int encode_psw_char(char c)
+{
+    int i;
+    c = toupper(c);
+    if (isdigit(c))
+	i = ((int) c - (int) '0') + 1;
+    else
+    if (isalpha(c))
+	i = ((int) c - (int) 'A') + 11;
+    else
+	i = 0;
+    return i;
+}
+
+/*
+ * This function doesnt appear to be used - PWain 13-01-1995
+ *
+ * static char retrieve_psw_char(int v)
+ * {
+ *    if (v == 0)
+ *	 return (char) 0;
+ *    if (v < 11)
+ *	return (char) (v + (int) '0');
+ *    return (char) (v + (int) 'A');
+ *}
+ */
+
+static int password_to_pin(char *buf)
+{
+    int pin = 0;
+    for (; *buf; buf++)
+    {
+	pin *= 37;
+	pin += encode_psw_char(*buf);
+    }
+    return pin;
+}
+
+/* 
+ * This function doesnt appear to be used anywhere. Commented out
+ * -- pwain 13-01-1995
+ *
+ * static void pin_to_password(char *buf, int pin)
+ * {
+ *    int x;
+ *    while (pin)
+ *    {
+ *	x = pin % 37;
+ *	pin = pin / 37;
+ *	*(buf++) = retrieve_psw_char(x);
+ *    }
+ *    *buf = 0;
+ *}
+ */
+
+#endif /* ACCESSPLUS */
+
+#ifdef __riscos
+int gethostname(char *name, int namelen)	/* Missing from library */
+{
+    char *p = getenv("Inet$HostName");	/* P:3 */
+    if (!p)
+	return -1;		/* P:0 */
+    strncpy(name, p, namelen);
+    return 0;			/* P:3 */
+}
+
+#ifndef SERVERLIST
+/*{{{  #define htonl*/
+/* If only C had a rotate operator, we could code a 4 instruction eor,lsr,bic,eor sequence */
+#define ROR(x,y) ((unsigned)(x)>>(y)|(unsigned)(x)<<32-(y))
+#define htonl(x)        (((x)^ROR(x,16))>>8&~0xff00^ROR(x,8))
+
+char *inet_ntoa(struct in_addr in)	/* Numeric only version */
+{
+    static char name[20];	/* P:3861 */
+    unsigned char k[4];
+    *(long *) &k = *(long *) &in;
+    sprintf(name, "%d.%d.%d.%d", k[0], k[1], k[2], k[3]);
+    return name;		/* P:3861 */
+}
+
+#else
+
+static char *inet_addr2s(long addr)	/* wrapper for
+					 * gethostbyaddr */
+{
+    struct hostent *h;
+    struct sockaddr_in ouraddr;
+    char *s;
+    int i;
+    memset(&ouraddr, 0, sizeof(ouraddr));
+    ouraddr.sin_family = AF_INET;
+    ouraddr.sin_addr.s_addr = addr;
+    ouraddr.sin_port = ourport;
+    DEBUGf("gethostbyaddr %lx...", addr);
+    h = gethostbyaddr((void *) &addr, sizeof(addr), AF_INET);
+    DEBUGf("returns %p\n", h);
+    if (h)
+	return h->h_name;
+    DEBUGf("servernames..");
+    for (i = 0; i < serversmax; i++)
+	if (addr == servers[i] && servernames[i])
+	{
+	    DEBUGf("Found %d:%s\n", i, servernames[i]);
+	    return servernames[i];
+	}
+    DEBUGf("inet_ntoa...");
+    s = inet_ntoa(ouraddr.sin_addr);
+    DEBUGf("returns %p %s\n", s, s ? s : "NULL");
+    return s ? s : "unknown";
+}
+
+#endif
+#endif
+#ifdef TRANSPORTLIST
+static long inet_s2addr(char *s)
+{
+    struct hostent *h;
+    struct sockaddr_in addr;
+    int i;
+    h = gethostbyname(s);
+    if (h)
+    {
+	memcpy(&addr.sin_addr, h->h_addr, h->h_length);
+	return addr.sin_addr.s_addr;
+    }
+#ifdef SERVERLIST
+    for (i = 0; i < serversmax; i++)
+	if (!stricmp(s, servernames[i]))
+	    return servers[i];
+#endif
+    return inet_addr(s);
+}
+#endif
+
+void sendpacket(int c, void *p, int n)	/* Transmit p+n to c */
+{
+    struct sockaddr_in ouraddr;	/* P:4963 */
+    int cc;
+    memset(&ouraddr, 0, sizeof(ouraddr));
+    ouraddr.sin_family = AF_INET;
+    ouraddr.sin_addr.s_addr = (long) c;
+    ouraddr.sin_port = ourport;
+    DEBUGf("..sendto %s %p+%x <%x>..", inet_ntoa(ouraddr.sin_addr), p, n, *(int *) p);	/* P:1954 */
+    cc = sendto(oursocket, p, n, 0, (struct sockaddr *) & ouraddr, sizeof(ouraddr));
+    if (cc < 0)
+    {
+	lasterror = lookuperrno(errno, "sendto");	/* P:4 */
+	DEBUGf("!!Error %x %s,", lasterror->errnum, lasterror->errmess);	/* P:0 */
+    }
+    DEBUGf("%d\n", cc);		/* P:1954 */
+}
+
+/*
+ * transmit joined
+ * p+n,q+m,
+ */
+void sendsplitpacket(int c, void *p, int n, void *q, int m, int evil)
+{
+    char *b = (char *) buf;	/* safe to use this since internet
+				 * only delivers messages in
+				 * callbacks *//* P:1038 */
+    evil = evil;
+#ifdef DEBUG
+    if (n + m > BUFSIZE)	/* should never happen */
+	n = *(int *) -1;	/* P:0 */
+#endif
+    memcpy(b, p, n);
+    memcpy(b + n, q, m);	/* Arg! must be better way??? */
+    sendpacket(c, b, n + m);
+}
+
+static void broadcast(char *msg, int msglen)	/* broadcast msg over
+						 * all interfaces */
+{
+    struct ifconf ifc;		/* P:139 */
+    char buf[256];
+    struct ifreq *ifr;
+    int n;
+    struct sockaddr_in ouraddr;
+    DEBUGf("Broadcast %d bytes code %x:", msglen, msg[0]);	/* P:21 */
+    ifc.ifc_len = sizeof(buf);
+    ifc.ifc_buf = buf;
+    if (socketioctl(oursocket, SIOCGIFCONF, (char *) &ifc) < 0)
+    {
+	lasterror = lookuperrno(errno, "SIOCGIFCONF");	/* P:0 */
+	DEBUGf("%s\n", lasterror->errmess);	/* P:0 */
+	return;			/* P:0 */
+    }
+    ifr = ifc.ifc_req;
+    for (n = ifc.ifc_len / sizeof(struct ifreq); --n >= 0; ifr++)	/* P:417 */
+    {
+	if (ifr->ifr_addr.sa_family != AF_INET)	/* P:139 */
+	{
+	    DEBUGf("Unknown family %d\n", ifr->ifr_addr.sa_family);	/* P:0 */
+	    continue;
+	}
+	if (socketioctl(oursocket, SIOCGIFFLAGS, (char *) ifr) < 0)
+	{
+	    lasterror = lookuperrno(errno, "SIOCGIFFLAGS");	/* P:0 */
+	    DEBUGf("%s\n", lasterror->errmess);	/* P:0 */
+	    continue;
+	}
+	if ((ifr->ifr_flags & IFF_UP) == 0 ||	/* P:278 */
+	    (ifr->ifr_flags & IFF_LOOPBACK) ||
+	  (ifr->ifr_flags & (IFF_BROADCAST | IFF_POINTOPOINT)) == 0)
+	{
+	    DEBUGf("Rejected flags %x\n", ifr->ifr_flags);	/* P:0 */
+	    continue;
+	}
+	if (socketioctl(oursocket, SIOCGIFADDR, (char *) ifr) < 0)
+	    continue;		/* P:0 */
+	ourinetaddr = ((struct sockaddr_in *) & ifr->ifr_addr)->sin_addr.s_addr;
+	DEBUGf("%lx->", ourinetaddr);	/* P:21 */
+	if (ifr->ifr_flags & IFF_POINTOPOINT)
+	{
+	    if (socketioctl(oursocket, SIOCGIFDSTADDR, (char *) ifr) < 0)	/* P:0 */
+		continue;	/* P:0 */
+	    memcpy(&ouraddr, &ifr->ifr_broadaddr, sizeof(ifr->ifr_broadaddr));
+	}
+	else
+	if (ifr->ifr_flags & IFF_BROADCAST)	/* P:139 */
+	{
+	    if (socketioctl(oursocket, SIOCGIFBRDADDR, (char *) ifr) < 0)	/* P:139 */
+		continue;	/* P:0 */
+	    memcpy(&ouraddr, &ifr->ifr_broadaddr, sizeof(ifr->ifr_broadaddr));
+	}
+	DEBUGf("%lx,", ouraddr.sin_addr.s_addr);	/* P:21 */
+	ouraddr.sin_port = ourport;
+	if (sendto(oursocket, msg, msglen, 0, (struct sockaddr *) & ouraddr, sizeof(ouraddr)) < 0)
+	{
+	    lasterror = lookuperrno(errno, "broadcast sendto");	/* P:0 */
+	    DEBUGf("%s\n", lasterror->errmess);	/* P:0 */
+	}
+	else
+	    DEBUGf("ok,");	/* P:160 */
+    }
+    DEBUGf("done\n");		/* P:21 */
+}
+
+#ifdef SERVERLIST
+/* H,h=>server J,j=>not server, capitals want reply from servers */
+static void serverbroadcast(long addr, int Hi)	/* Broadcast Hi as a
+						 * message */
+{
+     host.key = Hi;
+    if (!hostname[0] && servername)
+	strcpy(hostname, servername);
+    if (addr == -1)
+	broadcast((char *) &host, sizeof(host));
+    else
+	sendpacket((int) addr, (char *) &host, sizeof(host));
+}
+
+static void addserver(long a, char *name)	/* add to list of server
+						 * addrs */
+{
+    int i;
+    for (i = 0; i < serversmax; i++)
+	if (servers[i] == a)
+	    goto gotserv;
+
+    if (serversmax < MAXSERVERS)
+    {
+	servers[serversmax] = a;
+	servernames[serversmax] = strdup(name);
+	serversmax++;
+    }
+    fs_receive((int) a, 0, -1);	/* new server arrives */
+  gotserv:;
+}
+
+static void subserver(long a)	/* remove from list of
+				 * servers */
+{
+    int i;
+    for (i = 0; i < serversmax; i++)
+	if (servers[i] == a)
+	{
+	    free(servernames[i]);
+	    memmove(&servers[i], &servers[i + 1], 4 * (serversmax - i - 1));
+	    memmove(&servernames[i], &servernames[i + 1], 4 * (serversmax - i - 1));
+	    serversmax--;
+	    fs_receive((int) a, 0, -2);	/* server departs */
+	    break;
+	}
+}
+#endif
+
+#ifdef CLIENTLIST
+static void gotclient(long a)	/* add addr to list of
+				 * client addrs */
+{
+    int i;
+    for (i = 0; i < clientsmax; i++)
+	if (clients[i].addr == a)
+	{
+	    clients[i].when = MONOTIME;
+	    goto gotclient;
+	}
+
+    if (clientsmax < MAXCLIENTS)
+    {
+	clients[clientsmax].addr = a;
+	clients[clientsmax].when = MONOTIME;
+	clientsmax++;
+    }
+  gotclient:;
+}
+#endif
+
+static void pollsock(void)	/**/
+{
+    int len, fromlen;		/* P:4718 */
+    struct sockaddr_in ouraddr;
+
+  lp:				/* P:9436 */
+    fromlen = sizeof(ouraddr);
+    len = recvfrom(oursocket, buf, BUFSIZE, 0, (struct sockaddr *) & ouraddr, &fromlen);
+    if (len <= 0 && errno == EWOULDBLOCK)	/* P:4718 */
+	return;			/* P:9436 */
+
+    if (len <= 0)
+    {
+	lasterror = lookuperrno(errno, "recvfrom");	/* P:0 */
+	return;			/* P:0 */
+    }
+
+    /*
+     * Some attempt to ignore broadcasts from ourselves. Only support
+     * for one interface address seems worth while.
+     */
+
+    /*  if (ouraddr.sin_addr.s_addr==ourinetaddr)   --- removed for
+     *                                      Starling own disc view support. -gw
+     *	     goto lp; \*P:0*/
+
+    DEBUGf("Got %d Code %x from %s:", len, buf[0], inet_ntoa(ouraddr.sin_addr));	/* P:1907 */
+#ifdef CLIENTLIST
+    gotclient(ouraddr.sin_addr.s_addr);
+#endif
+    switch (*(char *) &buf[0])	/* P:4718 */
+    {
+      case 'F':	/**//* P:185 */
+        {
+	    fs_receive((int) ouraddr.sin_addr.s_addr, (char *) &buf[0], len);
+	    goto lp;
+	}
+
+#ifdef SERVERLIST
+       case 'H':	/* server startup */
+       case 'J':		/* non-server startup */
+	serverbroadcast(ouraddr.sin_addr.s_addr, servername ? 'h' : 'j');
+	d_msg((int) ouraddr.sin_addr.s_addr, 0, 0, 0, 0, 0, 0);
+	if (*(char *) &buf[0] == 'J')
+	    subserver(ouraddr.sin_addr.s_addr);
+	else
+	    addserver(ouraddr.sin_addr.s_addr, (char *) &buf[1]);
+	goto lp;
+
+       case 'h':	/* server broadcast/reply */
+	addserver(ouraddr.sin_addr.s_addr, (char *) &buf[1]);
+	goto lp;
+
+       case 'j':	/* not-server broadcast/reply */
+	subserver(ouraddr.sin_addr.s_addr);
+	goto lp;
+#endif
+    }
+    gotpacket((int) ouraddr.sin_addr.s_addr, buf, len);
+    goto lp;
+}
+
+RETURNMETHOD event_handler(regs *r, void *private_word)	/**/
+{
+    int s;
+    private_word = private_word;/* P:165009 */
+    if (r->r[0] != Internet_Event)
+	return VIAR14;		/* P:319874 */
+    if (debug > 3)
+	DEBUGf("<<<Inet_Event %x socket=%x %s>>>\n", r->r[1], r->r[2], r->r[2] == oursocket ? "**OURS**" : "");	/* P:0 */
+    if (oursocket == r->r[2])
+    {
+	switch (r->r[1])	/* P:9436 */
+	{
+	  case Socket_Async_Event:	/* P:4718 */
+	    s = ensure_irqs_on();
+	    pollsock();
+	    restore_irqs(s);
+	    break;
+	  case Socket_Urgent_Event:	/* P:0 */
+	    break;
+	  case Socket_Broken_Event:	/* P:0 */
+	    break;
+	}
+	return VIASTACK;	/* P:4718 */
+    }
+    return VIAR14;		/* P:354 */
+}
+
+void poll(void)	/**/
+{
+    dropper();			/* visit user mode to do any receive *//* P
+				 * :458626 */
+}
+
+static void broadcastticker()	/**/
+{
+#ifdef CLIENTLIST
+    int i;			/* P:45 */
+#endif /* CLIENTLIST */
+
+#ifdef SERVERLIST
+    serverbroadcast(-1, servername ? 'h' : 'j');
+#endif /* SERVERLIST */
+
+#ifdef CLIENTLIST
+    for (i = 0; i < clientsmax; i++)
+	if (MONOTIME - clients[i].when > BROADCASTDELAY * 3)
+	{
+	    d_msg((int) clients[i].addr, 0, 0, 0, 0, 0, 0);
+	    memmove(&clients[i], &clients[i + 1], sizeof(clients[i]) * (clientsmax - (i + 1)));
+	    i--;
+	    clientsmax--;
+	}
+#endif /* CLIENTLIST */
+}
+
+#ifdef USEFREEWAY
+static int fwdiscschanged;
+static int fwinst;
+
+#ifdef ACCESSPLUS
+struct owner
+{
+    struct owner *o_next;
+    char *o_name;
+    int o_pin;
+    int o_ndiscs;
+};
+
+static struct owner *o_head;
+
+int strlen_ctrl(char *s)
+{
+    char *t;
+    t = s;
+    while (*t >= ' ')
+	t++;
+    return t - s;
+}
+
+static void zero_terminate(char *s)
+{
+    *(s + strlen_ctrl(s)) = 0;
+}
+
+static int owner_discs(char *name, int flag)
+{
+    struct owner *o;
+    char namedir[64];
+
+    for (o = o_head; o; o = o->o_next)
+    {
+	switch (flag)
+	{
+	  case 0:
+	    o->o_ndiscs = 0;
+	    continue;
+
+	  case 1:
+	    if (stricmp(name, o->o_name) != 0)
+		break;
+
+	    o->o_ndiscs++;
+	    return (o->o_ndiscs);
+
+	  case 2:
+	    if (o->o_ndiscs == 0)
+	    {
+		sprintf(namedir, "%s. ", o->o_name);
+		resourcefs_register("Logon", namedir,
+				    FILETYPE_DISCSN, 0);	/* P:1 */
+	    }
+	    continue;
+	}
+    }
+    return -1;
+}
+
+int enum_owners(char *buf, int i)
+{
+    struct owner *o;
+    int n = 0;
+    for (o = o_head; o; o = o->o_next, n++)
+    {
+	if (n == i)
+	{
+	    strcpy(buf, o->o_name);
+	    return (++n);
+	}
+    }
+    return -1;
+}
+
+void owner_logoff(char *name)
+{
+    struct owner *prev, *next;
+    char buf[128];
+    if (o_head == 0)
+	return;
+    zero_terminate(name);
+    if (stricmp(o_head->o_name, name) == 0)
+    {
+	next = o_head;
+	o_head = o_head->o_next;
+	goto found;
+    }
+    prev = o_head;
+    next = prev->o_next;
+    for (;;)
+    {
+	if (next == 0)
+	    return;
+	if (stricmp(next->o_name, name) == 0)
+	    break;
+	prev = next;
+	next = prev->o_next;
+    }
+    prev->o_next = next->o_next;
+
+  found:
+    _swix(Freeway_Register, _INR(0, 2), Freeway_Register_Deregister_Auth, DOMAIN_DISCS, (next->o_pin));
+    sprintf(buf, "Filer_Closedir Resources:$.Logon.%s", next->o_name);
+    _kernel_oscli(buf);
+    dodismount(next->o_name);
+    free(next->o_name);
+    next->o_pin = 0;
+    free((char *) next);
+    fwdiscschanged = 1;
+}
+
+int owner_logon(char *name, char *pinstr, int fromfiler)
+{
+    char *n;
+    struct owner *o;
+    /* int r, pin, addr, starttime, pos = 0; -- PWain 13-01-95 */
+    int pin, addr, starttime, pos = 0;
+    char buf[128], namedir[64], descriptor;
+    int firsttimeround = 0;
+    int repeat_logon = 0;
+
+    zero_terminate(name);
+    if(name==NULL || *name==NULL) return 0;
+
+    for (o = o_head; o; o = o->o_next)
+	if (stricmp(name, o->o_name) == 0) {
+	    /* 
+	     * Original fix, which in light of CD shares is now wrong!
+	     *  sprintf(buf,
+	     *	    "Filer_Opendir Resources:$.Logon.%s %d 300 -LargeIcons",
+	     *	    o->o_name, 150 + lastopen);
+	     * lastopen += 15;
+	     * _kernel_oscli(buf);
+	     * return 1;
+	     */
+	     repeat_logon = 1;
+	     goto repeat_found;
+	    }
+    zero_terminate(pinstr);
+    if (strlen(pinstr) == 0)
+	pin = 1;
+    else
+	pin = password_to_pin(pinstr);
+    if (pin <= 0)
+	return 0;
+    n = rmalloc(strlen(name) + 1);
+    if (!n)
+	return 0;
+    o = (struct owner *) rmalloc(sizeof(struct owner));
+    if (!o)
+    {
+	free(n);
+	return 0;
+    }
+    strcpy(n, name);
+    o->o_name = n;
+    o->o_pin = pin;
+    o->o_ndiscs = 0;
+    o->o_next = o_head;
+    o_head = o;
+    _swix(Freeway_Register, _INR(0, 2), Freeway_Register_Register_Auth, DOMAIN_DISCS, (o->o_pin));
+    if (!fromfiler)
+	goto found;
+
+    visdelay_begin();
+    starttime = time(0);
+    firsttimeround = 1;
+    while (time(0) < starttime + 5)
+    {
+	if (fwdiscschanged || firsttimeround)
+	{
+	    firsttimeround = 0;
+	    while (pos != -1 && !_swix(Freeway_Enumerate,
+				       _INR(0, 8) | _OUTR(6, 7),
+				       1, DOMAIN_DISCS, sizeof(namedir),
+				       &namedir, sizeof(descriptor),
+				       &descriptor, 0, pos, (o->o_pin),
+				       &addr, &pos))	/* P:104 */
+	    {
+		if (pos == -1)
+		    break;
+
+		if ((!descriptor & ATTRIBUTE_SUBDIR) &&
+		    (!descriptor & ATTRIBUTE_CDROM))
+		    continue;
+
+		if (descriptor & ATTRIBUTE_CDROM)
+		{
+		    if (stricmp(namedir, o->o_name) == 0)
+		    {
+			visdelay_end();
+			goto found;
+		    }
+		}
+		else
+		{
+		    for (n = namedir; *n; n++)
+		    {
+			if (*n == '@' && n != namedir)
+			{
+			    *n = 0;
+			    if (stricmp(namedir, o->o_name) == 0)
+			    {
+				visdelay_end();
+				goto found;
+			    }
+			}
+		    }
+		}
+	    }
+	}
+    }
+
+    visdelay_end();
+
+    /*
+     * One last check to see if nothing is found.
+     */
+  repeat_found:
+    pos=0;
+    _swix(Freeway_Enumerate, _INR(0, 8) | _OUTR(6, 7),
+	1, DOMAIN_DISCS, sizeof(namedir), &namedir, sizeof(descriptor),
+	&descriptor, 0, pos, (o->o_pin), &addr, &pos);
+
+    if (pos != -1) goto found;
+
+    owner_logoff(o->o_name);
+    return 0;
+
+  found:
+    sprintf(namedir, "%s. ", o->o_name);
+    if (!(descriptor & ATTRIBUTE_CDROM))
+	resourcefs_register("Logon", namedir, FILETYPE_DISCSN, 0);	/* P:1 */
+    if (fromfiler)
+    {
+	if (!(descriptor & ATTRIBUTE_CDROM))
+	{
+	    sprintf(buf,
+		    "Filer_Opendir Resources:$.Logon.%s %d 300 -LargeIcons",
+		    o->o_name, 150 + lastopen);
+	    lastopen += 15;
+	    _kernel_oscli(buf);
+	}
+	else
+	{
+#if 0
+	    sprintf(buf,
+	            "Filer_Opendir Resources:$.Logon.%s %d 300 -LargeIcons",
+		    o->o_name, 150 + lastopen);
+#else
+	    sprintf(buf, "Filer_Opendir Resources:$.Discs %d 300 -LargeIcons",
+		    150 + lastopen);
+#endif
+	    lastopen += 15;
+	    _kernel_oscli(buf);
+	}
+    }
+    if (!repeat_logon) fwdiscschanged = 1;
+    return 1;
+}
+
+static void fwrefresh(void)
+{
+    int pos = 0;		/* P:1430 */
+    char descriptor;
+    char name[30];
+    int addr, type;
+    if (!fwdiscschanged)
+	return;			/* P:2824 */
+    fwdiscschanged = 0;
+    resourcefs_clear();
+    (void) owner_discs((char *) 0, 0);
+    numdiscs = 0;
+    while (!_swix(Freeway_Enumerate, _INR(0, 7) | _OUTR(6, 7),
+		  0, DOMAIN_DISCS, sizeof(name), &name,
+		  sizeof(descriptor), &descriptor, 0, pos, &addr, &pos) &&
+	   pos != -1)	/* P:104 */
+    {
+	if (!(descriptor & ATTRIBUTE_HIDDEN))	/* P:25 */
+	{
+	    if (descriptor & ATTRIBUTE_SUBDIR)
+	    {
+		char discname[30], owner[30], namedir[64], *a, *b, *c;
+		b = owner;
+		c = 0;
+		for (a = name; *a; a++)
+		{
+		    if (*a == '@' && a != name)
+		    {
+			if (b)
+			{
+			    *b = 0;
+			    b = 0;
+			    c = discname;
+			}
+		    }
+		    else
+		    {
+			if (b)
+			    *b++ = *a;
+			if (c)
+			    *c++ = *a;
+		    }
+		}
+		if (b)
+		    *b = 0;
+		if (c)
+		    *c = 0;
+		if (owner_discs(owner, 1) == -1)
+		    continue;
+		sprintf(namedir, "%s.%s", owner, discname);
+		type = (descriptor & ATTRIBUTE_PROTECTED) ?
+		    FILETYPE_DISCSDP : FILETYPE_DISCSD;
+		resourcefs_register("Logon", namedir, type,
+		  (descriptor & ATTRIBUTE_PROTECTED ? 0x03 : 0x30) &
+		   (descriptor & ATTRIBUTE_READONLY ? 0x11 : 0x33));
+		goto next;
+	    }
+	    else
+	    {
+		if (descriptor & ATTRIBUTE_PROTECTED)
+		    type = FILETYPE_DISCSP;
+		else
+		if (descriptor & ATTRIBUTE_READONLY)
+		    type = FILETYPE_DISCSR;
+		else
+		if (descriptor & ATTRIBUTE_CDROM)
+		    type = FILETYPE_DISCSCD;
+		else
+		    type = FILETYPE_DISCS;
+	    }
+	    resourcefs_register("Discs", name, type,
+		  (descriptor & ATTRIBUTE_PROTECTED ? 0x03 : 0x30) &
+		   (descriptor & ATTRIBUTE_READONLY ? 0x11 : 0x33));
+	    numdiscs++;
+	}
+
+      next:
+	fs_receive(addr, name, -1);	/* new server disc arrives */
+    }
+    (void) owner_discs((char *) 0, 2);
+    if (!numdiscs)
+	resourcefs_register("Discs", " ", FILETYPE_DISCSN, 0);	/* P:1 */
+    _swix(OS_ServiceCall, _IN(1), Service_RemoteFSVolume);
+}
+#else
+static void fwrefresh(void)
+{
+    int pos = 0;		/* P:1430 */
+    char descriptor;
+    char name[30];
+    int addr, type;
+    if (!fwdiscschanged)
+	return;			/* P:2824 */
+    fwdiscschanged = 0;
+    resourcefs_clear();
+    numdiscs = 0;
+
+    while (!_swix(Freeway_Enumerate, _INR(0, 7) | _OUTR(6, 7), 0, DOMAIN_DISCS, sizeof(name), &name, sizeof(descriptor), &descriptor, 0, pos, &addr, &pos) && pos != -1)	/* P:104 */
+    {
+	if (!(descriptor & ATTRIBUTE_HIDDEN))	/* P:25 */
+	{
+	    if (descriptor & ATTRIBUTE_PROTECTED)
+		type = FILETYPE_DISCSP;	/* P:25 */
+	    else
+	    if (descriptor & ATTRIBUTE_READONLY)
+		type = FILETYPE_DISCSR;	/* P:25 */
+	    else
+            if (descriptor & ATTRIBUTE_CDROM)
+                type = FILETYPE_DISCSCD;
+	    else
+		type = FILETYPE_DISCS;	/* P:25 */
+#ifdef AACLIENT
+	    if (type != FILETYPE_DISCSR)
+		continue;
+#endif
+	    resourcefs_register("Discs", name, type,
+		  (descriptor & ATTRIBUTE_PROTECTED ? 0x03 : 0x30) &
+		   (descriptor & ATTRIBUTE_READONLY ? 0x11 : 0x33));
+	    numdiscs++;
+	}
+	fs_receive(addr, name, -1);	/* new server disc arrives */
+    }
+    if (!numdiscs)
+	resourcefs_register("Discs", " ", FILETYPE_DISCSN, 0);	/* P:1 */
+    _swix(OS_ServiceCall, _IN(1), Service_RemoteFSVolume);
+}
+#endif				/* defined(ACCESSPLUS) */
+
+static void fwinit(void)
+{
+#ifdef ACCESSPLUS
+    o_head = 0;
+#endif
+    numdiscs = 0;		/* P:6 */
+    fwdiscschanged = 1;
+    _swix(Freeway_Register, _INR(0, 1),
+	  Freeway_Register_Register, DOMAIN_DISCS);
+    starttime = time(0);
+    _swix(Freeway_Register, _INR(0, 1), Freeway_Register_Register, DOMAIN_CLIENTS);
+    _swix(Freeway_Write, _INR(0, 7), Freeway_Write_Add, DOMAIN_CLIENTS, clientname, sizeof(starttime), &starttime);
+    if (!fwinst)
+    {
+	_swix(OS_Claim, _INR(0, 2), UpCallV, &fwupcall, private_word);	/* P:4 */
+	CallEvery(&fwrefresh, 100);
+	fwinst = 1;
+    }
+}
+
+static void fwclear(int uc)	/**/
+{
+    if (fwinst)			/* P:1 */
+    {
+	 _swix(OS_Release, _INR(0, 2), UpCallV, &fwupcall, private_word);	/* P:1 */
+	RemoveCallEvery(&fwrefresh);
+	fwinst = 0;
+    }
+    if (!uc)
+    {
+	_swix(Freeway_Write, _INR(0, 7), Freeway_Write_Remove, DOMAIN_CLIENTS, clientname, sizeof(starttime), &starttime);	/* P:0 */
+	_swix(Freeway_Register, _INR(0, 1), Freeway_Register_Deregister, DOMAIN_CLIENTS);
+	_swix(Freeway_Register, _INR(0, 1), Freeway_Register_Deregister, DOMAIN_DISCS);
+    }
+    resourcefs_clear();
+    _swix(OS_ServiceCall, _IN(1), Service_RemoteFSVolume);
+}
+
+RETURNMETHOD fwupcall_handler(regs * r, void *private_word)	/**/
+{
+    private_word = private_word;	/* P:34 */
+    DEBUGf("fwupcall %x %x %x %s %x %x %x %x\n", r->r[0], r->r[1], r->r[2], (char *) r->r[3], r->r[4], r->r[5], *(char *) r->r[5], r->r[6]);	/* P:10 */
+    if (r->r[0] == 12 && r->r[2] == DOMAIN_DISCS)	/* P:34 */
+	/* {{{  Note to keep resources:$.Discs up to date */
+	switch (r->r[1])	/* P:34 */
+	{
+	  case UpCall_Freeway_Added:
+	  case UpCall_Freeway_Changed:
+	  case UpCall_Freeway_Removed:	/**//* P:39 */
+	    fwdiscschanged = 1;
+	    break;
+
+	  case UpCall_Freeway_Deleted:	/**//* P:0 */
+	    /* remove our export entry? */
+	    break;
+	}
+
+    if (r->r[0] == 12 && r->r[2] == DOMAIN_CLIENTS)	/* P:34 */
+	/* {{{  Inform server when a client goes away */
+	switch (r->r[1])	/* P:34 */
+	{
+	  case UpCall_Freeway_Added:	/* P:11 */
+	  case UpCall_Freeway_Changed:	/* P:11 */
+	  case UpCall_Freeway_Removed:	/* P:17 */
+	    d_msg(r->r[6], 0, 0, 0, 0, 0, 0);
+	    break;
+	  case UpCall_Freeway_Deleted:	/* P:0 */
+	    /* remove our export entry? */
+	    break;
+	}
+
+    return VIAR14;		/* P:34 */
+}
+#endif
+
+error *turnon(void)	/**/
+{
+    error *err = NULL;		/* P:3 */
+    int NBIO = 1;
+    int ASYNC = 1;
+    int on = 1;
+    struct sockaddr_in ouraddr;
+
+    if (weareon)
+	return NULL;		/* P:0 */
+    DEBUGf("turnon..");		/* P:0 */
+    buf = rmalloc(BUFSIZE);
+    if (!buf)
+	return ERR(NoMem);	/* P:0 */
+#ifdef CLIENTLIST
+    clients = calloc(MAXCLIENTS, sizeof(*clients));
+    if (!clients)
+	return ERR(NoMem);
+    clientsmax = 0;
+#endif
+#ifdef SERVERLIST
+    servers = calloc(MAXSERVERS, sizeof(*servers));
+    if (!servers)
+	return ERR(NoMem);
+    servernames = calloc(MAXSERVERS, sizeof(*servernames));
+    if (!servers)
+	return ERR(NoMem);
+    serversmax = 0;
+#endif
+    if (gethostname(hostname, sizeof(hostname)))
+	hostname[0] = 0;	/* P:0 */
+    if (hostname[0])
+	strcpy(clientname, hostname);	/* P:3 */
+    else
+	sprintf(clientname, "%u", time(0));	/* P:3 */
+    {
+	char *p = getenv("RemoteFS$InternetPort");
+	ourport = p ? atoi(p) : RemoteInternetPort;
+    }
+    memset(&ouraddr, 0, sizeof(ouraddr));
+    ouraddr.sin_family = AF_INET;
+    ouraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    ouraddr.sin_port = ourport;
+    oursocket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (oursocket == -1)
+	return lookuperrno(errno, "socket");	/* P:0 */
+
+    if (bind(oursocket, (struct sockaddr *) & ouraddr, sizeof(ouraddr)) == -1)
+    {
+	err = lookuperrno(errno, "bind");	/* P:0 */
+	socketclose(oursocket);
+	return err;		/* P:0 */
+    }
+    if (socketioctl(oursocket, FIONBIO, &NBIO) == -1)
+    {
+	err = lookuperrno(errno, "FIONBIO");	/* P:0 */
+	socketclose(oursocket);
+	return err;		/* P:0 */
+    }
+    if (socketioctl(oursocket, FIOASYNC, &ASYNC) == -1)
+    {
+	err = lookuperrno(errno, "FIOASYNC");	/* P:0 */
+	socketclose(oursocket);
+	return err;		/* P:0 */
+    }
+    DEBUGf("remoteInternet inited ok, oursocket=%d\n", oursocket);	/* P:0 */
+    if (setsockopt(oursocket, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on)) == -1)
+    {
+	err = lookuperrno(errno, "setsockopt");	/* P:0 */
+	socketclose(oursocket);
+	return err;		/* P:0 */
+    }
+
+#ifdef SERVERLIST
+    if (_swix(RemoteDaemon_Exports, _OUT(0), &servername))
+	servername = 0;		/* 0 signifies we are not a server
+				 * (yet?) */
+#endif
+    err = window_init();
+    if (err)
+	return err;		/* P:0 */
+
+    _swix(OS_Claim, _IN(0) | _IN(1) | _IN(2), 16, &event, private_word);
+    _swix(OS_Byte, _IN(0) | _IN(1), 14, Internet_Event);
+    CallEvery(broadcastticker, BROADCASTDELAY);
+/*  CallEvery(pollsock,1); */
+    weareon = 1;
+    dropper();
+#ifdef SERVERLIST
+    serverbroadcast(-1, servername ? 'H' : 'J');	/* both want replies,
+							 * but 'H' says we're a
+							 * server as well */
+#endif
+#ifdef USEFREEWAY
+    fwinit();
+#endif
+#ifndef NOTMODULE
+    _kernel_setenv("Remote$Internet", "On");
+#endif
+    fs_receive(-1, 0, -1);	/* all servers arrive */
+    DEBUGf("ok\n");		/* P:0 */
+    return err;			/* P:3 */
+}
+
+void turnoff(void)	/**/
+{
+#if defined(CLIENTLIST) || defined(SERVERLIST)
+    int i;			/* P:0 */
+#endif
+    if (!weareon)
+	return;			/* P:0 */
+    DEBUGf("turnoff..");	/* P:0 */
+    weareon = 0;
+#ifndef NOTMODULE
+    _kernel_setenv("Remote$Internet", "Off");
+#endif
+#ifdef USEFREEWAY
+    fwclear(0);
+    DEBUGf("fwclear..");	/* P:0 */
+#endif
+    RemoveCallEvery(broadcastticker);
+/*  RemoveCallEvery(pollsock); */
+    DEBUGf("RemoveCallEvery..");/* P:0 */
+    fs_receive(-1, 0, -2);	/* all servers depart */
+    DEBUGf("fs_receive..");	/* P:0 */
+    _swix(OS_Byte, _IN(0) | _IN(1), 13, Internet_Event);
+    _swix(OS_Release, _IN(0) | _IN(1) | _IN(2), 16, &event, private_word);
+    DEBUGf("release event..");	/* P:0 */
+    socketioctl(oursocket, FIOASYNC, &weareon);
+    socketioctl(oursocket, FIONBIO, &weareon);
+    DEBUGf("socketioctl..");	/* P:0 */
+    socketclose(oursocket);
+    DEBUGf("socketclose..");	/* P:0 */
+    window_done();
+    DEBUGf("window_done..");	/* P:0 */
+#ifdef CLIENTLIST
+    for (i = 0; i < clientsmax; i++)
+	d_msg((int) clients[i].addr, 0, 0, 0, 0, 0, 0);
+    free(clients);
+    clientsmax = 0;
+#endif
+#ifdef SERVERLIST
+    free(servers);
+    for (i = 0; i < serversmax; i++)
+	free(servernames[i]);
+    free(servernames);
+    serversmax = 0;
+#endif
+    free(buf);
+    DEBUGf("OK\n");		/* P:0 */
+}
+
+void inet_service(regs * r)	/**/
+{
+#ifdef TRANSPORTLIST
+    long addr;
+    char *conn;
+#endif
+    if (!weareon)		/* P:9942 */
+	return;			/* P:28 */
+    switch (r->r[1])		/* P:9928 */
+    {
+      case Service_Reset:	/**//* P:0 */
+	turnoff();
+	turnon();
+	break;
+
+      case Service_RemoteFSSend:	/**//* P:0 */
+	inet_send(r->r[0], (char *) r->r[2], r->r[3]);
+	break;
+
+#ifdef TRANSPORTLIST
+      case Service_TransportOpen:	/**/
+	conn = (char *) r->r[0];
+	if (strnicmp(conn, "internet;", 9))
+	    break;
+	addr = inet_s2addr(conn + 9);
+	if (-1 == addr)
+	    break;
+	r->r[0] = (int) addr;
+	r->r[1] = 0;		/* Claim service */
+	r->r[2] = MYSWI;
+	r->r[3] = MAXDATA;
+	r->r[4] = 255;
+	DEBUGf("connection opened to %s=%x\n", conn, r->r[0]);
+	break;
+
+      case Service_TransportEnumerate:	/**/
+	if (r->r[0])
+	    --r->r[0];
+	else
+	{
+	    char *p;
+	    int m;
+	    int n = 0;
+	    int i;
+	    int pos = 0;
+	    char *s;
+#ifdef SERVERLIST
+	    int sm = serversmax;
+	    char name[20];
+	    char descriptor;
+	    long addr;
+	    while (!_swix(Freeway_Enumerate, _INR(0, 7) | _OUTR(6, 7), 0, DOMAIN_DISCS, sizeof(name), &name, sizeof(descriptor), &descriptor, 0, pos, &addr, &pos) && pos != -1)
+	    {
+		for (i = 0; i < sm; i++)
+		    if (servers[i] == addr)
+			goto not;
+		if (sm < MAXSERVERS)
+		    servers[sm++] = addr;
+	      not:	;
+	    }
+#endif
+
+	    for (i = 0, s = "internet", p = (char *) r->r[2], m = r->r[3];;)
+	    {
+		int l = strlen(s);
+		if (n + l + 1 <= m)
+		    strcpy(&p[n], s);
+		n += l + 1;
+#ifdef  SERVERLIST
+	next:
+		if (i < sm)
+		{
+		    s = inet_addr2s(servers[i++]);
+		    if (!stricmp(s, hostname))
+			goto next;
+		    continue;
+		}
+#endif
+		break;
+	    }
+	    r->r[1] = 0;
+	    r->r[3] = n <= m ? n : m - n;
+	    r->r[0] = 0;
+	}
+	break;
+#endif
+
+#ifdef SERVERLIST
+      case Service_RemoteFSExport:	/**/
+	{
+	    char *o = servername;
+	    servername = (char *) r->r[0];
+	    if (o && !servername || servername && !o)
+		serverbroadcast(-1, servername ? 'h' : 'j');
+	}
+	break;
+#endif
+#ifdef USEFREEWAY
+
+      case Service_FreewayTerminating:	/**//* P:1 */
+	fwclear(1);
+	break;
+
+      case Service_FreewayStarting:	/**//* P:3 */
+	fwinit();
+	break;
+#endif
+    }
+}
+
+error *inet_msg(int client, union Message *m, int msize, char *p, int n,
+		struct moreproc *mp, int *outsize)	/**/
+{
+    if (!m)			/* P:608 */
+    {
+	 DEBUGf("Closing %x\n", client);	/* P:0 */
+	return NULL;		/* P:0 */
+    }
+    if (weareon)
+	return domsg(client, m, msize, p, n, mp, outsize);	/* P:1216 */
+    else
+	return ERR(InActive);	/* P:0 */
+}
+
+error *inet_send(int c, char *p, int n)	/* broadcast or transmit
+					 * p+n */
+{
+    *(int *) p = 'F';		/* P:139 */
+    DEBUGf("inet_send %d bytes to %x code %d\n", n, c, p[4]);	/* P:21 */
+    if (c == -1)
+	broadcast(p, n);	/* P:139 */
+    else
+	sendpacket(c, p, n);	/* P:139 */
+    return 0;			/* P:139 */
+}
+
+#ifndef NOTMODULE
+error *inet_command(int cmd, int argc, char *argv[])	/**/
+{
+    error *err = NULL;
+
+    switch (cmd)
+    {
+      case 0:
+	if (argc >= 1 && !stricmp(argv[1], "on") && !weareon)
+	    turnon();
+	if (argc >= 1 && !stricmp(argv[1], "off") && weareon)
+	    turnoff();
+	if (argc >= 1 && !stricmp(argv[1], "directory") && weareon)
+	{
+	    int i;
+	    printf("Hostname is %s\n", hostname);
+	    for (i = 0; i < serversmax; i++)
+		printf("%-16s %s\n", inet_ntoa(*(struct in_addr *) & servers[i]), servernames[i]);
+	}
+	if (!argc && lasterror)
+	    printf("LastError: %s\n", lasterror->errmess);
+	break;
+    }
+    return err;
+}
+
+void module_finalise(void)	/**/
+{
+    turnoff();
+    lookup_clear();
+#ifdef DEBUG
+    rfreeall();
+#endif
+}
+
+error *module_initialise(char *cmd_tail, int podule_base, void *privw)	/**/
+{
+    private_word = privw;
+    cmd_tail = cmd_tail;
+    podule_base = podule_base;
+    atexit(module_finalise);
+    lookup_init("RemoteFS:Messages");
+
+#ifdef FIXINETBUG
+    {				/* Fix up bug in gethostent routine,
+				 * using zapped version with global
+				 * labels */
+	extern char hostaddr[];
+	extern char *host_addrs[2];
+	host_addrs[0] = hostaddr;
+    }
+#endif
+
+    /*
+     * Grr.. because a module is not in the service chain during
+     * its initialisation, we have to wait till a callback to
+     * enable the transport
+     */
+    CallAfter((void (*) ()) turnon, 0);
+    return 0;
+}
+
+void module_service(int service_number, regs * r, void *private_word)	/**/
+{
+    service_number = service_number;
+    private_word = private_word;
+    inet_service(r);
+}
+
+error *module_command(char *s, int argc, int cmd_no, void *privw)	/**/
+{
+    char buf[256];
+    char *t;
+    char *argv[20];
+    int c, f, b;
+    argc = argc;
+    privw = privw;
+    for (c = 1, f = 0, t = buf; t < buf + sizeof(buf) && (b = *s++) >= ' ';)
+    {
+	if (f)
+	    *t++ = (b == ' ') ? f = 0 : b;
+	else
+	if (b != ' ')
+	    argv[c++] = t, *t++ = b, f = 1;
+    }
+    *t = 0;
+#ifdef DEBUG
+    if (argc >= 2 && !stricmp(argv[1], "debug"))
+    {
+	debug = atoi(argv[2]);
+	return 0;
+    }
+#endif
+#ifdef PROFILING
+    else
+    if (argc >= 2 && !stricmp(argv[1], "mapstore"))
+    {
+	_fmapstore(argv[2]);
+	return 0;
+    }
+#endif
+    return inet_command(cmd_no, argc, argv);
+}
+
+error *module_swi(int swinum, regs * r, void *privw)	/**/
+{
+     privw = privw;
+    switch (swinum)
+    {
+      case RemoteInternet_Msg & 63:
+	return inet_msg((int) r->r[0], (union Message *) r->r[1],
+			r->r[2], (void *) r->r[3], r->r[4],
+			(struct moreproc *) & r->r[5], &r->r[2]);
+
+#if 0
+      case RemoteInternet_Send & 63:
+	return inet_send((int) r->r[0], (char *) r->r[1], r->r[2]);
+#endif
+
+      default:
+	return lookuperr(ERRBadSWI, "BadSWI", "RemoteInternet");
+    }
+}
+
+static struct moreproc	/**/
+{
+    int param;
+    int r12;
+    int addr;
+} mp;
+
+struct moreproc *makemp(moreproc *p)	/**/
+{
+    mp.param = (int) p;
+    mp.r12 = (int) private_word;
+    mp.addr = (int) &xmoreproc;
+    return &mp;
+}
+
+int xmoreproc_handler(regs *r, void *private_word)	/**/
+{
+    error *err;
+    private_word = private_word;
+    err = (*((moreprocstr *) & r->r[5])->fn) (r->r[0], (char *) r->r[1], r->r[2], (char *) r->r[3], r->r[4], (char **) &r->r[3], &r->r[4]);
+    if (err)
+    {
+	r->r[0] = (int) err;
+	r->r[12] |= (1u << 28);
+    }
+    return VIAR14;
+}
+
+error *d_msg(int client, union Message *m, int msize, char *p, int n,
+	     struct moreproc *mp, int *outsize)	/**/
+{
+    return _swix(RemoteDaemon_Msg, _INR(0, 7) | _OUT(2), client, m,
+		 msize, p, n, mp->param, mp->r12, mp->addr,
+		 outsize ? outsize : (int *) &outsize);
+}
+
+error *fs_receive(int c, char *p, int n)	/**/
+{
+    return _swix(RemoteFS_Receive, _INR(0, 5), p, n, MYSWI, c,
+		 "internet", MAXDATA);
+}
+
+#endif
+
+/* EOF internet.c */

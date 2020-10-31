@@ -1,0 +1,423 @@
+
+/* utils.c */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "main.h"
+#include "utils.h"
+#include "gui.h"
+#include "discspec.h"
+
+/* ------------------------------------------------------------------------ */
+
+static void terminal_error(_kernel_oserror* er)
+{
+  _swix(Wimp_ReportError,_INR(0,2),er,0,"Installer");
+  exit(0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int check_OSversion(void)
+{
+  int OSversion;
+
+  /* read OS identifier */
+  _swix(OS_Byte,_INR(0,2)|_OUT(1),129,0,255,&OSversion);
+
+  switch(OSversion)
+  {
+    case OSversion_350:
+      break;
+    case OSversion_360:
+      break;
+    case OSversion_370:
+      break;
+    default:
+      gui_installer_terminal_error("OS version not recognised "
+                         "(must be 3.50, 3.60 or 3.70)");
+      break;
+  }
+
+  return OSversion;
+}
+
+/* ------------------------------------------------------------------------ */
+
+/* should get first floppy path, ie. floppy where installer resides */
+static void get_floppy_root(char *spath)
+{
+  char *root;
+  _kernel_oserror *e;
+
+  /* canonicalise path name */
+  e = _swix(OS_FSControl,_INR(0,5),37,"<Installer$Dir>",spath,0,0,256);
+  if (e) terminal_error(e);
+
+  root = strchr(spath,':');
+  if(*++root == ':') *++root = '\0';
+}
+
+/* ------------------------------------------------------------------------ */
+
+/* should be hard disc where !boot etc. reside */
+static void find_resources_device(char *devname)
+{
+  char            *root, *v;
+  _kernel_oserror *e;
+  static char     *em_nores =  "Cannot find system resources";
+
+  v = getenv("system$path");
+  if (v)
+  {  
+    /* canonicalise path name */
+    e = _swix(OS_FSControl,_INR(0,5),37,"*",devname,"system$path",0,256);
+    if (e) v = NULL;
+  }
+  if (v == NULL) gui_installer_terminal_error(em_nores);
+
+  root = strchr(devname,'$');
+  if (root == NULL) gui_installer_terminal_error(em_nores);
+  *(root-1) = '\0';
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int get_min_freespace(char *devname)
+{
+  static int minobjsizes[DiscSpecSize] =   { DiscMinObjSizes };
+  static int minfreespaces[DiscSpecSize] = { DiscMinFreeSpaces };
+
+  int i, minobjsize, dsize, minfs;
+  discrecord_t    discrec;
+  char            root[256];
+  _kernel_oserror *e;
+
+  if ( (strncmp(devname,"ADFS::",6) == 0) ||
+       (strncmp(devname,"adfs::",6) == 0)    )
+  {
+    e = _swix(ADFS_DescribeDisc,_INR(0,1),devname+6,&discrec);
+    if (e) terminal_error(e);
+
+    minobjsize = (discrec.idlen+1) << discrec.bitsize;
+
+    if (minobjsize < (minobjsizes[0] << 10))
+      minfs = minfreespaces[0];
+
+    if (minobjsize > (minobjsizes[DiscSpecSize-1] << 10))
+      minfs = minfreespaces[DiscSpecSize-1];
+
+    for (i=0; i<DiscSpecSize; i++)
+      if (minobjsize == (minobjsizes[i] << 10))
+        minfs = minfreespaces[i];
+  }
+  else
+  {
+    strcpy(root,devname);
+    strcat(root,".$");
+    e = _swix(OS_FSControl,_INR(0,1)|_OUT(2),49,root,&dsize);
+    if (e) terminal_error(e);
+    dsize >>= 20;
+    minfs = DiscSize0 + dsize/DiscSizeDivisor;
+    if (minfs < minfreespaces[0])
+      minfs = minfreespaces[0];
+    if (minfs > minfreespaces[DiscSpecSize-1])
+      minfs = minfreespaces[DiscSpecSize-1];
+  }
+
+  return minfs;
+}
+
+/* ------------------------------------------------------------------------ */
+
+void init_control(control_t *control)
+{
+  int i;
+  static char *reslist[ResListSize] = { ResList };
+  static char *xcr[XCreateListSize] = { XCreateList };
+  static char *xmv[XMoveListSize]   = { XMoveList };
+
+  control->OSversion = check_OSversion();
+  get_floppy_root(control->floppy_root);
+  control->floppy_index = 1;
+  control->activate_newres = 1;
+  find_resources_device(control->res_devicename);
+  control->min_freespace = get_min_freespace(control->res_devicename);
+  strcpy(control->ires_dirname,InactiveResDirName);
+  strcpy(control->arc_name1,ArcsName1);
+  strcpy(control->arc_name2,ArcsName2);
+  control->max_objsize = ArcMaxObjSize;
+  control->total_bytes = ArcTotalBytes;
+  for (i=0; i<ResListSize; i++) control->res_list[i] = reslist[i];
+  for (i=0; i<XCreateListSize; i++) control->xcreates[i] =xcr[i];
+  for (i=0; i<XMoveListSize; i++) control->xmoves[i] =xmv[i];
+}
+
+/* ------------------------------------------------------------------------ */
+
+int get_floppy(char *want_floppy_path, char* message)
+{
+  char *root, canonp[256];
+  int  found;
+
+  /* canonicalise path name */
+  _swix(OS_FSControl,_INR(0,5),37,"ADFS::0",canonp,0,0,256);
+  root = strchr(canonp,'\0');
+  *root++ = '.';
+  *root   = '\0';
+
+  found = (strcmp(want_floppy_path,canonp) == 0);
+
+  if (!found && message) gui_installer_message(message,1);
+
+  return found;
+}
+
+/* ------------------------------------------------------------------------ */
+
+int check_free_space(void)
+{
+  char message[256];
+  char temp[256];
+  int  freesp;
+
+  strcpy(temp,control.res_devicename);
+  strcat(temp,".$"); 
+
+  /* read free space on device */
+  if (_swix(OS_FSControl,_INR(0,1)|_OUT(1),49,temp,&freesp))
+  {
+    gui_installer_terminal_error("internal error");
+    return 0;
+  }
+  else
+  {
+    if (freesp < (control.min_freespace << 20))
+    {
+      sprintf(message,"%s must have at least %1d Mbytes free for install",
+              control.res_devicename,control.min_freespace);
+      gui_installer_message(message,1);
+      return 0;
+    }
+    else
+    {
+      return 1;
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int obj_exists(char *oname)
+{
+  int ohandle;
+  char fullname[256];
+
+  sprintf(fullname,"%s.$.%s",control.res_devicename,oname);
+  _swix(OS_Find,_INR(0,2)|_OUT(0),0x43,fullname,0,&ohandle);
+  if (ohandle != 0) _swix(OS_Find,_INR(0,1),0,ohandle);
+
+  return (ohandle != 0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int ensure_dir(char *dname)
+{
+  char fullname[256];
+  _kernel_oserror *e;
+
+  sprintf(fullname,"%s.$.%s",control.res_devicename,dname);
+  e = _swix(OS_File,_IN(0)|_IN(1)|_IN(4),8,fullname,0);
+
+  return (e == NULL);
+}
+
+/* ------------------------------------------------------------------------ */
+
+int create_resource_directories(void)
+{
+  char message[256];
+  int i, reqd_newobjs = 1, ensured_newobjs = 0;
+
+  /* ensure name of directory for inactive resources does not clash */
+  if (obj_exists(control.ires_dirname))
+  {
+    sprintf(message,"%s.$.%s already exists; please move or rename it",
+            control.res_devicename,control.ires_dirname);
+    gui_installer_message(message,1);
+    return 0;
+  }
+
+  if (control.activate_newres)
+  {
+    /* ensure top-level resource objects exist in current resources
+       (empty directories will be created if necessary) */
+
+    reqd_newobjs += ResListSize;
+    for (i=0; i<ResListSize; i++)
+      ensured_newobjs += ensure_dir(control.res_list[i]);
+  }
+
+  /* create and ensure directory for inactive resources */
+  ensured_newobjs += ensure_dir(control.ires_dirname);
+
+  if (ensured_newobjs < reqd_newobjs)
+  {
+    /* we won't be able to create enough objects in root dir to
+       complete installation */
+
+    sprintf(message,"%s.$ is too full of items; please move %1d of them",
+            control.res_devicename,reqd_newobjs-ensured_newobjs);
+    gui_installer_message(message,1);
+    return 0;
+  }
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+int check_apps_in_root(void)
+{
+  int  i, tag, Napps;
+  char dname[256], appname[256];
+  _kernel_oserror *e;
+
+  Napps = 0;
+  sprintf(dname,"%s.$",control.res_devicename);
+  e = _swix(OS_GBPB,_INR(0,6)|_OUT(4),9,dname,appname,1,0,256,0,&tag);
+  while (!e && tag != -1)
+  {
+    if (appname[0] == '!')
+    {
+      for (i=1; appname[i] != '\0'; i++) appname[i] = tolower(appname[i]);
+      if (strcmp(appname,"!boot") !=  0) Napps++;
+    }
+    e = _swix(OS_GBPB,_INR(0,6)|_OUT(4),9,dname,appname,1,tag,256,0,&tag);
+  }
+  if (e) terminal_error(e);
+
+  return Napps;
+}
+
+/* ------------------------------------------------------------------------ */
+
+int check_feasibility(void)
+{
+  int f = 1;
+
+  if (f) f &= check_free_space();
+  if (f) f &= create_resource_directories();
+
+  return f;
+}
+
+/* ------------------------------------------------------------------------ */
+
+_kernel_oserror *activate_newresources(void)
+{
+  _kernel_oserror *e;
+  int  i;
+  char cmd[256], oname[256], dname[256], ires_path[256], ores_path[256];
+
+  sprintf(cmd,"filer_closedir %s",control.res_devicename);
+  _kernel_oscli(cmd);
+
+  sprintf(ires_path,"%s.$.%s",control.res_devicename,control.ires_dirname);
+  sprintf(ores_path,"%s.old",ires_path);
+
+  /* create .old directory */
+  e = _swix(OS_File,_IN(0)|_IN(1)|_IN(4),8,ores_path,0);
+  if (e) return e;
+
+  for (i=0; i<ResListSize; i++)
+  {
+    sprintf(oname,"%s.$.%s",control.res_devicename,control.res_list[i]);
+    sprintf(dname,"%s.%s",ores_path,control.res_list[i]);
+
+    /* set attributes of old resource, to private read, and not locked */
+    e = _swix(OS_File,_IN(0)|_IN(1)|_IN(5),4,oname,1);
+    if (e) return e;
+
+    /* move (rename) old resource to .old directory */
+    e = _swix(OS_FSControl,_INR(0,2),25,oname,dname);
+    if (e) return e;
+  }
+
+  for (i=0; i<ResListSize; i++)
+  {
+    sprintf(oname,"%s.%s",ires_path,control.res_list[i]);
+    sprintf(dname,"%s.$.%s",control.res_devicename,control.res_list[i]);
+
+    /* move (rename) new resource to active root */
+    e = _swix(OS_FSControl,_INR(0,2),25,oname,dname);
+    if (e) return e;
+  }
+
+  for (i=0; i<ResListSize; i++)
+  {
+    sprintf(oname,"%s.%s",ores_path,control.res_list[i]);
+    sprintf(dname,"%s.%s",ires_path,control.res_list[i]);
+
+    /* move (rename) old resource up out of .old directory */
+    e = _swix(OS_FSControl,_INR(0,2),25,oname,dname);
+    if (e) return e;
+  }
+
+  /* delete .old */
+  e = _swix(OS_File,_INR(0,1),6,ores_path);
+  if (e) return e;
+
+  /* extra creates */
+  for (i=0; i<XCreateListSize; i++)
+  {
+    sprintf(dname,"%s.%s",ires_path,control.xcreates[i]);
+    e = _swix(OS_File,_IN(0)|_IN(1)|_IN(4),8,dname,0);
+    if (e) return e;
+  }
+
+  /* extra moves */
+  for (i=0; i<XMoveListSize; i++)
+  {
+    sprintf(oname,"%s.$.%s",control.res_devicename,control.xmoves[i]);
+    sprintf(dname,"%s.%s",ires_path,control.xmoves[i]);
+    /* set attributes of old resource, to private read, and not locked */
+    e = _swix(OS_File,_IN(0)|_IN(1)|_IN(5),4,oname,1);
+    if (e == NULL)
+    {
+      /* if it exists, move it */
+      e = _swix(OS_FSControl,_INR(0,2),25,oname,dname);
+      if (e) return e;
+    }
+  }
+
+  /* if we get here, we should be happy */
+  return NULL;
+}
+
+/* ------------------------------------------------------------------------ */
+
+void do_shutdown(int centiwait)
+{
+  int itime, jtime;
+
+  if (centiwait)
+  {
+    _swix(OS_ReadMonotonicTime,_OUT(0),&itime);
+    jtime = itime + 100;
+    while (itime < jtime)
+    {
+      _swix(OS_ReadMonotonicTime,_OUT(0),&itime);
+    }
+  }
+
+  _swix(TaskManager_Shutdown,_IN(0),0x12);
+}
+

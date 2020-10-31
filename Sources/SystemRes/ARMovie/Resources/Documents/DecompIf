@@ -1,0 +1,208 @@
+                 The interface between the Player and the
+            Acorn Replay Decompressors in the !ARMovie resource
+            ===================================================
+
+The Replay "ARMovie" format allows for different sound and video compression
+formats. An interface inside the ARMovie Player program ("!ARMovie.Player")
+allows easier introduction of new video decompression code and allows other
+programs to use the ARMovie video decompressors. Sound format 2 provides
+similar independence for sound compression methods: the format directly
+names the sound decompression code which will be used - provided this is
+located in <ARMovie$SoundDir> (see ToUseSound for more details).
+
+There are therefore two ways to introduce new video compression formats: total
+replacement of the Player program (provide a !ARMovie.Decomp<N>.!RunImage for a
+new compression type <N> which implements the entire ProgIf command interface)
+or provide a decompressor which uses the Player interface (provide a
+!ARMovie.Decomp<N>.Decompress file). This document describes the
+Player/Decompressor interface.
+
+Using the interface to provide a new Decompress
+-----------------------------------------------
+
+Using the interface means keeping most of the architecture of the Player
+system:
+
+- interleaved video+sound chunk format
+- format of sound code and interface to it
+- key frame system (but it can be ignored completely, also)
+- decompressor called in IRQ mode; should run with interrupts (mostly)
+  enabled
+- flags between disc loader and decompressor
+- flags between decompressor and screen painter
+- decompressor provides the colour looked up output
+
+Details of using the sound system are in 'ToUseSound': either the current
+Acorn Replay MovingLines sound code can be used or new sound formats added
+by sound code implementing the current interface (described from the point
+of view of the client in ToUseSound) can be added using format 2 to name
+the sound code. No changes to Player programs is required.
+
+In order to start some of the decompressors (MovingLines, for example) at
+any position, the use of key frames is possible. The compressor stores the
+state of the stream every chunk uncompressed in the key frame data
+structure. The Player program will load the uncompressed file from the data
+structure in order to start decompression at an arbitary point, providing
+the 'previous frame' state (see below). Decompressors which can start
+anywhere use an ARMovie file without the key frame data structure (by giving
+a -1 offset to the keys in the header).
+
+The decompressor is called in IRQ mode with interrupts enabled in order to
+decompress the next frame. Code in the Player handles semaphores between
+decompression and painting frames and between loading the video chunks and
+decompressing frames. Other code in the Player takes data from the
+decompressed frames buffer and paints it onto the screen (in IRQ mode also)
+and code waits for compressed data buffers to be empty and refills them from
+the filing system (in User mode as the foreground task). To allow these
+other tasks to run, the IRQ code must leave interrupts enabled for as much
+time as possible (the MovingLines decompressor leaves interrupts enabled for
+all of its work). In any case IRQ must not be disabled for longer than 1
+full sound buffer: about 2mS.
+
+The disc loader works in a double buffered manner: two buffers each
+containing either one or two chunks of data (2 or 4 seconds per buffer
+conventionally). The addresses of the two buffers and one or two chunks per
+buffer are all chosen dynamically and the Player program knows from the
+ARMovie header how many times to call the decompression code. The two
+buffers will always start on word addresses.
+
+Using the interface play with existing Decompress code
+------------------------------------------------------
+
+As well as being able to provide new compression formats by using the
+Player/ Decompress interface, other programs can also use the Decompress
+code, in effect pretending to be the Player program as far as the Decompress
+code is concerned. This greatly extends the capability of the Replay system:
+programs could be written to play ARMovie files in the desktop while
+multitasking (obviously non-real time). Or sections of an ARMovie file could
+be decompressed to memory and editted. Or whatever. The ability to patch the
+Decompress code allows player programs to load two copies of a Decompress
+code: patch one to generate data for one format and patch the other to
+generate data for a different format (e.g. non-dithered for the screen).
+
+Such a playing program has to do all the tasks normally done by the
+!ARMovie.Player program:
+
+- read the file header to discover the data
+- establish the dither for the screen if needed
+- load the right decompress code, patch and initialise it
+- load the key frame if required
+- load the chunks from the file
+- call the decompress entry point for each frame in the block
+
+but it need do no more than this. It can structure its data structures as it
+wishes (excepting that Decompress codes write pixels as words).
+
+Decompress "Info" file
+----------------------
+
+In order that Decompress code providers can incorporate their own names for
+formats, provide format origination text, provide compress and edit routines
+with hints on various formats, an Info file called Decomp<N>.Info can be
+provided (the !ARMovie.Player does not need this file). It contains the
+following information:
+
+Name of format
+Originator
+exact number of bits per pixel (or empty if this is variable)
+desired x multiple; minimum x size; maximum x size
+desired y multiple; minimum y size; maximum y size
+temporal (or empty if temporal information is not required)
+list of colour spaces which can be held in the format
+
+For example:
+
+Moving Lines
+© Acorn Computers 1993
+
+1;1;1280
+1;1;1024
+Temporal
+YUV 5,5,5; RGB 5,5,5
+
+Formal interface: "Decompress" file (any filetype can be used)
+--------------------------------------------------------------
+
+The Player program loads the decompress code at a quad word aligned address
+in memory. It then processes the patch table and then calls the init point.
+Later on the player calls the decompressor in USR mode to decompress the
+first chunk's worth of frames (or to do -explode). For a full play, the
+player will call the decompressor in IRQ mode.
+
+First word: patch table offset
+
+ Purpose: to allow the player to insert pixel colour lookup in the
+          decompressor. May in future allow other values to patched.
+          Note that an unpatched decompressor should still work!!
+
+ The offset table consists of words. Each word has the bottom 16 bits
+ as the offset of a word (usually an instruction) from the start of the
+ decompressor. The top 4 bits are an opcode number. The remaining 12
+ bits may have a meaning for that opcode. The list is terminated by a
+ word of -1.
+
+ Opcode 0: patch in colour lookup
+  bits 27..24: destination register
+  bits 23..20: source register
+  bits 19..17: pixel lookup table register
+ The Player alters the word to lookup the pixel colour. The value of
+ the source register and the size of the result in the destination
+ register may change for different decompressors. For MovingLines the
+ source register value is either RGB or YUV 15 bits and the destination
+ value is always a word value. An unpatched MovingLines decompressor
+ produces RGB or YUV output.
+
+Second word: init entry point
+
+ Purpose: to allow the decompressor to initialise any tables that are
+          needed
+
+ On entry:
+   r0 - source x size of movie
+   r1 - source y size of movie
+   r2..r12 - scratch
+   r13 - stack
+   r14 - return address
+   processor mode: USR
+   flags - V set signals error, otherwise irrelevant
+
+Third word: decompress entry point
+
+ Purpose: decompress precisely one frame
+
+ On entry:
+   r0 to r5 are set up by Player as follows:
+   r0 - source byte pointer
+   r1 - output pointer - save output pixels here (word aligned)
+   r2 - previous output pointer (allows copying from previous frame)
+   r3 - pixel dither lookup table
+   r4 - return address (can't be r14...)
+   r5..r12 - scratch
+   r13 - small stack (RISC OS irq stack)
+   r14 - unuseable
+   processor mode: IRQ, interrupts ENABLED (usually)
+   flags - irrelevant
+ On exit
+   r0 - next value of source byte pointer
+   r1..r12 - irrelevant
+   r13 - must be same value as on entry
+   r14 - irrelevant
+   processor mode: IRQ, interrupts ENABLED
+   flags - irrelevant
+
+ Decompressed pixels are stored as Words!!! For the MovingLines decompressor
+ to work, the source pointer must be half word aligned.
+
+The 'DecompresH' file
+---------------------
+
+A decompression provider can additionally provide a DecompresH program. This
+has exactly the same interface as the Decompress file, but stores output
+pixels as half words. This allows the Player program to use less store (and
+run slightly faster) in some screen modes (in particular, mode 15).
+
+Programs which use the decompression programs must not assume the existence
+of 'DecompresH' forms of decompressors and must be capable of using the
+'Decompress' file instead. For some compression formats, the gain in the
+Player of using the half word output may be completely lost by inefficiency
+in the decompressor.

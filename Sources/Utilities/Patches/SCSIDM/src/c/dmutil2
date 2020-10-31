@@ -1,0 +1,769 @@
+/*
+ * $Header: /smsa/bsd:etc/scsidm/dmutil2.c:bsd  1.5  $
+ * $Source: /smsa/bsd:etc/scsidm/dmutil2.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	dmutil2.c,v $
+ * Revision 1.5  90/08/13  15:24:36  jroach
+ * Bring Risc OS and RISCiX versions in line with each other.
+ * 
+ * Revision 1.4  90/05/25  11:08:28  kwelton
+ * new routine isoptical() tests whether device is an explicitly supported
+ * optical drive.
+ * Extended set of known device classes to include those defined in SCSI 2.
+ * 
+ * Revision 1.3  89/10/23  14:40:06  kwelton
+ * Created a new function, nounixarea() which tests for no user-defined
+ * partitions in a partition table.
+ * 
+ * Revision 1.2  89/05/16  16:14:22  kwelton
+ * Missed off a parameter to a fputs() call - fixed it.
+ * 
+ * Revision 1.1  89/04/06  11:22:25  kwelton
+ * Initial revision
+ * 
+ *
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /smsa/bsd:etc/scsidm/dmutil2.c:bsd  1.5  $";
+#endif
+
+#include <stdio.h>
+#include <ctype.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "ps_direct.h"
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <dev/ps_direct.h>
+#endif
+#include "scsidm.h"
+#include "dmcmds.h"
+#include "partition.h"
+
+#define ToLower(x)	((isupper(x)) ? (tolower(x)) : (x))
+
+	/* import externals */
+import u_int unixstart, unixlen;	/* start & length of UNIX partition */
+import PTLIST *pthead, *pttail;		/* linked list of partitions */
+
+import char *KnownOpticals[];
+import int NOpticals;
+
+	/* declare external routines */
+import char *ctime();
+import void *malloc();
+
+static MAPINFO mapdata[NUSERPART];
+
+static bool submerged();
+
+	/* declare routines defined this segment */
+int nounixarea();
+char *typename();
+u_char *addrpage();
+void showptable(), prpmap(), freept();
+bool chainpt(), adfsoverlap(), isoptical();
+
+/**********************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, dmutil2.c:
+ *
+ * 1) int atox() - convert ASCII to hexadecimal
+ *
+ * 2) u_char *addrpage() - address the start of a page
+ *
+ * 3) int scanlist() - scan comma separated list for set of values
+ *
+ * 4) void showptable() - print contents of partition table
+ *
+ * 5) void prpmap() - print map of partition table
+ *
+ * 6) static bool submerged() - test whether a partition is hidden
+ *
+ * 7) bool chainpt() - add a partition table into the linked list
+ *
+ * 8) void freept() - clear linked list of partition tables
+ *
+ * 9) bool adfsoverlap() - does a table have partitions in the ADFS area?
+ *
+ * 10) char *typename() - return a string describing peripheral type
+ *
+ * 11) int nounixarea() - return YES/NO boolean testing for a unix area
+ *
+ * 12) bool isoptical() - check device against list of known optical drives
+ *
+ */
+ 
+/************************************************************************/
+
+int atox(data)
+
+u_char *data;
+
+{
+	/*
+	 * subroutine atox() -
+	 *
+	 * routine works like atoi(), except that it converts to hexadecimal
+	 * rather than decimal. returned value is conversion result.
+	 *
+	 */
+
+	/* declare autos */
+	register u_int n = 0, neg = 0;
+
+	/* skip white space, test for sign */
+	for( ; ; ++data)
+	{
+	 switch(*data)
+	 {
+	 case ' ':
+	 case '\t':
+	  continue;
+	  
+	 case '-':
+	  neg = 1;
+	  /* fall thru' to next case */
+
+	 case '+':
+	  ++data;
+	  /* fall thru' to next case */
+
+	 default:
+	  break;
+	 }
+
+	 /* leave for loop if falling out of switch */
+	 break;
+	}
+
+	/* now convert all valid digits */
+	while( (*data >= '0' && *data <= '9') ||
+	       ((*data = ToLower(*data)) >= 'a' && *data <= 'f') )
+	{
+	 n = n * 0x10 + (u_int)(*data - ((isdigit(*data)) ? '0' : 'a' - 10));
+	 ++data;
+	}
+
+	/* finished */
+	return( neg ? -n : n);
+}
+
+/************************************************************************/
+
+u_char *addrpage(pages,pagespace,pageno)
+
+u_char *pages;
+int pagespace, pageno;
+
+{
+	/*
+	 * subroutine addrpage() -
+	 *
+	 * routine scans through *pages up to a maximum of pagespace
+	 * bytes, searching for page number pageno. returned value is
+	 * a pointer to the start of the page, NULL if not found.
+	 *
+	 */
+
+	/* declare autos */
+	register u_char *cptr;
+
+	/* scan through all the pages */
+	for( cptr = pages; cptr < (pages + pagespace); )
+	 /* is this the page? */
+	 if( (*cptr & PAGNOMSK) == pageno )
+	  return(cptr);
+	 else
+	  /* step to the next page */
+	  cptr += *(cptr + 1) + 2;
+
+	/* loop has finished without finding a page */
+	return(NULL);
+}
+
+/************************************************************************/
+
+int scanlist(src,dst,cfunc)
+
+u_char *src, *dst;
+int (*cfunc)();
+
+{
+	/*
+	 * subroutine scanlist() -
+	 *
+	 * routine scans the comma separated list of values in src for
+	 * data which is to be entered in dst. cfunc() is the conversion
+	 * function to be used. returned value is the number of conversions,
+	 * -1 if an error occured.
+	 *
+	 */
+
+	/* declare autos */
+	register int retc = 0;
+	register u_char *start, *end;
+	register bool more = TRUE;
+
+	/* loop over the list */
+	for( start = end = src; more; start = end )
+	{
+	 /* find the end of the next member */
+	 while( *end != ',' && *end != '\0' )
+	  /* move pointer along */
+	  ++end;
+
+	 /* is the the last member of the list? */
+	 if( *end == '\0' )
+	  more = FALSE;
+	 else
+	  *end = '\0';
+
+	 /* convert the data */
+	 if( (*dst++ = (*cfunc)(start)) == 0 && *start != '0' )
+	 {
+	  /* bad input */
+	  printf("Bad input: %s\n",start);
+	  return(-1);
+	 }
+	 else
+	  ++retc;
+
+	 /* restore the separator if necessary */
+	 if( more )
+	  *end++ = ',';
+	}
+
+	/* finished */
+	return(retc);
+}
+
+/************************************************************************/
+
+void showptable(infoblock)
+
+UNIX_Info *infoblock;
+
+{
+	register int i;
+	register Partition *pptr;
+
+	printf("\n\t\tTable was written on %s",
+		(char*) ctime(&(infoblock->pt.time_stamp)));
+
+	/* print table header */
+	fputs("\n\t\t\t\tPartition Table",stdout);
+	fputs("\n\t\t\t\t---------------\n\t",stdout);
+	fputs("+------+--------------+--------------",stdout);
+	fputs("+-----------------+------------+\n\t",stdout);
+	fputs("|  No  |     Start    |    Length    ",stdout);
+	fputs("|     Text        |  Comments  |\n\t",stdout);
+	fputs("+------+--------------+--------------",stdout);
+	fputs("+-----------------+------------+\n",stdout);
+
+	/* print stats for all valid partitions */
+	for( i = 0; i < NUSERPART; ++i )
+	{
+	 register char *comment;
+
+	 pptr = ((Partition *)(infoblock->pt.pt)) + i;
+	 if( (pptr->flags & PT_VALID) != PT_VALID )
+	  /* ignore this partition */
+	  continue;
+
+	 /* set comment field */
+	 if( (pptr->flags & PT_READ_ONLY) )
+	  comment = "Read Only";
+	 else
+	  comment = "";
+
+	 /* this partition is OK - print the stats */
+	 printf("\t|   %d  | %11u  | %11u  | %-*s| %-10.10s |\n",
+		 i,pptr->start,pptr->length,
+		 TEXT,pptr->text,comment);
+	}
+
+	fputs("\t+------+--------------+--------------",stdout);
+	fputs("+-----------------+------------+\n\n",stdout);
+
+	/* finished */
+	return;
+}
+
+/************************************************************************/
+
+void prpmap(pt)
+
+Table *pt;
+
+{
+	/*
+	 * subroutine prpmap() -
+	 *
+	 * routine prints a map of the passed partition table. no value
+	 * is returned.
+	 *
+	 */
+
+	/* declare autos */
+	register int i;
+	register char *pmap, *cptr;
+	register MAPINFO *mptr;
+
+	/* try to allocate core for the map */
+	if( (pmap = malloc(MAPSIZE * sizeof(char))) == NULL )
+	{
+	 printf("\nOut of core: cannot print partition map\n\n");
+	 return;
+	}
+
+	/* fill the map with spaces */
+	for( i = 0, cptr = pmap; i < MAPSIZE; ++i )
+	 *cptr++ = ' ';
+
+	/* print space occupied by each partition */
+	for( i = 0; i < NUSERPART; ++i )
+	{
+	 register int j;
+	 register int pstart, plength;
+	 register Partition *pptr;
+	 register MAPINFO *tmp;
+
+	 /* clear the data for this partition */
+	 mptr = mapdata + i;
+	 bzero((char *)mptr,sizeof(*mptr));
+
+	 if( ((pptr = ((Partition *)(pt->pt)) + i)->flags & PT_VALID)
+	    != PT_VALID )
+	  /* ignore this partition */
+	  continue;
+
+	 /* fetch then validate partition start & length */
+	 pstart = pptr->start;
+	 plength = pptr->length;
+
+	 /* check that start is not before unixstart */
+	 if( pstart < unixstart )
+	 {
+	  /* is the whole partition lost */
+	  if( (unixstart - pstart) < plength )
+	  {
+	   /* no */
+	   printf("Partition %d has %d blocks in the "
+#if defined(SCSIDM_FOR_RISCOS)
+		  "RISC OS area, ignoring these\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+		  "SCSIFS area, ignoring these\n",
+#endif
+		  i,unixstart - pstart);
+	   plength -= (unixstart - pstart);
+	   pstart = unixstart;
+	  }
+	  else
+	  {
+	   printf("Partition %d is completely within "
+#if defined(SCSIDM_FOR_RISCOS)
+		  "the RISC OS area, ignoring it\n",
+#elif defined(SCSIDM_FOR_RISCiX)
+		  "the SCSIFS area, ignoring it\n",
+#endif
+		  i);
+	   continue;
+	  }
+	 }
+
+	 /* fill in partition info */
+	 mptr->blok1 = pstart;
+	 mptr->blokn = pstart + (plength - 1);
+
+	 /* calculate the start cell for this partition's map */
+	 mptr->map1 = (u_int)(((u_long)(mptr->blok1 - unixstart)
+					* MAPSIZE) / unixlen);
+
+	 /* calculate the end cell for this partition's map */
+	 mptr->mapn = (u_int)(((u_long)(mptr->blokn - unixstart)
+					* MAPSIZE) / unixlen);
+
+	 /*
+	  * adjust the end of the map so it does not falsely mark
+	  * overlapping partitions
+	  */
+	 for( cptr = (pmap + mptr->mapn);
+	      *cptr != ' ' && cptr >= (pmap + mptr->map1);
+	      --cptr )
+	 {
+	  for( j = 0; j < i; ++j )
+	  {
+	   tmp = mapdata + j;
+	   if( (tmp->blok1 <= mptr->blokn && tmp->blokn >= mptr->blokn)
+	      || (tmp->blok1 <= mptr->blok1 && tmp->blokn >= mptr->blok1) )
+	    /* overlap - do not worry any further */
+	    break;
+	  }
+	  if( j != i )
+	   /* overlap found - leave this outer loop */
+	   break;
+
+	  /* blocks clash, but there is no true overlap - adjust map */
+	  --(mptr->mapn);
+	 }
+	 /*
+	  * very small partitions may only utilise one cell in
+	  * the map which is also occupied by the ends of
+	  * surrounding partitions. if this is the case, force
+	  * the cell to be marked.
+	  *
+	  * NOTE: this is not foolproof - two very small partitions
+	  * occupying the same map cell will result in one partition
+	  * disappearing: there is not a lot that can be done about this
+	  * simply & quickly.
+	  */
+	 if( ++cptr == (pmap + mptr->map1) )
+	 {
+	  /* will have moved mapn too far back */
+	  ++(mptr->mapn);
+
+	  /* mark the cell and this partition is finished */
+	  *cptr = i + '0';
+	  break;
+	 }
+
+	 /*
+	  * adjust the start of the map so that only truly
+	  * overlapping partitions are marked as such.
+	  */
+	 for( cptr = (pmap + mptr->map1);
+	      *cptr != ' ' && cptr <= (pmap + mptr->mapn); ++cptr )
+	 {
+	  for( j = 0; j < i; ++j )
+	  {
+	   tmp = mapdata + j;
+	   if( tmp->blok1 <= mptr->blok1 && tmp->blokn >= mptr->blok1 )
+	   {
+	    /* overlap: mark this cell, do not bother to search further */
+	    *cptr = '^';
+	    break;
+	   }
+	  }
+	  if( i == j )
+	   /* no overlap found */
+	   ++(mptr->blok1);
+	 }
+
+	 /* now fill in the rest of the map */
+	 while( cptr <= (pmap + mptr->mapn) )
+	 {
+	  *cptr = (*cptr == ' ') ? (i + '0') : '^';
+	  ++cptr;
+	 }
+	}
+
+	/* now mark all totally submerged partitions */
+	for( i = 0; i < NUSERPART; ++i )
+	{
+	 if( ((((Partition *)pt) + i)->flags & PT_VALID) != PT_VALID )
+	  /* ignore this partition */
+	  continue;
+	 else
+	  mptr = mapdata + i;
+
+	 if( submerged(i,mptr->blok1,mptr->blokn) )
+	 {
+	  register int j;
+	  for( j = mptr->map1; j <= mptr->mapn; ++j )
+	   *(pmap + j) = '*';
+	 }
+	}
+
+	/* print the map out */
+	fputs("\n\t\t\t\tPartition Map",stdout);
+	fputs("\n\t\t\t\t-------------\n\t+",stdout);
+	for( i = 0; i < MAPCOLS; ++i )
+	 putchar('-');
+	fputs("+\n",stdout);
+
+	for( i = 0; i < MAPROWS; ++i )
+	 printf("\t|%.*s|\n",MAPCOLS,pmap + (i * MAPCOLS));
+
+	fputs("\t+",stdout);
+	for( i = 0; i < MAPCOLS; ++i )
+	 putchar('-');
+	fputs("+\n\t     ^: overlapping partitions    "
+	      "*: submerged partitions\n\n",stdout);
+
+	/* finished */
+	free(pmap);
+	return;
+}
+
+/************************************************************************/
+
+static bool submerged(part,start,stop)
+
+int part, start, stop;
+
+{
+	/*
+	 * subroutine submerged() -
+	 *
+	 * routine determines whether the partition part is completely
+	 * covered from logical block number start onwards. returned
+	 * value is TRUE if so, else FALSE.
+	 *
+	 */
+
+	/* declare autos */
+	register int i;
+	register MAPINFO *mptr;
+
+	/* loop over all partitions */
+	for( i = 0; i < NUSERPART; ++i )
+	{
+	 /* do not count the current partition */
+	 if( i == part )
+	  continue;
+	 else
+	  mptr = mapdata + i;
+
+	 /*
+	  * only interested in partitions that start before or
+	  * with the current partition - those starting later
+	  * cannot mean the entire partition is covered
+	  */
+	 if( mptr->blok1 <= start && mptr->blokn >= start )
+	 {
+	  /* check for a single partition covering the current one */
+	  if( mptr->blokn >= stop )
+	   /* current partition is submerged */
+	   return(TRUE);
+	  else
+	   /*
+	    * this partition does not cover it, see
+	    * whether another one covers the rest
+	    */
+	   return( submerged(part,(mptr->blokn) + 1,stop));
+	 }
+	}
+
+	/* no partitions found to submerge this one */
+	return(FALSE);
+}
+
+/************************************************************************/
+
+bool chainpt(table,current)
+
+UNIX_Info *table;
+bool current;
+
+{
+	/*
+	 * subroutine chainpt() -
+	 *
+	 * routine chains the passed partition table into the linked
+	 * list if an identical table is not already there. returned
+	 * value is TRUE if all OK, FALSE if no more core could be
+	 * allocated.
+	 *
+	 */
+
+	/* declare autos */
+	register long *tstamp;
+	register PTLIST *ptnext;
+
+	/* set pointer to timestamp of new table */
+	tstamp = &(table->pt.time_stamp);
+
+	/* check for table already here */
+	for( ptnext = pthead; ptnext != NULL; ptnext = ptnext->nextpt )
+	 if( *tstamp == ptnext->pt.pt.time_stamp )
+	  /* already in list */
+	  return(TRUE);
+
+	/* not in list - allocate some core */
+	if( (ptnext = malloc(sizeof(PTLIST))) == NULL )
+	{
+	 /* out of luck */
+	 fputs("chainpt(): out of core\n",stdout);
+	 return(FALSE);
+	}
+
+	/* fill in the new member of the list */
+	ptnext->pt = *table;
+	ptnext->current = current;
+	ptnext->nextpt = NULL;
+
+	/* chain this into the list */
+	if( pthead == NULL )
+	 pthead = pttail = ptnext;
+	else
+	 pttail = pttail->nextpt = ptnext;
+
+	/* finished */
+	return(TRUE);
+}
+
+/************************************************************************/
+
+void freept()
+
+{
+	/*
+	 * subroutine freept() -
+	 *
+	 * routine frees all elements in the linked list of partition
+	 * tables. no value is returned.
+	 *
+	 */
+
+	/* no autos */
+
+	for( pttail = pthead; pttail != NULL; pttail = pthead )
+	{
+	 /* move head down the list */
+	 pthead = pthead->nextpt;
+
+	 /* free this element */
+	 free(pttail);
+	}
+
+	/* finished */
+	return;
+}
+
+/************************************************************************/
+
+bool adfsoverlap(pt,adfsend)
+
+Partition *pt;
+u_int adfsend;
+
+{
+	/*
+	 * subroutine adfsoverlap() -
+	 *
+	 * routine determines whether any entry in the Partition table
+	 * at pt is in the ADFS area, which finishes at adfsend. returned
+	 * value is TRUE if there is an overlap, else FALSE.
+	 *
+	 */
+
+	/* declare autos */
+	register int i;
+	register Partition *pptr;
+
+	/* loop over all user partitions */
+	for( i = 0; i < NUSERPART; ++i )
+	{
+	 /* ignore invalid partitions */
+	 if( !((pptr = pt + i)->flags & PT_VALID) )
+	  continue;
+
+	 /* no partition should start before the end of ADFS */
+	 if( pptr->start <= adfsend )
+	  /* overlap */
+	  return(TRUE);
+	}
+
+	/* no partition found with an overlap */
+	return(FALSE);
+}
+
+/************************************************************************/
+
+char *typename(perphtype)
+
+u_char perphtype;
+
+{
+	/*
+	 * subroutine typename() -
+	 *
+	 * routine returns a string describing the peripheral type.
+	 *
+	 */
+
+	/* declare autos */
+	register int i;
+	struct _ptypes
+	{
+	 u_char ptype;
+	 char *pdesc;
+	} *ptptr;
+	
+	static struct _ptypes ptypes[] =
+	{
+         { DAPTYPE,	"direct access" },
+	 { SAPTYPE,	"sequential access" },
+	 { PTRPTYPE,	"printer" },
+         { PROCPTYPE,	"processor" },
+         { WORMPTYPE,	"write-once, read multiple" },
+         { CDROMPTYPE,	"read-only direct access" },
+         { SCANPTYPE,	"scanner" },
+         { OMPTYPE,	"optical memory" },
+         { CHANGEPTYPE,	"changer" },
+         { COMMSPTYPE,	"communications" },
+         { TARGETPTYPE,	"target device" }
+	};
+
+	static int nptypes = sizeof(ptypes) / sizeof(ptypes[0]);
+
+	/* loop over known types */
+	for( i = 0, ptptr = ptypes; i < nptypes; ++i, ++ptptr )
+	 if( perphtype == ptptr->ptype )
+	  return(ptptr->pdesc);
+
+	/* no match found */
+	return("unknown peripheral type");
+}
+
+/************************************************************************/
+
+int nounixarea(pt)
+Partition *pt;
+{
+	/*
+	 * subroutine nounixarea() -
+	 *
+	 * routine returns a YES/NO answer on whether none of the user
+	 * definable partitions are valid: TRUE -> no unix areas, FALSE
+	 * -> unix areas present.
+	 */
+	int i;
+
+	for( i = 0; i < NUSERPART; ++i )
+	 if( (pt + i)->flags & PT_VALID )
+	  /* found a valid partition */
+	  break;
+
+	return( i == NUSERPART );
+}
+
+/************************************************************************/
+
+bool isoptical(d_ident)
+char *d_ident;
+{
+    /*
+     * subroutine isoptical() -
+     *
+     * routine checks the identification text against a list of known
+     * optical devices. returned value is TRUE if a match found, else
+     * FALSE.
+     */
+
+    /* declare autos */
+    int i;
+
+    for( i = 0; i < NOpticals; ++i )
+	if( !strncmp(d_ident, KnownOpticals[i], strlen(KnownOpticals[i])) )
+	    break;
+
+    return( (i == NOpticals) ? FALSE : TRUE );
+}
+
+/************************************************************************/

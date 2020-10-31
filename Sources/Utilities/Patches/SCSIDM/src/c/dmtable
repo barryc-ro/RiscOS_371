@@ -1,0 +1,316 @@
+/*
+ * $Header: /smsa/bsd:etc/scsidm/dmtable.c:bsd  1.5  $
+ * $Source: /smsa/bsd:etc/scsidm/dmtable.c: $
+ *
+ * Copyright (c) 1989 Acorn Computers Ltd., Cambridge, England
+ *
+ * $Log:	dmtable.c,v $
+ * Revision 1.5  90/08/13  15:22:34  jroach
+ * Bring Risc OS and RISCiX versions in line with each other.
+ * Change default RISCiX block size to 4096 from 8192.
+ * 
+ * Revision 1.4  90/08/02  15:52:27  kwelton
+ * mkdisktab() now verifies that a valid partition table exists BEFORE
+ * prompting for output filename.
+ * 
+ * Revision 1.3  90/05/25  11:03:52  kwelton
+ * mkdisktab() has to cheat for optical drives & pretend they have 16 heads.
+ * Otherwise, mkfs creates an excessively large number of cylinder groups.
+ * 
+ * Revision 1.2  89/06/26  16:06:59  kwelton
+ * The number of cylinders is now stored in cdev, so do not bother calculating
+ * it any more.
+ * 
+ * Revision 1.1  89/04/06  11:22:12  kwelton
+ * Initial revision
+ * 
+ * 
+ */
+
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /smsa/bsd:etc/scsidm/dmtable.c:bsd  1.5  $";
+#endif
+
+#include <stdio.h>
+#if defined(SCSIDM_FOR_RISCOS)
+#include "disktab.h"
+#include "file.h"
+#include "errno.h"
+#include "ps_direct.h"
+#elif defined(SCSIDM_FOR_RISCiX)
+#include <disktab.h>
+#include <sys/file.h>
+#include <sys/errno.h>
+#include <dev/ps_direct.h>
+#endif
+#include "scsidm.h"
+#include "partition.h"
+
+	/* import externals */
+import char **iphelp;
+import struct d_parms *cdev;
+import int errno;
+import bool optical;
+
+	/* declare external functions */
+import int access(), vdstr();
+import u_int unixstartbyte();
+import unsigned long ipdata();
+import bool gotdev();
+
+	/* declare statics */
+static struct disktab dt =
+{
+	NULL,				/* drive name */
+	"winchester",			/* drive type */
+	0,				/* sector size */
+	0,				/* # tracks/cylinder */
+	0,				/* # sectors/track */
+	0,				/* # cylinders */
+	1,				/* revolutions per minute */
+	0,				/* supports DEC bad144 std? */
+	1,				/* use sect rather than cyl offsets? */
+	{
+		{ 0, 4096, 1024 },
+		{ 0, 4096, 1024 },
+		{ 0, 4096, 1024 },
+		{ 0, 4096, 1024 },
+		{ 0, 4096, 1024 },
+		{ 0, 4096, 1024 },
+		{ 0, 4096, 1024 },
+		{ 0, 4096, 1024 },
+	}				/* partition entries */
+};
+	
+
+static bool wrtdisktab();
+
+/************************************************************************/
+
+/*
+ * scsidm - program to provide low level SCSI disk management
+ *
+ * routines this segment, dmtable.c:
+ *
+ * 1) void mkdisktab() - create a sample disk table entry
+ *
+ * 2) static bool wrtdisktab() - write a sample disk table entry
+ *
+ */
+
+/************************************************************************/
+
+void mkdisktab(argc,argv)
+
+int argc;
+char **argv;
+
+{
+	/*
+	 * subroutine mkdisktab() -
+	 *
+	 * routine creates a sample disk table entry & writes it out
+	 * to a file given by the user. no value is returned.
+	 *
+	 */
+
+	/* declare autos */
+	register int i;
+	register u_int unixaddr;
+	UNIX_Info info;
+	char fnamebuf[CANBSIZ], *fname;
+	static char dnamebuf[CANBSIZ];
+
+	static char *fnameiphelp[] =
+	{
+	 "The current command is create a sample disktab entry.  Enter",
+	 "the name of the file to write this entry into.",
+	 ""
+	};
+
+	/* check that a device name is given */
+	if( !gotdev(*argv) )
+	 return;
+
+	/*
+	 * try to get the address of the start of the
+	 * UNIX partition
+	 */
+	if( (unixaddr = unixstartbyte(TRUE)) == -1 )
+	 return;
+
+	/* read the partition table */
+	if( rddev(unixaddr,(char *)&info,sizeof(info),FALSE) != GOOD )
+	 return;
+
+	/* check for a proper table */
+	if( info.id != ID_MARK )
+	{
+	 fputs("partition table not found\n",stdout);
+	 return;
+	}
+
+	/* get the filename & see whether we can write it */
+	if( --argc > 0 )
+	 fname = *++argv;
+	else
+	{
+	 iphelp = fnameiphelp;
+	 (void)ipdata(fnamebuf,"filename? >",vdstr,FALSE);
+	 fname = fnamebuf;
+	}
+
+	if( access(fname,W_OK) == -1 )
+	{
+	 /*
+	  * may be that the file does not exist - try
+	  * to create it
+	  */
+	 if( errno == ENOENT )
+	 {
+	  /* this is the case */
+	  register int opstat;
+	  if( (opstat = open(fname,O_CREAT,0600)) == -1 )
+	  {
+	   /* really does not like the file */
+	   perror(fname);
+	   return;
+	  }
+	  else
+	   /* file was OK - close it again */
+	   close(opstat);
+	 }
+	 else
+	 {
+	  perror(fname);
+	  return;
+	 }
+	}
+	else
+	 /* truncate the new file */
+	 ftruncate(fname,(off_t)0);
+
+	/*
+	 * start filling out the disktab entry
+	 */
+	if( cdev->d_ident[0] != '\0' )
+	{
+	 register char *sptr, *dptr;
+
+	 /* copy ident string up till EOS or 1st space character */
+	 for( sptr = cdev->d_ident, dptr = dnamebuf;
+	      *dptr = *sptr; ++sptr, ++dptr )
+	  /* test for a space */
+	  if( *dptr == ' ' )
+	  {
+	   /* terminate the string & stop */
+	   *dptr = '\0';
+	   break;
+	  }
+	}
+	else
+	 /* no ident string available - use default */
+	 strcpy(dnamebuf,"SCSI_disk");
+
+	dt.d_name = dnamebuf;
+
+	/* set shape parameters */
+	dt.d_secsize = cdev->d_bloksize;
+	dt.d_nsectors = cdev->d_blokstrk;
+	dt.d_ncylinders = cdev->d_cyls;
+
+	if( !optical && cdev->d_type != OMPTYPE )
+	    dt.d_ntracks = cdev->d_heads;
+	else
+	{
+	    /*
+	     * pretend we have 16 heads - prevents mkfs creating an
+	     * excessive number of cylinder groups
+	     */
+	    dt.d_ntracks = 16;
+	}
+
+	/* store partition information */
+	for( i = 0; i < MAX_PARTITION; ++i )
+	{
+	 /* set the no. of blocks in this partition */
+	 dt.d_partitions[i].p_size = (info.pt.pt[i].flags & PT_VALID)
+	 	== PT_VALID ? info.pt.pt[i].length : -1;
+	}
+
+	/* try to write this information to file */
+	if( !wrtdisktab(fname) )
+	{
+	 fputs("could not write sample disktab entry\n",stdout);
+	 return;
+	}
+
+	/* finished */
+	return;
+}
+
+/************************************************************************/
+
+static bool wrtdisktab(fname)
+
+char *fname;
+
+{
+	/*
+	 * subroutine wrtdisktab() -
+	 *
+	 * routine uses the information held in the static dt to write
+	 * a sample disktab entry in fname. returned value is TRUE if
+	 * all OK, else FALSE.
+	 *
+	 */
+
+	/* declare autos */
+	register int i;
+	register bool retc;
+	FILE *fp;
+
+	/* try to open the file */
+	if( (fp = fopen(fname,"w")) == NULL )
+	{
+	 perror(fname);
+	 return(FALSE);
+	}
+
+	/*
+	 * there now follows a set of fprintf()'s, rather than
+	 * testing the exit status from each one, press on
+	 * regardless, and use ferror() when finished.
+	 */
+	fputs("#\n# rm set to 1 gives a 1:1 interleave\n#\n",fp);
+	fputs("#\n# change the name field as appropriate\n#\n",fp);
+	fprintf(fp,"%s:\\\n",dt.d_name);
+	fprintf(fp,"\t:ty=%s:ns#%d:nt#%d:nc#%d:se#%d:rm#%d",
+		dt.d_type,dt.d_nsectors,dt.d_ntracks,
+		dt.d_ncylinders,dt.d_secsize,dt.d_rpm);
+	for( i = 0; i < MAX_PARTITION; ++i )
+	{
+	 register char c;
+	 
+	 /* ignore undefined partitions */
+	 if( dt.d_partitions[i].p_size == -1 )
+	  continue;
+
+	 c = 'a' + i;
+	 fprintf(fp,":\\\n\t:p%c#%d:b%c#%d:f%c#%d",
+	 	 c,dt.d_partitions[i].p_size,
+	 	 c,dt.d_partitions[i].p_bsize,
+	 	 c,dt.d_partitions[i].p_fsize);
+	}
+	fputc('\n',fp);
+
+	/* check for errors on file */
+	if( (retc = ferror(fp)) )
+	 perror(fname);
+
+	/* return appropriate status */
+	fclose(fp);
+	return( retc ? FALSE : TRUE );
+}
+
+/************************************************************************/

@@ -1,0 +1,408 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/* Title: c.flex
+ * Purpose: provide memory allocation for interactive programs requiring
+ *          large chunks of store.
+ * History: IDJ: 06-Feb-92: prepared for source release
+ *          SJM: 10/93: cleanup to allow use of dynamic areas if they exist
+ *                      removed flex_budge cos I'm never going to use it.
+ */
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "werr.h"
+#include "flex.h"
+#include "wimpx.h"
+#include "msgs.h"
+
+#include "memalloc.h"
+#include "mem_int.h"
+#include "flex_int.h"
+
+#define ALLOW_DYNAMIC_AREA  1
+
+/* ----------------------------------------------------------------------------------------- */
+
+static int flex__initialised = 0;
+static int pagesize = 0;                    /* assumed to be a power of 2 */
+
+       void *flex__base = NULL;             /* base address of flex memory  - handle for d_alloc */
+static int flex__available;                 /* bytes actually allocated to flex area */
+       int flex__used;                      /* bytes actually allocated in flex blocks */
+
+static mem_allocfn  flex__adjustsize = 0;   /* Function to change flex area size */
+
+/* ----------------------------------------------------------------------------------------- */
+
+#define ROUND_UP_PAGES(a)   (((a) + pagesize - 1) &~ (pagesize - 1))
+#define FLEX_ERR            msgs_lookup("flex1:Flex memory error (%d)")
+
+/* ----------------------------------------------------------------------------------------- */
+
+/*  This implementation goes above the original value of GetEnv,
+    to memory specifically requested from the Wimp. The heap is kept
+    totally compacted all the time, with pages being given back to
+    the Wimp whenever possible.
+ */
+
+static BOOL wimpslot_adjust(void **anchor, size_t nbytes)
+{
+    BOOL success = FALSE;
+    _kernel_swi_regs r;
+    _kernel_oserror  *err;
+    int memlim, appspace, oldmemlim;
+
+   /* read memory limit value */
+    r.r[0] = 0;
+    r.r[1] = 0;
+    r.r[2] = 0;
+    err = _kernel_swi(OS_ChangeEnvironment, &r, &r);
+    oldmemlim = memlim = r.r[1];
+
+   /* read appspace value */
+    r.r[0] = 14;  /* Application space */
+    r.r[1] = 0;
+    r.r[2] = 0;
+    err = _kernel_swi(OS_ChangeEnvironment, &r, &r);
+    appspace = r.r[1];
+
+   /* set memory limit before slot size change ... */
+    if (appspace > memlim)
+    {
+       r.r[0] = 0;
+       r.r[1] = appspace;
+       r.r[2] = 0;
+       err = _kernel_swi(OS_ChangeEnvironment, &r, &r);
+    }
+
+   /* set wimpslot size */
+    {
+        int dud = -1,
+            base_slot = (int)*anchor - 0x8000,
+            new_slot = base_slot + nbytes;
+        err = (_kernel_oserror *)wimp_slotsize(&new_slot, &dud, &dud);
+        success = new_slot >= base_slot + nbytes;
+    }
+
+   /* .... and set memory limit back again */
+    if (appspace > memlim)
+    {
+        r.r[0] = 0;
+        r.r[1] = oldmemlim;
+        r.r[2] = 0;
+        err = _kernel_swi(OS_ChangeEnvironment, &r, &r);
+    }
+
+    return success;
+    anchor = anchor;
+}
+
+/* ----------------------------------------------------------------------------------------- */
+
+void flex__fail(int i)
+{
+   werr(0, FLEX_ERR, i);
+}
+
+static void flex__check(void)
+{
+    if (flex__initialised == 0)
+        werr(TRUE, msgs_lookup("flex3:Flex not initialised"));
+#if 0
+   {
+      flex__rec *p = FLEX_REC(0),
+                *top = FLEX_REC(flex__used);
+      while (p < top)
+      {
+         if (*(p->anchor) != p + 1) flex__fail(7);
+
+         p = NEXT_REC(p);
+      }
+   }
+#endif
+}
+
+/* Tries to get at least n more bytes, raising flex__lim and
+   returning TRUE if it can. */
+
+static BOOL flex__ensure(int n)
+{
+    int limit = flex__used + n;
+    if (limit <= flex__available)
+        return TRUE;
+
+    limit = ROUND_UP_PAGES(limit);
+    if (!flex__adjustsize(&flex__base, limit))
+    {
+        flex__adjustsize(&flex__base, flex__available);
+        return FALSE;
+    }
+
+    flex__available = limit;
+    return TRUE;
+}
+
+/* Gives away memory, lowering flex__lim, if possible. */
+
+static void flex__give(void)
+{
+    int limit = ROUND_UP_PAGES(flex__used);
+    if (limit < flex__available)
+    {
+        flex__adjustsize(&flex__base, limit);
+        flex__available = limit;
+    }
+}
+
+BOOL flex_alloc(flex_ptr anchor, int n)
+{
+   flex__rec *p;
+
+   flex__check();
+
+   if (n < 0 || !flex__ensure(sizeof(flex__rec) + roundup(n)))
+   {
+      *anchor = 0;
+      return FALSE;
+   }
+
+   p = FLEX_REC(flex__used);
+   flex__used += sizeof(flex__rec) + roundup(n);
+
+   p->anchor = anchor;
+   p->size = n;
+
+   p->name = memalloc__nextareaname;
+   memalloc__nextareaname = NULL;
+
+   *anchor = p + 1; /* sizeof(flex__rec), that is */
+   return TRUE;
+}
+
+
+/* Move all the anchors from p upwards. This is in anticipation
+   of that block of the heap being shifted. */
+
+static void flex__reanchor(flex__rec *p, int by)
+{
+    flex__rec *top = FLEX_REC(flex__used);
+
+    while (p < top)
+    {
+        if (*(p->anchor) != p + 1)
+            flex__fail(6);
+
+        *(p->anchor) = ((char*) (p + 1)) + by;
+
+        p = NEXT_REC(p);
+    }
+}
+
+
+void flex_free(flex_ptr anchor)
+{
+   flex__rec    *p = ((flex__rec*) *anchor) - 1;
+   int          roundsize = roundup(p->size);
+   flex__rec    *next = (flex__rec*) (((char*) (p + 1)) + roundsize);
+
+   flex__check();
+
+   if (p->anchor != anchor) 
+   {
+      flex__fail(0);
+   }
+
+   flex__reanchor(next, - (sizeof(flex__rec) + roundsize));
+
+   memmove(p, next, (char *)FLEX_REC(flex__used) - (char *)next);
+
+   flex__used -= sizeof(flex__rec) + roundsize;
+
+   flex__give();
+
+   *anchor = 0;
+}
+
+
+int flex_size(flex_ptr anchor)
+{
+    flex__rec *p = ((flex__rec*) *anchor) - 1;
+    flex__check();
+    
+    if (p->anchor != anchor) 
+    {
+       flex__fail(4);
+    }
+    
+    return(p->size);
+}
+
+
+int flex_extend(flex_ptr anchor, int newsize)
+{
+    flex__rec *p = ((flex__rec*) *anchor) - 1;
+    return flex_midextend(anchor, p->size, newsize - p->size);
+}
+
+
+BOOL flex_midextend(flex_ptr anchor, int at, int by)
+{
+   flex__rec *p;
+   flex__rec *next;
+
+   flex__check();
+
+   p = ((flex__rec*) *anchor) - 1;
+
+   if (p->anchor != anchor) 
+      flex__fail(1);
+
+   if (at > p->size) 
+      flex__fail(2);
+
+   if (by < 0 && (-by) > at) 
+      flex__fail(3);
+
+   if (by == 0) 
+   {
+      /* do nothing */
+   }
+   else if (by > 0) 
+   { 
+        /* extend */
+        
+        int growth = roundup(p->size + by) - roundup(p->size);
+        /* Amount by which the block will actually grow. */
+        
+        if (!flex__ensure(growth))
+           return FALSE;
+        
+        next = NEXT_REC(p);
+
+        /* The move has to happen in two parts because the moving
+        of objects above is word-aligned, while the extension within
+        the object may not be. */
+        
+        flex__reanchor(next, growth);
+        
+        memmove((char *)next + roundup(growth), next,
+                (char *)FLEX_REC(flex__used) - (char *)next);
+        
+        flex__used += growth;
+        
+        memmove(((char*) (p + 1)) + at + by, ((char*) (p + 1)) + at, p->size - at);
+        
+        p->size += by;
+   }
+   else 
+   { 
+      /* The block shrinks. */
+      int shrinkage;
+
+      next = NEXT_REC(p);
+
+      by = -by;                                             /* a positive value now */
+      shrinkage = roundup(p->size) - roundup(p->size - by); /* a positive value */
+
+      memmove(((char*) (p + 1)) + at - by, ((char*) (p + 1)) + at, p->size - at);
+
+      p->size -= by;
+
+      flex__reanchor(next, - shrinkage);
+
+      memmove((char *)next - shrinkage, next, (char *)FLEX_REC(flex__used) - (char *)next);
+
+      flex__used -= shrinkage;
+
+      flex__give();
+   }
+
+   return TRUE;
+}
+
+
+
+#pragma -s1     /* stack checking off */
+
+int flex_dont_budge(int n, void **a)
+{
+    return 0;
+    n = n;
+    a = a;
+}
+
+#pragma -s0     /* stack checks on again */
+
+
+#if ALLOW_DYNAMIC_AREA
+
+static void free_flex(void)
+{
+    d_free(&flex__base);
+}
+
+#endif
+
+
+void flex_Init(const char *programname)
+{
+    if (flex__initialised == 0)
+    {
+        _swix(OS_ReadMemMapInfo, _OUT(0), &pagesize);
+#if ALLOW_DYNAMIC_AREA
+        alloc_nextiscalled(programname);
+        if (d_alloc(&flex__base, 0))
+        {
+            flex__adjustsize = d_alloc;
+            atexit(free_flex);
+            memalloc__flexisdynamic = TRUE;
+        }
+        else
+#endif
+        {
+            int dud = -1, slotsize = -1;
+            no_err(wimp_slotsize(&slotsize, &dud, &dud));
+
+            flex__base = (char *)0x8000 + slotsize;
+            flex__available = 0;
+            flex__used = 0;
+            _kernel_register_slotextend(flex_dont_budge);
+
+            flex__adjustsize = wimpslot_adjust;
+        }
+
+        flex__initialised = 1;
+
+        /* Check that we're in the Wimp environment. */
+        {
+            void *a;
+            if (! flex_alloc(&a, 1)) 
+               werr(TRUE, msgs_lookup("flex2:Not enough memory, or not within *desktop world."));
+            
+            flex_free(&a);
+        }
+    }
+}
+
+/* eof flex_.c */

@@ -1,0 +1,242 @@
+
+/* unarc.c - unarchive from squashed,split archive */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "swis.h"
+
+#include "unarc.h"
+
+
+#define ObjType_Dir 2
+#define TruncateSentinel -1
+
+#define FlagsField     0x7f000000
+#define LengthField    0x00ffffff
+#define IsSquashed     0x01000000
+#define IsDirectory    0x02000000
+#define IsTruncated    0x04000000
+#define IsNotTruncated 0x7bffffff
+#define IsContinuation 0x08000000
+
+
+typedef struct
+{
+  unsigned int load;
+  unsigned int exec;
+  unsigned int length;
+  unsigned int attribs;
+  unsigned int otype;
+  char         name[256];
+} drec_t;
+
+
+static unsigned char *buff, *sqbuff, *sqwork;
+static drec_t drec;
+
+static FILE *fi;
+static int  Narcs;
+static char arcname[256];
+
+#define verbose 0
+/* static int verbose */
+static int  maxobjsize, bytessofar;
+static char destdir[256];
+static unarc_progress_proc  progproc;
+static unarc_getfloppy_proc getfloppyproc;
+static unarc_giveup_proc    giveupproc;
+
+static _kernel_oserror e_nosqd = { 0, "Squash decompress failure" };
+static _kernel_oserror e_nomem = { 0, "Not enough memory" };
+static _kernel_oserror e_nofil = { 0, "Archive would not open" };
+
+/* ------------------------------------------------------------------------ */
+
+/* read next tag (flags and length), handling join across split arcs */
+static int read_tag(void)
+{
+  int  flags;
+
+  if (Narcs == -1)
+  {
+    Narcs = 0;
+    getfloppyproc(1,arcname);
+    fi = fopen(arcname,"rb");
+    if (fi == NULL) giveupproc(&e_nofil);
+    if (verbose) printf("new arc: %s\n",arcname);
+  }
+
+  fread(&flags,4,1,fi); bytessofar += 4;
+  if (flags == TruncateSentinel)
+  {
+    if (verbose) printf("  brk\n");
+    fclose(fi);
+    Narcs++;
+    getfloppyproc(Narcs+1,arcname);
+    if (verbose)  printf("new arc: %s\n",arcname);
+    fi = fopen(arcname,"rb");
+    if (fi == NULL) giveupproc(&e_nofil);
+    fread(&flags,4,1,fi); bytessofar += 4;
+  }
+
+  return flags;
+}
+
+/* ------------------------------------------------------------------------ */
+
+/* join object transparently */
+static void read_object(int *flags, int *length, unsigned char *buff)
+{
+  int flg, len, tflg, tlen;
+
+  flg = read_tag();
+
+  len = flg & LengthField;
+  flg = flg & FlagsField;
+
+  if (len)
+  {
+    fread(buff,len,1,fi); bytessofar += len;
+    tflg = flg;
+    while (tflg & IsTruncated)
+    {
+      read_object(&tflg,&tlen,buff+len);
+      len += tlen;
+    }
+  }
+
+  *length = len;
+  *flags  = flg & IsNotTruncated;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static _kernel_oserror *arc_extract(char *rootdir)
+{
+  int   blen, nest, flags, sqlen, sqstatus;
+  char  todir[256], fname[256];
+  _kernel_oserror *e = (_kernel_oserror *)NULL;
+
+  nest = 1;
+  strcpy(todir,rootdir);
+
+  read_object(&flags,&blen,buff);
+  if (blen == 0) nest--;
+  while (nest)
+  {
+
+    if (flags & IsDirectory)
+    {
+      memcpy(&drec.attribs,buff,4);
+      strcpy(drec.name,(char *)(buff+4));
+      strcat(todir,".");
+      strcat(todir,drec.name);
+      if (verbose) printf("  dir %s\n",drec.name);
+      /* create dir */
+      e = _swix(OS_File,_IN(0)|_IN(1)|_IN(4),8,todir,0);
+      if (e) return e;
+      /*set attributes */
+      e = _swix(OS_File,_IN(0)|_IN(1)|_IN(5),4,todir,drec.attribs);
+      if (e) return e;
+    }
+    else
+    {
+      if (flags & IsSquashed)
+      {
+        e = _swix(Squash_Decompress,_INR(0,5)|_OUT(0)|_OUT(5),
+                  4,sqwork,buff,blen,sqbuff,maxobjsize,&sqstatus,&sqlen);
+        if (e) return e;
+        if (sqstatus != 0) return &e_nosqd;
+
+        sqlen = maxobjsize - sqlen;
+        memcpy(&drec,sqbuff,5*4);
+        strcpy(drec.name,(char *)(sqbuff+5*4));
+        strcpy(fname,todir);
+        strcat(fname,".");
+        strcat(fname,drec.name);
+        if (verbose) printf("  sqf %s\n",drec.name);
+        e = _swix(OS_File,_INR(0,5),0,fname,drec.load,drec.exec,
+                  sqbuff+sqlen-drec.length,sqbuff+sqlen);
+        if (e) return e;
+      }
+      else
+      {
+        memcpy(&drec,buff,5*4);
+        strcpy(drec.name,(char *)(buff+5*4));
+        strcpy(fname,todir);
+        strcat(fname,".");
+        strcat(fname,drec.name);
+        if (verbose) printf("  uqf %s\n",drec.name);
+        e = _swix(OS_File,_INR(0,5),0,fname,drec.load,drec.exec,
+                  buff+blen-drec.length,buff+blen);
+        if (e) return e;
+      }
+      /*set attributes */
+      e = _swix(OS_File,_IN(0)|_IN(1)|_IN(5),4,fname,drec.attribs);
+      if (e) return e;
+    }
+
+    if (progproc) progproc(bytessofar,nest,drec.name);
+
+    if (flags & IsDirectory) nest++;
+
+    read_object(&flags,&blen,buff);
+    while (nest && (blen == 0))
+    {
+      if (verbose) printf("  <--\n");
+      nest--;
+      if (nest > 0)
+      {
+        *(strrchr(todir,'.')) = '\0';
+        read_object(&flags,&blen,buff);
+      }
+    }
+
+  } /* while (nest) */
+
+  return e;
+}
+
+/* ------------------------------------------------------------------------ */
+
+_kernel_oserror *unarchive_init(int max_objsize,
+                                unarc_progress_proc  prog_proc,
+                                unarc_getfloppy_proc getfloppy_proc,
+                                unarc_giveup_proc giveup_proc)
+{
+  int  sqworksize;
+  _kernel_oserror *e = NULL;
+
+  maxobjsize    = max_objsize;
+  progproc      = prog_proc;
+  getfloppyproc = getfloppy_proc;
+  giveupproc    = giveup_proc;
+  bytessofar    = 0;
+
+  e = _swix(Squash_Decompress,_INR(0,1)|_OUT(0),8,256,&sqworksize);
+  if (e) return &e_nosqd;
+
+  buff   = malloc(maxobjsize);
+  sqbuff = malloc(maxobjsize);
+  sqwork = malloc(sqworksize);
+  if ((buff == NULL) || (sqbuff == NULL) || (sqwork == NULL))
+     return &e_nomem;
+
+  Narcs = -1;
+
+  return e;
+}
+
+/* ------------------------------------------------------------------------ */
+
+_kernel_oserror *unarchive(char *to_dir)
+{
+  _kernel_oserror *e;
+
+  strcpy(destdir,to_dir);
+  e = arc_extract(destdir);
+  if (!e) fclose(fi);
+  return e;
+}

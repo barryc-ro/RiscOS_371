@@ -1,0 +1,761 @@
+        SUBT    BMU interface code -> BMUstuff
+
+; Change record
+; =============
+;
+; CDP - Christopher Partington, Cambridge Systems Design
+; TMD - Tim Dobson
+;
+;
+; 09-Dec-91  19:12  CDP
+; First version.
+;
+; 20-Jan-92  15:29  CDP
+; Changed IIC addresses to conform to new BMU specification.
+; Fixed IRQ/FIQ disable code when writing to IOC.
+; Fixed CommandBMU SWI call to WriteBMU.
+;
+; 30-Jan-92  10:51  CDP
+; Split BMU read ram routine out of read SWI.
+; Use stack for IIC parameter blocks, not static workspace.
+; Add SetAutostart command.
+; Check BMU version on initialisation.
+; Added code dependent on BacklightBug.
+;
+; 12-Feb-92  13:39  CDP
+; BMU version number redefined so code changed to check memory map id part
+; and not the firmware version.
+; Added DoIICOp and calls so that IIC operations are retried when they fail.
+; Failure to read BMU interrupt status in IRQ handler now reenables IRQ - it
+; didn't do before because it assumed that the BMU was sick.
+;
+; 03-Mar-92  14:21  CDP
+; ClaimBMUIRQandInit and ReleaseBMUIRQ maintain flag to determine whether
+; device is currently claimed.
+; ReleaseBMUIRQ now removes any pending IRQHandler Callback.
+; Initialisation code and SWI handlers changed so that SWIs are bounced if
+; BMU initialisation failed.
+;
+; 02-Apr-92  18:04  CDP
+; Added support for variable PortableBMUV_ChargeRate and reflected change in
+; use of life variables here.
+; Changed MemoryMapId from 2 to 3.
+;
+; 10-Apr-92  16:28  TMD
+; Added code in BMUIRQCallBack to check for lid switch change and call
+; PortableControl to possibly change state of LCDEnable and Backlight.
+;
+; 13-Apr-92  17:25  CDP
+; BMU address for charge rate changed from 92 to 5E.
+;
+;
+;*End of change record*
+
+;******************************************************************************
+
+; Number of retries to make and the delay between then when a BMU IIC
+; transfer fails.
+
+BMUIIC_Retries          *       2
+BMUIIC_RetryDelay       *       600     ; 1/2 microsecond units
+
+
+; We only know about one memory map of the BMU hardware and this is it.
+; It is returned as the low nibble of the byte at BMUA_VersionNumber.
+
+BMUMemoryMapId          *       3
+
+
+; BMU addresses
+
+BMUA_VersionNumber      *       &50
+BMUA_Status             *       &5C
+BMUA_CommandReg         *       &90
+BMUA_AutostartCount     *       &9E
+
+
+; BMU commands
+
+BMUC_RemovePower        *       1 << 1
+BMUC_SetPartCharge      *       1 << 2
+BMUC_SetFullCharge      *       1 << 3
+BMUC_SetAutostart       *       1 << 0
+
+
+; IIC addresses (IICAddress.. symbols defined in Hdr:IIC)
+
+IIC_Addr_Write_ReadAddress      *       IICAddress_AcornBMUMicrocontroller
+IIC_Addr_Read_Data              *       IICAddress_AcornBMUMicrocontroller + 1
+IIC_Addr_Write_AddressAndData   *       IICAddress_AcornBMUMicrocontroller2
+
+;******************************************************************************
+
+        MakeErrorBlock  BadBMUVariable
+        MakeErrorBlock  BadBMUCommand
+        MakeErrorBlock  BMUBusy
+        MakeErrorBlock  BadBMUVersion
+        MakeErrorBlock  BMUFault
+        MakeErrorBlock  BMUVecClaim
+
+;******************************************************************************
+
+BMUVarTable
+        DCB     BMUA_VersionNumber      ;  0 : version number
+        DCB     &80                     ;  1 : nominal battery capacity
+        DCB     &82                     ;  2 : measured battery capacity
+        DCB     &88                     ;  3 : used battery capacity
+        DCB     &8A                     ;  4 : usable capacity
+        DCB     &8C                     ;  5 : reserved
+        DCB     &8E                     ;  6 : charge estimate
+        DCB     &56                     ;  7 : voltage
+        DCB     &54                     ;  8 : current
+        DCB     &52                     ;  9 : temperature
+        DCB     BMUA_Status             ; 10 : flags/status
+        DCB     &5E                     ; 11 : charge rate (b7..b4)
+        ASSERT  (. - BMUVarTable) = PortableBMU_Num_Variables
+        ALIGN
+
+;******************************************************************************
+
+DoMicroDelay    ENTRY   "R1,R2"
+;
+; Delay for >= R0/2 microseconds
+;
+; Entry:
+;    R0 = time delay in 1/2 microsecond units
+;
+; Exit:
+;    R0 undefined
+;    All other registers and flags preserved
+
+        MOV     R2,#IOC                 ; R2 -> IOC
+        STRB    R0, [R2, #Timer0LR]     ; copy counter into output latch
+        LDRB    R1, [R2, #Timer0CL]     ; R1 := low output latch
+10
+        STRB    R0, [R2, #Timer0LR]     ; copy counter into output latch
+        LDRB    R14, [R2, #Timer0CL]    ; R14 := low output latch
+        TEQS    R14, R1                 ; unchanged ?
+        MOVNE   R1, R14                 ; copy anyway
+        BEQ     %BT10                   ; then loop
+        SUBS    R0, R0, #1              ; decrement count
+        BNE     %BT10                   ; loop if not finished
+        EXITS
+
+;******************************************************************************
+
+DoIICOp ENTRY   "R3"
+;
+; Do IIC operation with retries.
+; ENABLES IRQs
+;
+; Entry:
+;    R0-R2 = parameters for IIC_Control
+;    IRQ state unknown
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 preserved
+;    All other registers and flags preserved
+
+; enable IRQs as this could take some time
+
+        BIC     LR,LR,#I_bit
+        TEQP    PC,LR
+
+        MOV     R3,#BMUIIC_Retries      ; R3 = retries to make
+        Push    "R0"                    ; save IIC parameter
+10
+        SWI     XIIC_Control            ; do IIC op
+        Pull    "R0",VC                 ; if no error, restore R0
+        PullEnv VC                      ; ...and exit
+        BICVCS  PC,LR,#V_bit            ; ...restoring IRQ state and clearing V
+
+; error occurred - do retry if not exceeded count
+
+        TEQS    R3,#0                   ; retries 0?
+        ADDEQ   SP,SP,#4                ; if so, discard stacked R0
+        PullEnv EQ                      ; ...and exit
+        ORREQS  PC,LR,#V_bit            ; ...restoring IRQ state and setting V
+
+; not exceeded retries
+
+        SUB     R3,R3,#1                ; decrement retries to go
+
+; delay a while to let BMU recover
+
+        MOV     R0,#BMUIIC_RetryDelay   ; 1/2 microsecond units
+        BL      DoMicroDelay
+
+        LDR     R0,[SP]                 ; reload R0
+        B       %BT10                   ; retry the access
+
+;******************************************************************************
+
+ReadBMURAM      ROUT
+;
+; Read BMU RAM
+;
+; Entry:
+;    R0 = BMU address (not variable number)
+;
+; Exit:
+;    VS => R0 -> error
+;          R1 preserved
+;    VC => R0 preserved
+;          R1 = value read from BMU RAM
+
+        Push    "R0-R2,LR"
+
+; form IIC parameter block and call IIC module to write address to read
+
+        SUB     SP,SP,#4                        ; create pblk on stack
+        STRB    R0,[SP]
+        MOV     R0,#IIC_Addr_Write_ReadAddress
+        MOV     R1,SP                           ; R1 -> parameter block
+        MOV     R2,#1                           ; R2 = block length
+        BL      DoIICOp                         ; do the IIC operation
+        ADDVS   SP,SP,#8                        ; if error, discard pblk & R0
+        Pull    "R1-R2,PC",VS                   ; ...and exit
+
+; form IIC parameter block and call IIC module to read the data
+; R1 -> block
+; R2 = length
+
+        MOV     R0,#IIC_Addr_Read_Data
+        BL      DoIICOp                         ; do the IIC operation
+        ADDVS   SP,SP,#8                        ; if error, discard pblk & R0
+        Pull    "R1-R2,PC",VS                   ; ...and exit
+
+; return value read in R1
+
+        LDRB    R1,[R1]                         ; return value read
+        ADD     SP,SP,#4                        ; discard IIC pblk
+        STR     R1,[SP,#4]                      ; overwrite stacked R1
+        Pull    "R0-R2,PC"
+
+;******************************************************************************
+
+WriteBMURAM     ROUT
+;
+; Write to BMU RAM
+;
+; Entry:
+;    R0 = BMU address (not variable number)
+;    R1 = value
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 preserved
+;    R1 preserved
+
+        Push    "R0-R2,LR"
+
+; form IIC parameter block
+
+        SUB     SP,SP,#4                        ; allocate space for IIC blk
+        STRB    R0,[SP,#0]                      ; put address in IIC block
+        STRB    R1,[SP,#1]                      ; and value
+
+; call IIC module
+
+        MOV     R0,#IIC_Addr_Write_AddressAndData
+        MOV     R1,SP                           ; R1 -> IIC parameter block
+        MOV     R2,#2                           ; R2 = block length
+        BL      DoIICOp                         ; do the IIC operation
+        ADD     SP,SP,#4                        ; discard IIC block
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+
+        Pull    "R0-R2,PC"        
+
+;******************************************************************************
+
+SWI_ReadBMUVariable     ENTRY   "R0-R2"
+;
+; SWI: read BMU variable
+;
+; Entry:
+;    R0 = variable
+;
+; Exit:
+;    VS => R0 -> error
+;          R1 preserved
+;    VC => R0 preserved
+;          R1 value of variable
+;    All other registers and flags preserved
+
+        LDR     LR,BMUerrorpointer
+        TEQS    LR,#0                           ; error with BMU?
+        MOVNE   R0,LR                           ; if error, move it to R0
+        BNE     %FT92                           ; ...and branch
+
+; no error initialising BMU so ok to continue
+
+        TEQS    R0,#PortableBMUV_Flags          ; flags are read from copy
+        LDREQB  R1,BMU_Flags
+        STREQ   R1,[SP,#4]                      ; overwrite stacked R1
+        EXITS   EQ
+
+; not read of soft copy of flags so need to read value from BMU
+
+        ASSERT  PortableBMU_Min_Variable = 0
+        CMPS    R0,#PortableBMU_Num_Variables
+        BHS     %FT90
+
+; get BMU RAM address to read from table and read it
+
+        addr    LR,BMUVarTable                  ; LR -> table of addresses
+        LDRB    R0,[LR,R0]                      ; R0 = BMU RAM address
+        BL      ReadBMURAM                      ; returns value in R1
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+        STRVC   R1,[SP,#4]                      ; if ok, overwrite stack R1
+        PullEnv
+        ORRVSS  PC,LR,#V_bit
+        BICVCS  PC,LR,#V_bit
+
+;~~~~~~~~~~~~~~~
+
+90
+; bad BMU variable number
+
+        addr    R0,ErrorBlock_BadBMUVariable
+92
+; error, R0 -> tokenised error block
+
+        BL      ErrorLookupNoParms
+        STR     R0,[SP]                         ; overwrite stack R0
+        PullEnv
+        ORRS    PC,LR,#V_bit
+
+;******************************************************************************
+
+SWI_WriteBMUVariable    ENTRY   "R0"
+;
+; SWI: write BMU variable
+;
+; Entry:
+;    R0 = variable
+;    R1 = value
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 preserved
+;    R1 preserved
+
+        LDR     LR,BMUerrorpointer
+        TEQS    LR,#0                           ; error with BMU?
+        MOVNE   R0,LR                           ; if error, move it to R0
+        BNE     %FT92                           ; ...and branch
+
+; check variable number is ok
+
+        ASSERT  PortableBMU_Min_Variable = 0
+        CMPS    R0,#PortableBMU_Num_Variables
+        BHS     %FT90
+ 
+; get BMU RAM address to write from table
+
+        addr    LR,BMUVarTable                  ; LR -> table of addresses
+        LDRB    R0,[LR,R0]                      ; get address
+        BL      WriteBMURAM
+
+; If it's flags, don't update soft copy as we're interested in what the BMU
+; thinks its flags are, not the user. BMU should IRQ if it changes them.
+
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+        PullEnv
+        ORRVSS  PC,LR,#V_bit
+        BICVCS  PC,LR,#V_bit
+
+;~~~~~~~~~~~~~~~
+
+90
+; bad BMU variable number
+
+        addr    R0,ErrorBlock_BadBMUVariable
+92
+; error, R0 -> tokenised error block
+
+        BL      ErrorLookupNoParms
+        STR     R0,[SP]                         ; overwrite stack R0
+        PullEnv
+        ORRS    PC,LR,#V_bit
+
+;******************************************************************************
+
+SWI_CommandBMU  ENTRY   "R0-R3"
+;
+; Issues a command to the BMU
+;
+; Entry:
+;    R0 = command
+;    R1 etc. parameters
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 preserved
+
+        LDR     LR,BMUerrorpointer
+        TEQS    LR,#0                           ; error with BMU?
+        MOVNE   R0,LR                           ; if error, move it to R0
+        BNE     %FT92                           ; ...and branch
+
+; check command is in range
+
+        CMPS    R0,#PortableBMU_Min_Command
+        BLO     %FT10
+        CMPS    R0,#PortableBMU_Num_Commands
+        BHS     %FT10
+
+        MOV     R2,R0                           ; save command
+        MOV     R3,R1                           ; and parameter
+
+; check no BMU command in progress
+
+        MOV     R0,#BMUA_CommandReg
+        BL      ReadBMURAM
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+        EXIT    VS
+
+; have read commandreg - check it's zero
+
+        TEQS    R1,#0
+        BNE     %FT20                           ; branch if command in progress
+
+        MOV     R0,R2                           ; restore R0 = command
+        MOV     R1,R3                           ; restore R1 = parameter
+
+; check for autostart as this needs extra write first
+
+        TEQS    R0,#PortableBMUC_SetAutostart
+        BNE     %FT01                           ; branch if not autostart
+
+; command: setup autostart
+
+        MOV     R0,#BMUA_AutostartCount
+        BL      WriteBMURAM                     ; write autostart count
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+        PullEnv VS                              ; ...and quit
+        ORRVSS  PC,LR,#V_bit
+
+; have written autostart delay, now issue command
+
+        MOV     R1,#BMUC_SetAutostart           ; load BMU command
+        B       %FT02                           ; and branch
+
+;~~~~~~~~~~~~~~~
+
+01
+        TEQS    R0,#PortableBMUC_RemovePower
+        MOVEQ   R1,#BMUC_RemovePower
+        TEQS    R0,#PortableBMUC_SetPartCharge
+        MOVEQ   R1,#BMUC_SetPartCharge
+        TEQS    R0,#PortableBMUC_SetFullCharge
+        MOVEQ   R1,#BMUC_SetFullCharge
+
+02
+; write to command reg (R1 = command)
+
+        MOV     R0,#BMUA_CommandReg
+        BL      WriteBMURAM                     ; (R0,R1->R0,V)
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+        PullEnv
+        ORRVSS  PC,LR,#V_bit
+        BICVCS  PC,LR,#V_bit
+
+;~~~~~~~~~~~~~~~
+
+10
+; bad BMU command code
+
+        addr    R0,ErrorBlock_BadBMUCommand
+        BL      ErrorLookupNoParms
+        STR     R0,[SP]                         ; overwrite stack R0
+        PullEnv
+        ORRS    PC,LR,#V_bit
+
+;~~~~~~~~~~~~~~~
+
+20
+; BMU command in progress
+
+        addr    R0,ErrorBlock_BMUBusy
+92
+        BL      ErrorLookupNoParms
+        STR     R0,[SP]                         ; overwrite stack R0
+        PullEnv
+        ORRS    PC,LR,#V_bit
+
+;******************************************************************************
+
+BMUIRQCallback  ENTRY   "R0-R1"
+;
+; Callback from BMU IRQ
+;
+; Clears IRQ by reading BMU status, generates event and reenables IRQ
+;
+; Entry:
+;    R12 -> workspace
+;    MODE: SVC
+;    IRQs enabled
+;
+; Exit:
+;    All registers and flags preserved
+
+; read flags (clears IRQ)
+
+        MOV     R0,#BMUA_Status
+        BL      ReadBMURAM
+
+; if error, save flag for SWI handlers and quit
+
+        addr    R0,ErrorBlock_BMUFault,VS
+        STRVS   R0,BMUerrorpointer
+        EXITS   VS
+
+; update flags and generate event
+; R1 = BMU flags
+; OS_GenerateEvent switches to SVC mode, disabling IRQs
+
+        LDRB    LR, BMU_Flags                   ; get old flags
+        EOR     LR, LR, R1                      ; EORed with new flags
+        TST     LR, #PortableBMUF_LidOpen       ; has lid opened or closed?
+        STRB    R1, BMU_Flags                   ; store new flags anyway
+        BEQ     %FT05                           ; [no, so skip]
+
+; lid switch has opened or closed, so make a dummy call to PortableControl
+; which may turn on or off the LCDEnable and Backlight bits in LC.
+
+        Push    "R0,R1"
+        MOV     R0, #0                          ; EOR mask (ie no change)
+        MOV     R1, #-1                         ; AND mask (ditto)
+        BL      PortableControl
+        Pull    "R0,R1"
+
+05
+        MOV     R0,#Event_PortableBMU
+        SWI     XOS_GenerateEvent
+
+ [ BacklightBug
+
+; if charger present, switch on backlight
+
+        TSTS    R1,#PortableBMUF_ChargerPresent
+        MOVNE   R0,#PortableControl_BacklightEnable     ; EOR bits
+        MVNNE   R1,R0                                   ; AND bits
+        SWINE   XPortable_Control
+
+ ]
+
+10
+; reenable BMU IRQ in IOC
+
+        MOV     LR,PC                           ; disable IRQ and FIQ
+        ORR     LR,LR,#I_bit :OR: F_bit
+        TEQP    PC,LR
+
+        MOV     R0,#IOC
+        LDRB    R1,[R0,#IOCIRQMSKA]
+        ORR     R1,R1,#IOEB_battery_low_bit
+        STRB    R1,[R0,#IOCIRQMSKA]
+
+        EXITS                                   ; exit restoring IRQs/FIQs
+
+;******************************************************************************
+
+BMUIRQHandler   ENTRY   "R0-R1"
+;
+; Called on BMU IRQ.
+; Disables IRQ and adds callback to handle the IRQ
+;
+; Entry:
+;    R12 -> workspace
+;    MODE: IRQ
+;    IRQs disabled
+;
+; Exit:
+;    All registers and flags preserved
+
+; clear IRQ in IOC
+
+        MOV     R0,#IOC
+        MOV     R1,#IOEB_battery_low_bit
+        STRB    R1,[R0,#IOCIRQCLRA]
+
+; disable IRQ in IOC
+
+        MOV     LR,#F_bit                       ; disable FIQ
+        TST     LR,PC
+        TEQEQP  LR,PC
+
+        LDRB    R1,[R0,#IOCIRQMSKA]
+        BIC     R1,R1,#IOEB_battery_low_bit
+        STRB    R1,[R0,#IOCIRQMSKA]
+
+        TEQEQP  LR,PC                           ; restore FIQ state
+
+; switch to SVC mode for SWI
+
+        MOV     R0,PC                           ; save mode
+        TEQP    PC,#SVC_mode :OR: I_bit         ; enter SVC mode
+        NOP
+
+; now in SVC mode, IRQs disabled
+; add callback to do BMU stuff
+
+        Push    "R0,LR"
+        addr    R0,BMUIRQCallback
+        MOV     R1,wp
+        SWI     XOS_AddCallBack
+        Pull    "R0,LR"
+        TEQP    PC,R0                           ; reenter old mode
+        NOP
+
+; back in previous mode, IRQs disabled
+
+        EXITS
+
+;******************************************************************************
+
+ClaimBMUIRQandInit      ENTRY   "R1-R2"
+;
+; Claims device vector for BMU IRQ, reads current values of BMU flags
+; and enables BMU IRQ
+;
+; Entry:
+;    MODE: SVC
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+;    All other registers preserved
+
+; preinitialise copy of BMU_Flags in case something fails during initialisation
+; and we want the module to carry on
+
+        MOV     R0,#PortableBMUF_ChargerPresent :OR: PortableBMUF_BatteryPresent :OR: PortableBMUF_LidOpen
+        STRB    R0,BMU_Flags
+
+; claim device vector for BMU IRQ
+
+        MOV     R0,#Ringing_DevNo               ; IL7
+        addr    R1,BMUIRQHandler
+        MOV     R2,wp
+        SWI     XOS_ClaimDeviceVector
+        addr    R1,ErrorBlock_BMUVecClaim,VS    ; save error for SWI routines
+        STRVS   R1,BMUerrorpointer
+        EXIT    VS
+
+        MOV     R0,#1                           ; indicate claimed device
+        STRB    R0,BMUDevFlag
+
+; read BMU version number
+
+        MOV     R0,#BMUA_VersionNumber
+        BL      ReadBMURAM
+        addr    R1,ErrorBlock_BMUFault,VS       ; save error for SWI routines
+        BVS     %FT90
+
+; check BMU memory map
+
+        AND     R1,R1,#&0F                      ; memory map is LS nibble
+        TEQS    R1,#BMUMemoryMapId              ; the one we know about?
+        BNE     %FT60                           ; branch if not
+
+        MOV     R0,#BMUA_Status
+        BL      ReadBMURAM
+        addr    R1,ErrorBlock_BMUFault,VS       ; save error for SWI routines
+        BVS     %FT90
+
+        STRB    R1,BMU_Flags
+
+; enable IRQ in IOC
+
+        MOV     LR,PC                           ; disable IRQ and FIQ
+        ORR     LR,LR,#I_bit :OR: F_bit
+        TEQP    PC,LR
+
+        MOV     R0,#IOC
+        LDRB    R1,[R0,#IOCIRQMSKA]
+        ORR     R1,R1,#IOEB_battery_low_bit
+        STRB    R1,[R0,#IOCIRQMSKA]
+
+        MOV     R1,#0                           ; flag all ok for SWI routines
+        STR     R1,BMUerrorpointer
+
+        PullEnv
+        BICS    PC,LR,#V_bit                    ; exit restoring IRQ/FIQ
+
+;~~~~~~~~~~~~~~~
+
+60
+
+; incorrect BMU version number
+
+        addr    R0,ErrorBlock_BadBMUVersion     ; R0 -> error block
+        MOV     R1,R0                           ; save for SWI routines
+        BL      ErrorLookupNoParms
+
+; fall through to release device
+
+90
+
+; error, R0 -> error block, R1 -> error block for SWI routines
+; release device
+
+        STR     R1,BMUerrorpointer      ; save error pointer for SWI routines
+
+        Push    "R0"                    ; save error
+        BL      ReleaseBMUIRQ
+        Pull    "R0"                    ; restore error
+        SETV
+        EXIT
+
+;******************************************************************************
+
+ReleaseBMUIRQ   ENTRY   "R1-R2"
+;
+; Disables BMU IRQ and releases device vector for BMU IRQ
+;
+; Exit:
+;    VS => R0 -> error
+;    VC => R0 undefined
+;    All other registers preserved
+
+; check if have got device
+
+        LDRB    R1,BMUDevFlag
+        TEQS    R1,#0
+        EXITS   EQ
+
+; have got device so free it
+; disable IRQ
+
+        PHPSEI  R2
+        MOV     R0,#IOC
+        LDRB    R1,[R0,#IOCIRQMSKA]
+        BIC     R1,R1,#IOEB_battery_low_bit
+        STRB    R1,[R0,#IOCIRQMSKA]
+        PLP     R2
+
+; remove any pending callback for IRQ handler
+
+        addr    R0,BMUIRQCallback
+        MOV     R1,wp
+        SWI     XOS_RemoveCallBack
+
+; release device
+
+        MOV     R0,#Ringing_DevNo
+        addr    R1,BMUIRQHandler
+        MOV     R2,wp
+        SWI     XOS_ReleaseDeviceVector
+
+; if released device, flag it as not claimed
+
+        MOVVC   R1,#0
+        STRVCB  R1,BMUDevFlag
+
+        EXIT
+
+;******************************************************************************
+
+        END

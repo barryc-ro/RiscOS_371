@@ -1,0 +1,998 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <setjmp.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "osfile.h"
+#include "osfscontrol.h"
+#include "toolbox.h"
+#include "window.h"
+#include "actionbutton.h"
+#include "optionbutton.h"
+#include "stringset.h"
+#include "writablefield.h"
+#include "radiobutton.h"
+#include "button.h"
+#include "draggable.h"
+#include "wimpspriteop.h"
+#include "proginfo.h"
+#include "menu.h"
+
+#include "event.h"
+
+#include "Detect.h"
+#include "Gadgets.h"
+#include "Main.h"
+#include "Load.h"
+#include "Save.h"
+#include "ModUtils.h"
+#include "IfsDbox.h"
+#include "FileUtils.h"
+#include "AUN.h"
+#include "SmallDrag.h"
+#include "Versions.h"
+
+messagetrans_control_block MFD;
+toolbox_block IdBlock;
+
+toolbox_o MainObject;
+toolbox_o AUNObject, AccessObject, InternetObject;
+toolbox_o RoutingObject, NamesObject, InterfacesObject;
+toolbox_o RouteDoptsObject;
+
+bool InternetEnabled, AUNEnabled, AccessEnabled;
+bool HaveResolver, HaveResolve, HaveInetDB, HaveDNSResolver, HaveAResolver;
+char HostName[64];
+char LocalDomain[64];
+char Resolver[3][64];
+bool UseResolver;
+int ResolverType;
+char Gateway[64];
+//char InternetDir[256];
+bool HaveEconet;
+bool AmRouter, UseRouteD;
+char RouteDoptions[24] = "DEFAULT";
+unsigned int CMOSIP;
+int WimpVersion;
+
+static jmp_buf restart_buf;
+
+static bool quit_handler(wimp_message *, void *);
+static bool error_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool create_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool help_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool main_button_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool closemain_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool internet_enable_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool internet_close_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool access_enable_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool access_action_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool aun_enable_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool aun_action_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool file_drag_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool file_click_handler(wimp_event_no, wimp_block *, toolbox_block *, void *);
+static bool hostname_changed(bits, toolbox_action *, toolbox_block *, void *);
+static bool general_close_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool general_click_handler(wimp_event_no, wimp_block *, toolbox_block *, void *);
+static bool general_key_handler(wimp_event_no, wimp_block *, toolbox_block *, void *);
+static bool internet_click_handler(wimp_event_no, wimp_block *, toolbox_block *, void *);
+static bool routed_default(bits, toolbox_action *, toolbox_block *, void *);
+static bool routing_option_handler(bits, toolbox_action *, toolbox_block *, void *);
+static void aun_shade(int), internet_shade(int), access_shade(int);
+
+wimp_MESSAGE_LIST(5) messages = { message_DATA_SAVE,
+                                  message_DATA_SAVE_ACK,
+    	    	    	    	  message_DATA_LOAD,
+    	    	    	    	  message_DATA_OPEN,
+    	    	    	    	  0
+    	    	    	    	};
+toolbox_ACTION_LIST(16) actions = { action_ERROR,
+    	    	    	    	    action_OBJECT_AUTO_CREATED,
+    	    	    	    	    action_WINDOW_ABOUT_TO_BE_SHOWN,
+                                    action_ACTION_BUTTON_SELECTED,
+    	    	    	    	    action_OPTION_BUTTON_STATE_CHANGED,
+    	    	    	    	    action_RADIO_BUTTON_STATE_CHANGED,
+    	    	    	    	    action_WRITABLE_FIELD_VALUE_CHANGED,
+    	    	    	    	    action_DRAGGABLE_DRAG_ENDED,
+    	    	    	    	    action_STRING_SET_ABOUT_TO_BE_SHOWN,
+    	    	    	    	    action_WINDOW_DIALOGUE_COMPLETED,
+    	    	    	    	    action_PROG_INFO_ABOUT_TO_BE_SHOWN,
+    	    	    	    	    action_Help,
+    	    	    	    	    action_Quit,
+    	    	    	    	    action_DefaultNetmask,
+    	    	    	    	    /*action_UpdateAUNCMOS,*/
+    	    	    	    	    action_DefaultRouteD,
+    	    	    	    	    0
+                                  };
+
+typedef struct
+{
+    const char *filename;
+    toolbox_c component;
+} DragIcon;
+
+static bool proginfo(bits event_code, toolbox_action *event,
+                     toolbox_block *id, void *handle)
+{
+    proginfo_set_version(0, id->this_obj, msgs_lookup("_Version"));
+
+    return TRUE;
+}
+
+/*
+ * The patented Kev C error handling system.
+ *
+ * Errors and traps are reported in the standard RISC OS fashion.
+ * In particular data aborts are reported as "Internal error: Data abort at
+ * &xxxxxxxx" instead of "Illegal address (eg wildly outside array bounds)".
+ * This is achieved by removing the Data Abort etc handlers so they go
+ * through the default handler (helpfully dumping into the register area)
+ * which then raises the usual error message. The signal handlers are then
+ * called as normal, but _kernel_last_oserror() now returns something
+ * useful.
+ *
+ * Error boxes have two buttons, "Continue" and "Quit", unless the toolbox
+ * hasn't initialised, in which case the only option is "Quit". "Continue"
+ * will jump back into the polling loop.
+ *
+ * Note that RISC OS 3.50-3.60 Wimps screw up in the case of serious errors
+ * (eg traps); the "May have gone wrong" preliminary box will have the wrong
+ * sprite, and the "Describe"d secondary box will be missing its Quit button.
+ */
+static int init_state;
+
+static void sighandler(int sig)
+{
+    wimp_error_box_selection b;
+    char Quit[32];
+    messagetrans_control_block cb;
+
+    messagetrans_open_file(&cb, "WindowManager:Messages", 0);
+    messagetrans_lookup(&cb, "Quit:Quit", Quit, sizeof Quit, 0, 0, 0, 0, 0);
+    messagetrans_close_file(&cb);
+
+    b = wimp_report_error_by_category((os_error *) _kernel_last_oserror(),
+                (init_state >= 1 ? wimp_ERROR_BOX_OK_ICON : 0) |
+                wimp_ERROR_BOX_CATEGORY_ERROR << wimp_ERROR_BOX_CATEGORY_SHIFT,
+                msgs_lookup("_TaskName"), "!inetsetup", wimpspriteop_AREA, Quit);
+
+    if (b == wimp_ERROR_BOX_SELECTED_OK)
+    {
+        signal(sig, sighandler);
+    	longjmp(restart_buf, 1);
+    }
+
+    exit(1);
+}
+
+int main()
+{
+    int i;
+    byte *a, *b;
+    void *h;
+
+    for (i=os_HANDLER_UNDEFINED_INSTRUCTION; i<=os_HANDLER_ADDRESS_EXCEPTION; i++)
+    {
+    	h=os_read_default_handler(i, &a, &b);
+    	os_change_environment(i, h, a, b, 0, 0);
+    }
+
+    signal(SIGFPE, sighandler);
+    signal(SIGILL, sighandler);
+    signal(SIGSEGV, sighandler);
+    signal(SIGSTAK, sighandler);
+    signal(SIGOSERROR, sighandler);
+
+    toolbox_initialise(0, 310, (wimp_message_list *) &messages,
+                               (toolbox_action_list *) &actions,
+                               "<InetSetup$Dir>",
+    	    	       &MFD, &IdBlock, &WimpVersion, 0);
+
+    event_initialise(&IdBlock);
+
+    event_set_mask(wimp_MASK_NULL|wimp_MASK_LEAVING|wimp_MASK_ENTERING|
+                   wimp_MASK_LOSE|wimp_MASK_GAIN|wimp_MASK_POLLWORD);
+
+    event_register_toolbox_handler(event_ANY, action_OBJECT_AUTO_CREATED, create_handler, 0);
+    event_register_toolbox_handler(event_ANY, action_ERROR, error_handler, 0);
+    event_register_wimp_handler(event_ANY, wimp_MOUSE_CLICK, general_click_handler, 0);
+    event_register_wimp_handler(event_ANY, wimp_KEY_PRESSED, general_key_handler, 0);
+    event_register_message_handler(message_QUIT, quit_handler, 0);
+    event_register_toolbox_handler(event_ANY, action_Help, help_handler, 0);
+    event_register_toolbox_handler(event_ANY, action_Quit, closemain_handler, 0);
+    event_register_toolbox_handler(event_ANY, action_WINDOW_DIALOGUE_COMPLETED,
+                                              general_close_handler, 0);
+    event_register_toolbox_handler(event_ANY, action_PROG_INFO_ABOUT_TO_BE_SHOWN,
+                                              proginfo, 0);
+
+    FileInit();
+
+    ScanInterfaces();
+
+    CheckConfig();
+
+    setjmp(restart_buf);
+
+    init_state=1;
+
+    for (;;)
+    	event_poll(0, 0, 0);
+}
+
+char *msgs_lookup(const char *token)
+{
+    int used;
+    static char msgs_buffer[256];
+
+    messagetrans_lookup(&MFD, token, msgs_buffer, sizeof msgs_buffer,
+                        NULL, NULL, NULL, NULL, &used);
+
+    msgs_buffer[used]='\0';
+
+    return msgs_buffer;
+}
+
+static bool error_handler(bits event_code, toolbox_action *event,
+                             toolbox_block *id, void *handle)
+{
+    report_error((os_error *) &event->data.error);
+
+    return TRUE;
+}
+
+void make_error(const char *token)
+{
+    os_error err;
+    err.errnum = 1;
+    strcpy(err.errmess, msgs_lookup(token));
+    report_error(&err);
+}
+
+void report_error(os_error *e)
+{
+    wimp_report_error_by_category(e,
+        wimp_ERROR_BOX_OK_ICON |
+        wimp_ERROR_BOX_CATEGORY_ERROR << wimp_ERROR_BOX_CATEGORY_SHIFT,
+        msgs_lookup("_TaskName"),
+        "!inetsetup",
+        wimpspriteop_AREA,
+        0);
+}
+
+static bool quit_handler(wimp_message *message, void *handle)
+{
+    exit(0);
+
+    return TRUE;
+}
+
+static bool closemain_handler(bits event_code, toolbox_action *event,
+                             toolbox_block *id, void *handle)
+{
+    exit(0);
+
+    return TRUE;
+}
+
+static bool general_close_handler(bits event_code, toolbox_action *event,
+                                  toolbox_block *id, void *handle)
+{
+    toolbox_o o = id->parent_obj;
+
+    while (o != toolbox_NULL_OBJECT)
+    {
+        if (toolbox_get_object_class(0, o) != class_WINDOW)
+            return FALSE;
+
+        if (toolbox_get_object_info(0, o) & toolbox_INFO_SHOWING)
+        {
+            xwimp_set_caret_position(window_get_wimp_handle(0, o),
+                                     (wimp_i) -1, 0, 0, (1<<25), 0);
+            return FALSE;
+        }
+
+        toolbox_get_parent(0, o, &o, 0);
+    }
+
+    return FALSE;
+}
+
+static bool mainclick_handler(wimp_event_no event_code, wimp_block *event,
+    	    	    	      toolbox_block *id, void *handle)
+{
+    switch (id->this_cmp)
+    {
+      case main_AUN:
+        if (AUNObject == 0)
+        {
+            static DragIcon icon = { "InetDBase:AUNMap", aun_Mappings };
+
+            AUNObject = toolbox_create_object(0, (toolbox_id) "AUN");
+            event_register_toolbox_handler(AUNObject,
+            	    	    	    	   action_OPTION_BUTTON_STATE_CHANGED,
+            	    	    	    	   aun_enable_handler, 0);
+            event_register_wimp_handler(AUNObject, wimp_MOUSE_CLICK, file_click_handler,
+                                                                     &icon);
+            event_register_toolbox_handler(AUNObject, action_DRAGGABLE_DRAG_ENDED,
+                                           file_drag_handler, &icon);
+            event_register_toolbox_handler(AUNObject, action_ACTION_BUTTON_SELECTED,
+             	    	    	    	   aun_action_handler, 0);
+            /*event_register_toolbox_handler(AUNObject, action_UpdateAUNCMOS,
+                                           UpdateAUNCMOS, 0);*/
+            optionbutton_set_state(0, AUNObject, aun_Enable, AUNEnabled);
+            aun_shade(AUNEnabled);
+            AUNFaff(AUNObject);
+        }
+        toolbox_show_object(0, AUNObject, toolbox_POSITION_DEFAULT, 0,
+                            id->this_obj, id->this_cmp);
+        return TRUE;
+      case main_Access:
+        if (AccessObject == 0)
+        {
+            AccessObject = toolbox_create_object(0, (toolbox_id) "Access");
+            event_register_toolbox_handler(AccessObject,
+            	    	    	    	   action_OPTION_BUTTON_STATE_CHANGED,
+            	    	    	    	   access_enable_handler, 0);
+            event_register_toolbox_handler(AccessObject, action_ACTION_BUTTON_SELECTED,
+             	    	    	    	   access_action_handler, 0);
+            optionbutton_set_state(0, AccessObject, access_Enable, AccessEnabled);
+            access_shade(AccessEnabled);
+        }
+        toolbox_show_object(0, AccessObject, toolbox_POSITION_DEFAULT, 0,
+                            id->this_obj, id->this_cmp);
+        return TRUE;
+      case main_Internet:
+        if (InternetObject == 0)
+        {
+            static DragIcon icon = { CONFIGDIR_READ "User", internet_Extra };
+
+            InternetObject = toolbox_create_object(0, (toolbox_id) "Internet");
+            event_register_wimp_handler(InternetObject, wimp_MOUSE_CLICK,
+                                        internet_click_handler, 0);
+            event_register_wimp_handler(InternetObject, wimp_MOUSE_CLICK,
+                                        SmallDragHandler, (void *) internet_Extra);
+            event_register_wimp_handler(event_ANY, wimp_USER_DRAG_BOX,
+                                        SmallDragFinish, (void *) internet_Extra);
+            event_register_wimp_handler(InternetObject, wimp_MOUSE_CLICK,
+                                        file_click_handler, &icon);
+            event_register_toolbox_handler(InternetObject, action_DRAGGABLE_DRAG_ENDED,
+                                           file_drag_handler, &icon);
+            event_register_toolbox_handler(InternetObject,
+            	    	    	    	   action_OPTION_BUTTON_STATE_CHANGED,
+            	    	    	    	   internet_enable_handler, 0);
+            event_register_toolbox_handler(InternetObject,
+            	    	    	    	   action_WINDOW_DIALOGUE_COMPLETED,
+            	    	    	    	   internet_close_handler, 0);
+            optionbutton_set_state(0, InternetObject, internet_Enable, InternetEnabled);
+            internet_shade(InternetEnabled);
+        }
+        toolbox_show_object(0, InternetObject, toolbox_POSITION_DEFAULT, 0,
+                            id->this_obj, id->this_cmp);
+        return TRUE;
+      case main_AUN_B:
+      case main_Access_B:
+      case main_Internet_B:
+      {
+        toolbox_action action;
+        toolbox_o obj;
+        toolbox_c cmp;
+        bool on;
+
+        on = !(button_get_flags(0, id->this_obj, id->this_cmp) & wimp_ICON_SELECTED);
+        button_set_flags(0, id->this_obj, id->this_cmp, wimp_ICON_SELECTED,
+                                                   on ? wimp_ICON_SELECTED : 0);
+
+        if (id->this_cmp == main_AUN_B)
+        {
+            obj = AUNObject;
+            cmp = aun_Enable;
+            AUNEnabled = on;
+        }
+        else if (id->this_cmp == main_Access_B)
+        {
+            obj = AccessObject;
+            cmp = access_Enable;
+            AccessEnabled = on;
+        }
+        else
+        {
+            obj = InternetObject;
+            cmp = internet_Enable;
+            InternetEnabled = on;
+        }
+        if (obj)
+        {
+            optionbutton_set_state(0, obj, cmp, on);
+            action.size = 20;
+            action.action_no = action_OPTION_BUTTON_STATE_CHANGED;
+            action.flags = optionbutton_STATE_CHANGED_SELECT;
+            ((optionbutton_action_state_changed *)&action.data)->on = on;
+            toolbox_raise_toolbox_event(0, obj, cmp, &action);
+        }
+        return TRUE;
+      }
+    }
+
+    return FALSE;
+}
+
+static bool create_handler(bits event_code, toolbox_action *event,
+                           toolbox_block *id, void *handle)
+{
+    if (strcmp(event->data.created.name, "Main") == 0)
+    {
+        MainObject = id->this_obj;
+        event_register_toolbox_handler(MainObject, action_ACTION_BUTTON_SELECTED,
+                                       main_button_handler, 0);
+    	event_register_wimp_handler(MainObject, wimp_MOUSE_CLICK, mainclick_handler, 0);
+    	if (!Exists("BootResources:!Internet") ||
+    	    !RMFind("Internet", "System:Modules.Network.Internet", v_Internet))
+    	{
+    	    gadget_set_flags(0, MainObject, main_Internet, gadget_FADED);
+    	    gadget_set_flags(0, MainObject, main_Internet_B, gadget_FADED);
+    	}
+    	/*else
+    	{
+    	    strcpy(InternetDir, getenv("Inet$Path"));
+    	    *strrchr(InternetDir, '.') = '\0';
+    	}*/
+    	if (!RMFind("Freeway", "System:Modules.Network.Freeway", v_Freeway) ||
+    	    !RMFind("ShareFS", "System:Modules.Network.Share+", v_ShareFS))
+        {
+    	    gadget_set_flags(0, MainObject, main_Access, gadget_FADED);
+    	    gadget_set_flags(0, MainObject, main_Access_B, gadget_FADED);
+    	}
+    	if (!RMFind("Net", "System:Modules.Network.Net", v_Net) &&
+    	    !RMFind("NetI", "System:Modules.Network.NetI", v_NetI) &&
+    	    !HaveEconet)
+    	{
+    	    gadget_set_flags(0, MainObject, main_AUN, gadget_FADED);
+    	    gadget_set_flags(0, MainObject, main_AUN_B, gadget_FADED);
+    	}
+    	button_set_flags(0, MainObject, main_AUN_B, wimp_ICON_SELECTED,
+    	                               AUNEnabled ? wimp_ICON_SELECTED : 0);
+    	button_set_flags(0, MainObject, main_Access_B, wimp_ICON_SELECTED,
+    	                               AccessEnabled ? wimp_ICON_SELECTED : 0);
+    	button_set_flags(0, MainObject, main_Internet_B, wimp_ICON_SELECTED,
+    	                               InternetEnabled ? wimp_ICON_SELECTED : 0);
+    }
+    else if (strcmp(event->data.created.name, "RouteDopts") == 0)
+    {
+        RouteDoptsObject = id->this_obj;
+        writablefield_set_value(0, id->this_obj, routedopts_Options, RouteDoptions);
+        event_register_toolbox_handler(id->this_obj, action_DefaultRouteD, routed_default, 0);
+    }
+    else if (strcmp(event->data.created.name, "RouteMenu") == 0)
+    {
+        menu_set_fade(0, id->this_obj, routemenu_RouteDOptions, !UseRouteD);
+    }
+
+    return FALSE;
+}
+
+static bool general_click_handler(wimp_event_no event_code, wimp_block *event,
+    	    	    	          toolbox_block *id, void *handle)
+{
+    wimp_caret caret;
+
+    /* Action buttons sometimes open a dialogue box - if we grab the caret
+       here the new dialogue box won't get it */
+
+    if (id->this_cmp != toolbox_NULL_COMPONENT &&
+    	gadget_get_type(0, id->this_obj, id->this_cmp) == class_ACTION_BUTTON &&
+    	(actionbutton_get_click_show(0, id->this_obj, id->this_cmp) ||
+    	  !(gadget_get_flags(0, id->this_obj, id->this_cmp) & actionbutton_IS_LOCAL)))
+    	return FALSE;
+
+    wimp_get_caret_position(&caret);
+
+    if (caret.w != event->pointer.w)
+    	xwimp_set_caret_position(event->pointer.w, (wimp_i) -1, 0, 0, (1<<25), 0);
+
+    return FALSE;
+}
+
+static bool general_key_handler(wimp_event_no event_code, wimp_block *event,
+    	    	    	        toolbox_block *id, void *handle)
+{
+    wimp_process_key(event->key.c);
+
+    return TRUE;
+}
+
+static void internet_shade(int flags)
+{
+    int i;
+    static toolbox_c toshade[] = { internet_Interfaces, internet_Routing,
+                                   internet_Names, internet_Logo,
+                                   internet_Extra };
+
+    flags = flags ? 0: gadget_FADED;
+
+    for (i = 0; i < sizeof toshade / sizeof toshade[0]; i++)
+        gadget_set_flags(0, InternetObject, toshade[i], flags);
+}
+
+static bool internet_enable_handler(bits event_code, toolbox_action *event,
+                                    toolbox_block *id, void *handle)
+{
+    optionbutton_action_state_changed *opt =
+                           (optionbutton_action_state_changed *)&event->data;
+    if (id->this_cmp != internet_Enable)
+    	return FALSE;
+
+    internet_shade(opt->on);
+    button_set_flags(0, MainObject, main_Internet_B, wimp_ICON_SELECTED,
+                                           opt->on ? wimp_ICON_SELECTED : 0);
+    if (AUNObject)
+    {
+    	gadget_flags flags;
+    	flags = (opt->on && optionbutton_get_state(0, AUNObject, aun_Enable))
+    	                ? 0 : gadget_FADED;
+        gadget_set_flags(0, AUNObject, aun_Mappings, flags);
+    }
+
+    if (!opt->on)
+    {
+        if (RoutingObject) toolbox_hide_object(0, RoutingObject);
+        if (NamesObject) toolbox_hide_object(0, NamesObject);
+        if (InterfacesObject) toolbox_hide_object(0, InterfacesObject);
+    }
+
+    return TRUE;
+}
+
+static bool internet_close_handler(bits event_code, toolbox_action *event,
+                                   toolbox_block *id, void *handle)
+{
+    if (RoutingObject) toolbox_hide_object(0, RoutingObject);
+    if (NamesObject) toolbox_hide_object(0, NamesObject);
+    if (InterfacesObject) toolbox_hide_object(0, InterfacesObject);
+
+    return FALSE;
+}
+
+static void access_shade(int flags)
+{
+    flags = flags ? 0: gadget_FADED;
+
+    gadget_set_flags(0, AccessObject, access_Logo1, flags);
+    gadget_set_flags(0, AccessObject, access_Logo2, flags);
+    gadget_set_flags(0, AccessObject, access_Logo3, flags);
+}
+
+static bool access_enable_handler(bits event_code, toolbox_action *event,
+                                    toolbox_block *id, void *handle)
+{
+    optionbutton_action_state_changed *opt =
+                           (optionbutton_action_state_changed *)&event->data;
+
+    if (id->this_cmp != access_Enable)
+    	return FALSE;
+
+    access_shade(opt->on);
+    button_set_flags(0, MainObject, main_Access_B, wimp_ICON_SELECTED,
+                                         opt->on ? wimp_ICON_SELECTED : 0);
+
+    return TRUE;
+}
+
+static bool access_action_handler(bits event_code, toolbox_action *event,
+                               toolbox_block *id, void *handle)
+{
+    if (event->flags & actionbutton_SELECTED_DEFAULT)
+    {
+        AccessEnabled=optionbutton_get_state(0, id->this_obj, access_Enable);
+        return TRUE;
+    }
+
+    if (event->flags & actionbutton_SELECTED_CANCEL)
+    {
+        optionbutton_set_state(0, id->this_obj, access_Enable, AccessEnabled);
+        access_shade(AccessEnabled);
+    	button_set_flags(0, MainObject, main_Access_B, wimp_ICON_SELECTED,
+                                        AccessEnabled ? wimp_ICON_SELECTED : 0);
+    	return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void aun_shade(int active)
+{
+    int i;
+    bool istate;
+    gadget_flags flags;
+    static toolbox_c toshade[] = { aun_Logo1, aun_Logo2,
+                                   aun_ThisStation, aun_FileServer, aun_PrintServer,
+                                   aun_ThisStationLabel, aun_FileServerLabel,
+                                   aun_PrintServerLabel/*, aun_UpdateCMOS*/ };
+
+    flags = (active || HaveEconet) ? 0: gadget_FADED;
+
+    for (i = 0; i < sizeof toshade / sizeof toshade[0]; i++)
+        gadget_set_flags(0, AUNObject, toshade[i], flags);
+
+    if (!InternetObject)
+    	istate = InternetEnabled;
+    else
+    	istate = optionbutton_get_state(0, InternetObject, internet_Enable);
+
+    gadget_set_flags(0, AUNObject, aun_Mappings, istate && active ? 0 : gadget_FADED);
+}
+
+static bool aun_enable_handler(bits event_code, toolbox_action *event,
+                                    toolbox_block *id, void *handle)
+{
+    optionbutton_action_state_changed *opt =
+                           (optionbutton_action_state_changed *)&event->data;
+
+    switch (id->this_cmp)
+    {
+      case aun_Enable:
+        aun_shade(opt->on);
+        button_set_flags(0, MainObject, main_AUN_B, wimp_ICON_SELECTED,
+                                          opt->on ? wimp_ICON_SELECTED : 0);
+    	return TRUE;
+    }
+
+    return FALSE;
+}
+
+static bool aun_action_handler(bits event_code, toolbox_action *event,
+                               toolbox_block *id, void *handle)
+{
+    if (event->flags & actionbutton_SELECTED_DEFAULT)
+    {
+        UpdateAUNCMOS();
+        AUNEnabled=optionbutton_get_state(0, id->this_obj, aun_Enable);
+        return TRUE;
+    }
+
+    if (event->flags & actionbutton_SELECTED_CANCEL)
+    {
+        optionbutton_set_state(0, id->this_obj, aun_Enable, AUNEnabled);
+        aun_shade(AUNEnabled);
+        button_set_flags(0, MainObject, main_AUN_B, wimp_ICON_SELECTED,
+                                        AUNEnabled ? wimp_ICON_SELECTED : 0);
+    	AUNFaff(id->this_obj);
+    	return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void check_existence(toolbox_o obj, DragIcon *icon)
+{
+    if (obj == RoutingObject && !Exists(icon->filename))
+    {
+        osfile_create_dir(CONFIGDIR_STEM, 0);
+        osfscontrol_copy("<InetSetup$Dir>.Blanks.Routes",
+                         CONFIGDIR_WRITE "Routes",
+                         0, 0, 0, 0, 0, 0);
+    }
+
+    if (obj == InternetObject && !Exists(icon->filename))
+    {
+    	osfile_create_dir(CONFIGDIR_STEM, 0);
+	osfscontrol_copy("<InetSetup$Dir>.Blanks.User",
+                         CONFIGDIR_WRITE "User",
+                         0, 0, 0, 0, 0, 0);
+    }
+}
+
+static bool file_drag_handler(bits event_code, toolbox_action *event,
+                             toolbox_block *id, void *handle)
+{
+    draggable_action_drag_ended *drag = (draggable_action_drag_ended *) &event->data;
+    DragIcon *icon = (DragIcon *) handle;
+
+    if (id->this_cmp != icon->component)
+        return FALSE;
+
+    if (drag->ids.wimp.w == window_get_wimp_handle(0, id->this_obj))
+        return FALSE;
+
+    check_existence(id->this_obj, icon);
+
+    DragFile(icon->filename, drag);
+
+    return TRUE;
+}
+
+static void dns_shade(int active)
+{
+    int i;
+    gadget_flags flag;
+    static toolbox_c toshade[] = { dns_LocalDomain, dns_DomainLabel,
+                                   dns_Primary, dns_PrimaryLabel,
+                                   dns_Secondary, dns_SecondaryLabel,
+                                   dns_Tertiary, dns_TertiaryLabel,
+                                   dns_ResolverType, dns_ResolverTypeLabel };
+
+    flag = active ? 0 : gadget_FADED;
+
+    for (i = 0; i < sizeof toshade / sizeof toshade[0]; i++)
+        gadget_set_flags(0, NamesObject, toshade[i], flag);
+}
+
+static bool dns_enable_handler(bits event_code, toolbox_action *event,
+                               toolbox_block *id, void *handle)
+{
+    radiobutton_action_state_changed *state =
+                    (radiobutton_action_state_changed *) &event->data;
+
+    if (id->this_cmp != dns_UseDNS)
+        return FALSE;
+
+    dns_shade(state->on);
+
+    return TRUE;
+}
+
+static bool file_click_handler(wimp_event_no event_code, wimp_block *event,
+    	    	    	       toolbox_block *id, void *handle)
+{
+    DragIcon *icon = (DragIcon *) handle;
+
+    if (id->this_cmp == icon->component && event->pointer.buttons == wimp_CLICK_SELECT)
+    {
+    	check_existence(id->this_obj, icon);
+
+        DoubleClickFile(icon->filename, event->pointer.w,
+            	    	event->pointer.pos.x, event->pointer.pos.y);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static bool internet_click_handler(wimp_event_no event_code, wimp_block *event,
+    	    	    	           toolbox_block *id, void *handle)
+{
+    switch (id->this_cmp)
+    {
+      case internet_Routing:
+        if (RoutingObject == 0)
+        {
+            static DragIcon icon = { CONFIGDIR_READ "Routes", routing_RoutesFile };
+
+            RoutingObject = toolbox_create_object(0, (toolbox_id) "Routing");
+            writablefield_set_value(0, RoutingObject, routing_Gateway, Gateway);
+            optionbutton_set_state(0, RoutingObject, routing_Router, AmRouter);
+            optionbutton_set_state(0, RoutingObject, routing_RouteD, UseRouteD);
+            event_register_toolbox_handler(RoutingObject, action_DRAGGABLE_DRAG_ENDED,
+                                           file_drag_handler, &icon);
+            event_register_toolbox_handler(RoutingObject,
+                                           action_OPTION_BUTTON_STATE_CHANGED,
+                                           routing_option_handler, 0);
+            event_register_wimp_handler(RoutingObject, wimp_MOUSE_CLICK,
+                                        file_click_handler, &icon);
+        }
+        toolbox_show_object(0, RoutingObject, toolbox_POSITION_DEFAULT, 0,
+                            id->this_obj, id->this_cmp);
+        return TRUE;
+      case internet_Interfaces:
+        if (InterfacesObject == 0)
+            MakeIfsDbox(id);
+        else
+       	    toolbox_show_object(0, InterfacesObject, toolbox_POSITION_DEFAULT, 0,
+                            	id->this_obj, id->this_cmp);
+        return TRUE;
+      case internet_Names:
+        if (NamesObject == 0)
+        {
+            static DragIcon icon = { "InetDBase:Hosts", dns_HostsFile };
+
+            NamesObject = toolbox_create_object(0, (toolbox_id) "DNS");
+
+            writablefield_set_value(0, NamesObject, dns_HostName, HostName);
+            writablefield_set_value(0, NamesObject, dns_LocalDomain, LocalDomain);
+            writablefield_set_value(0, NamesObject, dns_Primary, Resolver[0]);
+            writablefield_set_value(0, NamesObject, dns_Secondary, Resolver[1]);
+            writablefield_set_value(0, NamesObject, dns_Tertiary, Resolver[2]);
+            radiobutton_set_state(0, NamesObject, UseResolver ? dns_UseDNS : dns_NoDNS, 1);
+            dns_shade(UseResolver);
+            if (!HaveAResolver)
+            	gadget_set_flags(0, NamesObject, dns_UseDNS, gadget_FADED);
+            else
+            {
+                char set[256]="";
+                char *sep="";
+                if (HaveResolver)
+                {
+                    strcat(set, msgs_lookup("Res0"));
+                    sep=",";
+                }
+                if (HaveResolve)
+                {
+                    strcat(set, sep);
+                    strcat(set, msgs_lookup("Res1"));
+                    sep=",";
+                }
+                if (HaveInetDB)
+                {
+                    strcat(set, sep);
+                    strcat(set, msgs_lookup("Res2"));
+                    sep=",";
+                }
+                if (HaveDNSResolver)
+                {
+                    strcat(set, sep);
+                    strcat(set, msgs_lookup("Res3"));
+                }
+                stringset_set_available(0, NamesObject, dns_ResolverType, set);
+                sprintf(set, "Res%d", ResolverType);
+                stringsetsetselected_string(0, NamesObject, dns_ResolverType,
+                                            msgs_lookup(set));
+            }
+            event_register_toolbox_handler(NamesObject, action_RADIO_BUTTON_STATE_CHANGED,
+                                           dns_enable_handler, 0);
+            event_register_toolbox_handler(NamesObject, action_DRAGGABLE_DRAG_ENDED,
+                                           file_drag_handler, &icon);
+            event_register_toolbox_handler(NamesObject, action_WRITABLE_FIELD_VALUE_CHANGED,
+                                           hostname_changed, 0);
+            event_register_wimp_handler(NamesObject, wimp_MOUSE_CLICK, file_click_handler,
+                                                                       &icon);
+        }
+        toolbox_show_object(0, NamesObject, toolbox_POSITION_DEFAULT, 0,
+                            id->this_obj, id->this_cmp);
+        return TRUE;
+      case internet_Logo:
+      {
+        char buffer[256];
+        if (event->pointer.buttons == wimp_CLICK_SELECT)
+        {
+            int pos;
+            sprintf(buffer, "Filer_OpenDir %n", &pos);
+            osfscontrol_canonicalise_path("BootResources:!Internet", buffer+pos, 0, 0,
+                                          sizeof buffer - pos);
+        }
+        else
+            sprintf(buffer, "Do Filer_OpenDir %s", CONFIGDIR_STEM);
+
+        os_cli(buffer);
+        return FALSE;
+      }
+    }
+
+    return FALSE;
+}
+
+static bool help_handler(bits event_code, toolbox_action *event,
+                         toolbox_block *id, void *handle)
+{
+    if (getenv("Help$Dir") == NULL)
+    {
+        if (getenv("Help$Start"))
+            xwimp_start_task("Run <Help$Start>", 0);
+        else
+            xwimp_start_task("Run Resources:$.Apps.!Help", 0);
+    }
+
+    return TRUE;
+}
+
+static void ReadDboxes()
+{
+    extern toolbox_o interface_object[16];
+    int i;
+
+    if (RoutingObject)
+    {
+        writablefield_get_value(0, RoutingObject, routing_Gateway, Gateway, sizeof Gateway);
+        AmRouter=optionbutton_get_state(0, RoutingObject, routing_Router);
+        UseRouteD=optionbutton_get_state(0, RoutingObject, routing_RouteD);
+    }
+    if (RouteDoptsObject)
+        writablefield_get_value(0, RouteDoptsObject, routedopts_Options, RouteDoptions,
+                                                                  sizeof RouteDoptions);
+
+    if (NamesObject)
+    {
+        char buffer[256];
+        UseResolver = radiobutton_get_state(0, NamesObject, dns_UseDNS, 0);
+        writablefield_get_value(0, NamesObject, dns_Primary, Resolver[0], sizeof Resolver[0]);
+        writablefield_get_value(0, NamesObject, dns_Secondary, Resolver[1], sizeof Resolver[0]);
+        writablefield_get_value(0, NamesObject, dns_Tertiary, Resolver[2], sizeof Resolver[0]);
+        writablefield_get_value(0, NamesObject, dns_HostName, HostName, sizeof HostName);
+        writablefield_get_value(0, NamesObject, dns_LocalDomain, LocalDomain, sizeof LocalDomain);
+        stringsetgetselected_string(0, NamesObject, dns_ResolverType, buffer, sizeof buffer);
+        for (i=0; i<4; i++)
+        {
+            char token[8];
+            sprintf(token, "Res%d", i);
+            if (strcmp(buffer, msgs_lookup(token)) == 0)
+            {
+                ResolverType = i;
+                break;
+            }
+        }
+    }
+
+    if (!InterfacesObject)
+        MakeIfsDbox(0);
+
+    for (i = 0; i < interfaces; i++)
+    {
+        if (!optionbutton_get_state(0, InterfacesObject, (i << 8) + 3))
+        {
+            interface_address[i][0]='\0';
+            continue;
+        }
+
+        writablefield_get_value(0, interface_object[i], if_Address, interface_address[i], sizeof interface_address[i]);
+        writablefield_get_value(0, interface_object[i], if_Netmask, interface_netmask[i], sizeof interface_netmask[i]);
+        if (interface_is_pp[i])
+            writablefield_get_value(0, interface_object[i], if_LinkAddr, interface_linkaddr[i], sizeof interface_linkaddr[i]);
+        if (optionbutton_get_state(0, interface_object[i], if_Primary))
+            primary_interface = i;
+        radiobutton_get_state(0, interface_object[i], if_Manual,
+                                                   &interface_addrtype[i]);
+    }
+
+    if (InternetObject)
+        InternetEnabled=optionbutton_get_state(0, InternetObject, internet_Enable);
+}
+
+static bool main_button_handler(bits event_code, toolbox_action *event,
+                                toolbox_block *id, void *handle)
+{
+    if (event->flags & actionbutton_SELECTED_DEFAULT)
+    {
+    	ReadDboxes();
+        SaveSetup();
+    }
+
+    return TRUE;
+}
+
+static bool hostname_changed(bits event_code, toolbox_action *event,
+                             toolbox_block *id, void *handle)
+{
+    writablefield_action_value_changed *wa =
+           (writablefield_action_value_changed *) &event->data;
+
+    strcpy(HostName, wa->string);
+
+    if (InterfacesObject)
+    {
+        int i;
+        extern toolbox_o interface_object[16];
+
+    	for (i = 0; i < interfaces; i++)
+    	    if (radiobutton_get_state(0, interface_object[i], if_FromHostname, 0))
+    	    	writablefield_set_value(0, interface_object[i], if_Address, HostName);
+    }
+
+    return TRUE;
+}
+
+static bool routed_default(bits event_code, toolbox_action *event,
+                           toolbox_block *id, void *handle)
+{
+    writablefield_set_value(0, id->this_obj, routedopts_Options, "DEFAULT");
+
+    return TRUE;
+}
+
+static bool routing_option_handler(bits event_code, toolbox_action *event,
+                                   toolbox_block *id, void *handle)
+{
+    optionbutton_action_state_changed *opt =
+                           (optionbutton_action_state_changed *)&event->data;
+
+    switch (id->this_cmp)
+    {
+      case routing_RouteD:
+        menu_set_fade(0, window_get_menu(0, id->this_obj),
+                      routemenu_RouteDOptions, !opt->on);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+

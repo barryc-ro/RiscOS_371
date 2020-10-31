@@ -1,0 +1,335 @@
+/* Title:   main.c
+ * Purpose: main module of the Toolbox
+ * Author:  IDJ
+ * History: 21-Jul-93: IDJ: created
+ *          26-Jul-94: IDJ: added Service_ToolboxStarting/TaskDied
+ *          24-Jan-95: IDJ: don't send round Toolbox_Starting svc call, when started up
+ *                          from ROM start-up sequence.
+ *
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "const.h"
+#include "macros.h"
+#include "services.h"
+#include "debug.h"
+#include "mem.h"
+#include "messages.h"
+#include "rmensure.h"
+#include "objects.toolbox.h"
+
+#include "globals.h"
+#include "services.h"
+
+#include "object.h"
+#include "task.h"
+#include "resf.h"
+#include "event.h"
+#include "filters.h"
+#include "callback.h"
+
+#include "main.h"
+
+/* service call sent round after ROM initialisation */
+
+#define Service_PostInit 0x73
+
+
+#define MAX_SWIS 64
+
+/* --- array of Toolbox SWIs (64 entries) --- */
+
+static _kernel_oserror *(*swis [MAX_SWIS])(_kernel_swi_regs *r)  = 
+        {
+          /* --- client SWIs --- */ 
+          object_create,                  /* Toolbox_SWIChunkBase + 0  */
+          object_delete,                  /* Toolbox_SWIChunkBase + 1  */
+#if 0
+          object_copy,                    /* Toolbox_SWIChunkBase + 2  */ 
+#else
+          NULL,
+#endif
+          object_show,                    /* Toolbox_SWIChunkBase + 3  */
+          object_hide,                    /* Toolbox_SWIChunkBase + 4  */
+          object_get_state,               /* Toolbox_SWIChunkBase + 5  */
+          object_miscop,                  /* Toolbox_SWIChunkBase + 6  */
+          object_set_client_handle,       /* Toolbox_SWIChunkBase + 7  */
+          object_get_client_handle,       /* Toolbox_SWIChunkBase + 8  */
+          object_get_class,               /* Toolbox_SWIChunkBase + 9  */
+          object_get_parent,              /* Toolbox_SWIChunkBase + 10 */
+          object_get_ancestor,            /* Toolbox_SWIChunkBase + 11 */
+          object_get_template_name,       /* Toolbox_SWIChunkBase + 12 */
+          event_raise_toolbox_event,      /* Toolbox_SWIChunkBase + 13 */
+          task_get_sys_info,              /* Toolbox_SWIChunkBase + 14 */
+          task_initialise,                /* Toolbox_SWIChunkBase + 15 */
+          resf_load_resource_file,        /* Toolbox_SWIChunkBase + 16 */
+
+          /* --- unused --- */
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+          NULL,
+
+          /* --- object class SWIs --- */
+          object_deregister_module,      /* Toolbox_SWIChunkBase + 58 */
+          resf_template_lookup,          /* Toolbox_SWIChunkBase + 59 */
+          object_get_internal_handle,    /* Toolbox_SWIChunkBase + 60 */
+          object_register_module,        /* Toolbox_SWIChunkBase + 61 */
+          filters_register_prefilter,    /* Toolbox_SWIChunkBase + 62 */
+          filters_register_postfilter    /* Toolbox_SWIChunkBase + 63 */
+        };
+
+/* +++++++++++++++++++++++++++++++++ finalisation code +++++++++++++++++++++++++++++++++ */
+
+#ifdef ROM
+static _kernel_oserror *__ROM;
+static int ROM_started = 0;
+#endif
+
+extern _kernel_oserror *Toolbox_finalise (int fatal, int podule, void *pw)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *e;
+#ifndef ROM
+    extern int       messages_file(void);
+#endif
+
+    IGNORE(fatal);
+    IGNORE(podule);
+    IGNORE(pw);
+
+    /*
+     * if tasks are active or modules registered, refuse to die
+     */
+
+    if (task_any_active())
+    {
+        e = make_error (Toolbox_TasksActive, 0);
+        DEBUG debug_output ("finalise", "T:failed to finalise %s\n", e->errmess);
+        return e;
+    }
+
+
+    /*
+     * clean up before module exit
+     */
+
+    /*
+     * close the Toolbox messages file
+     */
+
+    messages_file_close();
+
+
+#ifndef ROM
+    /*
+     * ... and deregister from ResourceFS
+     */
+
+    regs.r[0] = messages_file();
+    _kernel_swi (ResourceFS_DeregisterFiles, &regs, &regs);
+#endif
+
+    /*
+     * free up all memory that we may have left allocated!
+     */
+
+    mem_free_all ();
+
+#ifdef ROM 
+    if(!__ROM) _swix(0xa2c41, 0);
+#endif
+
+    return NULL;
+}
+
+
+/* ++++++++++++++++++++++++++++++++ initialisation code +++++++++++++++++++++++++++++++ */
+
+extern _kernel_oserror *Toolbox_init(char *cmd_tail, int podule_base, void *pw)
+{
+    _kernel_oserror *e;
+    _kernel_swi_regs regs;
+    char            *messages_filename;
+#ifndef ROM
+    extern int       messages_file(void);
+#endif
+
+    IGNORE(cmd_tail);
+    IGNORE(podule_base);
+
+#ifdef ROM
+    __ROM = _swix(0xa2c43, _IN(0), pw);
+#endif
+
+    /*
+     * store value of private word, so that we can use it when creating a new
+     * task descriptor.  This value is then read, in pre and postfilters.
+     */
+
+    DEBUG debug_set_var_name("Toolbox$Debug");
+    DEBUG debug_output ("init", "T:Toolbox init\n");
+
+    /*
+     * we need the new filter manager which passes on claimed events to
+     * other filters
+     */
+
+    if ((e = rmensure ("FilterManager", "FilterMgr", "0.09")) != NULL)
+        return e;
+
+    private_word = pw;
+
+#ifndef ROM
+    /* 
+     * register our resources with ResourceFS
+     */
+
+    regs.r[0] = messages_file();
+    if ((e = _kernel_swi (ResourceFS_RegisterFiles, &regs, &regs)) != NULL)
+        return e;
+#endif
+
+    /*
+     * register our messages file with MessageTrans (assumes messages module loaded)
+     */
+
+    if (getenv ("Toolbox$Path") == NULL)
+        messages_filename = "Resources:Resources.Toolbox.Messages";
+    else
+        messages_filename = "Toolbox:Messages";
+
+    if ((e = messages_file_open(messages_filename)) != NULL)
+        return e;
+
+
+    /*
+     * register callback handler to send round Service_ToolboxStarting after
+     * we have init'ed OK.
+     */
+
+    regs.r[0] = (int) &toolbox_starting_callback_handler;
+#ifdef ROM
+    regs.r[1] = (int)&ROM_started;
+#else
+    regs.r[1] = 0;
+#endif
+    _kernel_swi (OS_AddCallBack, &regs, &regs);
+
+
+    return NULL;
+}
+
+
+
+/* +++++++++++++++++++++++++++++++++ service handler code ++++++++++++++++++++++++++++++ */
+
+
+extern void Toolbox_services(int service_number, _kernel_swi_regs *r, void *pw)
+{  
+    _kernel_swi_regs regs;
+           
+    IGNORE(pw);
+
+    DEBUG debug_output ("services", "T:Service call %d\n", r->r[1]);
+
+    /* /* look at mode change, and maybe reload sprites for that mode */
+
+    if (service_number == Service_Memory && r->r[2] == (int)Image__RO_Base)
+    {
+       /* wimp is trying to map out app space - don't let it !*/
+       /* r2 holds CAO pointer */
+       r->r[1] = 0;  /* don't map out app space */
+    }
+    else if (service_number == Service_WimpCloseDown)
+    {
+        TaskDescriptor *t;
+
+        /* task dying - r2 holds task handle */
+        if ((t = task_find (r->r[2])) != NULL)
+        {
+            task = t;
+
+            regs.r[0] = r->r[2];
+            regs.r[1] = Service_ToolboxTaskDied;
+            _kernel_swi (OS_ServiceCall, &regs, &regs);
+
+            task_exit (t);
+        }
+    }
+    else if (service_number == Service_FilterManagerInstalled)
+    {
+        task_filtermgr_restarting();
+    }
+#ifdef ROM 
+    else if (service_number == Service_PostInit)
+    {
+        ROM_started = 1;
+    }
+#endif
+}
+
+/* ++++++++++++++++++++++++++++++++++++++ SWI code +++++++++++++++++++++++++++++++++++++ */
+
+
+extern _kernel_oserror *Toolbox_SWI_handler(int swi_no, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *e = NULL;
+
+    IGNORE(pw);
+
+    DEBUG debug_output ("SWIs", "T:Toolbox SWI %d\n", swi_no);
+
+    /*
+     * We disallow "object" SWIs and get_sys_info for non-toolbox tasks)
+     */
+
+    if (task == NULL && (swi_no < Toolbox_GetTemplateName - Toolbox_SWIChunkBase ||
+                         swi_no == Toolbox_GetSysInfo - Toolbox_SWIChunkBase))
+        return make_error (Toolbox_NotaToolboxTask, 0);
+
+
+    /*
+     * despatch the swi, reporting out of range errors
+     */
+
+    if (swi_no > MAX_SWIS || swis[swi_no] == NULL)
+        return make_error_hex (Toolbox_BadSWI, 1, swi_no + Toolbox_SWIChunkBase);
+    else
+        e = (*swis[swi_no])(r);
+
+    return e;
+}
+
+
+/* ++++++++++++++++++++++++++++++++++++++ star commands ++++++++++++++++++++++++++++++++++++*/
+
+extern _kernel_oserror *Toolbox_commands(char *arg_string, int argc, int cmd_no, void *pw)
+{
+    IGNORE(argc);
+    IGNORE(pw);
+    IGNORE(arg_string);
+
+    switch (cmd_no)
+    {
+        case 0:
+            mem_print_list();
+            break;
+
+        default:
+            break;
+    }
+
+    return NULL;
+}
+
+
+
+

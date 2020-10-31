@@ -1,0 +1,354 @@
+
+; >Halftone32
+;revamped code for 32 bit (16m colour) quality
+;also includes 8 bit grey as special case
+
+; This file does all the halftoning calcs
+; Macros are defined to make it easier to read/edit...
+
+; This macro moves the x,y within a halftone to then next position in the 'same row'
+        MACRO
+        NextRow32 $x,$y,$halfsize,$rowmove
+        ADD   $x,$x,#1                                     ;increment x
+        CMP   $x,$halfsize                                 ;off the end?
+
+        ASSERT  $x=R2
+        ASSERT  $y=R3
+        ASSERT  $rowmove=R5
+        BLGE    move_the_row32
+        MEND
+
+move_the_row32
+
+        SUB     R5,R4,R6, LSL #2
+        LDR     R2,[R5,R3,LSL #2]                      ;load x'y'x''y'' (rownext/colnext)
+        MOV     R3,R2,LSR #8                                 ;fetch y'
+        AND     R2,R2,#&FF                                   ;fetch and straighten x'
+        AND     R3,R3,#&FF                                   ;straighten y'
+        STR     R3,[R7,#4]
+        MOV     PC,lr
+
+        MACRO
+        NextRow2_32 $x,$y,$halfsize,$rowmove
+        ADD   $x,$x,#1                                     ;increment x
+        CMP   $x,$halfsize                                 ;off the end?
+        LDRGE $x,[$rowmove,$y,LSL #2]                      ;load x'y'x''y'' (rownext/colnext)
+        MOVGE $y,$x,LSR #8                                 ;fetch y'
+        ANDGE $x,$x,#&FF                                   ;fetch and straighten x'
+        ANDGE $y,$y,#&FF                                   ;straighten y'
+        MEND
+
+; This macro moves the x,y within a halftone to then next position in the 'same column'
+        MACRO
+        NextColumn32 $x,$y,$halfsize,$rowmove,$xstart,$ystart
+        MOV   $x,$xstart                                   ;go back to x,y at start of line
+        ADD   $y,$ystart,#1                                ;increment y
+        CMP   $y,$halfsize                                 ;off the end?
+        LDRGE $x,[$rowmove,$x,LSL #2]                      ;load x'y'x''y'' (rownext/colnext)
+        MOVGE $x,$x,LSR #16                                ;fetch x''
+        MOVGE $y,$x,LSR #8                                 ;fetch and straighten y''
+        ANDGE $x,$x,#&FF                                   ;straighten x''
+        MOV   $xstart,$x                                   ;keep for next start of line
+        MOV   $ystart,$y
+        MEND
+
+; This macro is the fundamental halftone comparison
+        MACRO
+        HalfTone32 $x,$y,$halfsize,$table,$level,$temp
+        MLA   $temp,$halfsize,$y,$x                       ;work out the index (should be quick, all numbers are small)
+        LDRB  $temp,[$table,$temp]                        ;and load the level
+        CMP   $level,$temp                                ;exit HS if dot to be set
+        MEND
+
+; This macro is for colour 'same column' changes (four halftones involved)
+        MACRO
+        ColourNextColumn32 $x,$y,$halfsize,$table,$rowmove,$HalfInfo,$xstart,$ystart,$ptr
+        ADR   $ptr,$HalfInfo                                ;address the relevant table
+        LDMIA $ptr,{$x,$y,$table,$halfsize,$xstart,$ystart} ;load loads of stuff
+        SUB   $rowmove,$table,$halfsize,LSL #2              ;index to rowend table
+        NextColumn32 $x,$y,$halfsize,$rowmove,$xstart,$ystart
+        STMIA $ptr,{$x,$y,$table,$halfsize,$xstart,$ystart} ;redundant stores, but what the hell
+        MEND
+
+; This macro is for colour 'same row' changes (four halftones involved), and halftone comparison
+        MACRO
+        ColourHalfTone32 $pixel,$x,$y,$halfsize,$table,$rowmove,$HalfInfo,$Value,$Bit,$ptr,$level,$temp
+        ADR   $ptr,$HalfInfo                               ;address relevant info
+        LDMIA $ptr,{$x,$y,$table,$halfsize}                ;load it
+
+        ASSERT  $halfsize=R6
+        ASSERT  $table=R4
+        ASSERT  $rowmove=R5
+
+        LDRB  $level,$Value                                ;load the colour level
+        HalfTone32 $x,$y,$halfsize,$table,$level,$temp     ;halftone it
+        ORRHS $pixel,$pixel,#1 :SHL: $Bit                  ;set bit required
+        NextRow32 $x,$y,$halfsize,$rowmove                 ;shift halftone on one in row
+        ASSERT $ptr=R7
+        STR   $x,[$ptr]                                    ;and store result
+        MEND
+
+;click halftone position on by count in R2 (for margin skip)
+;entry: R7 = info ptr, R2 = no. of pixels to adjust for
+ht_adjust_ht
+        Push      "R0-R2,R8-R10,LR"
+        MOVS      R0,R2
+        LDMIA     R7,{R2,R3,R4,R6}
+  Debug mjs," x y",R2,R3
+        BEQ       ht_adj_done
+        SUBS      R10,R6,R2     ;no. clicks to end of halftone
+        BEQ       ht_adj_loop0_done
+;click to end of halftone
+ht_adj_loop0
+        NextRow32 R2,R3,R6,R5
+        SUBS      R0,R0,#1
+        BEQ       ht_adj_done
+        SUBS      R10,R10,#1
+        BNE       ht_adj_loop0
+ht_adj_loop0_done
+        MOV       R8,R2         ;remember x,y just after click ...
+        MOV       R9,R3         ;...and count repeat size in R10
+;learn repeat length to same position
+ht_adj_loop1
+        NextRow32 R2,R3,R6,R5
+        SUBS      R0,R0,#1
+        BEQ       ht_adj_done
+        ADD       R10,R10,#1
+        CMP       R2,R8
+        CMPEQ     R3,R9
+        BNE       ht_adj_loop1
+  Debug mjs,"repeat size,halfsize ",R10,R6
+;now reduce out the repeat (find remainder)
+        DivRem    R9,R0,R10,R8            ;R0/R10,remainder in R0
+        CMP       R0,#0
+        BEQ       ht_adj_done
+;finish residual clicks
+ht_adj_loop2                   ;now finish the adjust
+        NextRow32 R2,R3,R6,R5
+        SUBS      R0,R0,#1
+        BNE       ht_adj_loop2
+ht_adj_done
+        STR       R2,[R7]
+        Pull      "R0-R2,R8-R10,PC"
+    
+
+;process white space margin, left or right
+; entry: R2 = size of margin (left or right)
+;        R10 -> next output pixel (1 byte/pixel) 
+;        R1 -> next input pixel (4 bytes/pixel)
+;
+; corrupts R2-R5
+;
+ht_process_margin
+        Push      "LR"
+        MOV       R5,R10     
+        MOV       R3,#0
+        MOVS      R4,R2
+        BEQ       ht_pm_done
+  Debug mjs,"ht process_margin ",R4
+ht_pm_next
+        STR       R3,[R5],#4       ;store 4 white ouput pixels at a time
+        SUBS      R4,R4,#4
+        BNE       ht_pm_next
+ht_pm_done
+        ADD       R10,R10,R2       ;adjust output ptr
+        ADD       R1,R1,R2,LSL #2  ;adjust input ptr
+  Debug mjs,"Key",R2
+        ADR       R7,KeyHalfInfo
+        BL        ht_adjust_ht
+  Debug mjs,"Cyan",R2
+        ADR       R7,CyanHalfInfo
+        BL        ht_adjust_ht
+  Debug mjs,"Magenta",R2
+        ADR       R7,MagentaHalfInfo
+        BL        ht_adjust_ht
+  Debug mjs,"Yellow",R2
+        ADR       R7,YellowHalfInfo
+        BL        ht_adjust_ht
+        Pull      "PC"
+
+
+; Halftone goes
+; Size (all halftones are stored square)
+; Rowend data * 4* halfsize
+; (if simple, will be 00000000 00010100 00020200 00030300 etc. same row/column, zap to 0)
+; Halftone pattern (may include repeats!) * halfsize * halfsize
+
+Do_HalftoneColourSprite32
+; Halftone a colour sprite with screen-angle rotation...
+; Entry:   R0=columncount
+;          R1=rowcount
+;          R10=sprite
+;          R12,KCMYTable=inverse table (8-bit only)
+;          R12,XXXHalfInfo=info on halftone, suitably initialised (at start of image!!!)
+
+        STMFD SP!,{R0,R14}                         ;Keep columncount for later
+
+;initialise margin handling
+        STR   R10,rowmargins
+        MOV   R2,#0
+        STR   R2,lastleftmargin
+        STR   R2,lastrightmargin
+        STR   R2,lastleftgreymargin
+        STR   R2,lastrightgreymargin
+        LDMIA R10,{R2-R5}
+        STR   R2,thisleftmargin
+        STR   R3,thisrightmargin
+        STR   R4,thisleftgreymargin
+        STR   R5,thisrightgreymargin
+
+hc32_rowloop
+        STMFD SP!,{R1}                             ;save row count...
+        LDR   R1,redbuffer                         ;...and use R1 for pixel ptr
+
+;currently, ignore grey margins (process as colour)
+        Push  "R2-R5"
+  Debug mjs,"  left margins"
+        LDR   R2,thisleftmargin
+        SUB   R0,R0,R2
+        BL    ht_process_margin      ;process R2 marginal pixels on left
+        LDR   R3,thisrightmargin
+        SUB   R0,R0,R3               ;R0 is now no. of non-marginal pixels
+  Debug mjs,"  left margins done (R0)",R0
+        Pull  "R2-R5"
+
+        CMP   R0,#0
+        BEQ   hc32_columnloop1a
+
+hc32_columnloop
+        LDR   R11,[R1],#4                          ;next pixel
+        STR   R11,KCMYValues                       ;Easiest if stored and reloaded (R11 reusable now)
+        LDRB  R11,Overlap                          ;Get the overlap flag
+        TEQ   R11,#0                               ;Is it set?
+        BLNE  hc32_overlap                         ;Compensate for overlaps
+;**
+hc32_colourloop1
+        MOV   R11,#0                               ;Clear the pixel
+;set the relevant bits and move the halftones on a pixel
+        ColourHalfTone32 R11,R2,R3,R6,R4,R5,KeyHalfInfo,    KeyValue,    3,R7,R9,R14
+        ColourHalfTone32 R11,R2,R3,R6,R4,R5,CyanHalfInfo,   CyanValue,   2,R7,R9,R14
+        ColourHalfTone32 R11,R2,R3,R6,R4,R5,MagentaHalfInfo,MagentaValue,1,R7,R9,R14
+        ColourHalfTone32 R11,R2,R3,R6,R4,R5,YellowHalfInfo, YellowValue, 0,R7,R9,R14
+        TEQ   R11,#2_111          ;Always best to use K
+        MOVEQ R11,#2_1000         ;Instead of C=M=Y
+;You must not set Key and another bit
+        TST   R11,#1 :SHL: 3
+        TSTNE R11,#2_111
+        BLNE  hc32_keywithother
+
+        STRB  R11,[R10],#1                         ;Store the result
+        SUBS  R0,R0,#1                             ;Next column
+        BNE   hc32_columnloop
+
+hc32_columnloop1a
+        Push  "R2-R5"
+  Debug mjs,"  right margins"
+        LDR   R2,thisrightmargin
+        BL    ht_process_margin              ;process R2 marginal pixels on right
+  Debug mjs,"  right margins done "
+        Pull  "R2-R5"
+
+        STR   R1,redbuffer
+        LDMFD SP!,{R1}                       ;restore row count
+
+;move the halftones down a line
+        ColourNextColumn32 R2,R3,R6,R4,R5,KeyHalfInfo,    R7,R8,R9
+        ColourNextColumn32 R2,R3,R6,R4,R5,CyanHalfInfo,   R7,R8,R9
+        ColourNextColumn32 R2,R3,R6,R4,R5,MagentaHalfInfo,R7,R8,R9
+        ColourNextColumn32 R2,R3,R6,R4,R5,YellowHalfInfo, R7,R8,R9
+
+        LDR   R0,[SP]                       ;Reinstate columncount
+        CMP   R1,#1
+        BLE   hc32_columnloop2
+
+;update margins
+        Push  "R3-R8"
+        LDR    R7,rowmargins
+        ADD    R7,R7,R0,LSL #2
+        STR    R7,rowmargins
+        LDMIA  R7,{R3-R6}
+        LDR    R7,thisleftmargin
+        STR    R3,thisleftmargin
+        STR    R7,lastleftmargin
+        LDR    R8,thisleftgreymargin
+        STR    R5,thisleftgreymargin
+        STR    R8,lastleftgreymargin
+        LDR    R7,thisrightmargin
+        STR    R4,thisrightmargin
+        STR    R7,lastrightmargin
+        LDR    R8,thisrightgreymargin
+        STR    R6,thisrightgreymargin
+        STR    R8,lastrightgreymargin
+        Pull  "R3-R8"
+
+hc32_columnloop2
+        SUBS  R1,R1,#1                             ;Next row
+        BNE   hc32_rowloop
+
+        LDMFD SP!,{R0,PC}^
+; All done!
+
+hc32_keywithother
+;        BIC   R11,#2_111            ;Zap the odd bits
+                                     ;Image will be a bit dark UNLESS you
+                                     ;expand the size of the other dots
+        MOVS  PC,R14
+
+hc32_overlap
+        TEQ    R11,#1
+        BNE    hc32_overlap2
+;1 means that overlap is complete, so we need to add K back onto CMY
+;EXCEPT if C=M=Y (so should keep K for Key halftone)
+        STMFD   SP!,{R0-R3,R14}
+        LDR     R11,KCMYValues
+        MOV     R14,#&FF
+        AND     R0,R14,R11
+        AND     R1,R14,R11,LSR#8
+        AND     R2,R14,R11,LSR#16
+        AND     R3,R14,R11,LSR#24
+        TEQ     R1,R2
+        TEQEQ   R2,R3
+        LDMEQFD SP!,{R0-R3,PC}
+        ADD     R1,R1,R0
+        ADD     R2,R2,R0
+        ADD     R3,R3,R0
+        MOV     R11,R1,LSL#8
+        ADD     R11,R11,R2,LSL#16
+        ADD     R11,R11,R3,LSL#24
+        STR     R11,KCMYValues
+        LDMFD   SP!,{R0-R3,PC}
+hc32_overlap2
+        TEQ    R11,#2
+        MOVNE  PC,R14
+;2 means random overlap i.e. compensate by multiplying by 1+k and clamping
+;Note this is an approximation anyway so inaccuaracies will make no difference
+;they will simply shift the error elsewhere!
+        STMFD  SP!,{R0-R2,R14}
+        LDR    R11,KCMYValues
+        MOV    R14,#&FF
+        AND    R0,R14,R11
+        MOV    R2,R0                  ;K stays the same
+        ADD    R0,R0,#&100            ;Being a small amount out won't matter!
+        AND    R1,R14,R11,LSR#8       ;Get component
+        MUL    R1,R0,R1               ;Multiply by (1+K)
+        MOV    R1,R1,LSR#8            ;Get rid of the lower bits
+        CMP    R1,#&FF                ;Clamp into position
+        MOVHI  R1,#&FF                ;Ouch!
+        ADD    R2,R2,R1,LSL#8         ;And add in the result
+        AND    R1,R14,R11,LSR#16
+        MUL    R1,R0,R1
+        MOV    R1,R1,LSR#8
+        CMP    R1,#&FF
+        MOVHI  R1,#&FF
+        ADD    R2,R2,R1,LSL#16
+        AND    R1,R14,R11,LSR#24
+        MUL    R1,R0,R1
+        MOV    R1,R1,LSR#8
+        CMP    R1,#&FF
+        MOVHI  R1,#&FF
+        ADD    R2,R2,R1,LSL#24
+        STR    R2,KCMYValues
+        LDMFD  SP!,{R0-R2,PC}
+
+
+        END

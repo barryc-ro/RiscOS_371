@@ -1,0 +1,390 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "os.h"
+#include "toolbox.h"
+
+#include "ModUtils.h"
+#include "Main.h"
+#include "Load.h"
+#include "Versions.h"
+#include "IfsDbox.h"
+#include "Gadgets.h"
+
+#include "sys/types.h"
+#include "netinet/in.h"
+#include "arpa/inet.h"
+
+char interface_location[16][32];
+char interface_name[16][64];
+char interface_unit[16][16];
+char interface_module[16][32];
+int interface_version[16];
+char interface_filename[16][16];
+char interface_address[16][64];
+char interface_netmask[16][16];
+char interface_linkaddr[16][16];
+char interface_is_pp[16];
+int primary_interface = -1;
+int interfaces;
+int v_MbufManager, v_AUNMsgs, v_Internet, v_BootNet,
+    v_Net, v_NetI, v_Freeway, v_ShareFS, v_Resolver,
+    v_Resolve, v_InetDB, v_DNSResolver;
+bool StartupExists;
+
+void ScanInetStartup(void);
+void GetHostName(FILE *);
+void GetInterface(FILE *, char *);
+void GetResolvers(FILE *);
+void GetRouting(FILE *);
+static void DefaultAnInterface(void);
+
+os_error *CheckConfig(void)
+{
+    FILE *f;
+    char buffer[256];
+
+    #define GetVer(mod) v_##mod = VersionToInt(msgs_lookup("v_" #mod))
+    GetVer(MbufManager);
+    GetVer(AUNMsgs);
+    GetVer(Internet);
+    GetVer(BootNet);
+    GetVer(Net);
+    GetVer(NetI);
+    GetVer(Freeway);
+    GetVer(ShareFS);
+    GetVer(Resolver);
+    GetVer(Resolve);
+    GetVer(InetDB);
+    GetVer(DNSResolver);
+
+    if (RMFind("Resolver", "System:Modules.Network.Resolver", v_Resolver))
+    	HaveResolver = TRUE;
+    if (RMFind("Resolve", "System:Modules.Network.Resolve", v_Resolve))
+    	HaveResolve = TRUE;
+    if (RMFind("InetDB", "System:Modules.Network.InetDB", v_InetDB))
+    	HaveInetDB = TRUE;
+    if (RMFind("DNSResolver", "System:Modules.Network.DNSResolve", v_DNSResolver))
+    	HaveDNSResolver = TRUE;
+
+    HaveAResolver = HaveResolver || HaveResolve || HaveInetDB || HaveDNSResolver;
+
+    InternetEnabled = FALSE;
+
+    f=fopen("<Boot$ToBeLoaded>.SetUpNet", "r");
+
+    if (f && fgets(buffer, sizeof buffer, f))
+        if (strstr(buffer, "!Internet"))
+            InternetEnabled = TRUE;
+
+    fclose(f);
+
+    if (getenv("Inet$Path"))
+    	ScanInetStartup();
+
+    if (!StartupExists)
+    	DefaultAnInterface();
+
+    if (!InternetEnabled)
+    {
+        AccessEnabled = RMLoaded("ShareFS") && RMLoaded("Freeway");
+        AUNEnabled = RMLoaded("Net");
+    }
+
+    return FALSE;
+}
+
+void ScanInetStartup(void)
+{
+    FILE *f;
+    char buffer[256];
+    char buffer2[20];
+
+    f=fopen(CONFIGDIR_READ "Startup", "r");
+    if (!f)
+    	return;
+
+    StartupExists = TRUE;
+
+    while (fgets(buffer, sizeof buffer, f))
+    {
+        if (buffer[0]=='|' && buffer[1]=='\n')
+            break;
+    }
+  nextsection:
+    if (feof(f))
+    {
+        fclose(f);
+        return;
+    }
+
+    fgets(buffer, sizeof buffer, f);
+    fgets(buffer2, sizeof buffer2, f);
+    if (strstr(buffer, "Host name"))
+    	GetHostName(f);
+    else if (strstr(buffer, "Interface: "))
+    	GetInterface(f, strstr(buffer, "Interface: ")+sizeof "Interface: "-1);
+    else if (strstr(buffer, "Name resolver"))
+    	GetResolvers(f);
+    else if (strstr(buffer, "Routing"))
+    	GetRouting(f);
+    else if (strstr(buffer, "AUN"))
+    	AUNEnabled=TRUE;
+    else if (strstr(buffer, "Access"))
+    	AccessEnabled=TRUE;
+
+    goto nextsection;
+}
+
+void GetHostName(FILE *f)
+{
+    char buffer[256];
+
+    while (fgets(buffer, sizeof buffer, f))
+    {
+        if (buffer[0] == '|')
+            return;
+
+        if (strstr(buffer, "Inet$HostName"))
+            sscanf(buffer, "Set Inet$HostName %s", HostName);
+        else if (strstr(buffer, "Inet$LocalDomain"))
+            sscanf(buffer, "Set Inet$LocalDomain %s", LocalDomain);
+    }
+}
+
+void GetResolvers(FILE *f)
+{
+    char buffer[256];
+
+    while (fgets(buffer, sizeof buffer, f))
+    {
+        if (buffer[0] == '|')
+        	return;
+
+        if (!HaveResolver)
+            continue;
+
+        if (strstr(buffer, "Inet$Resolvers"))
+            sscanf(buffer, "Set Inet$Resolvers %s %s %s", Resolver[0], Resolver[1], Resolver[2]);
+        else if (strstr(buffer, "RMEnsure Resolver"))
+        {
+            UseResolver=1;
+            ResolverType=RT_Resolver;
+        }
+        else if (strstr(buffer, "RMEnsure Resolve"))
+        {
+            FILE *rf;
+            UseResolver=1;
+            ResolverType=RT_Resolve;
+            rf=fopen("InetDBase:resolve", "r");
+            if (rf)
+            {
+                int sn=0;
+
+                while (fgets(buffer, sizeof buffer, rf))
+                {
+                    if (buffer[0] != ';') /* Speed optimization! */
+                    {
+                        if (sscanf(buffer, "domain %s", LocalDomain) == 1) continue;
+                        if (sn<3) sscanf(buffer, "nameserver %s", Resolver[sn++]);
+                    }
+                }
+                fclose(rf);
+            }
+        }
+        else if (strstr(buffer, "RMEnsure InetDB"))
+        {
+            UseResolver=1;
+            ResolverType=RT_InetDB;
+            goto scanresconf;
+        }
+        else if (strstr(buffer, "RMEnsure DNSResolver"))
+        {
+            FILE *rf;
+            UseResolver=1;
+            ResolverType=RT_DNSResolver;
+          scanresconf:
+            rf=fopen("InetDBase:resconf", "r");
+            if (rf)
+            {
+                int sn=0;
+
+                while (fgets(buffer, sizeof buffer, rf))
+                {
+                    if (buffer[0] != ';') /* Speed optimization! */
+                    {
+                        if (sscanf(buffer, "domain %s", LocalDomain) == 1)
+                        {
+                            if (LocalDomain[strlen(LocalDomain)-1]=='.')
+                                LocalDomain[strlen(LocalDomain)-1]='\0';
+                            continue;
+                        }
+                        if (sn<3)
+                        {
+                            if (sscanf(buffer, "nameserver %s", Resolver[sn]) == 1)
+                                sn++;
+                        }
+                    }
+                }
+                fclose(rf);
+            }
+        }
+    }
+}
+
+void GetRouting(FILE *f)
+{
+    char buffer[256];
+
+    while (fgets(buffer, sizeof buffer, f))
+    {
+        if (buffer[0] == '|')
+        	return;
+
+        if (strstr(buffer, "Route -e add default"))
+            sscanf(buffer, "Route -e add default %s", Gateway);
+
+        else if (strstr(buffer, "Set Inet$IsGateway Yes"))
+            AmRouter = TRUE;
+
+        else if (strstr(buffer, "Set Inet$RouteDOptions"))
+        {
+            sscanf(buffer, "Set Inet$RouteDOptions %s", RouteDoptions);
+            if (strcmp(RouteDoptions, "\"\"") == 0)
+                strcpy(RouteDoptions, "DEFAULT");
+            else
+                UseRouteD = TRUE;
+        }
+    }
+}
+
+void GetInterface(FILE *f, char *s)
+{
+    char buffer[256];
+    char unit[16];
+    char *p;
+    bool done = FALSE;
+    bool halfdone = FALSE;
+    int i = -1;
+
+    /* Find which interface we're talking about */
+    if ((p = strchr(s, '\n')) != 0)
+    	*p = '\0';
+
+    while (fgets(buffer, sizeof buffer, f))
+    {
+        if (buffer[0] == '|')
+        	return;
+
+        if (done)
+            continue;
+
+    	if (!halfdone && strstr(buffer, "IfConfig -e "))
+    	{
+    	    sscanf(buffer, "IfConfig -e %s", unit);
+    	    for (i = 0; i < interfaces; i++)
+    	    {
+            	if (strcmp(interface_name[i], s) == 0 &&
+            	    strcmp(interface_unit[i], unit) == 0)
+            	    break;
+            }
+            if (i == interfaces)
+            {
+                done = TRUE;
+                continue;
+            }
+
+    	    if (primary_interface == -1 && strcmp(interface_unit[i], "ec0"))
+    	    	primary_interface = i;
+
+            if (!interface_is_pp[i])
+    	        sscanf(buffer + sizeof "IfConfig -e " - 1 + strlen(unit),
+    	               "%s netmask %s", interface_address[i], interface_netmask[i]);
+    	    else
+     	        sscanf(buffer + sizeof "IfConfig -e " - 1 + strlen(unit),
+    	               "%s %s netmask %s", interface_address[i], interface_linkaddr[i],
+    	                                   interface_netmask[i]);
+
+    	    done = TRUE;
+
+    	    if (strcmp(interface_address[i], HostName) == 0)
+    	        interface_addrtype[i] = if_FromHostname;
+            else if (strcmp(interface_address[i], "<Inet$CMOSIPAddr>") == 0)
+            {
+                struct in_addr in;
+                in.s_addr = CMOSIP;
+                interface_addrtype[i] = if_FromCMOS;
+                strcpy(interface_address[i], inet_ntoa(in));
+            }
+    	    else
+    	        interface_addrtype[i] = if_Manual;
+        }
+        else if (strstr(buffer, "IfRConfig -e "))
+    	{
+    	    sscanf(buffer, "IfRConfig -e %s", unit);
+    	    for (i = 0; i < interfaces; i++)
+    	    {
+            	if (strcmp(interface_name[i], s) == 0 &&
+            	    strcmp(interface_unit[i], unit) == 0)
+            	    break;
+            }
+            if (i == interfaces)
+            {
+                done = TRUE;
+                continue;
+            }
+
+    	    if (primary_interface == -1)
+    	    	primary_interface = i;
+
+            if (strstr(buffer, "revarp"))
+            {
+                interface_addrtype[i] = if_RevARP;
+            }
+            else if (strstr(buffer, "bootp"))
+            {
+                interface_addrtype[i] = if_BOOTP;
+            }
+            if (strstr(buffer, "netmask"))
+            {
+                strcpy(interface_netmask[i], "zzzz");
+                done = TRUE;
+            }
+            else
+                halfdone = TRUE;
+        }
+        else if (halfdone && strstr(buffer, "IfConfig -e"))
+        {
+            sscanf(strstr(buffer, "netmask"), "netmask %s", interface_netmask[i]);
+            done = TRUE;
+        }
+    }
+}
+
+void DefaultAnInterface(void)
+{
+    int first_int = -1, first_pp = -1;
+    int i;
+
+    for (i = 0; i < interfaces; i++)
+        if (first_int == -1 && !interface_is_pp[i])
+            first_int = i;
+        else if (first_pp == -1 && interface_is_pp[i])
+            first_pp = i;
+
+    /* Default the first non point-to-point interface, or failing that the
+       first point-to-point interface
+     */
+    if (first_pp >= 0 && first_int == -1)
+    	first_int = first_pp;
+
+    if (first_int == -1)
+    	return;
+
+    primary_interface = first_int;
+
+    strcpy(interface_netmask[first_int], "default");
+    strcpy(interface_address[first_int], HostName);
+    interface_addrtype[first_int] = if_FromHostname;
+}

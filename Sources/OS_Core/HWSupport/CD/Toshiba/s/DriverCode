@@ -1,0 +1,1384 @@
+; DriverCode.s
+
+
+
+
+;     NEVER CHANGE R7 or R11
+
+
+
+
+
+
+
+
+
+; This carries out the CD_ SWI commands for the Toshiba 3301
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+;-----------------------------------------------------------------------------------------------
+driver_handler_code ROUT
+;
+; on entry:
+;          r0  - r6= Whatever values the various CD_ SWIs use
+;          r7 -> control block
+;                control block + 0   = SCSI device id (0-7)
+;                control block + 4   = SCSI card number (0-3 usually 0)
+;                control block + 8   = Logical Unit Number (0-7 usually 0)
+;                control block + 12  = Drive type for this module
+;          r11 = the number of the CD_ SWI, ie/ 0 = CD_ReadData, 1 = CD_SeekTo etc;
+;          r12 -> workspace for this module
+;          r13 -> a full descending stack, approx. 1024 bytes
+;          r14 = address to return to
+; on exit:
+;          r0 must be preserved or be return value for the particular SWI
+;          r1 - r12 & r14 corrupted
+;-----------------------------------------------------------------------------------------------
+
+;--------------------
+; Special tag
+;--------------------
+ DCD       &EE50EE50
+
+;--------------------
+; Code
+;--------------------
+
+ STASH     "r0, r14"
+
+;----------------------------------------------------------
+; Branch to the correct piece of code to handle the command
+; The two top bits of R11 (SWIN) are used to indicate the
+; number of retries
+;----------------------------------------------------------
+
+ BIC       r14, SWIN, #3:SHL:30
+ ADR       r10, jump_table_start
+ LDR       r14, [ r10, r14, LSL #1 ]
+ MOV       r14, r14, LSL #16
+ ADD       pc, pc, r14, LSR #16
+
+jump_table_start
+ DCW notsupported    - jump_table_start - 4      ;  0   OK  ReadData
+ DCW SeekTo          - jump_table_start - 4      ;  1   OK  
+ DCW notsupported    - jump_table_start - 4      ;  2   OK  DriveStatus
+ DCW notsupported    - jump_table_start - 4      ;  3   OK  DriveReady
+ DCW GetParameters   - jump_table_start - 4      ;  4   
+ DCW SetParameters   - jump_table_start - 4      ;  5   
+ DCW notsupported    - jump_table_start - 4      ;  6   OK  OpenDrawer
+ DCW EjectButton     - jump_table_start - 4      ;  7   
+ DCW EnquireAddress  - jump_table_start - 4      ;  8   
+ DCW EnquireDataMode - jump_table_start - 4      ;  9   
+ DCW PlayAudio       - jump_table_start - 4      ; 10   OK 
+ DCW PlayTrack       - jump_table_start - 4      ; 11   OK 
+ DCW AudioPause      - jump_table_start - 4      ; 12   OK 
+ DCW EnquireTrack    - jump_table_start - 4      ; 13   
+ DCW ReadSubChannel  - jump_table_start - 4      ; 14   
+ DCW notsupported    - jump_table_start - 4      ; 15   OK  CheckDrive
+ DCW DiscChanged     - jump_table_start - 4      ; 16   OK
+ DCW notsupported    - jump_table_start - 4      ; 17   OK  StopDisc
+ DCW notsupported    - jump_table_start - 4      ; 18   OK  DiscUsed
+ DCW AudioStatus     - jump_table_start - 4      ; 19   
+ DCW notsupported    - jump_table_start - 4      ; 20   OK  Inquiry
+ DCW DiscHasChanged  - jump_table_start - 4      ; 21   
+ DCW notsupported    - jump_table_start - 4      ; 22   OK  Control
+ DCW Supported       - jump_table_start - 4      ; 23   
+ DCW notsupported    - jump_table_start - 4      ; 24   OK  Prefetch
+ DCW notsupported    - jump_table_start - 4      ; 25   OK  Reset
+ DCW notsupported    - jump_table_start - 4      ; 26   OK  CloseDrawer
+ DCW IsDrawerLocked  - jump_table_start - 4      ; 27   
+ DCW notsupported    - jump_table_start - 4      ; 28   OK  AudioControl
+ DCW notsupported    - jump_table_start - 4      ; 29   OK  AudioLevel
+ DCW Identify        - jump_table_start - 4      ; 30 
+
+ ALIGN
+
+notsupported
+ ADR       r0, not_supported_error
+ B         error_handler_lookup
+
+;-----------------------------------------------------------------------------------------------
+;ReadData ROUT
+;
+; on entry:
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r2 =   number of blocks
+;          r3 ->  where to put data
+;          r4 =   number of bytes from each block wanted
+;          r7 ->  control block
+;          r12 -> my workspace
+;          r13 -> full descending stack
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+SeekTo ROUT
+;
+; on entry:
+;          r0 = addressing mode
+;          r1 = address to seek to
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; seeks by audioseek, THEN if error, seeks by dataseek
+
+; R0 = address mode, R1 = address, RETURNS R1 = address
+
+ Debug " SeekTo "
+
+
+ SWI       XCD_ConvertToLBA
+
+ BVS       error_handler
+
+ MOV       r6, r1
+
+
+
+01
+;--------------------------------
+; Toshiba SCSI AudioSeek command
+;--------------------------------
+ BL        space_saver
+
+ MOV       r4, #&C0
+
+ BL        seek_saver
+
+ STMIA     r2, { r4, r10, r14 }
+
+ MOV       r4, #0
+
+ SWI       XSCSI_Op
+
+ GRABS     "r0, pc", VC
+
+;-----------------------------------------------------------------
+; Trap for IllegalRequest while trying to audio seek to a position
+; if TRUE then try data seek
+;-----------------------------------------------------------------
+
+ LDRB      r2, buffer
+ TEQ       r2, #&C0
+
+ LDREQ     r1, [ r0 ]
+ LDREQ     r2, =IllegalRequest
+ TEQEQ     r2, r1
+
+ BNE       error_handler
+
+;-----------------------------------------------------------------
+; Setup for data seek and try again
+;-----------------------------------------------------------------
+
+ MOV       r14, #&2B
+ STRB      r14, buffer
+
+
+ B         %BT01
+
+
+;-----------------------------------------------------------------------------------------------
+;DriveStatus ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          r0 = status { 1=OK, 2=BUSY, 4=NOTREADY, 8=UNAVAILABLE }
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+;DriveReady ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          r0 = 0 if drive is OK, else r0 = 1
+;
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+GetParameters ROUT
+;
+; on entry:
+;          r0 -> parameter block
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ MOV       r6, #0
+
+ Debug " GetParameters "
+
+
+
+SetParameters_jumps_in_here
+
+ STASH     "r0, r6"
+
+;--------------------------------
+; SCSI ModeSense command
+;--------------------------------
+ BL        space_saver
+
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r3, #&1a
+ ORR       r3, r3, r10, LSL #8+5
+ ORR       r3, r3, #&3f:SHL:16
+ MOV       r4, #32
+ STMIA     r2, { r3, r4 }
+
+ ADR       r3, buffer + 16
+
+ SWI       XSCSI_Op
+
+ GRAB      "r6, r14"
+
+ BVS       error_handler
+
+; Set parameters ?
+ TEQ       r14, #1
+ BEQ       SetParameters_jumps_back
+
+;----------------------------
+; Read retry count
+;----------------------------
+ LDRB      r2, buffer + 16 + 12 + 3
+
+;----------------------------
+; Data mode
+;----------------------------
+ LDR       r14, buffer + 16 + 4 + 4
+ TEQ       r14, #mode1datasizeHBLB
+ MOVEQ     r3, #1
+ MOVNE     r3, #2
+
+;----------------------------
+; RESERVED word
+;----------------------------
+ MOV       r1, #0 
+ MOV       r4, #0
+
+ STMIA     r6, { r1, r2, r3, r4 }
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+SetParameters ROUT
+;
+; on entry:
+;          r0 -> parameter block
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+;       = &1A   ; 6
+;       = 6
+;       = MaxParameterSize - 6
+;       = READDATA
+;       DCW parameterblock_offset + 6
+
+
+ Debug " SetParameters "
+
+
+ MOV       r6, #1
+
+ B         SetParameters_jumps_in_here
+
+SetParameters_jumps_back
+; r6 -> parameter block
+
+;---------------------------------------------
+; Make sure that the reserved word is set to 0
+;---------------------------------------------
+
+ LDMIA     r6, { r0, r1, r2, r3 }
+
+ TEQ       r3, #0
+ BNE       invalidparameter
+
+; not used in ModeSelect
+ STRB      r3, buffer + 16
+ STRB      r3, buffer + 16 + 2
+ STRB      r3, buffer + 16 + 4 + 1
+ STRB      r3, buffer + 16 + 4 + 2
+ STRB      r3, buffer + 16 + 4 + 3
+
+;------------------------------
+; Change LBA size in disc drive
+;------------------------------
+
+ TEQ       r2, #1
+ MOVEQ     r2, #mode1datasizeHBLB
+ LDRNE     r2, =mode2datasizeHBLB
+
+ STR       r2, buffer + 16 + 4 + 4
+
+
+;--------------------------------
+; SCSI ModeSelect command
+;--------------------------------
+ BL        space_saver
+
+ ORR       r0, r0, #escapepolloff + writedata   ; prevent 'escape key'
+
+ MOV       r3, #&15
+ ORR       r3, r3, r10, LSL #8+5
+ ORR       r3, r3, #2_10000:SHL:8
+ MOV       r4, #12
+ STMIA     r2, { r3, r4 }
+
+ ADR       r3, buffer + 16
+
+ SWI       XSCSI_Op
+
+ BVS       error_handler
+
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+;OpenDrawer ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+EjectButton ROUT
+;
+; on entry:
+;          r0 = 0 to allow eject, 1 to prevent
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug " EjectButton "
+
+
+;-----------------------
+; Check for valid switch
+;-----------------------
+ CMP       r0, #2
+ BCS       invalidparameter
+
+ MOV       r6, r0
+
+;--------------------------------
+; SCSI Prevent/allow command
+;--------------------------------
+
+ BL        space_saver
+
+ MOV       r4, #&1e
+ ORR       r4, r4, r10, LSL #8+5
+ STMIA     r2, { r4, r6 }
+
+ MOV       r4, #0
+
+ SWI       XSCSI_Op
+
+ BVS       error_handler
+
+ MOV       r0, r6
+ BL        SetDrawerStatus
+
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+EnquireAddress ROUT
+;
+; on entry:
+;          r0 = addressing mode for returned data
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = current laser position
+;-----------------------------------------------------------------------------------------------
+
+ Debug " EnquireAddress "
+
+ MOV       r6, r0
+
+;--------------------------------
+; SCSI ReadSubChannel command
+;--------------------------------
+
+ BL        space_saver
+
+ ORR       r0, r0, #escapepolloff + readdata
+
+ MOV       r1, #&c6
+ ORR       r1, r1, r10, LSL #8+5
+ ORR       r1, r1, #10:SHL:8
+ STMIA     r2, { r1, r3, r5 }
+
+ ADR       r3, buffer + 16
+
+ MOV       r1, #10
+
+ MOV       r4, #10
+
+ SWI       XSCSI_Op
+
+ BVS       error_handler
+
+
+
+;-----------------------------
+; Extract the current address
+;-----------------------------
+
+;   LSB of MSF
+ LDRB      r3, buffer + 16 + 9
+ ConvertBCDToNormal r3, r4
+
+;   ISB of MSF
+ LDRB      r1, buffer + 16 + 8
+ ConvertBCDToNormal r1, r4
+
+;   MSB of MSF
+ LDRB      r2, buffer + 16 + 7
+ ConvertBCDToNormal r2, r4
+
+ ORR       r2, r1, r2, LSL #8
+ ORR       r1, r3, r2, LSL #8
+
+;----------------------------------------
+; If caller wants return in MSF then ...
+;----------------------------------------
+
+ TEQ       r6, #MSFFormat
+
+ MOVNE     r0, #MSFFormat
+ SWINE     XCD_ConvertToLBA
+
+ BVS       error_handler
+
+;----------------------------------------
+; If caller wants return in PB format
+;----------------------------------------
+
+ TEQ       r6, #PBFormat
+
+ ADDEQ     r1, r1, #( MaxNumberOfBlocks + 1 ) * 2
+
+ MOV       r0, r1
+
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+EnquireDataMode ROUT
+;
+; on entry:
+;          r0 = addressing mode for block
+;          r1 = block
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = addressing mode (1 for mode 1, 2 for mode 2, 3 for mode 2 form 1)
+;-----------------------------------------------------------------------------------------------
+
+ Debug " EnquireDataMode "
+
+
+
+;----------------------
+; Seek to ...
+;----------------------
+
+; R0 = address mode, R1 = address, RETURNS R1 = address
+
+
+ SWI       XCD_ConvertToLBA
+
+ MOVVC     r6, r1
+
+;--------------------------------
+; Toshiba SCSI AudioSeek command
+;--------------------------------
+ BLVC      space_saver
+
+ MOVVC     r4, #&2b
+
+ BLVC      seek_saver
+
+ STMVCIA   r2, { r4, r10, r14 }
+
+ MOVVC     r4, #0
+
+ SWIVC     XSCSI_Op
+
+ BVS       error_handler
+
+;--------------------------------
+; SCSI EnquireDataMode command
+;--------------------------------
+
+ BL        space_saver
+
+ ORR       r0, r0, #escapepolloff + readdata
+
+ MOV       r1, #&c8
+ ORR       r1, r1, r10, LSL #8+5
+ STMIA     r2, { r1, r3, r5 }
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ MOV       r4, #1
+
+ MOV       r6, #0
+
+ SWI       XSCSI_Op
+
+ LDRVCB    r0, buffer + 16 + 0
+ GRABS     "r1, pc", VC
+
+;---------------------------------------
+; If illegal request then must be mode 0
+;---------------------------------------
+ LDR       r1, [ r0 ]
+ LDR       r2, =IllegalRequest
+ TEQ       r1, r2
+
+ BNE       error_handler
+
+
+ MOV       r0, #0
+
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+PlayAudio ROUT
+;
+; on entry:
+;          r0 = addressing mode for returned data
+;          r1 = start address
+;          r2 = end address
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug " PlayAudio "
+
+
+ STMIA     r12, { r0, r2 }
+
+;---------------------------
+; Seek to the start address
+;---------------------------
+ LDMIA     r7, { r2, r3, r4 }
+ ADR       r7, temp_control_block
+ STMIA     r7, { r2, r3, r4, r8 }
+
+ SWI       XCD_SeekTo
+
+;---------------------------
+; Play from current position
+;---------------------------
+
+ LDMVCIA   r12, { r0, r1 }
+ SWIVC     XCD_ConvertToLBA
+ MOVVC     r6, r1
+
+ BLVC      space_saver
+
+ MOVVC     r4, #&c1
+
+ BLVC      seek_saver
+
+ ORRVC     r4, r4, #3:SHL:8
+
+ STMVCIA   r2, { r4, r10, r14 }
+
+ MOVVC     r4, #0
+
+ SWIVC     XSCSI_Op
+
+ BVS       error_handler
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+PlayTrack ROUT
+;
+; on entry:
+;          r0 = track number
+;          r1 = &ff end of disc, &fe play to end of track
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug " PlayTrack "
+
+
+;-----------------------
+; Check track is 1 to 99
+;-----------------------
+ SUB       r14, r0, #1
+ CMP       r14, #100
+ BCS       invalidparameter
+
+;--------------------------------
+; SCSI PlayTrack command
+;--------------------------------
+ MOV       r6, r0
+
+ TEQ       r1, #&ff
+
+ BL        space_saver
+
+; end track
+ ORREQ     r6, r6, #99:SHL:24
+ ORRNE     r6, r6, r6, LSL #24
+ ADDNE     r6, r6, #1:SHL:24
+
+; end index
+ MOVEQ     r14, #99
+ MOVNE     r14, #1
+
+; start index
+ ORR       r6, r6, #1:SHL:8
+
+ MOV       r3, #&48
+ ORR       r3, r3, r10, LSL #8+5
+ STMIA     r2, { r3, r6, r14 }
+
+ MOV       r1, #10
+
+ MOV       r3, #0
+
+ SWI       XSCSI_Op
+
+ GRABS     "r0, pc", VC
+
+;-------------------------------------------
+; If illegal request then not an audio track
+;-------------------------------------------
+
+ LDR      r1, [ r0 ]
+ LDR      r2, =IllegalRequest
+ TEQ      r1, r2
+ BEQ      notaudiotrack
+
+ B        error_handler
+
+;-----------------------------------------------------------------------------------------------
+AudioPause ROUT
+;
+; on entry:
+;          r0 = 0 to resume, 1 to pause
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+
+ Debug " AudioPause "
+
+
+ MOV       r6, r0
+
+
+;----------------------------
+; Make sure that r0 = 0 to 1
+;----------------------------
+ CMP       r0, #2
+ BCS       invalidparameter
+
+
+ LDMIA     r7, { r2, r3, r4 }
+ ADR       r7, temp_control_block
+ STMIA     r7, { r2, r3, r4, r8 }
+
+
+;-----------------------------------------
+; Read sub-channel to find current address
+;-----------------------------------------
+ MOV       r0, #64
+ ADR       r1, buffer + 100
+ SWI       XCD_ReadSubChannel
+
+ BVS       error_handler
+
+ LDRB      r4, buffer + 16 + 0
+
+;-----------------------------------------
+; If pause on and not playing then ignore
+;-----------------------------------------
+
+ TEQ       r1, #3
+ TEQEQ     r6, #1
+ GRABS     "r0, pc", EQ
+
+;-----------------------------------------
+; If pause off and playing then ignore
+;-----------------------------------------
+
+; TEQ       r1, #0
+; TEQEQ     r6, #0
+; GRABS     "r0, pc", EQ
+
+;-----------------------------------------
+; If pause on then still
+;-----------------------------------------
+ TEQ        r6, #1
+ BNE        %FT01
+
+
+ BL        space_saver
+
+ MOV       r1, #&4b
+
+ STMIA     r2, { r1, r3, r5 }
+
+ MOV       r1, #10
+
+ MOV       r4, #0
+
+ SWI       XSCSI_Op
+
+ GRABS     "r0, pc", VC
+
+ B         error_handler
+
+
+01
+;-----------------------------------------
+; If pause off then play to end of disc
+;-----------------------------------------
+ MOV        r0, #LBAFormat
+ ADR        r1, buffer + 100 + 8
+ SWI        XCD_DiscUsed
+
+ ADRVC      r14, buffer + 100 + 4
+ LDMVCIA    r14, { r1, r2 }
+ SWIVC      XCD_PlayAudio
+
+ BVS        error_handler
+
+ GRABS      "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+EnquireTrack ROUT
+;
+; on entry:
+;          r0 = 0 start/end track, 1 to 99 info on that track
+;          r1 -> storage area
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug " EnquireTrack "
+
+;----------------------------
+; Make sure that r0 = 0 to 1
+;----------------------------
+ CMP       r0, #100
+ BCS       invalidparameter
+
+
+ TEQ       r0, #0          ; If first/last track wanted TYPE = 0 (ie/ ignore )
+ MOVEQ     r6, #0
+ BEQ       %FT01
+
+ ConvertNormalToBCD r0, r4, r5
+
+; If require specific track info, then TYPE = 2
+ MOV       r6, #2:SHL:8
+ ORR       r6, r6, r0, LSL #16
+
+01
+
+
+
+;--------------------------------
+; SCSI ReadTOC command
+;--------------------------------
+
+ STASH     "r0, r1"
+
+ BL        space_saver
+
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ ORR       r1, r6, #&c7
+ ORR       r1, r1, r10, LSL #8+5
+ STMIA     r2, { r1, r3, r5 }
+
+ MOV       r4, #4
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ SWI       XSCSI_Op
+
+ GRAB      "r1, r6"
+
+ BVS       error_handler
+
+
+ TEQ       r1, #0
+ LDRB      r2, buffer + 16        ; Start track ( Minutes )
+ ConvertBCDToNormal r2, r4, EQ
+ STREQB    r2, [ r6 ]
+ LDRB      r3, buffer + 16 + 1    ; End track ( Seconds )
+ ConvertBCDToNormal r3, r4, EQ
+ STREQB    r3, [ r6, #1 ]
+
+ ADRNE     r5, buffer + 16 + 0
+ BLNE      reads_saver
+
+ SWINE     XCD_ConvertToLBA
+
+ BVS       error_handler
+
+ STRNE     r1, [ r6 ]
+ LDRNEB    r1, buffer + 16 + 3
+ MOVNE     r1, r1, LSR #2
+ STRNEB    r1, [ r6, #4 ]
+
+
+
+
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+ReadSubChannel ROUT
+;
+; on entry:
+;          r0 = sub-channel = 64
+;          r1 -> storage area
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug " ReadSubChannel "
+
+;---------------------------------
+; Only sub-channel 'Q' supported
+;---------------------------------
+ TEQ       r0, #64
+ addr      r0, channel_not_supported_error, NE
+ BNE       error_handler_lookup
+
+;--------------------------------
+; SCSI ReadTOC command
+;--------------------------------
+
+ MOV       r6, r1
+
+ BL        space_saver
+
+ ORR       r0, r0, #escapepolloff + readdata   ; prevent 'escape key'
+
+ MOV       r1, #&c6
+ ORR       r1, r1, r10, LSL #8+5
+ ORR       r1, r1, #10:SHL:8              ; allocation length
+ STMIA     r2, { r1, r3, r5 }
+
+ MOV       r4, #10
+
+ MOV       r1, #10
+
+ ADR       r3, buffer + 16
+
+ SWI       XSCSI_Op
+
+
+;-------------------------------
+; Relative Binary Coded Decimal
+;-------------------------------
+
+ ADRVC     r5, buffer + 16 + 4
+ BLVC      reads_saver
+
+ SWIVC     XCD_ConvertToLBA    ; R0 = convert from MSF, R1 = address, RETURNS R1 = LBA address
+
+ STRVC     r1, [ r6 ], #4
+
+;-------------------------------
+; Absolute Binary Coded Decimal
+;-------------------------------
+
+ ADRVC     r5, buffer + 16 + 7
+ BLVC      reads_saver
+
+
+; R0 = convert from MSF, R1 = address, RETURNS R1 = LBA address
+ SWIVC     XCD_ConvertToLBA
+
+ BVS       error_handler
+
+ STR       r1, [ r6 ], #4
+
+;-------------------------------
+; Control bits
+;-------------------------------
+ LDRB      r2, buffer + 16 + 1             ; Don't care about bottom bits
+ MOV       r2, r2, LSR #2                 ; In fact, don't even want them
+ STRB      r2, [ r6 ], #1                 ;
+
+;----------------------------------
+; Track number Binary Coded Decimal
+;----------------------------------
+ LDRB      r2, buffer + 16 + 2
+ ConvertBCDToNormal r2, r3
+ STRB      r2, [ r6 ], #1
+
+;----------------------------------
+; Index number
+;----------------------------------
+
+ [ MSFFormat<>1
+ MOV       r0, #1
+ ]
+ STRB      r0, [ r6 ], #1
+
+
+ GRABS     "r0, pc"
+
+
+;--------------------------------
+reads_saver
+; r5 -> minutes, seconds, frames
+;--------------------------------
+ LDRB      r1, [ r5, #2 ]                ; Absolute frame
+ ConvertBCDToNormal r1, r3
+ LDRB      r2, [ r5, #1 ]                ; Absolute seconds
+ ConvertBCDToNormal r2, r3
+ ORR       r1, r1, r2, LSL #8
+ LDRB      r2, [ r5, #0 ]                ; Absolute minutes
+ ConvertBCDToNormal r2, r3
+ ORR       r1, r1, r2, LSL #16
+
+ MOV       r0, #MSFFormat
+
+ MOV       pc, r14
+
+
+;-----------------------------------------------------------------------------------------------
+;CheckDrive ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = drive status bits
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+DiscChanged ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = 0 if not changed, 1 if changed
+;-----------------------------------------------------------------------------------------------
+
+ Debug " DiscChanged "
+
+ MOV       r6, #0
+
+drawer_status_jumps_in_here
+
+;--------------------------------
+; SCSI TestUnitReady command
+;--------------------------------
+ BL        space_saver
+
+ MOV       r4, r10, LSL #8+5
+ STMIA     r2, { r4, r5 }
+
+ MOV       r4, #0
+
+ SWI       XSCSI_Op
+
+
+; Error
+ BVS       error_handler
+
+; No error
+ TEQ       r6, #0
+ BLEQ      HasDiscChanged
+ BLNE      GetDrawerStatus
+
+
+ [ debug=ON
+ MOV r6, r0
+ DebugDisplay r6
+ ]
+
+
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+;StopDisc ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+;DiscUsed ROUT
+;
+; on entry:
+;          r0 =  addressing mode that the disc length should be returned in
+;          r1 -> storage area to put data in
+;          r7 -> control block
+; on exit:
+;
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+AudioStatus ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = 0 playing audio, 1 paused, 2 muted, 3 play completed, 4 error, 5 not requested
+;-----------------------------------------------------------------------------------------------
+
+ Debug " AudioStatus "
+
+; does a ReadSubChannel and examines the first byte returned
+
+
+ LDMIA     r7, { r0, r1, r2 }
+ ADR       r7, temp_control_block
+ STMIA     r7, { r0, r1, r2, r8 }
+ MOV       r0, #64
+ ADR       r1, buffer + 100
+ SWI       XCD_ReadSubChannel
+
+ BVS       error_handler
+
+
+; Return the byte
+ LDRB      r0, buffer + 16
+
+ TEQ       r0, #2
+ MOVEQ     r0, #5
+
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+;Inquiry ROUT
+;
+; on entry:
+;          r0 -> place to put the inquiry data
+;          r7 -> control block
+; on exit:
+; 
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+DiscHasChanged ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ Debug " DiscHasChanged "
+
+ BL        SetDiscChanged
+
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+;Control ROUT
+;
+; on entry:
+;          r0 =  0, 1 or 2 to set SCSI error response
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+; This is never called - the CDFSDriver internal routine is used instead
+
+;-----------------------------------------------------------------------------------------------
+Supported ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = information word with bits set to indicate level of support
+;-----------------------------------------------------------------------------------------------
+
+ Debug " Supported "
+
+ MOV       r0, #TOSHIBAVERSIONBITS
+ GRABS     "r1, pc"
+
+;-----------------------------------------------------------------------------------------------
+;Prefetch ROUT
+;
+; on entry:
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+;Reset ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+;CloseDrawer ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+IsDrawerLocked ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;          r0 = 0 if unlocked, 1 if locked
+;
+;-----------------------------------------------------------------------------------------------
+
+ Debug " IsDrawerLocked "
+
+ MOV       r6, #1
+ B         drawer_status_jumps_in_here
+
+;-----------------------------------------------------------------------------------------------
+;AudioControl ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+;AudioLevel ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+Identify ROUT
+; on entry:
+;           r0  -> 36 byte SCSI inquiry data or 0
+;           r1  -> if r0 =0 THEN this -> an error block ie/ the reason inquiry data failed
+;           r7  -> control block, ignore the driver type, ie/ control block + 20
+;           r11 =  reason code for CD_Identify
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r2 = -1 if not recognized, else internal drive type
+;           r0-r1, r3-12 can be corrupted
+;-----------------------------------------------------------------------------------------------
+
+ Debug " Identify "
+
+;----------------------------
+; Is there any inquiry data ?
+;----------------------------
+ TEQ       r0, #0
+ BEQ       not_Toshiba
+
+;----------------------------
+; Removable media ?
+;----------------------------
+ LDRB      r1, [ r0 ]
+ LDRB      r2, [ r0, #1 ]
+ TST       r2, #128
+
+;----------------------------
+; Funny LUN ?
+;----------------------------
+ TEQNE     r1, #&7f
+ BEQ       not_Toshiba
+
+;---------------------------- 
+; Is it a Toshiba drive ?
+;---------------------------- 
+; r1 -> manufacturers name
+ MOV       r4, r0
+
+ ADD       r0, r0, #8
+ ADR       r1, Toshiba_name
+ MOV       r2, #?Toshiba_name
+ BL        CompareStrings
+
+ [ Version >= 101
+ BNE       not_Toshiba
+ ]
+
+;---------------------------- 
+; Check description
+;---------------------------- 
+
+ [ Version >= 101 ; include the Toshiba 3401 drive
+ ADD       r0, r4, #16
+ ADR       r1, Toshiba_description
+ MOV       r2, #?Toshiba_description
+ BL        CompareStrings
+ ADRNE     r1, Toshiba_description2
+ MOVNE     r2, #?Toshiba_description2
+ BLNE      CompareStrings
+ |
+ ADDEQ     r0, r4, #16
+ ADREQ     r1, Toshiba_description
+ MOVEQ     r2, #?Toshiba_description
+ BLEQ      CompareStrings
+ ]
+
+ MOVEQ     r2, #0
+
+ GRABS     "r0, pc", EQ
+
+;---------------------------- 
+not_Toshiba
+ MOV       r2, #-1
+ GRABS     "r0, pc"
+
+;-----------------------------------------------------------------------------------------------
+Toshiba_name         = "TOSHIBA"
+Toshiba_description  = "CD-ROM XM-3301"
+Toshiba_description2 = "CD-ROM XM-3401"
+ ALIGN
+
+
+;-----------------------------------------------------------------------------------------------
+; Routine to load default values and save space
+; on entry: r4 = opcode to put in
+;-----------------------------------------------------------------------------------------------
+seek_saver ROUT
+
+ STASH     r14
+
+ ORR       r4, r4, r10, LSL #8+5
+
+ AND       r14, r6, #255:SHL:24
+ AND       r1,  r6, #255:SHL:16
+ ORR       r4,  r4, r14, LSR #8
+ ORR       r4,  r4, r1, LSL #8
+
+ AND       r3,  r6, #255:SHL:8
+ AND       r1,  r6, #255
+ MOV       r10, r3, LSR #8
+ ORR       r10, r10, r1, LSL #8
+
+ MOV       r1, #10
+
+ GRAB      pc
+
+;-----------------------------------------------------------------------------------------------
+; Routine to load default values and save space
+;-----------------------------------------------------------------------------------------------
+space_saver ROUT
+ LDMIA     r7, { r8, r9, r10 }
+
+ ORR       r0, r8, r9,  LSL #3                 ; card number
+ ORR       r0, r0, r10, LSL #5                 ; lun
+ ORR       r0, r0, #escapepolloff + nodata     ; prevent 'escape key'
+ MOV       r1, #6
+ ADR       r2, buffer
+ MOV       r3, #0
+ MOV       r5, #0
+ MOV       r8, #1
+
+ MOV       pc, r14
+
+
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+
+ END

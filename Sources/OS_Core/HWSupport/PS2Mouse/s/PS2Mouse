@@ -1,0 +1,667 @@
+; > Sources.SerMouse
+
+;---------------------------------------------------------------------------
+; PointerRequest
+;       In:     r0 = reason code (0 = request state)
+;               r1 = device type (0 for us)
+;       Out:    r2 = signed 32-bit X movement
+;               r3 = signed 32-bit Y movement
+;
+;       Handle requests for mouse movements from the Kernel.
+;
+PointerRequest
+        TEQ     r0, #PointerReason_Request              ; If not requesting then
+        BNE     PointerIdentify                         ;   try identify.
+        TEQ     r1, #PointerDevice_PS2Mouse             ; If not a PS2 mouse then
+        MOVNES  pc, lr                                  ;   pass on call.
+
+        Push    "r10,r11"
+
+        ADR     lr, MouseData                   ; Get DeltaX, DeltaY and Buttons.
+        LDMIA   lr, {r2,r3,r10}
+
+        MOV     lr, #0                          ; Zero DeltaX and DeltaY.
+        STR     lr, DeltaX
+        STR     lr, DeltaY
+
+        LDRB    r11, LastButtons                ; Get button states on last poll.
+        EORS    r11, r11, r10                   ; Get differences.
+        Pull    "r10,r11,pc",EQ                 ; Claim vector if none.
+
+        STRB    r10, LastButtons
+        Push    "r0,r1,r9"
+
+        TST     r11, #4                         ; Check left (SELECT).
+        BEQ     %FT10
+
+        TST     r10, #4
+        MOVEQ   r0, #1
+        MOVNE   r0, #2
+        MOV     r1, #&70
+        MOV     r9, #KEYV
+        SWI     XOS_CallAVector
+10
+        TST     r11, #2                          ; Check centre (MENU).
+        BEQ     %FT20
+
+        TST     r10, #2
+        MOVEQ   r0, #1
+        MOVNE   r0, #2
+        MOV     r1, #&71
+        MOV     r9, #KEYV
+        SWI     XOS_CallAVector
+20
+        TST     r11, #1                          ; Check right (ADJUST).
+        Pull    "r0,r1,r9-r11,pc",EQ
+
+        TST     r10, #1
+        MOVEQ   r0, #1
+        MOVNE   r0, #2
+        MOV     r1, #&72
+        MOV     r9, #KEYV
+        SWI     XOS_CallAVector
+        Pull    "r0,r1,r9-r11,pc"                ; Claim call.
+
+;---------------------------------------------------------------------------
+; PointerIdentify
+;       In:     r0 = reason code 1
+;               r1 = pointer to device type record (or 0)
+;       Out:    r1 = pointer to updated list
+;
+;       Identify our pointer device.
+;
+PointerIdentify
+        TEQ     r0, #PointerReason_Selected     ; If selected then
+        BEQ     PointerSelected                 ;   initialise.
+        TEQ     r0, #PointerReason_Identify     ; If not identify then
+        MOVNES  pc, lr                          ;   pass on call.
+
+        ENTRY   "r2"
+
+        Debug   mod,"SM_PointerIdentify"
+
+        ADR     r2, PS2Data
+        BL      AddPointerStruct
+;        EXITS   VS
+
+;        ADR     r2, MSCData
+;        BL      AddPointerStruct
+;        EXITS   VS
+
+;        ADR     r2, MSData
+;        BL      AddPointerStruct
+        EXITS
+
+AddPointerStruct
+; In:   r1 = pointer to device type record list or 0
+;       r2 = pointer to device data
+; Out:  r1 = pointer to extended list
+        ENTRY   "r0-r4"
+
+        LDRB    r4, [r2], #1                    ; r4=device type, r2->device name/token
+
+  [ international
+        MOV     r1, r2
+        MOV     r2, #0
+        BL      MsgTrans_Lookup                 ; r2->device name looked up
+        EXIT    VS                              ; If lookup fails then don't add our record to list.
+  ]
+        MOV     r1, r2                          ; Save pointer to device name.
+        BL      strlen                          ; r3=length of string pointed to by r2
+        ADD     r3, r3, #MinPointerRecordSize   ; Includes byte for string terminator.
+        MOV     r0, #ModHandReason_Claim        ; Claim space for a device type record.
+        SWI     XOS_Module
+        EXIT    VS
+
+        LDR     r0, [sp, #4]                    ; Get back pointer to list we were passed.
+        STR     r0, [r2, #PointerNext]          ; Tag it onto ours.
+        MOV     r0, #0
+        STR     r0, [r2, #PointerFlags]         ; No flags.
+        STRB    r4, [r2, #PointerType]
+
+        ADD     r0, r2, #PointerName
+        BL      strcpy                          ; Copy name into record (r1 to r0).
+        STR     r2, [sp, #4]                    ; Pass on updated record pointer.
+
+        EXIT
+
+strlen
+; In:   r2->control char terminated string
+; Out:  r3=length of string
+        ENTRY   "r2"
+        MOV     r3, #0
+01
+        LDRB    lr, [r2], #1
+        CMP     lr, #" "
+        ADDCS   r3, r3, #1
+        BCS     %BT01
+        EXIT
+
+strcpy
+; In:   r0->null terminated destination string
+;       r1->control char terminated source string
+        ENTRY   "r0,r1"
+01
+        LDRB    lr, [r1], #1
+        CMP     lr, #" "
+        STRCSB  lr, [r0], #1
+        BCS     %BT01
+        MOV     lr, #0
+        STRB    lr, [r0]
+        EXIT
+
+PS2Data
+        DCB     PointerDevice_PS2Mouse
+ [ international
+        DCB     "PS2Name",0
+ |
+        DCB     "PS2 mouse",0
+ ]
+
+;MSCData
+;        DCB     PointerDevice_MSCMouse
+; [ international
+;        DCB     "MSCName",0
+; |
+;        DCB     "Mouse Systems Corp mouse",0
+; ]
+
+;MSData
+;        DCB     PointerDevice_MicrosoftMouse
+; [ international
+;        DCB     "MSName",0
+; |
+;        DCB     "Microsoft mouse",0
+; ]
+        ALIGN
+
+;---------------------------------------------------------------------------
+; PointerSelected
+;       In:     r1 = device type
+;
+;       Enable serial mouse if the type is one of ours, disable if not.
+;
+PointerSelected
+        TEQ     r1, #PointerDevice_PS2Mouse     ; If not ours then
+        BNE     Disable                         ;   make sure we're disabled.
+
+        ENTRY
+
+        Debug   mod,"SM_Enable"
+
+        BL      MouseInit                       ; Initialise mouse.
+        BL      ClaimVectors
+        BL      KeyInit
+
+        EXITS
+
+;---------------------------------------------------------------------------
+; MouseInit
+;       r1 = mouse type
+;
+;       Initialise serial mouse.
+;
+MouseInit
+        ENTRY
+
+        Debug   mod,"SM_MouseInit"
+
+        MOV     lr, #0                          ; Initialise mouse data.
+        STR     lr, DeltaX
+        STR     lr, DeltaY
+        STR     lr, Buttons
+
+        EXIT
+
+;---------------------------------------------------------------------------
+; ClaimVectors
+;       Out:    corrupts r0
+;
+;       Claim vectors for keyboard input.
+;
+Enable
+ClaimVectors
+        ENTRY   "r1-r4"
+
+        Debug   mod,"ClaimVectors"
+
+ [ IOMD
+        IRQOff  r0                              ; Disable keyboard IRQs.
+        RxOffTxOff r1,r2
+        SetPSR  r0
+
+        MOV     r0, #14
+        ADRL    r1, TXIRQHandler
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector
+
+        MOVVC   r0, #15
+        ADRVCL  r1, RXIRQHandler
+        SWIVC   XOS_ClaimDeviceVector
+ |
+        MOV     r0, #13
+        ADRL    r1, RXIRQHandler
+        MOV     r2, r12
+        IOMDBase r3
+        ADD     r3, r3, #IOMD_KBDCR
+        MOV     r4, #IOMD_KBDCR_RxF
+        SWI     XOS_ClaimDeviceVector
+
+        MOVVC   r0, #IOC
+        LDRVCB  r1, [r0, #IOCIRQMSKB]
+        ORRVC   r1, r1, #podule_IRQ_bit
+        STRVCB  r1, [r0, #IOCIRQMSKB]
+ ]
+        Debug   mod," vectors claimed"
+
+        EXIT
+
+;-----------------------------------------------------------------------------
+; KeyInit
+;
+;       Initialise the keyboard.
+;
+KeyInit
+        ENTRY   "r0"
+
+        Debug   key,"KeyInit"
+
+        MOV     r0, #state_RESET :OR: state_WANTBAT     ; Enter reset state.
+        STRB    r0, KBState
+
+        ADR     r0, TxBuffer                    ; Clear TxBuffer.
+        STR     r0, TxInsert
+        STR     r0, TxPtr
+
+        MOV     r0, #resend_count
+        STRB    r0, ResendCount
+
+        IRQOff  lr
+
+        KbdEnable r0,lr
+
+        IOMDBase lr                             ; Make sure we can transmit.
+        LDRB    lr, [lr, #IOCSERRX]
+
+        ADRL    r0, PS2_GetACKforRESET
+        STR     r0, State
+        MOV     r0, #command_RESET              ; Send reset command.
+        BL      SendByte
+        RxOffTxOn r0,lr
+
+        EXITS
+
+;---------------------------------------------------------------------------
+; ReleaseVectors
+;       Out:    corrupts r0
+;
+;       Release vectors for keyboard input.
+;
+Disable
+ReleaseVectors
+        ENTRY   "r1-r4"
+
+        Debug   mod,"ReleaseVectors"
+
+ [ IOMD
+        MOV     r0, #14
+        ADRL    r1, TXIRQHandler
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+
+        MOV     r0, #15
+        ADRL    r1, RXIRQHandler
+        SWI     XOS_ReleaseDeviceVector
+ |
+        MOV     r0, #13
+        ADRL    r1, RXIRQHandler
+        MOV     r2, r12
+        IOMDBase r3
+        ADD     r3, r3, #IOMD_KBDCR
+        MOV     r4, #IOMD_KBDCR_RxF
+        SWI     XOS_ReleaseDeviceVector
+ ]
+        Debug   mod," vectors released"
+
+        EXITS
+
+;-----------------------------------------------------------------------------
+; SendByte
+;
+;       In:     r0 = byte to send
+;               interrupts should be off
+;
+;       Insert the given byte into TxBuffer.
+;
+SendByte
+        ENTRY
+
+        Debug   key,"SendByte",r0
+       ;DREG    r0, "SendByte &",,LongWord
+
+        LDR     lr, TxInsert                    ; Get position to insert.
+        STRB    r0, [lr], #1                    ; Store the byte, increment pointer.
+        ADR     r0, TxBufferEnd
+        TEQ     r0, lr                          ; If reached the end then
+        ADREQ   lr, TxBuffer                    ;   wrap to the start.
+        STR     lr, TxInsert                    ; Update the pointer.
+
+        EXIT
+
+;-----------------------------------------------------------------------------
+; PrependByte
+;
+;       In:     r0 = byte to send (or -1 to send byte already there)
+;               interrupts should be off
+;
+;       Insert the given byte into TxBuffer before next byte to be sent.
+;
+PrependByte
+        ENTRY   "r1"
+
+        Debug   key,"PrependByte",r0
+       ;DREG    r0, "PrependByte",,LongWord
+
+        LDR     r1, TxPtr
+        ADR     lr, TxBuffer
+        TEQ     r1, lr                          ; If at the start then
+        ADREQ   r1, TxBufferEnd                 ;   wrap to the end.
+        SUB     r1, r1, #1
+        STR     r1, TxPtr
+        CMP     r0, #-1                         ; If we have a byte to insert then do it.
+        STRNEB  r0, [r1]
+
+        EXIT
+
+;-----------------------------------------------------------------------------
+; TXIRQHandler
+;       In:     r0-r3,r11 corruptible
+;
+;       Send a byte to the keyboard.
+;
+TXIRQHandler
+        RxOnTxOff r0,r1
+
+        LDR     r0, TxPtr
+        LDR     r1, TxInsert
+        TEQ     r0, r1                          ; If no bytes to send then we shouldn't be here but check anyway.
+        MOVEQS  pc, lr
+
+        LDRB    r1, [r0], #1                    ; Get byte to send, increment pointer.
+        ADR     r2, TxBufferEnd
+        TEQ     r0, r2                          ; If reached the end then
+        ADREQ   r0, TxBuffer                    ;   wrap to the start.
+        STR     r0, TxPtr                       ; Update pointer.
+
+        LDRB    r3, KBState
+        ORR     r3, r3, #state_WANTACK          ; Flag that we want to hear from keyboard before we can send again.
+        STRB    r3, KBState
+
+        IOMDBase r11
+ [ :LNOT: IOMD
+10
+        LDRB    r0, [r11, #IOMD_KBDCR]          ; Wait for TXE.
+        TST     r0, #IOMD_KBDCR_TxE
+        BEQ     %BT10
+ ]
+ [ false
+        MOV     r0, #&03240000
+        LDRB    r0, [r0]
+ ]
+ [ IOMD
+        STRB    r1, [r11, #IOCSERTX]            ; Send the byte.
+ |
+        MOV     r2, r1, LSL #16
+        STR     r2, [r11, #IOCSERTX]
+ ]
+
+        ;DebugTab r2,r3,#&01,r1
+
+        MOVS    pc, lr
+
+;-----------------------------------------------------------------------------
+; RXIRQHandler
+;       In:     r0-r3,r11 corruptible
+;
+;       Service keyboard receive interrupts.
+;
+RXIRQHandler    ROUT
+        ENTRY   "r9"
+
+        IOMDBase r11
+        LDRB    r1, [r11, #IOMD_KBDCR]          ; Get status so we can check parity.
+        LDRB    r0, [r11, #IOCSERRX]            ; Get byte that was sent.
+
+        ;DebugTab r2,r3,#&00,r0
+
+        LDRB    r3, KBState                     ; Get current state.
+        BIC     r3, r3, #state_WANTACK          ; Heard from keyboard so no longer want an ACK.
+
+        EOR     lr, r0, r0, LSR #4              ; Build parity in bit 0.
+        EOR     lr, lr, lr, LSR #2
+        EOR     lr, lr, lr, LSR #1
+        EOR     lr, lr, r1, LSR #2              ; Combine with received parity.
+        TST     lr, #1
+        BEQ     parityerror                     ; Should be odd parity.
+
+       ;DREG    r0, "Received &",,LongWord
+ STRB    r3, KBState
+        LDR     pc, State                       ;Got byte, so branch to handler for current state.
+
+
+
+
+; r1 = command
+; r2 = new state
+send_continue
+        MOV     r0, r1
+        BL      SendByte
+; r2 = new state
+continue
+        STR     r2, State
+
+        LDRB    r3, KBState
+        B       RXIRQExit
+
+parityerror
+        LDRB    r0, ResendCount                 ; Limit the number of times we ask to resend one byte.
+        SUBS    r0, r0, #1
+        MOVCC   r0, #resend_count
+        STRB    r0, ResendCount
+        MOVCS   r0, #command_RESEND             ; Ask keyboard to resend.
+        BCS     prependTX
+clearTX
+        LDR     r0, TxInsert                    ; Got severe problems receiving so stop sending and clear TX buffer.
+        STR     r0, TxPtr
+        B       RXIRQExitState
+
+resend
+        LDRB    r0, ResendCount                 ; Limit the number of times we resend one byte.
+        SUBS    r0, r0, #1
+        MOVCC   r0, #resend_count
+        STRB    r0, ResendCount
+        BCC     clearTX                         ; Got severe problems sending so clear TX buffer.
+        MOV     r0, #-1
+prependTX
+        BL      PrependByte
+        B       RXIRQExitState
+
+
+
+RXIRQExitState
+;unexpected
+        STRB    r3, KBState
+RXIRQExit
+        LDR     r0, TxPtr
+        LDR     r1, TxInsert
+        TEQ     r0, r1
+        EXITS   EQ
+        TST     r3, #state_WANTACK
+        RxOffTxOn r0,r1,EQ
+        EXITS
+
+
+;___________
+
+
+ForceRESET
+       ;DLINE   "PS2 mouse ForceRESET"
+        LDR     r0, TxInsert                    ;Flush any unsent commands
+        STR     r0, TxPtr
+        MOV     r0, #command_RESET              ;Reset the mouse
+        BL      SendByte
+        ADR     r2, PS2_GetACKforRESET
+        B       continue
+;
+; Sent   command_RESET (&FF)
+; expect keybd_ACK     (&FA)
+;   then keybd_BAT     (&AA)
+;   then               (&00)
+;
+PS2_GetACKforRESET
+       ;DREG    r0, "PS2_ACKforRESET &",,LongWord
+        TEQ     r0, #keybd_ACK
+        ADREQ   r2, PS2_GetBAT
+        BEQ     continue
+        B       unexpected              ;if mouse says keybd_BAT, we branch back to PS2_GetBAT
+
+;
+; Expect keybd_BAT     (&AA)
+;   then               (&00)
+;
+; we branch here from unexpected if we receive keybd_BAT out of sequence
+;
+PS2_GetBAT
+       ;DREG    r0, "PS2_GetBAT &",,LongWord
+        TEQ     r0, #keybd_BAT
+        ADREQ   r2, PS2_GetZero
+        BEQ     continue
+        B       unexpected              ;check for keybd_RESEND
+
+;
+; received a keybd_BAT (&AA)
+; expect               (&00)
+;
+PS2_GetZero
+       ;DREG    r0, "PS2_GetZero &",,LongWord
+        TEQ     r0, #0                  ;Device ID for mouse
+        MOVEQ   r1, #command_ENABLE
+        ADREQ   r2, PS2_GetACKforENABLE
+        BEQ     send_continue
+        B       unexpected
+
+;
+; Sent command_ENABLE (&F4)
+; expect keybd_ACK    (&FA)
+;
+PS2_GetACKforENABLE
+       ;DREG    r0, "PS2_ACKforENABLE &",,LongWord
+        TEQ     r0, #keybd_ACK
+        ADREQ   r2, PS2_GetByte1
+        BEQ     continue
+        B       unexpected
+
+;
+; expecting mouse data reports
+;
+; normally the state machine executes PS2_GetByte1, PS2_GetByte2, PS2_GetByte3,
+;                                     PS2_GetByte1, PS2_GetByte2, PS2_GetByte3,
+;                                     PS2_GetByte1, PS2_GetByte2, PS2_GetByte3, ...
+;
+; If the user unplugs the mouse, then reconnects it, the mouse sends AA 00, so...
+; If we receive AA 00 at any time, we might be in a mouse power on reset sequence,
+; but then again, it might be a mouse position report that happens to contain those bytes.
+;
+; Each state checks if the current byte is AA and chooses a different next state handler
+; if so. This alternate next state handler (xxx_afterBAT) checks for 00 and calls
+; ForceRESET if one is found.
+; This ensures that even if the AA 00 was actually a mouse position report that the
+; mouse and the state machine end up in a sane state.
+;
+PS2_GetByte1_afterBAT                           ;Abnormal entry point :-
+        TEQ     r0, #00                         ; previous byte was AA, if current one is 00
+        BEQ     ForceRESET                      ;   then hit mouse with a big stick.
+PS2_GetByte1                                    ;Normal entry point
+        ;DREG    r0, "PS2_GetByte1 &",,LongWord
+        STRB    r0, Byte1                       ;Store first byte of a 3byte position report
+        TEQ     r0, #keybd_BAT
+        ADREQ   r2, PS2_GetByte2_afterBAT       ;Choose alternate handler only if suspect data
+        ADRNE   r2, PS2_GetByte2
+        B       continue
+
+PS2_GetByte2_afterBAT
+        TEQ     r0, #00
+        BEQ     ForceRESET                      ;Looks like a mouse power-on-reset
+PS2_GetByte2
+        ;DREG    r0, "PS2_GetByte2 &",,LongWord
+        STRB    r0, Byte2
+        TEQ     r0, #keybd_BAT
+        ADREQ   r2, PS2_GetByte3_afterBAT
+        ADRNE   r2, PS2_GetByte3
+        B       continue
+
+PS2_GetByte3_afterBAT
+        TEQ     r0, #00
+        BEQ     ForceRESET                      ;Looks like a mouse power-on-reset
+PS2_GetByte3
+        ;DREG    r0, "PS2_GetByte3 &",,LongWord
+        STRB    r0, Byte3
+
+
+        STRB    r3, KBState
+        LDRB    r2, Byte1
+                                                ;Build Y movement into r1
+        AND     r1, r2, #&20                    ; extract Y data sign
+        ORR     r1, r0, r1, LSL #3              ; combine with Byte3 to give 9-bit signed number
+        MOV     r1, r1, LSL #23                 ;
+        MOV     r1, r1, ASR #23                 ; sign extend it to 32 bits.
+
+        LDRB    r3, Byte2                       ;Build X movement into r0
+        AND     r0, r2, #&10                    ; extract X data sign
+        ORR     r0, r3, r0, LSL #4              ; combine with Byte2 to give 9-bit signed number
+        MOV     r0, r0, LSL #23                 ;
+        MOV     r0, r0, ASR #23                 ; sign extend it to 32 bits.
+
+                                                ;Build button states in r2 (r2 = xxxx1MRL)
+        AND     r2, r2, #07                     ; r2 now 00000MRL
+        ORR     r2, r2, r2, LSL #3              ; r2 now 0000LMRL
+        MOV     r2, r2, LSR #1                  ; r2 now 00000LMR
+
+        ADR     lr, MouseData
+        LDMIA   lr, {r3,r9}                    ;Accumulate DeltaX,DeltaY and Buttons.
+        ADD     r0, r3, r0
+ [ true
+        ADD     r1, r9, r1
+ |
+        SUB     r1, r9, r1
+ ]
+        STMIA   lr, {r0-r2}
+
+        LDRB    r3, KBState
+
+        LDRB    r0, Byte3
+        TEQ     r0, #keybd_BAT
+        ADREQ   r2, PS2_GetByte1_afterBAT
+        ADRNE   r2, PS2_GetByte1
+        B       continue
+
+
+unexpected
+        STRB    r3, KBState
+
+        TEQ     r0, #keybd_RESEND               ; If RESEND then
+        BEQ     resend                          ;   resend last byte.
+
+        TEQ     r0, #keybd_BAT                  ; If BAT complete code then
+        BEQ     PS2_GetBAT                      ;   handle it.
+
+        B       ForceRESET
+
+
+;___________
+
+
+
+
+
+        END

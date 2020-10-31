@@ -1,0 +1,502 @@
+; > TranSprite
+        
+; ********************************************************************************
+; 
+; sprite_plotmasktransformed
+; sprite_plotspritetransformed
+; 
+;   in: r0  = reason code, tells you how r1, r2 should be handled.
+;       r1 -> sprite control block
+;       r2 -> sprite name / pointer to sprite (if r0 =&2xx).
+;       r3  = flags word
+;                   bit 0 set => R6 -> destination co-ords, else matrix.
+;                   bit 1 set => R4 -> source rectangle within sprite.
+;                   others are reserved for future expansion.
+;
+;       r4   = source rectangle block (if R3 bit 1 set).
+;       r5   = GCOL action (bit 3 for masking, bit 4 for "use palette not transtable")
+;       r6  -> matrix (if R3 bit 0 clear):
+;               r6!0,4,8,12,16,20 = matrix (as for Draw module)
+;       r6  -> destination co-ordinates
+;               r6!0,4 = X0,Y0 screen (1/256ths OS unit)
+;               r6!8,12 = X1,Y1 on screen (1/256ths OS unit)
+;               r6!16,20 = X2, Y2 on screen (1/256ths OS unit)
+;               r6!24,28 = X3, Y3 on screen (1/256ths OS unit)
+;       r7  -> translation table ( <= 0 => none).
+;
+; The source cordinates are inclusive at the bottom-left, and exclusive at the
+; top right.
+;
+; When specifying a destination parallelogram, the source rectangle is mapped as onto
+; the destination as follows:
+;
+;       x0, y0  ->  X0, Y0
+;       x1, y0  ->  X1, Y1
+;       x1, y1  ->  X2, Y2
+;       x0, y1  ->  X3, Y3
+; 
+; In the future it may be possible to set the destination to an arbitary
+; quadrilateral, rather than a parallelogram.   ** THIS IS NOT YET SUPPORTED **
+;
+; The routine handling this call should ensure that the resulting image covers exactly
+; the area that a call to Draw_Fill would produce if passed the same rectangle
+; and relevant transformation matrix, where it is filling to half-way through
+; the boundary.
+;
+; If your printer driver supports transformed sprites then it should set bit 27
+; of the printer driver info word to reflect this, so that applications 
+; authors can take advantage of the new features. 
+;
+; ********************************************************************************
+
+srcx0           RN      3               ; these four must be consecutive for LDMs
+srcy0           RN      4               ; check the code carefully if you
+srcx1           RN      5               ; change these assignments!
+srcy1           RN      6
+srcwidth        RN      8               ; these two must be consecutive too
+srcheight       RN      9
+
+
+        [ Medusa
+; For TrueColour sprites on B/W printers, we create the temporary
+; sprite in a suitable 8bpp mode, and we create our own translation
+; table to render the source down to 256 grey-levels.
+        ]
+
+sprite_plotmasktransformed
+sprite_plotspritetransformed
+        Push    "R0-R9,LR"
+
+        PrError sprite_put_no_grestore_return
+
+        CMP     R7, #0                  ;If user wants no translation table, then
+        MOVLT   R7, #0                  ;force R7 to zero (we use top bit of R7
+                                        ;  to distinguish a translation table from a
+                                        ;  sprite palette)
+        [ Medusa
+        BL      sprite_clear32Ktable
+        ]
+
+; Sprite and VDU calls issued from in here should go to the real code.
+
+        LDRB    LR,passthrough
+        STRB    LR,sprpassthrough
+        ORR     LR,LR,#passthrough_spr
+        STRB    LR,passthrough
+
+        [       PSDebugSprite
+        PrLnIm  "(sprite_plottransformed\n) print flush"
+        ]
+
+; Calculate the source origin and area
+        Push    "r0-r6"
+        BIC     r0,r0,#&FF
+        ORR     r0,r0,#SpriteReason_ReadSpriteSize
+        SWI     XOS_SpriteOp
+        MOV     srcwidth, r3                    ; width in srcwidth
+        MOV     srcheight, r4                   ; height in srcheight
+        Pull    "r0-r6"
+
+        TST     r3, #2
+        BEQ     sprite_no_source_clipping
+
+; Now fetch the source rectangle into registers
+        Push    "srcx0-srcy1"
+        LDMIA   r4, {srcx0-srcy1}               ; x0, y0, x1, y1
+
+        Debug   TransSprite, "Source clipping: ", srcx0, srcy0, srcx1, srcy1
+        
+; Clip to sprite size. x0,y0 inclusive, x1,y1 exclusive, which is true
+; even if x0 and y0 are swapped for reflection.
+
+        CMP     srcx0, #0               ; If x0 < 0, set it to zero
+        MOVLT   srcx0, #0
+        CMP     srcx0, srcwidth         ; If x0 >= w, set it to w - 1
+        SUBGE   srcx0, srcwidth, #1
+        CMP     srcy0, #0               ; If y0 < 0, set it to zero
+        MOVLT   srcy0, #0
+        CMP     srcy0, srcheight        ; If y0 >= h, set it to h - 1
+        SUBGE   srcy0, srcheight, #1
+        CMP     srcx1, #-1              ; If x1 < -1, set it to -1
+        MOVLT   srcx1, #-1
+        CMP     srcx1, srcwidth         ; If x1 > w, set it to w
+        MOVGT   srcx1, srcwidth
+        CMP     srcy1, #-1              ; If y1 < -1, set it to -1
+        MOVLT   srcy1, #-1
+        CMP     srcy1, srcheight        ; If y1 > h, set it to h
+        MOVGT   srcy1, srcheight
+
+        Debug   TransSprite, "Clipped source area x0 y0 x1 y1 ", srcx0, srcy0, srcx1, srcy1
+
+; Determine actual width and height (into srcwidth, srcheight).  If negative, alter
+; start position appropriately (ie, ensure that x0,y0 is the bottom-left pixel required).
+        SUBS    srcwidth, srcx1, srcx0          ; width
+        ADDMI   srcx0, srcx1, #1                ; swap endpoints
+        SUBS    srcheight, srcy1, srcy0         ; height
+        ADDMI   srcy0, srcy1, #1                ; swap endpoints
+
+        Debug   TransSprite, "Adjusted area ", srcx0, srcy0, srcx1, srcy1, srcwidth, srcheight
+
+; Now srcx0,srcy0 is the bottom-left point in the source sprite.
+        STR     srcx0, sourceclip_x
+        STR     srcy0, sourceclip_y
+
+        Pull    "srcx0-srcy1"
+        B       sprite_width_and_height_known
+
+sprite_no_source_clipping
+
+        RSB     srcheight, srcheight, #0        ; XXX default is flipped vertically!! !! !!
+
+        Debug   TransSprite, "No source clipping: width & height ", srcwidth, srcheight
+
+        MOV     lr, #0
+        STR     lr, sourceclip_x
+        STR     lr, sourceclip_y
+
+sprite_width_and_height_known
+
+; Now all registers are as on entry, except srcwidth and srcheight are set
+; correctly (though possibly negative indicating reflection (in the
+; parallelogram case only)).
+
+; Save current graphics state.
+
+        [       PSCoordSpeedUps
+        BL      ensure_OScoords
+        BLVC    output_gsave
+        |
+        BL      output_gsave
+        ]
+        PrPassError
+
+        TEQ     srcwidth, #0
+        TEQNE   srcheight, #0
+        BEQ     sprite_put_return               ; Note V is clear
+
+        TST     r3, #1
+        BEQ     sprite_explicit_matrix
+
+        Debuga  TransSprite, "Parallelogram"
+
+; R3 bit 0 set; so R6 points to a destination parallelogram.
+
+        MOV     r3, #8                  ; output 4 coordinate pairs
+00      LDR     r4, [r6], #4
+        Debuga  TransSprite, " ", r4
+        PrNumSp r4
+        SUBS    r3, r3, #1
+        BNE     %BT00
+        Debug   TransSprite, ""
+
+; Output the width and height in pixels.  These might be negative.
+        PrPair  srcwidth, srcheight
+        PrLnIm  "PAR"                   ; fit into parallogram command
+
+; Now make sure that width and height are positive
+        CMP     srcwidth, #0
+        RSBLT   srcwidth, srcwidth, #0
+        CMP     srcheight, #0
+        RSBLT   srcheight, srcheight, #0
+
+; Get size again to get the mask and mode values into r5 and r6
+; Stack jiggerypokery gets srcwidth and srcheight into r3 and r4
+
+        Push    "srcwidth, srcheight"
+
+        AND     r8,r5,#15                       ; Put the mask flag somewhere safe
+                                                ;   XXXX r8 same register as srcwidth
+; Check whether the user has asked to use the sprite's palette, rather
+; than the translation table.  Adjust if so.
+        BL      sprite_checkR5bit4
+
+        BICVC   r0,r0,#&FF
+        ORRVC   r0,r0,#SpriteReason_ReadSpriteSize
+        SWIVC   XOS_SpriteOp
+
+        Pull    "r3, r4"
+        PrPassError
+
+; Make GCOL actions 8-15 identical to actions 0-7 if the sprite has no mask.
+; Then ignore GCOL actions other than 0 and 8 (overwriting).
+        LDR     lr, [ sp ]                      ; reason code
+        AND     lr, lr, #255
+        TEQ     lr, #55                         ; is is PlotMaskTransformed?
+        MOVEQ   r8, r5                          ; yes; so preserve mask info
+        BEQ     %FT00                           ; and skip the colour stuff...
+
+        TEQ     r5, #0                          ; otherwise it's PutSpriteTransformed
+        ANDEQ   r8, r8, #7
+        TST     r8, #7
+        BNE     sprite_put_return      ; Note V is clear
+
+        [ Medusa
+
+; If the sprite is 16 or 32bpp, we want to process it specially.
+; XXX check the Sprite code keeps in step with this
+
+        MOV     LR, R6, LSR #27
+        AND     LR, LR, #31
+        Debug   Medusa, "TransSprite T=",LR
+        TEQ     LR, #5
+        BEQ     %FT02
+        TEQ     LR, #6
+        BNE     %FT00
+
+; It's a 32bpp sprite.
+
+        LDR     LR,info_features        ;If output is destined for a monochrome
+        TST     LR,#1                   ;  printer, fudge the sprite mode
+        BEQ     %FT01
+
+        PrLnIm  "1 32 1 1 SS  32 SM"    ;Set up scaling info
+        BLVC    sprite_output32bpp
+        PrPassError
+        B       sprite_put_return
+
+; It's a 16bpp sprite
+02
+        LDR     LR,info_features        ;If output is destined for a monochrome
+        TST     LR,#1                   ;  printer, fudge the sprite mode
+        BEQ     %FT01
+
+        PrLnIm  "1 16 1 1 SS  16 SM"    ;Set up scaling info
+        BLVC    sprite_output16bpp
+        PrPassError
+        B       sprite_put_return
+
+
+; Truecolour sprite->mono printer, so modify the mode number to make a
+; similar 8bpp mode and arrange for the real sprite to be plotted into
+; that as greyscale
+01
+        Debuga  Medusa, "Changing transprite type from ", R6
+        BIC     R6, R6, #2_11111 :SHL: 27
+        ORR     R6, R6, #2_00100 :SHL: 27
+        Debug   Medusa, " to ", R6
+; And create a suitable translation table, putting the address of the anchor block into R7
+        BL      sprite_make32Ktable
+
+        ]
+
+00
+
+
+;Now setup the special scaling required to ensure correct aspect ratio and size.
+;Output:1 <bits/pixel> 1 1 SS
+;      :<bits/pixel> SM
+
+        Push    "r0-r4"
+        MOV     r5, #1
+
+        MOVVC   r0, r6
+        MOVVC   r1, #VduExt_Log2BPP
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   r3, r5, LSL r2
+
+        PrPair  r5, r3,, FallThroughOnError
+        PrPair  r5, r5,, FallThroughOnError
+        PrLnIm  "SS", FallThroughOnError                          
+
+        PrNumSp r3,, FallThroughOnError         ; Output bix per pixel
+        PrLnIm  "SM", FallThroughOnError                          
+
+        MOVVC   r1, #VduExt_Log2BPC             ; Adjust X divisor for
+        SWIVC   XOS_ReadModeVariable            ; (software) bits/pixel
+        MOVVC   r9, r2
+
+        STRVS   r0, [ sp ]
+        Pull    "r0-r4"
+
+        LDR     lr, [ sp ]                      ; reason code
+        AND     lr, lr, #255
+        TEQ     lr, #55                         ; is is PlotMaskTransformed?
+
+; At this point r3 and r4 contain the positive width and height
+; of the sprite, possibly source clipped.
+        BEQ     sprite_mask_commonoutput
+        BNE     sprite_commonoutput
+        
+sprite_explicit_matrix
+
+        Debuga  TransSprite, "Explicit matrix"
+
+; Now make sure that width and height are positive
+        CMP     srcwidth, #0
+        RSBLT   srcwidth, srcwidth, #0
+        CMP     srcheight, #0
+        RSBLT   srcheight, srcheight, #0
+
+        MOV     r3, #6
+sprite_outputtransformloop
+        LDR     r4, [ r6 ], #4
+        Debuga  TransSprite, " ", r4
+        PrNumSp r4
+        SUBS    r3, r3, #1
+        BNE     sprite_outputtransformloop
+        Debug   TransSprite, ""
+
+        PrLnIm  "SDM"
+
+        Debug   TransSprite, "Absolute width and height: ", srcwidth, srcheight
+
+; Do this again to get the mask and mode values into r5 and r6
+; Stack jiggerypokery gets srcwidth and srcheight into r3 and r4
+
+        Push    "srcwidth, srcheight"
+
+        AND     r8,r5,#15                       ; Put the mask flag somewhere safe
+                                                ;   XXXX r8 same register as srcwidth
+; Check whether the user has asked to use the sprite's palette, rather
+; than the translation table.  Adjust if so.
+        BL      sprite_checkR5bit4
+
+        BICVC   r0,r0,#&FF
+        ORRVC   r0,r0,#SpriteReason_ReadSpriteSize
+        SWIVC   XOS_SpriteOp
+        PrPassError
+
+        Pull    "r3, r4"
+
+; Make GCOL actions 8-15 identical to actions 0-7 if the sprite has no mask.
+; Then ignore GCOL actions other than 0 and 8 (overwriting).
+
+        LDR     lr, [ sp ]                      ; reason code
+        AND     lr, lr, #255
+        TEQ     lr, #55                         ; is is PlotMaskTransformed?
+        MOVEQ   r8, r5                          ; yes; so preserve mask info
+        BEQ     %FT00                           ; and skip the colour stuff...
+
+        TEQ     r5, #0                          ; otherwise it's PutSpriteTransformed
+        ANDEQ   r8, r8, #7
+        TST     r8, #7
+        BNE     sprite_put_return               ; Note V is clear
+
+        [ Medusa
+
+; If the sprite is 16 or 32bpp, we want to process it specially.
+; XXX check the Sprite code keeps in step with this
+
+        MOV     LR, R6, LSR #27
+        AND     LR, LR, #31
+        Debug   Medusa, "TransSprite T=",LR
+        TEQ     LR, #5
+        BEQ     %FT02
+        TEQ     LR, #6
+        BNE     %FT00
+
+; It's a 32bpp sprite.
+
+        LDR     LR,info_features        ;If output is destined for a monochrome
+        TST     LR,#1                   ;  printer, fudge the sprite mode
+        BEQ     %FT01
+
+        BL      transsprite_outputscaling
+        BLVC    sprite_output32bpp
+        PrPassError
+        B       sprite_put_return
+
+; It's a 16bpp sprite
+02
+        LDR     LR,info_features        ;If output is destined for a monochrome
+        TST     LR,#1                   ;  printer, fudge the sprite mode
+        BEQ     %FT01
+
+        BL      transsprite_outputscaling
+        BLVC    sprite_output16bpp
+        PrPassError
+        B       sprite_put_return
+
+
+; Truecolour sprite->mono printer, so modify the mode number to make a
+; similar 8bpp mode and arrange for the real sprite to be plotted into
+; that as greyscale
+01
+        Debuga  Medusa, "Changing transprite type from ", R6
+        BIC     R6, R6, #2_11111 :SHL: 27
+        ORR     R6, R6, #2_00100 :SHL: 27
+        Debug   Medusa, " to ", R6
+; And create a suitable translation table, putting the address of the anchor block into R7
+        BL      sprite_make32Ktable
+
+        ]
+
+00
+
+;Now setup the special scaling required to ensure correct aspect ratio and size.
+;Output:<sprXeig> <bits/pixel> <sprYeig> 1 SS
+;      :<bits/pixel> SM
+
+        BL      transsprite_outputscaling
+        STRVS   r0, [ sp ]
+
+        LDR     lr, [ sp ]                      ; reason code
+        AND     lr, lr, #255
+        TEQ     lr, #55                         ; is is PlotMaskTransformed?
+        BEQ     sprite_mask_commonoutput
+        BNE     sprite_commonoutput
+
+;NOTREACHED
+        
+
+;Subroutine to setup the special scaling required to ensure correct aspect ratio and size.
+;Output:<sprXeig> <bits/pixel> <sprYeig> 1 SS
+;      :<bits/pixel> SM
+; This is called for the "explicit matrix" case only.
+; R5 and R9 are altered.
+
+transsprite_outputscaling
+        Push    "r0-r4,r7-r8,lr"
+        MOV     r5, #1
+
+        MOVVC   r0, r6
+        MOVVC   r1, #VduExt_XEigFactor
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   r4, r5, LSL r2                  ; R2=1<<X Eigen factor for sprite
+
+        MOVVC   r0, r6
+        MOVVC   r1, #VduExt_Log2BPP
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   r3, r5, LSL r2
+
+        PrPair  r4, r3,, FallThroughOnError
+        MOVVC   r1, #VduExt_YEigFactor
+        SWIVC   XOS_ReadModeVariable
+        MOVVC   r2, r5, LSL r2                  ; R2=1<<Y Eigen factor for sprite
+        PrPair  r2, r5,, FallThroughOnError
+        PrLnIm  "SS", FallThroughOnError                          
+
+        PrNumSp r3,, FallThroughOnError         ; Output bix per pixel
+        PrLnIm  "SM", FallThroughOnError
+
+        MOVVC   r1, #VduExt_Log2BPC             ; Adjust X divisor for
+        SWIVC   XOS_ReadModeVariable            ; (software) bits/pixel
+        MOVVC   r9, r2
+        BVS     transsprite_outputscaling_exit
+
+; Source clipping!  The desired effect is for the source origin to be pushed through
+; the user's transformation matrix.  At present, we have concatted the user's
+; matrix with the CTM, and also scaled so that the X coordinates are in bits and
+; the Y coordinates are in pixels.  So the following translate command should
+; put us in the correct place.
+;
+; Note that this is not the desired behaviour when the destination is specified
+; as a parallelogram, but this code is not used in that case.
+
+        LDR     r7, sourceclip_x
+        LDR     r8, sourceclip_y
+        TEQ     r7, #0
+        TEQEQ   r8, #0
+        BEQ     transsprite_outputscaling_exit
+
+        PrPair  r7, r3,, FallThroughOnError     ; r3 still contains bits per pixel
+        PrStrIm "mul ", FallThroughOnError
+        PrNumSp r8,, FallThroughOnError
+        PrLnIm  "T", FallThroughOnError
+
+transsprite_outputscaling_exit
+        STRVS   r0, [ sp ]
+        Pull    "r0-r4,r7-r8, pc"
+
+
+        END

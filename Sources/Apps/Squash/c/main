@@ -1,0 +1,667 @@
+/* -> c.main
+ * Wimp driver for the squash application.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "wimpt.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+#include "menu.h"
+#include "baricon.h"
+#include "event.h"
+#include "win.h"
+#include "werr.h"
+#include "template.h"
+#include "xferrecv.h"
+#include "xfersend.h"
+#include "swis.h"
+#include "msgs.h"
+#include "flex.h"
+#include "saveas.h"
+#include "visdelay.h"
+
+#include "kernel.h"
+
+#include "squash.h"
+#include "debug.h"
+
+#define VERSION_FIELD 4
+
+#define MAX_FILES 100
+
+static char *app_name;
+static menu icon_menu;
+static int use_save_box = 1;
+static int blocking = 0;
+#ifdef RISCOS_200
+static int to_free = -1;
+#endif
+static char *fname[MAX_FILES];
+static int ftype[MAX_FILES];
+static int ffirst = 0;
+static int flast = 0;
+static int squash_dirs = 1;
+static int squash_apps = 0;
+
+#ifndef RISCOS_200
+static char *lookup_message(char *token)
+{
+  char *cp = msgs_lookup(token);
+  char *text = malloc(strlen(cp) + 1);
+  if (text == NULL)
+    werr(1, "Squash: Out of store");
+  strcpy(text, cp);
+  return text;
+}
+
+static char *lookup_error(int errno)
+{
+  char token[12];
+  sprintf(token, "Squash%d", errno);
+  return lookup_message(token);
+}
+
+/*
+ * Get error text (with possible parameter) for the specified error
+ * number and possibly terminate.
+ */
+void show_error_num(int fatal, int errno)
+{
+  char *errmess;
+  if (errno > MAX_ERROR)
+    errno = 0;
+  errmess = lookup_error(errno);
+  werr(fatal, "%s: %s", app_name, errmess);
+  free(errmess);
+}
+#else
+void show_error_num(int fatal, int errno)
+{
+  if (errno > MAX_ERROR)
+    errno = 0;
+  werr(fatal, "%s: %s", app_name, error[errno]);
+}
+#endif
+
+void show_error(int fatal, char *text, char *fname)
+{
+  if (fname != NULL)
+    werr(fatal, "%s (object '%s'): %s", app_name, fname, text);
+  else
+    werr(fatal, "%s: %s", app_name, text);
+}
+
+/*
+ * Display info box (triggered by Info option in icon menu).
+ */
+static void program_info(void)
+{
+  dbox d;
+#ifdef RISCOS_200
+  char *version = SQUASH_VERS;
+#else
+  char *version = lookup_message("Version");
+#endif
+  /* Create the dialogue box */
+  if (d = dbox_new("ProgInfo"), d != NULL) {
+    dbox_setfield(d, VERSION_FIELD, version);
+    dbox_show(d);
+    dbox_fillin(d);
+    dbox_dispose(&d);
+  };
+#ifndef RISCOS_200
+  free(version);
+#endif
+}
+
+/*
+ * Handle icon menu selections.
+ */
+static void menu_proc(void *handle, char *hit)
+{
+  /*
+   * Three entries in the menu, one for info leading to (read only) dialogue box,
+   * one for toggling the save box (useful for large numbers of files)
+   * and the other the standard quit selection.
+   */
+  switch (hit[0]) {
+   case 1:
+    if (hit[1] != 0) program_info();
+    break;
+   case 2:
+    use_save_box = !use_save_box;
+    menu_setflags(icon_menu, 2, use_save_box, 0);
+    break;
+   case 3:
+    squash_apps = !squash_apps;
+    menu_setflags(icon_menu, 3, squash_apps, 0);
+    break;
+   case 4:
+    /* Quit */
+    free(app_name);
+    exit(0);
+   default:
+    /* Should never happen */
+    show_error_num(1, unknown_menu_click);
+  };
+}
+
+/*
+ * Clicking on the icon has no effect.
+ */
+static void icon_click(wimp_i icon)
+{
+  /* No action on select */
+}
+
+/*
+ * Create the icon menu.
+ */
+static menu create_menu(void)
+{
+#ifdef RISCOS_200
+  char *menutext = ">Info,Save Box,Squash Apps,Quit";
+#else
+  char *menutext = lookup_message("IconMenu");
+  char *sprite = lookup_message("TaskSprite");
+#endif
+  menu handle = menu_new(app_name, menutext);
+  if (handle == NULL) return NULL;
+  baricon(sprite, (int)resspr_area(), icon_click);
+  if (!event_attachmenu(win_ICONBAR, handle, menu_proc, 0))
+    return NULL;
+  menu_setflags(handle, 2, use_save_box, 0);
+  menu_setflags(handle, 3, squash_apps, 0);
+#ifndef RISCOS_200
+  free(sprite);
+  free(menutext);
+#endif
+  return handle;
+}
+
+/*
+ * Squash a file, either in place (file names are the same) or file to file.
+ * Error codes returned by the squash application are converted to error
+ * text and displayed.
+ */
+static BOOL squash(char *nameto, void *handle)
+{
+  char *namefrom = (char *)handle;
+  int argc = 2;
+  char *argv[3];
+
+  tracef1("Squashing file \"%s\"\n",namefrom);
+
+  argv[0] = app_name;
+  argv[1] = namefrom;
+  if (strcmp(namefrom, nameto) == 0)
+    argv[2] = NULL;
+  else
+    argv[argc++] = nameto;
+  (void)do_squash(argc, argv);
+  return 1;
+}
+
+/*
+ * Squash all files (and sub-directories) of the named directory, either
+ * in place or directory to directory.
+ */
+static BOOL squash_dir(char *nameto, void *handle)
+{
+  char *namefrom = (char *)handle;
+  _kernel_oserror *err;
+  _kernel_swi_regs r;
+  struct dirent {
+    int load_addr;
+    int exec_addr;
+    int length;
+    int file_attr;
+    int type;
+    char name[64];
+  } dirent;
+
+  tracef1("Squashing directory \"%s\"\n",namefrom);
+
+  /*
+   * If the destination directory does not exist then create it.
+   */
+  if (strcmp(nameto, (char *)namefrom)) {
+    r.r[0] = 8;
+    r.r[1] = (int)nameto;
+    r.r[4] = 0;
+    if ((err = _kernel_swi(OS_File, &r, &r)) != NULL) {
+      show_error(0, err->errmess, nameto);
+      return 1;
+    }
+  }
+
+  visdelay_begin();
+  /*
+   * Compress each file or sub-directory.
+   */
+  r.r[0] = 10;
+  r.r[1] = (int)namefrom;
+  r.r[2] = (int)&dirent;
+  r.r[4] = 0;
+  r.r[5] = sizeof(struct dirent);
+  r.r[6] = 0;
+  do {
+    char *from, *to;
+    r.r[3] = 1;
+    if ((err = _kernel_swi(OS_GBPB, &r, &r)) != NULL) {
+      show_error(0, err->errmess, namefrom);
+      break;
+    }
+    if (r.r[3] != 1)
+      break;
+    from = malloc(strlen((char *)namefrom) + strlen(dirent.name) + 2);
+    if (from == NULL) {
+      show_error_num(0, out_of_store);
+      break;
+    }
+    sprintf(from, "%s.%s", (char *)namefrom, dirent.name);
+
+    tracef1("Got directory entry for \"%s\"\n",from);
+
+    to = malloc(strlen(nameto) + strlen(dirent.name) + 2);
+    if (to == NULL) {
+      show_error_num(0, out_of_store);
+      free(from);
+      break;
+    }
+    sprintf(to, "%s.%s", nameto, dirent.name);
+    if (dirent.type == 2) {
+      if (squash_apps || dirent.name[0] != '!')
+        squash_dir(to, from);
+      else
+        copy_object(from, to, 0);
+    } else {
+      if ((squash_dirs && ((dirent.load_addr & 0x000fff00) != (SQUASH_TYPE << 8)))
+           || (!squash_dirs && ((dirent.load_addr & 0x000fff00) == (SQUASH_TYPE << 8))))
+        squash(to, from);
+      else
+        copy_object(from, to, 0);
+    }
+    free(to);
+    free(from);
+  } while (r.r[4] >= 0);
+
+  visdelay_end();
+  return 1;
+}
+
+static _kernel_oserror *save_desktop(int handle)
+{
+  _kernel_swi_regs r;
+  _kernel_oserror *err;
+  char *dir = getenv("Squash$Dir");
+  char *save_text = (char *)malloc(strlen(dir) + 6);
+  if (save_text == NULL) {
+    show_error_num(0, out_of_store);
+    return 0;
+  }
+  sprintf(save_text, "Run %s\n", dir);
+  r.r[0] = 2;
+  r.r[1] = handle;
+  r.r[2] = (int)save_text;
+  r.r[3] = strlen(save_text);
+  err = _kernel_swi(OS_GBPB, &r, &r);
+  free(save_text);
+  return err;
+}
+
+static BOOL unknown_event_handler(wimp_eventstr *e, void *handle)
+{
+  switch (e->e) {
+   case wimp_ESEND:
+   case wimp_ESENDWANTACK:
+    switch (e->data.msg.hdr.action) {
+      int filetype, fnext;
+      char *filename;
+     case wimp_MDATALOAD:
+      /*
+       * Add valid files or directories to the circular list. */
+      tracef0("Got DATALOAD\n");
+      filetype = xferrecv_checkinsert(&filename);
+      if ((fnext = flast + 1) == MAX_FILES) fnext = 0;
+      if (fnext != ffirst && filetype >= 0) {
+        if ((fname[flast] = malloc(strlen(filename) + 1)) == NULL) {
+          show_error_num(0, out_of_store);
+          return 1;
+        }
+        strcpy(fname[flast], filename);
+        ftype[flast] = filetype;
+        flast = fnext;
+        tracef1("Added \"%s\" to list\n",filename);
+      }
+      xferrecv_insertfileok();
+      return 1;
+     case wimp_MHELPREQUEST:
+      if (e->data.msg.data.helprequest.m.w == -2) {
+#ifdef RISCOS_200
+        char *text = "This is the !Squash icon.|MDrag files onto it to compress them.|MDouble-click on compressed files (or drag them here again) to decompress.";
+#else
+        char *text = lookup_message("HelpTxt");
+#endif
+        e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+        e->data.msg.hdr.action = wimp_MHELPREPLY;
+        e->data.msg.hdr.size = 256;
+        sprintf(e->data.msg.data.helpreply.text, "%s", text);
+        wimpt_noerr(
+          wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task)
+        );
+#ifndef RISCOS_200
+        free(text);
+#endif
+      }
+      return 1;
+#ifndef RISCOS_200
+     case 0x400c9:       /* saveas box or info box is closed */
+      tracef0("Got MENUSDELETED\n");
+      if (blocking) {    /* make sure its the saveas box */
+        tracef1("Save box closed, removing \"%s\"\n",fname[ffirst]);
+        free(fname[ffirst]);
+        if (++ffirst == MAX_FILES) ffirst = 0;
+        blocking = 0;
+      }
+      return 1;
+#endif
+     case wimp_SAVEDESK:
+      if (wimpt_complain((os_error *)save_desktop(e->data.msg.data.savedesk.filehandle)) != 0) {
+        /* Things went wrong (e.g. disc full on file output): ack the message,
+        to stop the closedown sequence. */
+        e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+        wimpt_complain(wimp_sendmessage(wimp_EACK, &e->data.msg, e->data.msg.hdr.task));
+      }
+      return 1;
+    };
+    break;
+#ifdef RISCOS_200
+   case wimp_ELOSECARET:
+    if (blocking) {    /* make sure its the saveas box */
+      if (to_free == -1)
+        to_free = ffirst;
+      if (++ffirst == MAX_FILES) ffirst = 0;
+      blocking = 0;
+    }
+    return 1;
+#endif
+  };
+  return 0;
+}
+
+static void set_icon(wimp_w w, wimp_i ii, char *name)
+{
+        wimp_icreate i;
+        wimp_i iii;
+        char *construct_location;
+
+        /* Get the info on the icon, and delete it */
+        i.w = w;
+        wimpt_complain(wimp_get_icon_info(i.w, ii, &i.i));
+        wimpt_complain(wimp_delete_icon(w, ii));
+
+        /* Find out where to construct the sprite name, and the prefix for it */
+        if ( i.i.data.indirecttext.validstring == (char *)0 ||
+              i.i.data.indirecttext.validstring == (char *)-1 )
+        {
+                construct_location = i.i.data.indirecttext.buffer;
+                i.i.flags &= ~wimp_ITEXT;    /* set not text */
+                i.i.flags |= wimp_ISPRITE;   /* set is sprite */
+                                             /* indirect assumed */
+                i.i.data.indirectsprite.spritearea = wimp_spritearea;
+        }
+        else
+        {
+                i.i.data.indirecttext.buffer[0] = '\0';
+                construct_location = i.i.data.indirecttext.validstring;
+                i.i.flags |= wimp_ISPRITE | wimp_ITEXT;   /* set is text and sprite */
+                                                          /* indirect assumed */
+        }
+        sprintf(construct_location, name);
+
+        /* now to check if the sprite exists. */
+        /* do a sprite_select on the Wimp sprite pool */
+        if ( wimp_spriteop( 24, construct_location ) != 0 )
+        {
+               /* the sprite does not exist: print general don't-know icon. */
+                sprintf( construct_location, "file_xxx" );
+        };
+
+        wimp_create_icon(&i, &iii); /* will recreate with same number. */
+        wimp_ploticon(&i.i);
+}
+
+static void my_fileicon
+(
+        wimp_w w,
+        wimp_i ii,
+        int filetype
+)
+{
+        if (filetype == 0x1000 || filetype == 0x2000)
+          set_icon(w, ii, "directory");
+        else {
+          char name[12];
+          sprintf( name, "file_%03x", filetype );
+          set_icon(w, ii, name);
+        }
+}
+
+static int saveas__filetype;
+static int saveas__estsize = 0;
+static xfersend_saveproc  saveas__saveproc;
+static xfersend_sendproc  saveas__sendproc;
+static xfersend_printproc saveas__printproc;
+static char *filename;
+static int saved;
+
+static int saveas__wimpevents(dbox d, void *ev, void *handle) {
+  wimp_eventstr *e = (wimp_eventstr*) ev;
+  switch (e->e) {
+  case wimp_EBUT:
+    if (e->data.but.m.bbits == wimp_BDRAGLEFT) {
+      dbox_getfield(d, 2, filename, 256);
+      xfersend(saveas__filetype, filename, saveas__estsize,
+                      saveas__saveproc, saveas__sendproc,
+                      saveas__printproc, e, handle);
+      saved = 1;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int my_saveas(int filetype, char *name, int estsize,
+              xfersend_saveproc saveproc,
+              xfersend_sendproc sendproc,
+              xfersend_printproc printproc,
+              void *handle)
+{
+  int directory = (filetype == 0x1000 || filetype == 0x2000);
+  dbox_field f;
+  int wh;
+  dbox saveas__d = dbox_new(directory ? "xfer_dir" : "xfer_send");
+  tracef0("Doing saveas\n");
+  saved = 0;
+  if (saveas__d == 0) return 0;
+
+  wh = dbox_syshandle(saveas__d);
+
+  filename = malloc(256);
+  saveas__filetype   = filetype;
+  saveas__saveproc   = saveproc;
+  saveas__sendproc   = sendproc;
+  saveas__printproc  = printproc;
+  saveas__estsize    = estsize;
+
+  dbox_show(saveas__d);
+  xfersend_close_on_xfer(1, wh);
+
+  my_fileicon((wimp_w)wh, 3, filetype);
+
+  if (directory) {
+   wimp_set_icon_state((wimp_w)wh, 1, wimp_ISELECTED, wimp_ISELECTED);
+   wimp_set_icon_state((wimp_w)wh, 4, 0, wimp_ISELECTED);
+   squash_dirs = 1;
+  }
+
+  dbox_raw_eventhandler(saveas__d, saveas__wimpevents, handle);
+  dbox_setfield(saveas__d, 2, name);
+  strncpy(filename, name, 256);
+
+  while ((f = dbox_fillin(saveas__d)) == 0 || f == 1 || f == 4) {
+    if (f == 1) {
+      if (!squash_dirs) {
+        wimp_set_icon_state((wimp_w)wh, 1, wimp_ISELECTED, wimp_ISELECTED);
+        wimp_set_icon_state((wimp_w)wh, 4, 0, wimp_ISELECTED);
+        squash_dirs = 1;
+      }
+    } else if (f == 4) {
+      if (squash_dirs) {
+        wimp_set_icon_state((wimp_w)wh, 1, 0, wimp_ISELECTED);
+        wimp_set_icon_state((wimp_w)wh, 4, wimp_ISELECTED, wimp_ISELECTED);
+        squash_dirs = 0;
+      }
+    } else {
+      int i = 0;
+      int dot = 0;
+      dbox_getfield(saveas__d, 2, filename, 256);
+      while ((!dot) && filename[i] != 0) dot = filename[i++] == '.';
+      if (!dot) {
+        show_error_num(0, saveas_error);
+        continue;
+      }
+
+      xfersend_set_fileissafe(1);
+
+      tracef1("Squashing object \"%s\"\n",filename);
+
+      saved = 1;
+      if (saveproc(filename, handle) == 1 && !dbox_persist())
+        break;
+    }
+    tracef0("waiting for another saveas dialogue event\n");
+  }
+  tracef0("Completed succesfully\n");
+  xfersend_close_on_xfer(0, 0);
+  xfersend_clear_unknowns();
+  dbox_hide(saveas__d);
+  dbox_dispose(&saveas__d);
+  free(filename);
+  tracef1("Returning %d to poll loop\n", saved);
+  return saved;
+}
+
+static void
+free_all()
+{
+  tracef0("Freeing all pending objects\n");
+  while (ffirst != flast) {
+    free(fname[ffirst]);
+    if (++ffirst == MAX_FILES) ffirst = 0;
+  }
+  blocking = 0;
+#ifdef RISCOS_200
+  to_free = -1;
+#endif
+}
+
+int main(int argc, char **argv) {
+#ifndef RISCOS_200
+  wimp_msgaction messages[] = {
+    wimp_MDATALOAD,
+    wimp_SAVEDESK,
+    wimp_MHELPREQUEST,
+    0x400c9,            /* MENUSDELETED */
+    wimp_MCLOSEDOWN
+  };
+#endif
+  res_init("Squash");
+#ifdef RISCOS_200
+  app_name = "Squash";
+#else
+  msgs_init();
+  app_name = lookup_message("TaskId");
+#endif
+  wimpt_init(app_name);
+  flex_init();
+#ifndef RISCOS_200
+  wimpt_wimpversion(300);
+  wimpt_messages(messages);
+#endif
+  if (argc == 2) {
+    squash(argv[1], argv[1]);
+    exit(0);
+  }
+  resspr_init();            /* Initialise sprites for the icon */
+  template_init();
+  dbox_init();              /* For the info dialogue box */
+  visdelay_init();
+  tracef0("Initialised\n");
+  icon_menu = create_menu();
+  win_add_unknown_event_processor(unknown_event_handler, 0);
+  win_claim_unknown_events(win_ICONBAR);
+  for (;;) {
+    event_process();
+    if (ffirst != flast) {
+      if (ftype[ffirst] == 0x1000 || ftype[ffirst] == 0x2000) {    /* Directory. */
+        if (blocking) continue;
+        blocking = 1;
+        if (my_saveas(ftype[ffirst], fname[ffirst], 0, squash_dir, 0, 0, (void *)fname[ffirst]) == 0)
+          free_all();
+      } else {
+        if (use_save_box) {
+          if (blocking) continue;
+          blocking = 1;
+          if (ftype[ffirst] == SQUASH_TYPE) {
+            squash_header header;
+            int fhand = open_file(fname[ffirst], OPEN_RO);
+            if (fhand == -1)
+              return 1;
+            if (file_RW(Rdata, fhand, (char *)&header, sizeof(squash_header), fname[ffirst]) == -1) {
+              close_file(fhand);
+              return 1;
+            }
+            close_file(fhand);
+            ftype[ffirst] = (header.load >> 8) & 0xfff;
+          } else
+            ftype[ffirst] = SQUASH_TYPE;
+          if (my_saveas(ftype[ffirst], fname[ffirst], 0, squash, 0, 0, (void *)fname[ffirst]) == 0)
+            free_all();
+        } else {
+          squash(fname[ffirst], fname[ffirst]);
+#ifdef RISCOS_200
+          if (to_free == -1)
+            to_free = ffirst;
+#else /* New RISC OS Wimp */
+          free(fname[ffirst]);
+#endif
+          if (++ffirst == MAX_FILES) ffirst = 0;
+        }
+      }
+#ifdef RISCOS_200 /* Old RISC OS Wimp */
+      if (to_free != -1) {
+        while (to_free != ffirst) {
+          free(fname[to_free]);
+          if (++to_free == MAX_FILES) ffirst = 0;
+        }
+        to_free = -1;
+      }
+#endif
+      /* Claim idle events so any remaining objects can be processed. */
+      tracef0("claiming idle events\n");
+      event_setmask(event_getmask() & ~wimp_EMNULL);
+      win_claim_idle_events(win_ICONBAR);
+    } else {
+      /* No more objects to process so free Squash workspace and release null events. */
+      tracef0("freeing workspace and releasing idle events\n");
+      free_workspace();
+      event_setmask(event_getmask() | wimp_EMNULL);
+      win_claim_idle_events(-1);
+    }
+  }
+  return 0;
+}

@@ -1,0 +1,376 @@
+/*
+ * system.c
+ *
+ * This is the module that handles the system window.
+ *
+ * J R C 8th Nov 1994 Modified to cope with copying the contents of old systems into
+ *                    specific subdirectories.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+#include "visdelay.h"
+
+#include "ftrace.h"
+#include "configure.h"
+#include "system.h"
+#include "version.h"
+
+#define FILE_NAME_LIMIT 511
+
+typedef union  osfile_info_words                osfile_info_words;
+union osfile_info_words
+   {  struct
+      {  unsigned exec_addr;
+         unsigned load_addr;
+      }
+      addrs;
+      char date_and_time [5];
+   };
+
+#ifndef FilerAction_SendSelectedDirectory
+#define FilerAction_SendSelectedDirectory       0x40f80
+#endif
+#ifndef FilerAction_SendSelectedFile
+#define FilerAction_SendSelectedFile            0x40f81
+#endif
+#ifndef FilerAction_SendStartOperation
+#define FilerAction_SendStartOperation          0x40f82
+#endif
+
+static int system_window=0;
+
+/*Returns the file's module version number, or -1 if something went wrong.
+   Extra return values removed, J R C 24th Mar 1995*/
+
+static int modver (char *modfile)
+{
+   FILE *ifile = fopen (modfile, "r");
+   int c, helpstring = 0, i, verno = 0, v = -1;
+
+   if (!ifile) return -1;
+
+   if (fseek (ifile, 0x14, SEEK_SET)) goto finish;
+
+   for (i = 0; i < 32; i+=8)
+   {
+      c = fgetc (ifile);
+      if (c == EOF) goto finish;
+
+      helpstring += (c << i);
+   }
+
+   if (helpstring == 0)
+      goto finish;
+
+   if (fseek (ifile, helpstring, SEEK_SET)) goto finish;
+
+   for (c = fgetc (ifile); c != '\t'; c = fgetc (ifile))
+      if (c == EOF) goto finish;
+
+   for (c = fgetc (ifile); c == '\t'; c = fgetc (ifile));
+
+   if (c == '.') goto finish;
+
+   for (; c != '.'; c = fgetc (ifile))
+   {
+      if (c < '0' || c > '9') goto finish;
+
+      verno = (verno*10) + c-'0';
+   }
+
+   verno *= 100;
+   c = fgetc (ifile);
+   if (c < '0' || c > '9') goto finish;
+   verno += (c-'0')*10;
+   c = fgetc (ifile);
+   if (c < '0' || c > '9') goto finish;
+   verno += c-'0';
+   c = fgetc (ifile);
+   if (c != ' ') goto finish;
+
+   v = verno;
+
+finish:
+   fclose (ifile);
+   return v;
+}
+
+static int osver (char *module)
+
+   /*Given a name of the form Sys:310.Modules.<module>, return 310.*/
+
+{  int v, version = -1, n, cptlen;
+   char canon [FILE_NAME_LIMIT + 1], *t;
+
+   ftracef1 ("osver (\"%s\")\n", module);
+
+   if (wimpt_complain (_swix (OS_FSControl, _IN(0)|_IN(1)|_IN(2)|_IN(3)|
+         _IN(4)|_IN(5), 37, module, canon, NULL, NULL, sizeof canon)))
+      return -1;
+
+   #if 0
+   /*This won't do because we might be called from inside a strtok() loop.
+      Grr!*/
+   for (t = strtok (canon, "."); t != NULL; t = strtok (NULL, "."))
+      if (sscanf (t, "%d%n", &v, &n) == 1 && n == strlen (t))
+         version = v;
+   #else
+   for (t = canon; *t != '\0'; t += cptlen)
+   {  cptlen = strcspn (t, ".");
+      ftracef2 ("component %.*s\n", cptlen, t);
+      if (sscanf (t, "%d%n", &v, &n) == 1 && n == cptlen)
+         version = v;
+      if (t [cptlen] != '\0') cptlen++;
+   }
+   #endif
+
+   ftracef1 ("version %d\n", version);
+   return version;
+}
+
+static int copy_newer (int as_modules, char *from, char *to, int to_version)
+
+   /*Does a fileract copy-newer, but based on module dates rather than file datestamps.*/
+
+{  int pos, taskstarted, srcver, dstver;
+   char enumbuf [FILE_NAME_LIMIT + 1], tbuf [FILE_NAME_LIMIT + 1], syspath [FILE_NAME_LIMIT + 1], *p;
+
+   ftracef1 ("copy_newer (%s)\n", as_modules? "as modules": "as files");
+
+   /*Copy the newer files across*/
+   if (wimpt_complain (_swix (Wimp_StartTask, _IN(0)|_OUT(0), "Filer_Action", &taskstarted)) ||
+         !taskstarted)
+      return 0;
+   if (wimpt_complain (_swix (FilerAction_SendSelectedDirectory, _IN(0)|_IN(1),
+         taskstarted, from)))
+      return 0;
+
+   pos = 0;
+   while (TRUE)
+   {  if (wimpt_complain (_swix (OS_GBPB,
+            _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(4),
+            9, from, enumbuf, 1, pos, sizeof enumbuf, "*", &pos)))
+         return 0;
+      if (pos == -1) break;
+
+      if (as_modules)
+      {  sprintf (tbuf, "%s.%s", to, enumbuf);
+         dstver = modver (tbuf);
+         ftracef3 ("modver (\"%s\") -> %d (enumbuf %s)\n", tbuf, dstver, enumbuf);
+         sprintf (tbuf, "%s.%s", from, enumbuf);
+         srcver = modver (tbuf);
+         ftracef3 ("modver (\"%s\") -> %d (enumbuf %s)\n", tbuf, srcver, enumbuf);
+
+         ftracef1 ("srcver %d\n", srcver);
+         ftracef1 ("dstver %d\n", dstver);
+
+         if (srcver != -1 && dstver != -1)
+         {  /*Both are modules ... use the module version number.*/
+
+            if (dstver >= srcver) /*was <= JRC 20th Dec 1994*/
+               continue;
+
+            /*Fix MED-xxxx: check that the module we are just about to copy in
+               lives in a consistent place for its directory's position in
+               System$Path. JRC 20th Dec 1994*/
+            strcpy (syspath, getenv ("System$Path"));
+            ftracef1 ("syspath %s\n", syspath);
+            ftracef1 ("syspath 0x%X\n", syspath);
+            for (p = strtok (syspath, ","); p != NULL; p = strtok (NULL, ","))
+            {  char module [FILE_NAME_LIMIT + 1];
+               int m;
+
+               ftracef1 ("at start, %s\n", p);
+
+               sprintf (tbuf, "%sModules.%s", p, enumbuf);
+               if (wimpt_complain (_swix (OS_FSControl, _IN(0)|_IN(1)|_IN(2)|
+                     _IN(3)|_IN(4)|_IN(5), 37, tbuf, module, NULL, NULL,
+                     sizeof module)))
+                  return 0;
+
+               ftracef1 ("%s\n", module);
+
+               m = modver (module);
+               ftracef3 ("modver (\"%s\") -> %d (enumbuf %s)\n", module, m, enumbuf);
+
+               ftracef1 ("srcver %d\n", srcver);
+               ftracef1 ("modver %d\n", m);
+               ftracef1 ("to_version %d\n", to_version);
+               ftracef1 ("modosver %d\n", osver (module));
+
+               /*Either version number is less and the OS version is less, or
+                  the version number is greater and the OS version is greater.*/
+               if (m != -1 && (srcver < m) != (to_version < osver (module)))
+                  werr (FALSE, msgs_lookup ("Incon"), enumbuf,
+                        (double) srcver/100, to, (double) m/100, p);
+
+               ftracef1 ("at end, p 0x%X\n", p);
+      }  }  }
+
+      ftracef1 ("sending file %s\n", enumbuf);
+      if (wimpt_complain (_swix (FilerAction_SendSelectedFile, _IN(0)|_IN(1),
+            taskstarted, enumbuf)))
+         return 0;
+   }
+
+   if (wimpt_complain (_swix (FilerAction_SendStartOperation,
+         _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4), taskstarted, 0 /*copy*/,
+         1 << 0 /*verbose*/ | 1 << 2 /*force*/ | 1 << 4 /*recurse*/ |
+         (as_modules? 0: 1 << 3 /*newer*/), to, strlen (to) + 1)))
+      return 0;
+
+   return 1;
+}
+
+static int system_merge (char *mergesource)
+
+{  char *ldot;
+   char from[FILE_NAME_LIMIT + 1],to[FILE_NAME_LIMIT + 1],enumbuf[FILE_NAME_LIMIT + 1];
+   int obj_type, file_type, v, pos;
+   osfile_info_words run;
+
+   /*Find a good place where !System might start*/
+   ldot = strrchr (mergesource, '.');
+   if (!ldot) ldot = strrchr (mergesource, ':');
+   if (!ldot) ldot = mergesource-1;
+   ldot++;
+
+   /*Check it was !System there*/
+   if (strcoll (ldot, "!System") != 0)
+      return 0; /*Might as well use strcoll, since it's relied on elsewhere. JRC 20th Dec 1994*/
+
+   /*For better checking of module versions, do the two parts of this in the
+      following order. JRC 20th Dec 1994*/
+
+   /*As a special service, we also copy all directories from the source into
+      the destination. We copy ordinary directories with copy_newer()
+      (assuming they are things like 310.Modules), and application
+      directories with Filer_Action's copy newer (assuming they are
+      things like CCShared). Ordinary files are left alone.*/
+   /*Except that directories are things like 310, not 310.Modules, so that
+      wouldn't work. JRC 20th Dec 1994*/
+   pos = 0;
+   while (TRUE)
+   {  if (wimpt_complain (_swix (OS_GBPB,
+            _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(4),
+            9, mergesource, enumbuf, 1, pos, sizeof enumbuf, "*", &pos)))
+         return 0;
+      if (pos == -1) break;
+
+      if (strcoll (enumbuf, "Modules") != 0)
+      {  sprintf (from, "%s.%s", mergesource, enumbuf);
+         if (wimpt_complain (_swix (OS_File, _IN(0)|_IN(1)|_OUT(0),
+               23 /*OSFile_ReadStampedNoPath*/, from, &obj_type)))
+            return 0;
+
+         if (obj_type == 2 || obj_type == 3)
+         {  sprintf (to, "<System$Dir>.%s", enumbuf);
+            if (!copy_newer (0, from, to, 0))
+               return 0; /*error reported already*/
+         }
+      }
+   }
+
+   if (wimpt_complain (version_read_dates ()))
+      return 0;
+
+   /*Find the vintage of this particular System by looking at !System.!Run.*/
+   sprintf (from, "%s.!Run", mergesource);
+   if (wimpt_complain (_swix (OS_File, _IN(0)|_IN(1)|_OUT(0)|_OUT(2)|_OUT(3)|_OUT(6),
+         23 /*OSFile_ReadStampedNoPath*/, from,
+         &obj_type, &run.addrs.load_addr, &run.addrs.exec_addr, &file_type)))
+      return 0;
+
+   if (!(obj_type == 1 /*osfile_IS_FILE*/ && file_type == 0xFEB /*osfile_TYPE_OBEY*/))
+      /*Not a supported setup, really. Just copy into the root.*/
+      v = 0;
+   else
+      v = version_from_date (run.date_and_time);
+
+   sprintf (from, "%s.Modules", mergesource);
+
+   if (v != 0)
+      sprintf (to, "<System$Dir>.%.3d.Modules", v);
+   else
+      strcpy (to, "<System$Dir>.Modules");
+
+   if (!copy_newer (1, from, to, v))
+      return 0; /*error reported already*/
+
+   return 1;
+}
+
+static void system_event_handler (wimp_eventstr *e,void *handle)
+{
+   wimp_mousestr m;
+
+   handle = handle;
+
+   switch (e->e)
+   {
+   case wimp_EOPEN:
+      wimp_open_wind (&e->data.o);
+      break;
+   case wimp_ECLOSE:
+      wimp_get_point_info (&m);
+      if (m.bbits == wimp_BRIGHT)
+      {
+         wimp_wstate s;
+         wimp_get_wind_state (system_window,&s);
+         reopen_main_window (s.o.box.x0,s.o.box.y1);
+      }
+      delete_window (&system_window);
+      break;
+   case wimp_ESEND:
+   case wimp_ESENDWANTACK:
+      switch (e->data.msg.hdr.action)
+      {
+      case wimp_MDATALOAD:
+         visdelay_begin ();
+         if ((e->data.msg.data.dataload.type==0x2000) &&
+              (system_merge (e->data.msg.data.dataload.name)))
+         {
+            wimp_msgstr m;
+            m.hdr.action=wimp_MDATALOADOK;
+            m.hdr.my_ref=0;
+            m.hdr.your_ref=e->data.msg.hdr.my_ref;
+            m.hdr.size=256;
+            m.data=e->data.msg.data;
+            wimp_sendmessage (wimp_ESEND,&m,e->data.msg.hdr.task);
+         }
+         visdelay_end ();
+         break;
+      }
+   }
+}
+
+
+int system_create_window (void)
+{
+   if (! system_window)
+      system_window=create_window ("System",system_event_handler,"SY");
+
+   return system_window;
+}
+
+void system_update_window (void)
+{
+}

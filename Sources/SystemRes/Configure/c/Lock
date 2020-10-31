@@ -1,0 +1,315 @@
+/*
+ * lock.c
+ *
+ * This is the module that handles the lock window. 
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "template.h"
+#include "msgs.h"
+#include "msgtrans.h"
+#include "menu.h"
+#include "res.h"
+#include "resspr.h"
+#include "dbox.h"
+#include "alarm.h"
+
+#include "configure.h"
+#include "lock.h" 
+#include "cmos.h"
+
+/*
+        Some useful SWIs
+*/
+#ifndef FSLock_Version
+#define FSLock_Version          0x44780
+#endif
+#ifndef FSLock_Status
+#define FSLock_Status           0x44781
+#endif
+#ifndef FSLock_ChangeStatus
+#define FSLock_ChangeStatus     0x44782
+#endif
+
+/* Define ADFS to be the locked filing system */
+#define FSLock_FilingSystem 8
+#define FSLock_FullyUnlocked 0
+#define FSLock_Unlocked 1
+#define FSLock_Locked 2
+
+#define fslock_changestatus(s,o,n) ((os_error *)_swix(FSLock_ChangeStatus,_IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4),(s),(o),(n),FSLock_FilingSystem,0))
+
+/*
+        Icon definitions
+*/
+#define LockWindow_OldPassword               1
+#define LockWindow_NewPassword1              3
+#define LockWindow_NewPassword2              5
+#define LockWindow_Change                    6  
+#define LockWindow_Cancel                    7
+#define LockWindow_Unlock                    8
+
+static int lock_window=0;
+static char *oldp;
+static char *newp1;
+static char *newp2;
+
+int lock_status( void )
+{
+        int t;
+
+        if ( _swix( FSLock_Status, _OUT(0), &t ) ) t=0;
+
+        return t;
+}
+
+static struct
+{
+        int errno;
+        char errtext[9];
+}       mustgivepass =
+{
+        0,
+        "LONOPASS"
+};
+
+static struct
+{
+        int errno;
+        char errtext[8];
+}       mustgivenew =
+{
+        0,
+        "LOFirst"
+};
+
+static void update_lock_status( void )
+{
+        char tempbuf[20];
+
+        sprintf( tempbuf, "LOL%d", lock_status() );
+        changeicontext( lock_window, LockWindow_Unlock, msgs_lookup( tempbuf ));
+
+        main_window_lockstate_update();
+}
+
+static void bung_caret_in_window( int what, void *handle )
+{
+        wimp_caretstr c;
+
+        what = what;
+        handle = handle;
+
+        if ( lock_window )
+        {
+                c.w = lock_window;
+                c.i = LockWindow_OldPassword;
+                c.height = -1;
+                c.index = 0;
+                (void)wimp_set_caret_pos( &c );
+        }
+}
+
+static void blank_password_fields( void )
+{
+        wimp_icon ii;
+
+        *oldp = 0;
+        *newp1 = 0;
+        *newp2 = 0;
+        (void)wimp_get_icon_info( lock_window, LockWindow_OldPassword, &ii );
+        redraw_icon( lock_window, &ii );
+        (void)wimp_get_icon_info( lock_window, LockWindow_NewPassword1, &ii );
+        redraw_icon( lock_window, &ii );
+        (void)wimp_get_icon_info( lock_window, LockWindow_NewPassword2, &ii );
+        redraw_icon( lock_window, &ii );
+
+        alarm_set( 0, bung_caret_in_window, 0 );
+}
+
+static os_error *lockunlockaction( void )
+{
+        os_error *err = NULL;
+
+        switch( lock_status() )
+        {
+        case FSLock_FullyUnlocked:
+                if ( strlen( newp1 ) < 5 || strlen( newp2 ) < 5 )
+                {
+                        wimp_caretstr c;
+
+                        /* Set caret to 1st new password field */
+                        c.w = lock_window;
+                        c.i = LockWindow_NewPassword1;
+                        c.height = -1;
+                        c.index = 0;
+                        (void)wimp_set_caret_pos( &c );
+
+                        err = msgtrans_error_lookup( &mustgivenew, msgs_main_control_block(), 0, 0, 0, 0, 0, 0 );
+                }
+                else
+                {
+                        err = fslock_changestatus( FSLock_Locked, NULL, newp1 );
+                }
+                break;
+        case FSLock_Unlocked:
+                err = fslock_changestatus( FSLock_Locked, NULL, NULL );
+                break;
+        case FSLock_Locked:
+                if ( !*oldp )
+                {
+                        err = msgtrans_error_lookup( &mustgivepass, msgs_main_control_block(), 0, 0, 0, 0, 0, 0 );
+                }
+                else
+                {
+                        err = fslock_changestatus( FSLock_Unlocked, oldp, NULL );
+                }
+                break;
+        }
+
+        if ( err )
+        {
+                wimp_reporterror( err, wimp_EOK, msgs_lookup( "TaskID" ));
+        }
+
+        update_lock_status();
+
+        return err;
+}
+
+static void lock_event_handler(wimp_eventstr *e,void *handle)
+{
+        char combuf[ 256 ];
+        os_error *err = NULL;
+        wimp_mousestr m;
+
+        handle=handle;
+
+        switch (e->e)
+        {
+        case wimp_EOPEN:
+                wimp_open_wind(&e->data.o);
+                break;
+        case wimp_ECLOSE:
+                wimp_get_point_info( &m );
+                if ( m.bbits==wimp_BRIGHT ) 
+                {
+                        wimp_wstate s;
+                        wimp_get_wind_state(lock_window,&s);
+                        reopen_main_window(s.o.box.x0,s.o.box.y1);
+                }
+                delete_window( &lock_window );
+                break;
+
+        case wimp_EBUT:
+                if ((e->data.but.m.bbits==wimp_BRIGHT) ||
+                    (e->data.but.m.bbits==wimp_BLEFT) )
+                {
+                        switch (e->data.but.m.i)
+                        {
+                        case LockWindow_Change:
+                                if ( (strlen( newp1 ) < 5 || strlen( newp2 ) < 5) && !(*newp1==0 && *newp2==0) )
+                                {
+                                        werr( 0, msgs_lookup( "LONoNew" ));
+                                        break;
+                                }
+
+                                if ( lock_status() > 0 && !*oldp )
+                                {
+                                        werr( 0, msgs_lookup( "LONOPASS" ));
+                                        break;
+                                }
+
+                                if ( *newp1==0 && *newp2==0 )
+                                {
+                                        err = fslock_changestatus( FSLock_FullyUnlocked, oldp, NULL );
+                                }
+                                else
+                                {
+                                        sprintf( combuf, "%%FSLock_ChangePassword ADFS %s %s %s", newp1, newp2, oldp );
+                                        err = os_cli( combuf );
+                                }
+
+                                if ( err )
+                                {
+                                        wimp_reporterror( err, wimp_EOK, msgs_lookup( "TaskID" ));
+                                }
+
+                                update_lock_status();
+                                break;
+
+                        case LockWindow_Cancel:
+                                /* It all happens automatically */
+                                break;
+
+                        case LockWindow_Unlock:
+                                err = lockunlockaction();
+                                break;
+                        }
+
+                        /*
+                                Blank all fields
+                        */
+                        blank_password_fields();
+
+                        /*
+                                If no error and left button, then close window
+                        */
+                        if ( !err && e->data.but.m.bbits==wimp_BLEFT )
+                        {
+                                delete_window( &lock_window );
+                        }
+                }
+                break;
+
+        case wimp_EKEY:
+                if ( e->data.key.chcode == 13 )
+                {
+                        if ( !lockunlockaction() )
+                                delete_window ( &lock_window );
+                }
+                else
+                {
+                        (void)wimp_processkey( e->data.key.chcode );
+                }
+                break;
+        }
+}
+
+int lock_create_window(void)
+{
+        if ( !lock_window )
+        {
+                lock_window = create_window( "Lock", lock_event_handler, "LO" );
+                oldp = icontext( lock_window, LockWindow_OldPassword );
+                newp1 = icontext( lock_window, LockWindow_NewPassword1 );
+                newp2 = icontext( lock_window, LockWindow_NewPassword2 );
+                if ( !oldp || !newp1 || !newp2 )
+                {
+                        delete_window( &lock_window );
+                        return 0;
+                }
+        }
+        update_lock_status();
+        blank_password_fields();
+
+        return lock_window;
+}
+
+void lock_update_window(void)
+{
+        if ( lock_window ) lock_create_window();
+}

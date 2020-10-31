@@ -1,0 +1,483 @@
+        TTL     > <wini>arm.IO_Podule.IO_Podule
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:ModHand
+        GET     Hdr:Services
+        GET     Hdr:Proc
+        GET     Hdr:Podule
+
+        GET     hdr.IO_Podule
+
+        GET     Version
+
+        LEADR   Module_LoadAddr
+
+TAB     *       9
+LF      *       10
+FF      *       12
+CR      *       13
+
+; Registers in 6522 VIA
+
+VIA_IRA    *    1
+VIA_ORA    *    VIA_IRA
+VIA_DDRA   *    3
+VIA_PCR    *    12
+VIA_IFR    *    13
+VIA_IER    *    14
+VIA_ORA_NH *    15
+
+
+; OSByte numbers
+
+ADCCurrentChannel * 188
+ADCMaximumChannel * 189
+ADCConversionType * 190
+
+maxADCChannel   *       4               ; Highest logical ADC channel
+
+
+                ^       0, wp
+IOAddress       #       4
+ChannelData     #       4*4
+FREDAddress     #       4
+JIMAddress      #       4
+ADCAddress      #       4
+VIAAddress      #       4
+IRQAddress      #       4
+OSByteVars      #       4
+
+LastConversion  #       1
+
+IO_WorkspaceSize * :INDEX: @
+
+; ********************* IO Module code starts here **************************
+
+Module_BaseAddr
+
+        DCD     0
+        DCD     IO_Init    -Module_BaseAddr
+        DCD     IO_Die     -Module_BaseAddr
+        DCD     IO_Service -Module_BaseAddr
+        DCD     IO_Title   -Module_BaseAddr
+        DCD     IO_HelpStr -Module_BaseAddr
+        DCD     IO_HC_Table-Module_BaseAddr
+        DCD     IO_PoduleSWI * Module_SWIChunkSize + Module_SWISystemBase
+        DCD     IO_SWICode -Module_BaseAddr
+        DCD     IO_SWITable-Module_BaseAddr
+
+IO_HelpStr
+        DCB     "I/O Podule"
+        DCB     TAB
+        DCB     "$Version ($CurrentDate)"
+        DCB     0
+
+IO_Title
+IO_SWITable
+        DCB     "I/O_Podule", 0
+        DCB     "Hardware", 0
+        ALIGN
+
+IO_HC_Table * Module_BaseAddr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In:   none
+
+; Out:  SYNC base of podule
+
+IO_SWICode ROUT
+
+        LDR     wp, [r12]
+        LDR     r1, IOAddress
+        MOV     pc, lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; r0-r6 trashable
+
+IO_Init ENTRY
+
+        LDR     r2, [r12]               ; Coming from hard reset?
+        CMP     r2, #0
+        MOVNE   wp, r2
+        BNE     %FT90
+
+        MOV     r3, #IO_WorkspaceSize
+        MOV     r0, #ModHandReason_Claim
+        SWI     XOS_Module
+        EXIT    VS                      ; 'No room in RMA' is acceptable msg
+        STR     r2, [r12]
+        MOV     wp, r2
+
+        LDR     r14, =Podule_BaseAddressANDMask
+        AND     r11, r11, r14           ; No CMOS needed, ensure clean address
+
+        MOV     r1, r10                 ; Command line argument?
+        LDRB    r0, [r1]
+        CMP     r0, #&20
+        BCC     %FT60
+
+        MOV     r0, #(2_101 :SHL: 29) + 10 ; Bad terms, restrict, base 10
+        MOV     r2, #3
+        SWI     XOS_ReadUnsigned
+        EXIT    VS
+        MOV     r2, r2, LSL #14
+        ADD     r11, r2, #&033C0000     ; Add SYNC base
+
+60      CMP     r11, #&033C0000         ; Silly SYNC address?
+        BCC     %FT99
+
+        STR     r11, IOAddress          ; r11 -> SYNC space
+        ADD     r14, r11, #&2000
+        STR     r14, VIAAddress
+        ADD     r14, r11, #&3000
+        STR     r14, IRQAddress
+
+        SUB     r11, r11, #&033C0000 - &03000000 ; r11 -> module space
+        STR     r11, FREDAddress
+        ADD     r14, r11, #&0800
+        STR     r14, JIMAddress
+        ADD     r14, r11, #&1000
+        STR     r14, ADCAddress
+
+        MOV     r0, #&A6                ; Read address of OSByte variables
+        MOV     r1, #0
+        MOV     r2, #&FF
+        SWI     XOS_Byte
+        ORR     r1, r1, r2, LSL #8
+        STR     r1, OSByteVars
+
+90      BL      IO_Service_Reset
+        EXIT
+
+
+99      ADR     r0, ErrorBlock_UnableToStart
+        SETV
+        EXIT
+
+ErrorBlock_UnableToStart
+        DCD     &00000880
+        DCB     "Unable to start without hardware address", 0
+        ALIGN
+
+        LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r0-r6 trashable
+
+IO_Die ENTRY
+
+        LDR     wp, [r12]               ; Dereference on death
+
+        BL      FlushADC                ; Stop any ADC interrupts
+
+        MOV     r0, #IrqV
+        ADR     r1, MyIRQHandler
+        MOV     r2, wp
+        SWI     XOS_Release
+        EXITS                           ; Assumes VClear in entry lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+IO_Service
+        TEQ     r1, #Service_PreReset
+        BEQ     IO_Service_PreReset
+
+        CMP     r1, #Service_Reset      ; CS, EQ if so
+        TEQNE   r1, #Service_UKByte*4,2 ; CC, EQ if so
+        MOVNE   pc, lr
+
+        LDR     wp, [r12]
+
+        BCC     IO_Service_UKByte
+
+IO_Service_Reset ENTRY "r0-r3"
+
+        MOV     r0, #IrqV
+        ADR     r1, MyIRQHandler
+        MOV     r2, wp
+        SWI     XOS_Claim
+        STRVS   r0, [sp]
+        EXIT    VS
+
+        LDR     r3, OSByteVars
+        LDRB    r1, [r3, #ADCMaximumChannel]
+        TEQ     r1, #0                  ; If we want conversions, start 'em up
+        LDRNEB  r1, [r3, #ADCCurrentChannel] ; from this point
+        BLNE    StartConversion
+
+        LDR     r14, VIAAddress
+        MOV     r0, #&00                ; No interrupts enabled from VIA
+        STRB    r0, [r14, #4*VIA_IER]
+        MOV     r0, #&7F                ; All interrupts cleared from VIA
+        STRB    r0, [r14, #4*VIA_IFR]
+        MOV     r0, #2_00001100         ; CA2 low output (enables this PIRQ)
+        STRB    r0, [r14, #4*VIA_PCR]   ; CA1,CB1,CB2 IRQ negative active edge
+
+; Port B, ACR, timers undefined
+
+        MOV     r14, #IOC               ; Enable PIRQ
+        TEQP    pc, #I_bit :OR: SVC_mode ; Disable IRQ whilst updating mask
+        LDRB    r0, [r14, #IOCIRQMSKB]
+        ORR     r0, r0, #podule_IRQ_bit
+        STRB    r0, [r14, #IOCIRQMSKB]
+        EXITS                           ; Exit restoring IRQ state
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        ALIGN
+
+IO_Service_PreReset ROUT
+
+        LDR     wp, [r12]               ; Dereference on service
+
+        B       FlushADC                ; Ensure ADC will not interrupt after
+                                        ; BREAK; user must look after User VIA
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    wp valid
+;       r2..r4 = r0..r2 from OSByte
+
+IO_Service_UKByte ENTRY "r0, r3"
+
+        AND     r0, r2, #&FF            ; Mask off the crap
+        AND     r1, r3, #&FF
+                                        ; No need to mask OSByte r2 in these
+        LDR     r3, OSByteVars
+
+        TEQ     r0, #&96
+        TEQNE   r0, #&97
+        BEQ     OSByte9697
+
+        TEQ     r0, #&80
+        BEQ     OSByte80
+
+        TEQ     r0, #&10
+        BEQ     OSByte16
+        TEQ     r0, #&11
+        BEQ     OSByte17
+
+        CMP     r0, #&92
+        RSBCSS  r14, r0, #&95
+        BCS     OSByte9295
+
+00      MOV     r1, #Service_UKByte     ; Pass it on round
+        EXIT
+
+; .............................................................................
+
+OSByte16
+        TEQ     r1, #0
+        BLNE    StartConversion
+
+        LDRB    r14, [r3, #ADCMaximumChannel]
+        STRB    r1, [r3, #ADCMaximumChannel]
+        MOV     r1, r14
+
+05      STR     r1, [sp, #4*1]          ; Stuff OSByte r1 (r3 in)
+
+10      MOV     r1, #0                  ; Claim service
+        EXIT
+
+; .............................................................................
+
+OSByte17
+        BL      StartConversion
+        B       %BT10                   ; Claim service
+
+; .............................................................................
+
+OSByte80
+        CMP     r1, #0
+        BNE     %FT20
+
+; ADVAL(0) - r4 := last channel number to have completed conversion
+;            r1 := fire button state b[1:0], ~LPSTB in b[2]
+
+        LDR     r14, VIAAddress
+        LDRB    r1, [r14, #4*VIA_IRA]
+        TST     r1, #&20
+        MOV     r1, r1, LSR #6          ; Fire buttons are in VIA PA b[7:6]
+        EOR     r1, r1, #3              ; Inverting inputs
+        ORREQ   r1, r1, #2_100          ; Set if ~LPSTB (CA1)
+
+        LDRB    r4, LastConversion
+        B       %BT05                   ; Stuff OSByte r1 and claim service
+
+
+; ADVAL(1..4) r4,r1 := MSB,LSB of value last converted on channel r1
+
+20      CMP     r1, #maxADCChannel
+        BHI     %BT00                   ; Pass it on round
+
+        ADR     r14, ChannelData - (1 :SHL: 2)
+        LDR     r14, [r14, r1, LSL #2]
+        AND     r1, r14, #&FF
+        MOV     r4, r14, LSR #8
+        B       %BT05                   ; Stuff OSByte r1 and claim service
+
+; .............................................................................
+; FRED and JIM
+
+OSByte9295
+
+        CMP     r0, #&94                ; => &94 -> JIM, else FRED
+        LDRLO   r14, FREDAddress
+        LDRHS   r14, JIMAddress
+
+        TST     r0, #1                  ; bit 0 set -> write/~read
+        LDREQB  r4, [r14, r1, LSL #2]
+        STRNEB  r4, [r14, r1, LSL #2]
+        B       %BT10                   ; Claim service
+
+; .............................................................................
+; SHEILA
+
+OSByte9697
+
+        CMP     r1, #&60                ; User VIA? (60..7F)
+        RSBHSS  r14, r1, #&7F
+        BLO     %FT90
+
+        AND     r1, r1, #&0F            ; Kill ghosting and reduce to 00..0F
+        TEQ     r1, #VIA_ORA
+        TEQNE   r1, #VIA_DDRA
+        TEQNE   r1, #VIA_ORA_NH
+        BEQ     %BT00                   ; Pass it on round if bits we can't do
+                                        ; (User port A is printer port)
+
+        MOV     r3, r4                  ; Byte to write (can't corrupt r4)
+
+        TEQ     r1, #VIA_PCR            ; Ensure bits set if PCR write
+        BICEQ   r3, r3, #2_00001110
+        ORREQ   r3, r3, #2_00001100     ; CA2 output forced low (keep IRQs on)
+
+        LDR     r14, VIAAddress
+
+80      CMP     r0, #&96                ; Do read or write SHEILA
+        LDREQB  r4, [r14, r1, LSL #2]   ; r14 = hardware base, r1 = reg offset
+        STRNEB  r4, [r14, r1, LSL #2]
+        B       %BT10                   ; Claim the service
+
+
+90      CMP     r1, #&C0                ; ADC? (C0..DF)
+        RSBHSS  r14, r1, #&DF
+
+        ANDHS   r1, r1, #3              ; Mask down to offset from hardware
+        RSBHSS  r14, r1, #2             ; Offset 03 is not ADC
+
+        LDRHS   r14, ADCAddress
+        BHS     %BT80
+
+        B       %BT00                   ; Pass it on round
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Note that it is not possible to use the RISC OS IRQ device handler scheme
+; as there are multiple IRQ sources from this podule and the ADC IRQ indication
+; is the wrong way up to be usable. Ho hum.
+
+        AlignForModule
+
+MyIRQHandler ROUT
+
+        Push    lr
+        MOV     r14, #IOC               ; Was it a podule IRQ requesting?
+        LDRB    r14, [r14, #IOCIRQREQB]
+        TST     r14, #podule_IRQ_bit
+        Pull    pc, EQ, ^
+
+; There's no point testing to see if it's our podule that's interrupting
+; as it may be some other device on it anyway, and there's always the
+; possibility that the user hasn't put the Molex links on right ...
+
+        LDR     r14, ADCAddress
+        LDRB    r14, [r14, #0]
+        TST     r14, #&80               ; b[7] clear if ADC conversion complete
+        Pull    pc, NE, ^
+
+        Push    "r0-r3"
+        LDR     r14, ADCAddress
+        LDRB    r1, [r14, #4]           ; ADCHi
+        LDRB    r0, [r14, #8]           ; ADCLo
+        ORR     r0, r0, r1, LSL #8      ; IRQ now cleared
+
+        LDR     r3, OSByteVars
+        LDRB    r1, [r3, #ADCCurrentChannel] ; Which one were we doing?
+        CMP     r1, #1                  ; Stop the punter from destroying us
+        RSBHSS  r14, r1, #maxADCChannel ; with silly CurrentChannel values
+        MOVLO   r1, #maxADCChannel
+        ADR     r2, ChannelData - (1 :SHL: 2)
+        STR     r0, [r2, r1, LSL #2]    ; Store this conversion value
+        STRB    r1, LastConversion
+
+        MOV     r2, pc                  ; Go into SVC mode to do SWI call
+        ORR     r14, r2, #SVC_mode
+        TEQP    r14, #0
+
+        MOV     r0, #Event_ADCConvert   ; Doesn't involve banked registers
+        Push    lr_svc
+        SWI     XOS_GenerateEvent       ; r1 is logical channel number
+        Pull    lr_svc
+        TEQP    r2, #0                  ; Restore mode
+
+        SUBS    r1, r1, #1              ; Doesn't involve banked registers
+        LDREQB  r1, [r3, #ADCMaximumChannel] ; Cycle round if wrapped to 0
+        BL      DoConversion            ; Doesn't restart if this is still 0
+
+        Pull    "r0-r3, lr, pc",,^      ; Claim IRQ
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r1 = logical channel number to do conversion on
+;       r3 -> OSByteVars
+
+DoConversion ENTRY "r1"
+
+10      TEQ     r1, #0
+        EXITS   EQ                      ; [no conversion wanted]
+
+        CMP     r1, #maxADCChannel      ; channels >4 -> 4
+        MOVHI   r1, #maxADCChannel
+        STRB    r1, [r3, #ADCCurrentChannel]
+        SUB     r1, r1, #1              ; logical 1..4 -> physical 0..3
+        LDRB    r14, [r3, #ADCConversionType]
+        TEQ     r14, #8                 ; All ~8 -> 12 bit conversion
+        ORRNE   r1, r1, #8
+        LDR     r14, ADCAddress
+        STRB    r1, [r14]               ; Do a conversion on channel r1
+        EXITS
+
+; .............................................................................
+
+StartConversion ALTENTRY
+
+        MOV     r14, #0
+        STRB    r14, LastConversion
+        B       %BT10
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; *** If ADC faulty, this will hang ***
+
+FlushADC ENTRY "r0"
+
+        MOV     r14, pc
+        ORR     r14, r14, #I_bit         ; SEI
+        TEQP    r14, #0
+
+        LDR     r14, ADCAddress
+        MOV     r0, #0
+        STRB    r0, [r14, #0]           ; Start a conversion on physical chan 0
+
+10      LDRB    r0, [r14, #0]           ; Wait for completion
+        TST     r0, #&80
+        BNE     %BT10
+
+        LDRB    r0, [r14, #4]           ; Read dummy results. End of story
+        LDRB    r0, [r14, #8]
+        EXITS                           ; Exit restoring interrupt state
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        LTORG
+
+        END

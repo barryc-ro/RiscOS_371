@@ -1,0 +1,645 @@
+/*  Title: > c.main
+ *  Purpose: Font editor for Arthur 2.00 Font Manager
+ *  Authors: Neil Raine, David De Vorchik
+ *  Status: under development
+ *  History:
+ *    07-Jan-88: NDR: file created
+ *    22-Apr-88: NDR: adapted to use new header files
+ *    18-Jul-88: NDR: font file format decided (version 0)
+ *    27-Jul-88: NDR: split source into many files !!!
+ *    11-Oct-88: NDR: version 1  scaffolding added
+ *    31-Oct-88: NDR: version 2  12-bit coordinates used instead of 16-bit
+ *     9-Nov-88: NDR: version 3  12-bit scaffold coords (top 4 bits = link)
+ *    29-Nov-88: NDR: version 4  bit 3 set in charflags => outlines
+ *    12-Jan-89: NDR: name changed from ArcFont to FontEd
+ *    24-Jan-89: NDR: check for cyclic scaffold links as they are made
+ *     6-Feb-89: NDR: implement bounding box and metrics handling
+ *     7-Feb-89: NDR: allow font name / design size to be altered
+ *     8-Feb-89: NDR: implement named character windows
+ *    13-Mar-89: NDR: version 5  skeleton threshold after scaffold index
+ *    15-Mar-89: NDR: version 6  composite characters and chunk dependency
+ *    20-Mar-89: NDR: Font_UnCacheFile called to allow direct font editing
+ *    10-May-89: NDR: Font outline filetype changed to &FF6
+ *     7-Aug-89: NDR: version 7  flag word precedes index in chunk
+ *    14-Nov-89: NDR: repaint red scaffold chars in new 16-across format
+ *    15-Dec-89: NDR: display sprites behind chars as templates
+ *    27-Jan-90: NDR: allow dragging to/from the scaffold tree window
+ *    10-Feb-90: NDR: implement interactive help on windows
+ *    16-Jul-90: NDR: implement command-line arguments for automatic font processing
+ *    02-Aug-90: NDR: allow chunk 0 to be displayed / altered
+ *    12-Nov-91: DDV: Bug fixes to redraw code of bit map data
+ *    13-Nov-91: DDV: Added support for non-zero winding rule fonts
+ *    14-Nov-91: DDV: Added show winding rule menu option (NYI)
+ *    18-Nov-92: SAH: Fixed ancient bug: + 4 & ~3 should be + 3 & ~3 when word aligning!!
+ */
+
+#include "h.includes"
+#include "h.wlink"
+#include "h.misc"
+
+#include "h.main"
+#include "h.drag"
+#include "h.editchar"
+#include "h.help"
+#include "h.loadsave"
+#include "h.menu"
+#include "h.redraw"
+#include "h.sprites"
+#include "h.suspend"
+
+
+os_error *drag_exportchar(wimp_msgstr *m);
+os_error *drag_copychar(wimp_w handle, int mousex, int mousey);
+
+
+/* ---- global variables -------------------------------------------------- */
+
+
+wimp_w      info_window,
+            save_window,
+            save_window2,
+            magnifier_window,
+            origin_window,
+            fontsize_window;
+
+char        *wricon_filename,    /* points somewhere inside workarea[...] */
+            *wricon_filename2,
+            *wricon_magnifierup,
+            *wricon_magnifierdown;
+char        * fsiz_xpoints,
+            * fsiz_ypoints,
+            * fsiz_xres,
+            * fsiz_yres;
+
+int         FontIndexOrgX,
+            FontIndexOrgY;
+
+wimp_box    OriginBox;
+char        * mb_origin;
+
+tt_fontindex t_fontindex;       /* global template buffers */
+tt_tree      t_tree;
+tt_skeleton  t_skeleton;
+tt_full      t_full;
+tt_bitmap    t_bitmap;
+
+
+/* ---- Main program ------------------------------------------------------- */
+
+
+static wimp_i iconbaricon;
+static wimp_t mytaskhandle;
+
+static int dontbudge(int n, void **p) { return(0); }
+
+int main(int argc, char **argv)
+{
+  os_error * err;
+  wimp_eventstr event;
+
+  mytracef_open("<FontEd$Trace>");
+
+  showpointer = ~false;
+  showcoords = false;
+  showwidth = ~false;
+  showbbox = false;
+  showfbox = false;
+  showsprites = ~false;
+  showhandles = ~false;
+  showendpoints = false;
+  showcharnames = ~false;
+
+  inithandlers();              /* set up our signal handlers */
+
+  hourglass_on();              /* in case initialisation takes a long time */
+
+  flex_init();
+  heap_init(0);                /* heap shrinkage is too slow */
+
+  _kernel_register_slotextend(dontbudge);    /* don't allow malloc heap to grow */
+
+  dragbox.type = DR_NONE;
+
+  Wind_Head.next = NULL;
+  fontxpos = 0;
+  fontypos = 1024-40+80;
+
+  /* first interpret the command-line arguments */
+
+  thisfont = NULL;
+
+  if (argc > 2) {
+    int argp;
+    for (argp=1;argp<argc;argp++) {
+      if (strcmp(argv[argp],"-load")==0) {
+                  erx(newfont(&thisfont));
+                  erx(loadfile(thisfont, argv[++argp], 0));
+      } else if (strcmp(argv[argp],"-version")==0) {
+                  int temp;
+                  if (!thisfont) finish("No current font file");
+                  sscanf(argv[++argp],"%d",&temp);
+                  thisfont->filedata->version = temp;
+                  erx(grungefiledata(&thisfont->filedata));
+      } else if (strcmp(argv[argp],"-save")==0) {
+                  if (!thisfont) finish("No current font file");
+                  if (strcmp(argv[++argp],"outlines")==0) {
+                         erx(savefile(thisfont,thisfont->filename,1));
+                  } else if (strcmp(argv[++argp],"intmetrics")==0) {
+                         erx(savefile2(thisfont,thisfont->filename2,1));
+                  }
+      } else if (strcmp(argv[argp],"-quit")==0) {
+                  cleanexit(0);                                /* turns off hourglass */
+      } else finish("Unrecognised parameter to !FontEd");
+    }
+  }
+
+  /* ---- Now initialise the Wimp ---- */
+
+  { int version = 200;
+    erx(wimp_taskinnit("FontEd", &version, &mytaskhandle));
+  }
+
+  erx(readmodeinfo());         /* get xwindlimit, ywindlimit, dx, dy */
+
+  {
+    struct
+    { wimp_wind w;             /* window header */
+      wimp_icon i[12];         /* 12 icons */
+      char indirected[256];    /* space for indirected data */
+    } t_save;                  /* use the stack for this (temporary) */
+
+    erx(wimp_open_template("<FontEd$Dir>.Templates"));
+
+    e(aborttemp(e),loadtemp("fontindex",&t_fontindex.w));
+    e(aborttemp(e),loadtemp("tree",&t_tree.w));
+    e(aborttemp(e),loadtemp("skeleton",&t_skeleton.w));
+    e(aborttemp(e),loadtemp("full",&t_full.w));
+    e(aborttemp(e),loadtemp("bitmap",&t_bitmap.w));
+
+    e(aborttemp(e),loadtemp("info",&t_save.w));
+      e(aborttemp(e),wimp_create_wind(&t_save.w,&info_window));
+      ((mp)Menu_IconBar)->item[0].submenu = (void *)info_window;
+
+    e(aborttemp(e),loadtemp("save_window",&t_save.w));
+      t_save.w.spritearea = (void *)1;
+      wricon_filename = t_save.i[1].data.indirecttext.buffer;
+      e(aborttemp(e),wimp_create_wind(&t_save.w,&save_window));
+      ((mp)Menu_FontIndex_Save)->item[0].submenu = (void *)save_window;
+      ((mp)Menu_FontIndex2)->item[0].submenu = (void *)save_window;
+
+    e(aborttemp(e),loadtemp("save_windo2",&t_save.w));
+      t_save.w.spritearea = (void *)1;
+      wricon_filename2 = t_save.i[1].data.indirecttext.buffer;
+      e(aborttemp(e),wimp_create_wind(&t_save.w,&save_window2));
+      ((mp)Menu_FontIndex_Save)->item[1].submenu = (void *)save_window2;
+
+    e(aborttemp(e),loadtemp("magnifier",&t_save.w));
+      t_save.w.spritearea = (void *)1;  /* use common sprite pool */
+      e(aborttemp(e),wimp_create_wind(&t_save.w,&magnifier_window));
+      wricon_magnifierup = t_save.i[0].data.indirecttext.buffer;
+      wricon_magnifierdown = t_save.i[1].data.indirecttext.buffer;
+      ((mp)Menu_Skeleton)->item[6].submenu = (void *)magnifier_window;
+
+    e(aborttemp(e),loadtemp("origin",&t_save.w));
+      e(aborttemp(e),wimp_create_wind(&t_save.w,&origin_window));
+      ((mp)Menu_Bitmap)->item[3].submenu = (void *)origin_window;
+      OriginBox = t_save.i[0].box;
+      mb_origin = t_save.i[5].data.indirecttext.buffer;
+
+    e(aborttemp(e),loadtemp("fontsize",&t_save.w));
+      e(aborttemp(e),wimp_create_wind(&t_save.w,&fontsize_window));
+      ((mp)Menu_FontIndex)->item[5].submenu = (void *)fontsize_window;
+      fsiz_xpoints = t_save.i[2].data.indirecttext.buffer;
+      fsiz_ypoints = t_save.i[4].data.indirecttext.buffer;
+      fsiz_xres    = t_save.i[8].data.indirecttext.buffer;
+      fsiz_yres    = t_save.i[10].data.indirecttext.buffer;
+
+    erx(wimp_close_template());
+  }
+
+  FontIndexOrgX = t_fontindex.i[0].box.x0;      /* top-left of icon read from template */
+  FontIndexOrgY = t_fontindex.i[0].box.y1;      /* size of icon set up in newfontwindow() */
+
+  /* create iconbar icon */
+  {
+    static wimp_icreate newfont
+                      = { -1,
+                          0,0,64,68,
+                          wimp_ISPRITE |
+                          wimp_BCLICKDEBOUNCE * wimp_IBTYPE,
+                          "!fonted"
+                        };
+    erx(wimp_create_icon(&newfont,&iconbaricon));
+  }
+
+
+  /* If there is a single argument, it must be a font filename */
+
+  if (argc == 2) {
+                erx(newfont(&thisfont));
+                erx(newfontwindow(thisfont));
+                erx(loadfile(thisfont, argv[1], 0));
+  }
+
+  /* ---- Now enter the main polling loop ---- */
+
+  do
+  {
+    hourglass_off();
+    err = NULL;
+    erx(wimp_poll(0x00,&event));
+    hourglass_on();                            /* in case it takes a long time */
+    switch(event.e)
+    { case wimp_ENULL:
+           { BOOL foundany;
+             if ((err=scanloading(&foundany, 1)) != NULL) break;
+             if (!foundany) if ((err=scanloading(&foundany, 0)) != NULL) break;
+             switch(dragbox.type) {
+               case DR_POINT:
+               case DR_SCAFFOLDX:
+               case DR_SCAFFOLDY:
+               case DR_RECTSCAFFOLD:
+               case DR_SPRITEBOX:
+                    err = draggingpoint();
+             }
+           }
+           break;
+      case wimp_EREDRAW:
+           err = event_redraw((wimp_redrawstr *)&event.data);
+           if (err) {
+             erx(wimp_drag_box(NULL));
+             dragbox.type = DR_NONE;
+             erx(event_close(event.data.o.w));      /* avoid multiple errors */
+           }
+           break;
+      case wimp_EOPEN:
+           err = event_open(&event.data.o);
+           break;
+      case wimp_ECLOSE:
+           err = event_close(event.data.o.w);
+           break;
+      case wimp_EPTRLEAVE:
+           break;
+      case wimp_EPTRENTER:
+           break;
+      case wimp_EBUT:
+           err = event_mouse(event.data.but.m);  /* copy struct */
+           break;
+      case wimp_EUSERDRAG:
+           err = event_dragbox();
+           break;
+      case wimp_EKEY:
+           err = event_keypress(&event.data.key.c,event.data.key.chcode);
+           break;
+      case wimp_EMENU:
+           err = event_menu(event.data.menu);
+           break;
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+           err = event_message(&event.data.msg);
+           break;
+      default:
+           break;
+    }
+    if (err!=NULL) erx(wimp_reporterror(err,wimp_EOK,"FontEd"));
+  } while(true);
+
+  return(0);
+}
+
+
+static int deleteref = -1;
+
+os_error * event_message(wimp_msgstr *m)
+{
+  switch (m->hdr.action)
+  {
+    case wimp_MCLOSEDOWN:
+         erx(wimp_closedown());
+         cleanexit(0);                          /* turns off hourglass */
+
+    case wimp_MMODECHANGE:
+         er(readmodeinfo());
+         break;
+
+    case wimp_MHELPREQUEST:
+         er(helprequest(m));
+         break;
+
+    case wimp_MDATAOPEN:
+         er(loadack(NULL,m));
+         break;
+
+    case wimp_MDATALOAD:
+         if (m->data.dataload.w == -2) {
+             er(loadack(NULL,m));
+         } else {
+             Wind_Link *wlink = findwindlink(m->data.dataload.w);
+             if (wlink != NULL) er(loadack(wlink,m));
+         }
+         break;
+
+    case wimp_MDATASAVE:
+         if (m->data.datasave.type == 0xADB ||    /* can still load the old filetypes */
+             m->data.datasave.type == 0xFF6 ||
+             m->data.datasave.type == 0xFF9 ||
+             m->data.datasave.type == 0xAFF) {    /* only font / draw / metrics / sprite files allowed */
+           m->hdr.action = wimp_MDATASAVEOK;
+           m->hdr.your_ref = m->hdr.my_ref;
+           m->data.datasave.estsize = -1;             /* indicate that a scrap file is to be used */
+           { os_regset r;
+             r.r[0] = (int) "Wimp$Scrap";
+             r.r[1] = 0;
+             r.r[2] = -1;
+             r.r[3] = 0;
+             r.r[4] = 0;
+             os_swix(OS_ReadVarVal, &r);    /* ignore errors */
+             if (r.r[2] == 0) returnerr("No scrap file - please open a directory containing !System");
+           }
+           strcpy(m->data.datasaveok.name,"<Wimp$Scrap>");
+           m->hdr.size = (sizeof(wimp_msghdr) + sizeof(wimp_msgdatasave) + 3) & ~3;
+           er(wimp_sendmessage(wimp_ESEND,m,m->hdr.task));
+           deleteref = m->hdr.my_ref;           /* used for deleting the scrap file */
+         }
+         break;
+
+    case wimp_MDATASAVEOK:
+         switch (dragcopy.type)                 /* dragbox copied into dragcopy at end of drag */
+         {
+           case DR_FILE:      /* outline/bitmap file */
+                {
+                  er(
+                    savefile(dragcopy.wlink->info,m->data.datasaveok.name,m->data.datasaveok.estsize));
+                  m->hdr.your_ref = m->hdr.my_ref;
+                  m->hdr.action = wimp_MDATALOAD;
+                  er(wimp_sendmessage(wimp_ESEND,m,m->hdr.task));
+                }
+                break;
+
+           case DR_FILE2:             /* metrics file */
+                {
+                  er(
+                    savefile2(dragcopy.wlink->info,m->data.datasaveok.name,m->data.datasaveok.estsize));
+                  m->hdr.your_ref = m->hdr.my_ref;
+                  m->hdr.action = wimp_MDATALOAD;
+                  er(wimp_sendmessage(wimp_ESEND,m,m->hdr.task));
+                }
+                break;
+
+           case DR_FONT:            /* draw file (ie. character outline) */
+                if (m->hdr.task == mytaskhandle) {   /* deal directly with drags within FontEd */
+                  er(
+                    drag_copychar(m->data.datasaveok.w,
+                                  m->data.datasaveok.x,
+                                  m->data.datasaveok.y));
+                } else {
+                  er(drag_exportchar(m));
+                  m->hdr.your_ref = m->hdr.my_ref;
+                  m->hdr.action = wimp_MDATALOAD;
+                  er(wimp_sendmessage(wimp_ESEND,m,m->hdr.task));
+                }
+         }
+  }
+  return(NULL);
+}
+
+
+/* SELECT-dragging a character within a font copies from one character to another
+ * Dragging to a skeleton window causes the dragged character to be displayed as a template
+ * Dragging to another task causes the character to be exported as a !Draw file
+ */
+
+os_error *drag_copychar(wimp_w handle, int mousex, int mousey)
+{
+  Wind_Link *wlink;
+  int ch;
+
+  if ((wlink = findwindlink(handle)) == NULL) return(NULL);
+
+  switch(wlink->type)
+  {
+    case W_FONTINDEX:
+    case W_TREE:
+         thisfont = (Font_Block *) wlink->info;
+         er(getwindowstate(handle));
+         if (thisfont->filedata->bpp == 0) {
+           wimp_box b;
+           if ((ch = getindex(wlink,mousex,mousey,&b)) < thisfont->nchars)
+           if (thisfont->chars[ch]!=dragcopy.d.font.fromchar) {
+             er(copychardata(dragcopy.d.font.fromchar,thisfont,ch));
+             invalidate(handle, b.x0-bx, b.y0-by, b.x1-bx, b.y1-by);
+           }
+         }
+         break;
+
+    case W_SKELETON:
+         thischar = (Char_Block *) wlink->info;
+         er(suspendpathdata(thischar->template));
+         er(loadchar(dragcopy.d.font.fromchar));
+         thischar->template = dragcopy.d.font.fromchar;
+         invalidate(handle, -big,-big,big,big);
+  }
+
+  return(NULL);
+}
+
+
+os_error *drag_exportchar(wimp_msgstr *m)
+{
+  int fillpath[MAXPATH], *ptr, *sizep;
+
+  thischar = dragcopy.d.font.fromchar;
+  x0 = thischar->xlowc;
+  y0 = thischar->ylowc;
+  x1 = thischar->xupperc;
+  y1 = thischar->yupperc;
+  xscale = (200 << 16) / thischar->parent->filedata->designsize;   /* 200 OS units wide */
+  yscale = (200 << 16) / thischar->parent->filedata->designsize;   /* 200 OS units high */
+  bx = 0;
+  by = (y1 * yscale) >> 16;
+
+  ptr = fillpath;
+  *ptr++ = *((int *)"Draw");
+  *ptr++ = 201;
+  *ptr++ = 0;
+  strcpy((char *)ptr,"FontEd      "); ptr += 3;
+  *ptr++ = scalex8(x0);
+  *ptr++ = scaley8(y0);
+  *ptr++ = scalex8(x1);
+  *ptr++ = scaley8(y1);
+  *ptr++ = 2;                      /* path object */
+  sizep = ptr++;                  /* fill size in later */
+  *ptr++ = scalex8(x0);
+  *ptr++ = scaley8(y0);
+  *ptr++ = scalex8(x1);
+  *ptr++ = scaley8(y1);
+  *ptr++ = 0;                 /* fill with black */
+  *ptr++ = -1;                /* do not stroke */
+  *ptr++ = 0;                 /* line width (n/a) */
+
+  if (nonzerowinding(thischar)) {
+    *ptr++ = 0<<6;            /* non-zero fill */
+  }
+  else {
+    *ptr++ = 1<<6;            /* even-odd fill */
+  }
+
+  ptr[0] = 0; ptr[1] = sizeof(fillpath) - (ptr+2-fillpath)*sizeof(int);
+  er(buildpath(thischar, ptr, (int *)-1, NULL));           /* ignore strokepath */
+  buildoutptr++;      /* point to one after terminator */
+
+  *sizep = (buildoutptr-sizep+1) * sizeof(int);
+  { os_filestr f;
+    f.action = 10;    /* save file, stamped */
+    f.name = m->data.datasaveok.name;
+    f.loadaddr = 0xAFF;
+    f.execaddr = 0;
+    f.start = (int)fillpath;
+    f.end = (int)buildoutptr;
+    er(os_file(&f));
+  }
+  return(NULL);
+}
+
+
+os_error *loadack(Wind_Link *wlink, wimp_msgstr *mess)
+{
+  int task    = mess->hdr.task;
+  int my_ref  = mess->hdr.my_ref;
+  int your_ref = mess->hdr.your_ref;
+
+  switch(mess->data.dataload.type)
+  {
+    case 0xFF6:            /* might be a metrics/outline/bitmap file */
+    case 0xADB:
+         if (wlink == NULL) {
+           er(newfont(&thisfont));
+           er(newfontwindow(thisfont));
+           wlink = Wind_Head.next;
+         }
+
+         if (wlink->type == W_FONTINDEX)
+         {
+           mess->hdr.your_ref = my_ref;
+           mess->hdr.action = wimp_MDATALOADOK;
+           mess->hdr.size = sizeof(wimp_msghdr);
+           er(wimp_sendmessage(wimp_ESEND,mess,task));
+           er(loadfile(wlink->info, mess->data.dataload.name, (your_ref==deleteref) ? -1 : 0));
+         }
+         break;
+
+    case 0xFF9:
+         if (wlink)
+         {
+           Char_Block *charptr;
+
+           er(findchar(&charptr,wlink,mess->data.dataload.x,mess->data.dataload.y));
+
+           if (charptr) {
+             mess->hdr.your_ref = my_ref;
+             mess->hdr.action = wimp_MDATALOADOK;
+             mess->hdr.size = sizeof(wimp_msghdr);
+             er(wimp_sendmessage(wimp_ESEND,mess,task));
+             er(loadbacksprite(charptr, mess->data.dataload.name));
+           }
+         }
+         break;
+  }
+
+  if (your_ref == deleteref) er(os_cli("Delete <Wimp$Scrap>"));
+  return(NULL);
+}
+
+
+os_error * event_open(optr)
+wimp_openstr *optr;
+{
+  int handle = optr->w;
+  wimp_wstate tempblk;
+
+  Wind_Link *wlink = findwindlink(handle);
+
+  if (wlink == NULL) return(wimp_open_wind(optr));
+
+  switch (wlink->type)
+  {
+    case W_FULL:
+    case W_SKELETON:
+         er(wimp_get_wind_state(handle,&tempblk));
+         er(wimp_open_wind(optr));
+         if (((Char_Block *)wlink->info)->variable || wlink->type == W_FULL)
+         if ((tempblk.o.box.y1-tempblk.o.box.y0)!=(optr->box.y1-optr->box.y0))
+           invalidate(handle,-big,-big,big,big);
+         return(NULL);
+    default:
+         return(wimp_open_wind(optr));
+  }
+}
+
+
+os_error * event_close(wimp_w handle)
+{
+  Wind_Link *wlink;
+
+  if ((wlink = findwindlink(handle)) == NULL) return(wimp_close_wind(handle));
+  /* backlink = previous entry */
+
+  switch(wlink->type)
+  {
+    case W_FONTINDEX:
+         if (dboxquery("Do you really want to discard this font?")==1) er(deletefont(wlink->info));
+         break;
+
+    case W_SKELETON:
+    case W_FULL:
+         er(suspendpathdata(wlink->info));      /* try to save memory */
+         /* drop through */
+
+    default:
+         deletewindlink(backlink,wlink);        /* backlink set up in findwindlink() */
+  }
+  return(NULL);
+}
+
+
+/* ---- Template loading routines ----------------------------------------- */
+
+
+#define workareasize 1024
+
+static char workarea[workareasize];
+static char * freeptr = workarea;
+static char * endptr  = workarea + workareasize;
+
+
+os_error * loadtemp(name,buffer)
+char *name;
+wimp_wind *buffer;
+{
+  union { int i[3]; char c[12]; } match;   /* ensure this is word-aligned! */
+  wimp_template tblk;
+
+  strcpy(match.c,name);
+
+  tblk.buf       = buffer;
+  tblk.work_free = freeptr;
+  tblk.work_end  = endptr;
+  tblk.font      = NULL;
+  tblk.name      = match.c;
+  tblk.index     = 0;
+
+  er(wimp_load_template(&tblk));
+
+  if (tblk.index == 0) returnerr("Template not found");
+  freeptr = tblk.work_free;
+  return(NULL);
+}
+
+
+void aborttemp(e)
+os_error *e;
+{
+  wimp_close_template();
+  errorexit(e);
+}
+

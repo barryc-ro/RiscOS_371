@@ -1,0 +1,2000 @@
+REM > !RunImage
+REM Version and date are in Messages file, please update in there.
+REM Formatter for ST506 and IDE hard discs
+REM for SCSI hard discs, see SCSI user guide
+
+REM To provide internal consistency, all disc addresses are
+REM represented as sector numbers - in a similar way to the
+REM FileCore changes.  For backwards compatability, we can
+REM convert the disc address at the last instant to be a
+REM sector address.
+
+REM default closing status indicates a panic
+*set HForm$EndStatus 1
+Log2ShareSize%=0:REM Unit of sharing
+ShareSize%=1<<Log2ShareSize%:REM Sharing multiple
+dev%=FALSE
+Verbose%=dev%
+REM Pointer into RMA, so set to zero up front for robustness on errors.
+REM Also flag so we can default to English if Messages file fails.
+msgs_file_desc%=0
+msgs_file_open%=FALSE
+ON ERROR PROCabort(REPORT$, 1)
+VDU 26 : VDU 12
+PROCInit:REM Opens the message file as its first action.
+PROCGetShape
+IF NOT BigADFS% THEN
+    REM Check that disc not too big
+    IF (DiscSize2%<>0 OR (DiscSize% AND &E0000000)<>0) THEN
+        PROCmessage_print_0("DiscSizeError")
+        PROCfinish
+    ENDIF
+ENDIF
+FormatFlag%=(FNChoose("Q01:","FormatOrInitChoose","FI","")="F")
+SoakStyle$=FNChoose("Q02:","SoakTestChoose","LSN", "")
+BootOpt$=FNChoose("BootOpt:","BootOptChoose","YN", "")
+IF FNchoose_no_lookup("Q03:",FNmessage_lookup_1("SureChoose", STR$(Drive%)),"YN", "")="N" PROCfinish
+
+PROCDisableEscape
+PROCMoanOp(Specify%,0,0,0)
+IF FormatFlag% THEN
+ PROCFormat
+ENDIF
+IF SoakStyle$<>"N" THEN
+ SoakFlag%=(SoakStyle$="L")
+ PROCVerify
+ENDIF
+PRINT
+PROCStructure
+PROCRestoreEscape
+
+REM *RMREINIT ADFS
+OSCLI("-ADFS-%MOUNT :"+STR$Drive%)
+OSCLI("-ADFS-%FREE :"+STR$Drive%)
+OSCLI("-ADFS-%DISMOUNT :"+STR$Drive%)
+
+REM All OK - return a successful status
+*set HForm$EndStatus 0
+PROCexit
+:
+
+DEF PROCInit
+LOCAL DriveOffset%
+PROCopen_message_file("<HForm$Dir>.Messages")
+PROCmessage_print_0("Banner")
+
+autoreply$=FNreadvarval("Hform$Autoreply")
+
+SYS"XOS_Module",18,"ADFS" TO ,,,A%;F%
+IF F%AND1 PROCmessage_print_0("NoADFS"):PROCfinish
+A%+=A%!20
+WHILE (?A%<>32) AND (?A%<>9) AND (?A%<>0):A%+=1:ENDWHILE
+IF ?A%=0 PROCfinish
+WHILE (?A%<ASC"0") OR (?A%>ASC"9"):A%+=1:ENDWHILE
+ADFSVersion%=((?A%-ASC"0")*10+(A%?2)-ASC"0")*10+(A%?3)-ASC"0"
+SYS"ADFS_Drives" TO ,,HDiscs%
+IF HDiscs%<1 PROCmessage_print_0("NoHardDiscs"):PROCfinish
+
+REM Find out what we're really dealing with here
+
+BigADFS%=FNBigADFS
+
+DriveOffset%=INSTR(autoreply$,"Drive=")
+IF (DriveOffset%<>0) THEN
+    Drive%=VAL(MID$(autoreply$,DriveOffset%+6))
+ELSE
+    REPEAT
+         Drive%=FNAsk("DriveAsk",4,4)
+    UNTIL Drive%>=4 AND Drive%<=7
+ENDIF
+
+IF (Drive%-3)>HDiscs% THEN
+ PROCmessage_print_1("SillyDiscNum", STR$(HDiscs%))
+ PROCfinish
+ENDIF
+IF ADFSVersion% < 210 THEN
+ IDE%=FALSE
+ELSE
+ SYS"ADFS_ControllerType",Drive% TO DriveType%
+ IF DriveType%=0 THEN
+  PROCmessage_print_1("DriveNotPresent", STR$(Drive%))
+  PROCfinish
+ ELSE
+  IF DriveType%=3 PROCmessage_print_1("DriveIsST506", STR$(Drive%))
+  IF DriveType%=4 PROCmessage_print_1("DriveIsIDE", STR$(Drive%))
+ ENDIF
+ IDE%=DriveType%=4
+ENDIF
+IF IDE% THEN
+ REM Determine whether this is IDE drive 0/1
+ SYS"XADFS_ControllerType",Drive%-1 TO A%;F%
+ IF ((F%AND1)=0) AND (A%=4) THEN IDEdrive%=1 ELSE IDEdrive%=0
+ DIM IDEid% 512
+ DIM IDEpb% 7
+ IDEpb%!0=0
+ IDEpb%!4=0
+ IDEpb%?5=&A0+(IDEdrive%<<4)
+ IDEpb%?6=&EC
+ SYS"ADFS_IDEUserOp",1<<24,,IDEpb%,IDEid%,512 TO r0%,,,,r4%
+ IF r0%<>0 OR r4%<>0 THEN
+  PROCmessage_print_1("DiscIdError", STR$~(r0%))
+  IDEcyls%=0:IDEheads%=0:IDEsecs%=0
+ ELSE
+  IDEcyls%=(IDEid%!2)AND&FFFF
+  IDEheads%=(IDEid%!6)AND&FFFF
+  IDEsecs%=(IDEid%!12)AND&FFFF
+  IDECapacity%=IDEcyls%*IDEheads%*IDEsecs%
+  IDEAddressSpace%=(IDEid%!(60*2))
+  IDEname$=""
+  IF (((IDEid%!98)>>9)AND1)<>0 THEN IDEHasLBA%=1 ELSE IDEHasLBA%=0
+  FOR I%=27*2 TO 46*2 STEP 2
+   A%=(IDEid%?(I%+1)) : B%=(IDEid%?I%)
+   IF (A%<32) OR (A%>=127) A%=ASC"."
+   IDEname$+=CHR$(A%)
+   IF (B%<32) OR (B%>=127) B%=ASC"."
+   IDEname$+=CHR$(B%)
+  NEXT
+  IDEfirm$=""
+  FOR I%=23*2 TO 26*2 STEP 2
+   A%=(IDEid%?(I%+1)) : B%=(IDEid%?I%)
+   IF (A%<32) OR (A%>=127) A%=ASC"."
+   IDEfirm$+=CHR$(A%)
+   IF (B%<32) OR (B%>=127) B%=ASC"."
+   IDEfirm$+=CHR$(B%)
+  NEXT
+  PROCmessage_print_3("IDEDescription", STR$(Drive%), IDEname$, IDEfirm$)
+  PROCmessage_print_3("IDEConfiguration", STR$(IDEcyls%), STR$(IDEheads%), STR$(IDEsecs%))
+  IF IDEHasLBA%<>0 THEN
+    PROCmessage_print_0("IDEHasLBA")
+  ENDIF
+ ENDIF
+ENDIF
+MakeParams%=7
+VerifyRetries%=1
+DefectRetries%=5
+Verify%=0
+Read%=1
+Write%=2
+WriteTrack%=4
+Restore%=6
+Specify%=&F
+AltDefectBit%=&10
+DiscStruc%=&14
+
+IF IDE% THEN
+ Log2SecSize%=9
+ LowSector%=1
+ELSE
+ Log2SecSize%=8
+ LowSector%=0
+ENDIF
+SecSize%=2^Log2SecSize%
+
+OldMapAdd%=0
+OldMapSize%=&200
+DirSize%=&800
+
+BootAdd%=&C00/SecSize%
+BootSize%=&200
+
+REM space for defects is a bootblock size (512), 
+REM less 64 bytes for disc record, reserved bytes and checksum, 
+REM less 16 bytes for hardware-specific parameters,
+REM less 4  bytes for a end-of-space fencepost (used by *defect)
+REM less 80 bytes for later defects to be added
+REM less 4  bytes for a terminator.
+
+MaxDefects%=(BootSize%-64-&10-4-4)DIV4
+
+REM If the disc is >512M bytes then we have an extra word
+REM required for a terminator.  Hence we have 4 bytes less
+REM for the defect list.  ie one less defect allowed
+
+BigMaxDefects%=MaxDefects%-1
+
+EndDefect%=1 << 29
+
+REM EndDefect2% gives the terminator word for a second
+REM defect list.
+
+EndDefect2%=1<<30
+
+OldLWM%=&E00
+FreeLink%=1
+CrossCheck%=3
+
+IF BigADFS% THEN
+    AdfsSwi%=&4024D: REM ADFS_SectorDiscOp
+ELSE
+    AdfsSwi%=&40240: REM ADFS_DiscOp
+ENDIF
+
+AdfsDiscErr%=&108C7
+MaxVerifyBad%=16
+Patterns%=8
+DIM Buf% &40000, DiscRec% 64+BootSize%, Defect% BootSize%, DirMark% 5, Bad%(MaxVerifyBad%),mc% 100, Pattern%(Patterns%-1)
+Boot%=DiscRec%+64
+BootRec%=Boot%+BootSize%-64
+REM
+REM DiscRec +---------+ 0
+REM         |         |
+REM Boot    +---------+ &40
+REM         |         |
+REM         |         |
+REM         |         |
+REM BootRec +---------+ &200
+REM         |         |
+REM         +---------+ &240
+REM
+Pattern%(2)=&FFFFFF
+Pattern%(3)=&6DB6DB
+Pattern%(4)=0
+Pattern%(5)=&2CB2CB
+Pattern%(6)=&5A5A5A
+Pattern%(7)=&4D34D3
+SecsPerTrk%=32:Heads%=1:Cyls%=1:ParkCyl%=1
+IF IDE% THEN
+ InitFlag%=0
+ LBAflag%=0
+ELSE
+ LowCurrentCyl%=1:PreCompCyl%=1
+ENDIF
+
+IF BigADFS%
+   RootDirAdd%=&400/512
+ELSE
+   RootDirAdd%=&400
+ENDIF
+
+Log2Alloc%=10:LinkBits%=10
+PROCShareSize
+IndRootDirAdd%=RootDirAdd%
+
+REM Having SectorsPerDisc% makes various calculations for
+REM DiscSize% and DiscSize2% much easier.
+
+IF IDEHasLBA% THEN
+   SectorsPerDisc%=IDEAddressSpace%
+ELSE
+   SectorsPerDisc%=IDECapacity%
+ENDIF
+DiscSize%=(SectorsPerDisc% AND ((1<<(32-Log2SecSize%))-1))<<Log2SecSize%
+DiscSize2%=(SectorsPerDisc%>>(32-Log2SecSize%))
+
+IF ((DiscSize% AND &E0000000)<>0) OR (DiscSize2%<>0) THEN
+    BigDisc%=TRUE
+ELSE
+    BigDisc%=FALSE
+ENDIF
+
+SYS"ADFS_Retries",&ff,0 TO ,,adfs_retries%
+LOCAL ERROR
+ON ERROR LOCAL : ON ERROR OFF : SYS"ADFS_Retries",&ff,adfs_retries% : PROCAsm : ENDPROC
+OSCLI("-ADFS-%DISMOUNT :"+STR$Drive%)
+ON ERROR OFF
+SYS"ADFS_Retries",&ff,adfs_retries%
+PROCAsm
+ENDPROC
+:
+
+
+DEF PROCGetShape
+Formatted% = FALSE
+PROCInitBootDefects
+PROCInitDiscRec
+SYS"ADFS_Retries",&ff,0 TO ,,adfs_retries%
+PROCMoanOp(Restore%,0,0,0)
+PROCOp(Read%,BootAdd%,Boot%,BootSize%)
+SYS"ADFS_Retries",&ff,adfs_retries%
+IF Result%<>0 OR NOT FNGoodDefects THEN
+ PROCmessage_print_0("NoValidFormat")
+ELSE
+ PROCOldShape
+ PROCOp(Verify%,0,0,SecSize%*SecsPerTrk%)
+ IF FNConfirmMake THEN Formatted% = TRUE
+ENDIF
+
+IF NOT Formatted% THEN
+ IF IDE% THEN
+  IF NOT FNCompareMake THEN
+   REM Drive not recognised - offer choice or custom specs.
+   IF INSTR(autoreply$,"NOunknown") PROCabort(FNmessage_lookup_0("UnknownDriveType"),1)
+   PROCAskMake
+  ENDIF
+ ELSE
+  REM ST506 drives don't identify themselves .. ask the user.
+  PROCAskMake
+ ENDIF
+ FOR I%=0 TO BootSize%-4
+  Boot%!I%=0
+ NEXT I%
+ PROCInitBootDefects
+ENDIF
+
+PROCAskShape((NOT Formatted%) AND EnglishMake$="OTHER")
+PROCmessage_print_1("WillFormat", TransMake$)
+PROCprintshape(IDE%)
+PRINT
+ENDPROC
+:
+
+DEF PROCOldShape
+SecsPerTrk%=BootRec%?1
+Heads%=BootRec%?2
+Log2Alloc%=BootRec%?5
+DiscSize%=BootRec%!&10
+DiscSize2%=BootRec%!&24
+
+IF ((DiscSize% AND &E0000000)<>0) OR (DiscSize2%<>0) THEN
+    BigDisc%=TRUE
+ELSE
+    BigDisc%=FALSE
+ENDIF
+
+SectorsPerDisc%=(DiscSize%>>>Log2SecSize%)+(DiscSize2%<<(32-Log2SecSize%))
+
+Cyls%=SectorsPerDisc% DIV (SecsPerTrk%*Heads%)
+IF IDE% THEN
+ InitFlag%=(BootRec%?-5)
+ LBAflag%=(BootRec%?-6)
+ELSE
+ LowCurrentCyl%=(BootRec%!-8) AND &3FF
+ PreCompCyl%=(BootRec%!-6) AND &3FF
+ENDIF
+IF BigDisc% THEN
+    ParkCyl%=(BootRec%!-4)DIV(SecsPerTrk%*Heads%)
+ELSE
+    ParkCyl%=(BootRec%!-4)DIV(SecSize%*SecsPerTrk%*Heads%)
+ENDIF
+PROCInitDiscRec
+ENDPROC
+:
+ 
+DEF PROCAskMake
+PROCrestoreparams(IDE%)
+Makes%=0
+I%=INSTR(autoreply$,"DriveType:")
+IF I%<>0 THEN
+ I%+=LEN("DriveType:")
+ Make%=EVAL(MID$(autoreply$,I%,INSTR(autoreply$,",",I%)-I%))
+ELSE
+ PROCmessage_print_0("DriveDisclaim")
+ REPEAT : REM list all the drive descriptions available
+  READ EnglishMake$, TokenMake$
+  TransMake$=FNmessage_lookup_0(TokenMake$)
+  Makes%+=1
+  PROCmessage_print_2("MakeMenu", RIGHT$(" "+STR$Makes%,2), TransMake$)
+  FOR I%=1 TO MakeParams%
+   READ A$
+  NEXT I%
+ UNTIL EnglishMake$="OTHER"
+ PRINT 
+ Make%=FNInputDec("ManufacturerDec",1,Makes%)
+ PROCrestoreparams(IDE%)
+ENDIF
+I%=(Make%-1)*(MakeParams%+2)
+WHILE I%>0
+ READ A$
+ I%-=1
+ENDWHILE
+IF IDE% THEN
+ READ EnglishMake$, TokenMake$, SecsPerTrk%, Heads%, Cyls%, InitFlag%, Dummy%, ParkCyl%, LBAflag%
+ELSE
+ READ EnglishMake$, TokenMake$, SecsPerTrk%, Heads%, Cyls%, LowCurrentCyl%, PreCompCyl%, ParkCyl%
+ENDIF
+TransMake$=FNmessage_lookup_0(TokenMake$)
+
+IF IDE% THEN
+ IF (EnglishMake$="OTHER") AND (IDEcyls%<>0) THEN
+  SecsPerTrk%=IDEsecs%
+  Heads%=IDEheads%
+  Cyls%=IDEcyls%
+  InitFlag%=1
+  LBAFlag%=1
+  IF INSTR(autoreply$,"LBA:On")<>0 THEN
+      LBAFlag%=1
+  ELSE
+      IF INSTR(autoreply$,"LBA:Off")<>0 THEN
+          LBAFlag%=0
+      ENDIF
+  ENDIF
+  ParkCyl%=IDEcyls%-1
+ ENDIF
+ENDIF
+ENDPROC
+:
+
+DEF FNConfirmMake
+LOCAL matched%
+PROCrestoreparams(IDE%)
+REPEAT
+READ EnglishMake$, TokenMake$, P1%, P2%, P3%, P4%, P5%, P6%, P7%
+TransMake$=FNmessage_lookup_0(TokenMake$)
+IF EnglishMake$="OTHER" THEN
+ PROCmessage_print_0("NonStandardShape")
+ PROCprintshape(IDE%)
+ PRINT
+ =FNChoose("Q04:","RetainShapeChoose","YN","")="Y"
+ENDIF
+matched%=TRUE
+IF IDE% THEN
+ IF P1%<>SecsPerTrk% OR P2%<>Heads% OR P3%<>Cyls% OR P4%<>InitFlag% OR P6%<>ParkCyl% OR P7%<>LBAflag% ENDIF: matched%=FALSE
+ELSE
+ IF P1%<>SecsPerTrk% OR P2%<>Heads% OR P3%<>Cyls% OR P4%<>LowCurrentCyl% OR P5%<>PreCompCyl% OR P6%<>ParkCyl% ENDIF: matched%=FALSE
+ENDIF
+UNTIL matched%
+
+PROCmessage_print_1("StandardShape", TransMake$)
+PROCprintshape(IDE%)
+PRINT
+=FNChoose("Q05:","UseShapeChoose","YN","")="Y"
+:
+
+DEF PROCprintshape(itype%)
+PROCmessage_print_3("PrintShape", STR$(Cyls%), STR$(Heads%), STR$(SecsPerTrk%))
+IF itype% THEN
+ PROCmessage_print_3("PrintShape3IDE", STR$(ParkCyl%), STR$(InitFlag%), STR$(LBAflag%))
+ELSE
+ PROCmessage_print_3("PrintShape2ST506", STR$(ParkCyl%), STR$(LowCurrentCyl%), STR$(PreCompCyl%))
+ENDIF
+ENDPROC
+:
+
+
+DEF FNCompareMake
+PROCrestorePROD
+REPEAT
+ READ EnglishMake$, TokenMake$, SecsPerTrk%, Heads%, Cyls%, InitFlag%, Dummy%, ParkCyl%, LBAflag%
+ TransMake$=FNmessage_lookup_0(TokenMake$)
+ IF EnglishMake$="OTHER" THEN
+   PROCmessage_print_0("UnknownDriveMake")
+   =FALSE
+ ENDIF
+UNTIL FNmatchstrings(EnglishMake$,IDEname$)
+=FNChoose("Q06:","StandardShapeChoose","YN","")="Y"
+:
+
+
+DEF PROCAskShape(tailored%)
+
+IF IDE% OR (INSTR(autoreply$,"NewMap")<>0) THEN
+ NewMap%=TRUE
+ELSE
+ NewMap%=(FNChoose("OldOrNewMap:", "OldNewMapChoose", "ON", "N")="N")
+ENDIF
+
+IF tailored% THEN
+    SecsPerTrk%=FNAsk("SectorsAsk",SecsPerTrk%,1)
+    IF IDE% THEN
+        REPEAT
+            Heads%=FNAsk("IDEHeadsAsk",Heads%,1)
+            IF Heads%>16 PROCmessage_print_0("IDEHeads16")
+        UNTIL Heads%<=16
+    ELSE
+        Heads%=FNAsk("ST506HeadsAsk",Heads%,1)
+        IF Heads%>8 PROCmessage_print_0("ST506Heads8")
+    ENDIF
+    Cyls%=FNAsk("CylindersAsk",Cyls%,1)
+
+    IF IDE% THEN
+        InitFlag%=FNAsk("InitAsk",InitFlag%,0)
+        IF IDEHasLBA% THEN
+           LBAFlag%=1
+           IF INSTR(autoreply$,"LBA:On")<>0 THEN
+               LBAFlag%=1
+           ELSE
+               IF INSTR(autoreply$,"LBA:Off")<>0 THEN
+                   LBAFlag%=0
+               ELSE
+                   LBAflag%=FNAsk("LBAAsk",LBAflag%,0)
+               ENDIF
+           ENDIF
+        ELSE
+           LBAflag%=0
+        ENDIF
+    ELSE
+        LowCurrentCyl%=FNAsk("LowCylinderAsk",LowCurrentCyl%,0)
+        PreCompCyl%=FNAsk("PrecompCylinderAsk",PreCompCyl%,0)
+    ENDIF
+    ParkCyl%=FNAsk("ParkCylinderAsk",ParkCyl%,0)
+ENDIF
+
+DiscRec%?1=SecsPerTrk%
+DiscRec%?2=Heads%
+
+REM Again, calculations for DiscSize% and DiscSize2%
+SectorsPerDisc%=SecsPerTrk%*Heads%*Cyls%
+IF IDEHasLBA% THEN
+   IF SectorsPerDisc%>IDEAddressSpace% THEN SectorsPerDisc%=IDEAddressSpace%
+ELSE
+   IF SectorsPerDisc%>IDECapacity% THEN SectorsPerDisc%=IDECapacity%
+ENDIF
+
+DiscSize%=(SectorsPerDisc% AND ((1<<(32-Log2SecSize%))-1))<<Log2SecSize%
+DiscSize2%=(SectorsPerDisc%>>(32-Log2SecSize%))
+
+IF ((DiscSize% AND &E0000000)<>0) OR (DiscSize2%<>0) THEN
+    BigDisc%=TRUE
+ELSE
+    BigDisc%=FALSE
+ENDIF
+
+DiscRec%!&10=DiscSize%
+DiscRec%!&24=DiscSize2%
+DiscRec%?&28=Log2ShareSize%
+
+REM If disc is large then flag this fact in disc record.
+IF ((DiscSize% AND &E0000000)<>0 OR (DiscSize2%<>0)) THEN 
+    DiscRec%?&29=1
+ELSE
+    DiscRec%?&29=0
+ENDIF
+
+FOR I%=0 TO BootSize%-4 STEP 4
+ Defect%!I%=Boot%!I%
+NEXT I%
+Boot%!0=EndDefect%
+REPEAT
+    ptr%=0
+    defectlist%=0
+    IF BigDisc% THEN
+        IF Defect%!ptr%>=EndDefect% THEN
+            IF Defect%!(ptr%+4)<EndDefect2% PROCmessage_print_0("CurrentDefects")
+        ELSE
+            PROCmessage_print_0("CurrentDefects")
+        ENDIF
+    ELSE
+        IF Defect%!(ptr%)<EndDefect% PROCmessage_print_0("CurrentDefects")
+    ENDIF
+    WHILE ((Defect%!ptr%<EndDefect%) AND NOT BigDisc%) OR (Defect%!ptr%<EndDefect2% AND BigDisc%)
+        IF ((Defect%!ptr% AND &E0000000)=EndDefect%) THEN
+            ptr%+=4
+            defectlist%=1
+        ELSE
+            IF defectlist%=0 THEN
+                defect%=Defect%!ptr%
+                defect%=defect% DIV SecSize%
+                sector%=(defect% MOD SecsPerTrk%) + LowSector%
+                defect%=defect% DIV SecsPerTrk%
+                PRINT TAB(((ptr%DIV4)MOD6)*13);"(";defect%DIVHeads%;",";defect%MODHeads%;",";sector%;")";
+                ptr%=ptr%+4
+            ELSE
+                defect%=Defect%!ptr%
+                sector%=(defect% MOD SecsPerTrk%) + LowSector%
+                defect%=defect% DIV SecsPerTrk%
+                PRINT TAB((((ptr%-4)DIV4)MOD6)*13);"(";defect%DIVHeads%;",";defect%MODHeads%;",";sector%;")";
+                ptr%=ptr%+4
+            ENDIF
+        ENDIF
+    ENDWHILE
+    IF BigDisc% THEN
+        Defects%=(ptr%DIV4)-1
+    ELSE
+        Defects%=ptr%DIV4
+    ENDIF
+    IF INSTR(autoreply$,"NOadddefects")=0 THEN
+        PRINT : PRINT
+        PROCmessage_print_0("DefectNoMore")
+        PROCmessage_print_0("DefectAdd")
+        IF NewMap% THEN
+            PROCmessage_print_0("DefectAddDisc")
+        ELSE
+            PROCmessage_print_0("DefectAddLogical")
+        ENDIF
+        PROCmessage_print_0("DefectRemove")
+    ENDIF
+    opt$=FNChoose("Q07:","ABCDChoose","ABCD","")
+    PRINT
+    CASE opt$ OF
+        WHEN "B","D":
+            cyl%=FNInputDec("CylinderDec",0,Cyls%-1)
+            head%=FNInputDec("HeadDec",0,Heads%-1)
+            IF IDE% THEN
+                sector%=FNInputDec("SectorDec",1,SecsPerTrk%)
+            ELSE
+                sector%=FNInputDec("IndexMFMDec",1-SecsPerTrk%,&10000)
+                IF sector%>=0 THEN
+                    sector%=sector% DIV 320
+                ELSE
+                    sector%=-sector%
+                ENDIF
+            ENDIF
+            defect%=((cyl%*Heads%+head%)*SecsPerTrk%+(sector%-LowSector%))
+            IF opt$="B" THEN
+                PROCAddPhysDefect(defect%)
+            ELSE
+                PROCRemovePhysDefect(defect%)
+            ENDIF
+        WHEN "C":
+            IF NewMap% THEN
+                PROCAddPhysDefect((FNInputHex2("DiscAddrHex")))
+            ELSE
+                PROCmessage_print_0("DFormatDefect1")
+                PROCmessage_print_0("DFormatDefect2")
+                PROCmessage_print_0("DFormatDefect3")
+                defect%=(FNInputHex("LogicalAddrHex")DIVSecSize%)
+                PROCAddPhysDefect(FNLogToPhys(defect%))
+            ENDIF
+    ENDCASE
+UNTIL LEFT$(opt$,1)="A"
+FOR I%=0 TO DiscStruc%-4 STEP 4
+ BootRec%!I%=DiscRec%!I%
+NEXT I%
+PROCInitHardDesc
+ENDPROC
+:
+DEF PROCFormat
+TIME=0
+LOCAL I%,J%,cyl%,head%
+PROCMoanOp(Specify%,0,0,0)
+PROCMoanOp(Restore%,0,0,0)
+
+PROCmessage_print_0("Formatting")
+IF IDE% THEN
+ FOR I%=0 TO 512-4 STEP 4:Buf%!I%=0:NEXT
+ FOR I%=0 TO SecsPerTrk%-1
+  Buf%?(2*I%+0)=&00  :REM format good
+  Buf%?(2*I%+1)=I%+1 :REM this sector
+ NEXT
+ELSE
+ FOR I%=0 TO 512-4 STEP 4:Buf%!I%=&077F03FF:NEXT
+ENDIF
+FOR cyl%=0 TO Cyls%-1
+ VDU13:PRINTcyl%;
+ FOR head%=0 TO Heads%-1
+  IF cyl%<>0 OR head%<>0 OR NOT Formatted% THEN
+   IF NOT IDE% THEN
+    J%=cyl% OR (head%<<24)
+    FOR I%=0 TO (SecsPerTrk%-1)*4 STEP 4:Buf%!I%=J% OR (I%<<14):NEXT
+   ENDIF
+   REM If its a big ADFS version then we use the big address form
+   PROCOp(WriteTrack%,(cyl%*Heads%+head%)*SecsPerTrk%,Buf%,512)
+   IF Result% PROCmessage_print_0("FormatError")
+  ENDIF
+ NEXT
+NEXT
+ENDPROC
+:
+DEF PROCVerify
+IF SoakFlag% PROCmessage_print_0("SoakPrompt")
+LOCAL add%,ptr%,sector%,head%,cyl%,defectlist%
+Cycle%=1:ErrorCycle%=-100
+CylSize%=SecsPerTrk%*Heads%
+suspects%=0:MaxSuspects%=1000
+DIM CylBuf% CylSize%+4, SusAdd%(MaxSuspects%), SusCount% MaxSuspects%
+VDU 13 : PROCmessage_print_0("Verifying")
+REPEAT
+    IF Cycle%>1 THEN
+        I%=Cycle% MOD Patterns%
+        IF I%>1 THEN
+            J%=Pattern%(I%)
+            J%=(J%>>>1) OR ((J% AND 1)<<23)
+            Pattern%(I%)=J%
+        ELSE
+            J%=RND(&1000000)-1
+        ENDIF
+        IF NOT SoakFlag% THEN 
+            VDU 13
+            PROCmessage_print_1("Pattern", STR$~(J%))
+        ENDIF
+        FOR I%=CylBuf% TO CylBuf%+CylSize% STEP 3:!I%=J%:NEXT
+        ptr%=0
+        defectlist%=0
+        IF BigADFS% THEN
+            IF Formatted% add%=SecsPerTrk% ELSE add%=0
+        ELSE
+            IF Formatted% add%=SecSize%*SecsPerTrk% ELSE add%=0
+        ENDIF
+        REPEAT
+            IF Defect%!ptr%>EndDefect% AND Defect%!ptr%<EndDefect2% AND BigADFS% AND BigDisc% AND defectlist%=0 THEN
+                ptr%+=4
+                defectlist%=1
+            ENDIF
+            
+            CylEnd%=add% - (add% MOD CylSize%) + CylSize%
+            
+            IF (defectlist%=1) THEN
+                REM Second defect list, no need to adjust
+                defect%=Defect%!ptr%
+            ELSE
+                REM First defect list, have to adjust
+                defect%=(Defect%!ptr%) DIV SecSize%
+            ENDIF
+            
+            IF defect%>CylEnd% OR defect%<add% THEN
+             length%=(CylEnd%-add%)*SecSize%
+            ELSE
+             length%=(defect%-add%)*SecSize%
+            ENDIF
+            
+            PROCOp(Write%,add%,0,length%)
+         
+            IF Result% THEN
+                 IF BigADFS% THEN
+                     add%=(ErrDiscAdd% AND &1FFFFFFF)+1
+                 ELSE
+                     add%=((ErrDiscAdd% AND &1FFFFF00) DIV SecSize%)+1
+                 ENDIF
+            ELSE
+                 add%+=length%
+            ENDIF
+            IF add%=defect% THEN add%+=1:ptr%+=4
+        UNTIL add%>=SectorsPerDisc%
+    ENDIF
+    IF SoakFlag% PRINT ".";
+    REM should start with add%=SecSize%*SecsPerTrk% since
+    REM cannot not cope with error in track 0, head 0
+    add%=0
+    ptr%=0
+    defectlist%=0
+    PROCMoanOp(Restore%,0,0,0)
+    REPEAT
+     IF defectlist%=0 THEN
+         REPEAT
+             IF (Defect%!ptr% AND &E0000000)<>EndDefect% THEN
+                 IF ((Defect%!ptr%)DIV SecSize%)<add% THEN
+                     ptr%+=4
+                 ENDIF
+             ELSE
+                 IF BigDisc% THEN
+                     defectlist%=1
+                     ptr%+=4
+                 ENDIF
+             ENDIF
+         UNTIL defectlist%=1 OR ((Defect%!ptr%)DIV SecSize%)>=add%
+     ENDIF
+     IF defectlist%=1 THEN
+         WHILE Defect%!ptr%<add%
+             ptr%+=4
+         ENDWHILE
+     ENDIF
+     IF defectlist%=0 THEN
+         defect%=(Defect%!ptr%) DIV SecSize%
+     ELSE
+         defect%=Defect%!ptr%
+     ENDIF
+     
+     IF defect%>SectorsPerDisc% THEN
+      length%=SectorsPerDisc%-add%
+     ELSE
+      length%=defect%-add%
+     ENDIF
+     
+     PROCOp(Verify%,add%,0,length%*SecSize%)
+     
+     IF Result% THEN
+      IF BigADFS% THEN
+          add%=ErrDiscAdd% AND &1FFFFFFF
+      ELSE
+          add%=(ErrDiscAdd% AND &1FFFFF00) DIV SecSize%
+      ENDIF
+      Try%=0
+      REPEAT
+       Try%+=1
+       PROCMoanOp(Restore%,0,0,0)
+       PROCOp(Verify%,add%,0,SecSize%)
+   REM **   PROCOp(Verify%,add%,0,SecSize%,&100)
+      UNTIL Result%=0 OR Try%=5
+      IF Result% Try%+=1
+      sector%=add%:REM DIV SecSize%
+      head%=sector% DIV SecsPerTrk%
+      sector%=sector% MOD SecsPerTrk%
+      cyl%=head% DIV Heads%
+      head%=head% MOD Heads%
+      PROCmessage_print_3("VerifyData", STR$(cyl%), STR$(head%), STR$(sector%+LowSector%))
+      sus%=0
+      WHILE sus%<suspects% AND SusAdd%(sus%)<>add%:sus%+=1:ENDWHILE
+      IF sus%=suspects% THEN
+       IF suspects%=MaxSuspects% THEN
+        sus%=RND(MaxSuspects%)-1
+       ELSE
+        suspects%+=1
+       ENDIF
+       SusAdd%(sus%)=add%
+       SusCount%?sus%=0
+      ENDIF
+      score%=2^(Try%-1)-1
+      IF NOT SoakFlag% score%=score%*4
+      SusCount%?sus%+=score%
+      IF (SusCount%?sus%>30) OR dev% THEN
+       IF SoakFlag% THEN
+        PROCmessage_print_1("DefectTIME", TIME$)
+       ELSE
+        PROCmessage_print_0("Defect")
+       ENDIF
+       PROCAddPhysDefect(add%)
+       ErrorCycle%=Cycle%
+      ELSE
+       IF SoakFlag% THEN
+        TIME=0:REPEAT UNTIL TIME>500:VDU 13:PRINTSPC(78);:VDU13
+       ELSE
+        PROCmessage_print_1("Retries", STR$(Try%))
+       ENDIF
+      ENDIF
+      add%=add%+1
+     ELSE
+      add%=add%+length%+1
+     ENDIF
+     IF add%>defect% THEN
+      ptr%+=4
+     ENDIF
+    UNTIL add%>=SectorsPerDisc%
+    IF SoakFlag% THEN
+     REPEAT
+      Key%=INKEY(0)
+     UNTIL Key%=-1 OR Key%=32
+     done%=(Key%=32)
+    ELSE
+     done%=Cycle%>ErrorCycle%+2
+    ENDIF
+    Cycle%+=1
+    IF SoakFlag% VDU &2E
+UNTIL done%
+ENDPROC
+:
+
+DEF PROCStructure
+IF NewMap% THEN
+ PROCNewStructure
+ELSE
+ PROCOldStructure
+ENDIF
+ENDPROC
+:
+
+DEF PROCOldStructure
+PROCWriteDefectList
+PROCWriteOldFsMap
+PROCWriteRootDir
+ENDPROC
+:
+
+DEF FNRoundUpShare(Secs%)
+IF Log2ShareSize%=0 THEN =Secs%
+=((Secs%+ShareSize%-1)DIVShareSize%)*ShareSize%
+
+REM Calculate the number of map bits required
+
+DEF FNMapBits(Secs%,Lg%,Lg2SecSize%)
+    LOCAL Shift%
+    Shift%=Lg2SecSize%-Lg%
+    IF (Shift%>0) THEN
+        =Secs%<<Shift%
+    ELSE
+        =Secs%>>(-Shift%)
+    ENDIF
+
+DEF FNRoundSectors(Bits%,Lg%,Lg2SecSize%)
+    LOCAL Shift%
+    Shift%=Lg2SecSize%-Lg%
+    IF (Shift%>0) THEN
+        =Bits%>>(Shift%)
+    ELSE
+        =Bits%<<(-Shift%)
+    ENDIF
+
+DEF FNdoalloc(Verbose%)
+ Log2Alloc%=Log%
+ PROCShareSize
+ MapBits%=FNMapBits(SectorsPerDisc%,Log2Alloc%,Log2SecSize%)
+ RoundSectors%=FNRoundSectors(MapBits%,Log2Alloc%,Log2SecSize%)
+ BestZones%=1 << 30      :REM init to rogue values
+ BestCylOff%=1 << 30
+ FOR DummySpare%=1 TO 1
+ FOR SpareBits% = 4*8 TO ZoneBits%-Zone0Bits%-8*8
+  PROCCalcZones
+  LinkBits%=10
+  REPEAT LinkBits%+=1
+   PROCCalcIds
+  UNTIL Ids%<=2^LinkBits% AND LinkBits%>=(Log2SecSize%+3)
+  IF SpareBits%-4*8>0 AND SpareBits%-4*8<=LinkBits% NEXT SpareBits%
+  IF OddBits%>0 AND OddBits%<=LinkBits% NEXT SpareBits%
+  IF LinkBits%>15 OR Zones%>127 THEN
+   IF Verbose% THEN PROCmessage_print_0("TooSmallAlloc")
+   Log2Alloc%+=1
+   NEXT DummySpare%
+   =FALSE  :REM restart alloc size loop
+  ENDIF
+  IF Zones% <= BestZones% THEN
+   Crucial%=FNRoundUpShare(Zones%*2)*SecSize%+DirSize%
+   IF MapZone%=0 Crucial%=BootAdd%*SecSize%+BootSize%
+   IF Crucial%<Alloc%*(LinkBits%+1) Crucial%=Alloc%*(LinkBits%+1)
+   CrucialEnd%=MapAdd%+Crucial%/SecSize%
+   defectlist%=0:REM We're in the first defect list
+   DefPtr%=Defect%
+   REPEAT
+    defect%=!DefPtr%
+    DefPtr%+=4
+    IF defect%>=EndDefect% AND defectlist%=0 AND BigDisc% THEN
+        defect%=!DefPtr%
+        DefPtr%+=4
+        defectlist%=1
+    ENDIF
+    IF defectlist%=0 AND defect%<EndDefect% THEN defect%=defect%/SecSize%
+   UNTIL defect%>=EndDefect% OR (defect%>=MapAdd% AND defect%<CrucialEnd%)
+   CylOff%=MapAdd% MOD (SecsPerTrk%*Heads%)
+   IF defect%>=EndDefect% AND CylOff%<BestCylOff% THEN
+    BestCylOff%=CylOff%
+    BestLinkBits%=LinkBits%
+    BestSpare%=SpareBits%
+    BestZones%=Zones%
+   ENDIF
+   IF BestCylOff% NEXT SpareBits%
+   NEXT DummySpare%
+  ELSE
+   NEXT DummySpare%
+  ENDIF
+IF BestZones%=(1<<30) AND Verbose%=TRUE THEN PROCmessage_print_0("InvalidAllocSize"):=FALSE
+=TRUE
+
+DEF PROCNewStructure
+Zone0Bits%=60*8
+ZoneBits%=SecSize%*8
+Log2Alloc%=9: REM requested by TCs ECR
+PROCShareSize
+IF Log2Alloc%<8 THEN Log2Alloc%=10:PROCShareSize
+
+REM * check for sensible default
+Alloc%=2^Log2Alloc%:Log%=Log2Alloc%
+WHILE FNdoalloc(FALSE)=FALSE
+  Alloc%=2^Log2Alloc%:Log%=Log2Alloc%
+ENDWHILE
+
+PRINT
+REPEAT: REM allocation size loop
+ Alloc%=FNAsk("AllocUnitAsk",2^Log2Alloc%,256)
+ Log%=7
+ REPEAT
+  Log%+=1
+ UNTIL Alloc%=2^Log%:REM OR Log%=13
+ REMIF Log%=13 UNTIL FALSE:REM restart alloc size loop
+UNTIL FNdoalloc(TRUE)
+
+PRINT
+LinkBits%=BestLinkBits%
+SpareBits%=BestSpare%
+PROCCalcZones
+PROCCalcIds
+Crucial%=FNRoundUpShare(Zones%*2)*SecSize%+DirSize%
+IF MapZone%=0 Crucial%=BootAdd%*SecSize%+BootSize%
+IF Crucial%<Alloc%*(LinkBits%+1) Crucial%=Alloc%*(LinkBits%+1)
+IF Crucial% MOD Alloc%<>0 Crucial%+=Alloc%-Crucial% MOD Alloc%
+IF MapZone%=0 THEN
+ RootDirAdd%=BootAdd%+BootSize%/SecSize%
+ IndRootDirAdd%=&200 + (BootAdd%*SecSize%+BootSize%) DIV SecSize% + 1
+ELSE
+ RootDirAdd%=MapAdd%+FNRoundUpShare((MapLen%*2)/SecSize%)
+ IndRootDirAdd%=&200+FNRoundUpShare(Zones%*2)/ShareSize%+1
+ENDIF
+DiscRec%?4=LinkBits%
+DiscRec%?5=Log2Alloc%
+IF BootOpt$="Y" THEN DiscRec%!7=2 ELSE DiscRec%!7=0
+DiscRec%?8=LowSector%
+DiscRec%?9=Zones%
+DiscRec%?&A=SpareBits% MOD 256
+DiscRec%?&B=SpareBits% DIV 256
+DiscRec%!&C=IndRootDirAdd%
+DiscRec%?&28=Log2ShareSize%
+BootRec%!4=DiscRec%!4
+BootRec%!8=DiscRec%!8
+BootRec%!&C=DiscRec%!&C
+BootRec%!&24=DiscRec%!&24
+BootRec%!&28=DiscRec%!&28
+FOR I%=0 TO Zones%*SecSize%-4 STEP 4
+ Buf%!I%=0
+NEXT I%
+FOR I%=0 TO 60-4 STEP 4
+ Buf%!(I%+4)=DiscRec%!I%
+NEXT I%
+PROCWriteDefectList
+PROCmessage_print_0("CreatingMap")
+ptr%=0
+DefectStart%=0
+defectlist%=0
+DiscEndBit%=FNDiscToMap(SectorsPerDisc%)
+ZoneStart%=Buf%
+ZoneStartBit%=0
+BootStartBit%=0
+BootEndBit%=0
+MapStartBit%=0
+MapEndBit%=0
+FOR zone%=0 TO Zones%-1
+ !ZoneStart%=1<<(15+FreeLink%*8)
+ ZoneEndBit%=ZoneStartBit%+ZoneBits%
+ UsedZoneEndBit%=ZoneEndBit%-SpareBits%+4*8
+ IF UsedZoneEndBit%>DiscEndBit% THEN
+  UsedZoneEndBit%=DiscEndBit%
+ ENDIF
+ PreFree%=ZoneStartBit%+FreeLink%*8
+ ZoneBit%=ZoneStartBit%+4*8
+ IF zone%=0 THEN
+  BootStartBit%=ZoneBit%
+  ZoneBit%=ZoneBit%+Zone0Bits%
+  length%=(BootAdd%*SecSize%+BootSize%) DIV Alloc%
+  IF length%<LinkBits%+1 length%=LinkBits%+1
+  PROCWriteLink(ZoneBit%,2)
+  PROCWriteLength(ZoneBit%,length%)
+  ZoneBit%=ZoneBit%+length%
+  BootEndBit%=ZoneBit%
+ ELSE
+  IF zone%=MapZone% THEN
+   MapStartBit%=ZoneBit%
+   length%=Crucial% DIV Alloc%
+   PROCWriteLink(ZoneBit%,2)
+   PROCWriteLength(ZoneBit%,length%)
+   ZoneBit%=ZoneBit%+length%
+   MapEndBit%=ZoneBit%
+  ENDIF
+ ENDIF
+ REPEAT
+  REM All defects that do not fit are removed here
+  IF ZoneBit%>DefectStart% THEN
+   IF defectlist%=0 THEN
+       IF Defect%!ptr%>=EndDefect% AND BigDisc% THEN
+           ptr%+=4
+           defectlist%=1
+           DefectStart%=FNDiscToMap(Defect%!ptr%)
+       ELSE
+           DefectStart%=FNDiscToMap((Defect%!ptr%)/SecSize%)
+       ENDIF
+   ELSE
+       DefectStart%=FNDiscToMap(Defect%!ptr%)
+   ENDIF
+   WHILE ((zone%=0 AND (DefectStart%>=BootStartBit% AND DefectStart%<BootEndBit%))) OR ((zone%=MapZone% AND (DefectStart%>=MapStartBit% AND DefectStart%<MapEndBit%)))
+       IF defectlist%=0 THEN
+           defectaddr$=FNhexaddr((Defect%!ptr%)/SecSize%)
+       ELSE
+           defectaddr$=FNhexaddr(Defect%!ptr%)
+       ENDIF
+       IF zone%=0 THEN
+           PROCmessage_print_1("BootDefectError",defectaddr$)
+       ELSE
+           PROCmessage_print_1("MapDefectError",defectaddr$)
+       ENDIF
+       ptr%+=4
+       IF defectlist%=0 THEN
+           IF Defect%!ptr%>=EndDefect% THEN
+               ptr%+=4
+               defectlist%=1
+               DefectStart%=FNDiscToMap(Defect%!ptr%)
+           ELSE
+               DefectStart%=FNDiscToMap((Defect%!ptr%)/SecSize%)
+           ENDIF
+       ELSE
+           DefectStart%=FNDiscToMap(Defect%!ptr%)
+       ENDIF
+   ENDWHILE
+   IF DefectStart%>=UsedZoneEndBit% THEN
+    DefectStart%=ZoneEndBit%
+   ELSE
+    DefectEnd%=DefectStart%+1
+    ptr%+=4
+    REPEAT
+     done1%=TRUE
+     REPEAT
+      done2%=TRUE
+      IF defectlist%=1 THEN
+         IF Defect%!ptr%>=EndDefect% THEN
+            NextDefect%=EndDefect%
+         ELSE
+            NextDefect%=FNDiscToMap(Defect%!ptr%)
+         ENDIF
+      ELSE
+          IF Defect%!ptr%>=EndDefect% THEN ptr%+=4:defectlist%=1
+          IF defectlist%=1 THEN
+            IF Defect%!ptr%>=EndDefect% THEN
+               NextDefect%=EndDefect%
+            ELSE
+               NextDefect%=FNDiscToMap(Defect%!ptr%)
+            ENDIF
+          ELSE
+            NextDefect%=FNDiscToMap((Defect%!ptr%)/SecSize%)
+          ENDIF
+      ENDIF
+      IF NextDefect%<UsedZoneEndBit% THEN
+       IF NextDefect%>ZoneEndBit%-(LinkBits%+1) THEN
+        NextDef%=ZoneEndBit%-(LinkBits%+1)
+       ELSE
+        NextDef%=NextDefect%
+       ENDIF
+       IF NextDef%-DefectEnd%<LinkBits%+1 THEN
+        IF NextDefect%+1>DefectEnd% THEN
+         DefectEnd%=NextDefect%+1
+        ENDIF
+        ptr%+=4
+        done2%=FALSE
+       ENDIF
+      ENDIF
+     UNTIL done2%
+     IF DefectEnd%-DefectStart%<LinkBits%+1 THEN
+      DefectEnd%=DefectStart%+LinkBits%+1
+      IF DefectEnd%>ZoneEndBit% THEN
+       DefectEnd%=ZoneEndBit%
+      ENDIF
+      done1%=FALSE
+     ENDIF
+     IF DefectEnd%>ZoneEndBit%-(LinkBits%+1) AND DefectEnd%<>ZoneEndBit% THEN
+      DefectEnd%=ZoneEndBit%
+      done1%=FALSE
+     ENDIF
+     IF DefectEnd%-DefectStart%<LinkBits%+1 THEN
+      DefectStart%=DefectEnd%-(LinkBits%+1)
+     ENDIF
+    UNTIL done1%
+   ENDIF
+  ENDIF
+  IF ZoneBit%>DefectStart% PROCmessage_print_0("ERROR1"):PROCfinish
+  IF DefectStart%-ZoneBit% <= LinkBits% THEN DefectStart%=ZoneBit%
+  IF DefectStart%>ZoneBit% THEN
+   PROCWriteLink(PreFree%,ZoneBit%-PreFree%)
+   IF DefectStart%>=UsedZoneEndBit% THEN
+    PROCWriteLength(ZoneBit%,UsedZoneEndBit%-ZoneBit%)
+    IF ZoneEndBit%>UsedZoneEndBit% THEN
+     PROCWriteLink(UsedZoneEndBit%,1)
+     PROCWriteLength(UsedZoneEndBit%,ZoneEndBit%-UsedZoneEndBit%)
+    ENDIF
+   ELSE
+    PROCWriteLength(ZoneBit%,DefectStart%-ZoneBit%)
+   ENDIF
+  PreFree%=ZoneBit%
+  ENDIF
+  IF DefectStart%<ZoneEndBit% THEN
+   IF DefectEnd%>UsedZoneEndBit%-(LinkBits%+1) THEN
+    DefectEnd%=ZoneEndBit%
+   ENDIF
+   PROCWriteLink(DefectStart%,1)
+   PROCWriteLength(DefectStart%,DefectEnd%-DefectStart%)
+   ZoneBit%=DefectEnd%
+  ELSE
+   ZoneBit%=ZoneEndBit%
+  ENDIF
+ UNTIL ZoneBit%=ZoneEndBit%
+ PROCWriteLink(PreFree%,0)
+ IF zone%=0 THEN
+  ZoneStart%?CrossCheck%=&FF
+ ELSE
+  ZoneStart%?CrossCheck%=0
+ ENDIF
+ ?ZoneStart%=FNNewMapCheck(ZoneStart%,SecSize%)
+ ZoneStart%=ZoneStart%+SecSize%
+ ZoneStartBit%=ZoneEndBit%
+NEXT zone%
+PROCmessage_print_0("WritingMap")
+PROCMoanOp(Write%,MapAdd%,Buf%,MapLen%)
+PROCMoanOp(Write%,MapAdd%+MapLen%/SecSize%,Buf%,MapLen%)
+PROCWriteRootDir
+ENDPROC
+:
+DEF PROCCalcZones
+UsedBits%=SecSize%*8-SpareBits%
+WholeZones%=(MapBits%+Zone0Bits%) DIV UsedBits%
+OddBits%=(MapBits%+Zone0Bits%) MOD UsedBits%
+IF OddBits% Zones%=WholeZones%+1 ELSE Zones%=WholeZones%
+MapZone%=Zones% DIV 2
+IF MapZone%=0 THEN
+     MapAdd%=0
+ELSE
+     IF (Alloc%>SecSize%) THEN
+         MapAdd%=(UsedBits%*MapZone%-Zone0Bits%)*(Alloc% DIV SecSize%)
+     ELSE
+         MapAdd%=(UsedBits%*MapZone%-Zone0Bits%) DIV (SecSize% DIV Alloc%)
+     ENDIF
+ENDIF
+MapLen%=Zones%*SecSize%
+ENDPROC
+:
+DEF PROCCalcIds
+IdsPerZone%=UsedBits% DIV (LinkBits%+1)
+Ids%=IdsPerZone% * WholeZones% + OddBits% DIV (LinkBits%+1)
+ENDPROC
+:
+
+REM discadd% is now a sector address of course
+
+DEF FNDiscToMap(discadd%)
+LOCAL bit%,zone%
+IF (Alloc%>SecSize%)
+    bit%=(discadd% DIV (Alloc% DIV SecSize%))+Zone0Bits%
+ELSE
+    bit%=(discadd% * (SecSize% DIV Alloc%))+Zone0Bits%
+ENDIF
+zone%=bit% DIV UsedBits%
+bit%=bit%+(bit% DIV UsedBits%)*SpareBits%+4*8
+= bit%
+
+:
+DEF PROCWriteLink(off%,link%)
+IF link%>=2^LinkBits% PROCmessage_print_0("ERROR2"):PROCfinish
+LOCAL bit%,add%,mask%
+bit%=off% MOD 8
+add%=Buf%+off% DIV 8
+mask%=2^LinkBits%-1
+!add%=(!add% AND NOT (mask%<<bit%)) OR link%<<bit%
+ENDPROC
+:
+DEF PROCWriteLength(off%,len%)
+IF len%<=LinkBits% PROCmessage_print_0("ERROR3"):PROCfinish
+off%=off%+len%-1
+Buf%?(off%DIV8)+=2^(off%MOD8)
+ENDPROC
+:
+DEF PROCWriteDefectList
+PROCmessage_print_0("WritingDefects")
+ptr%=0
+check%=0
+WHILE Defect%!ptr%<EndDefect%
+ Boot%!ptr%=Defect%!ptr%
+ PROCCheckPut(Boot%!ptr%)
+ ptr%=ptr%+4
+ENDWHILE
+check%=check% EOR (check%>>>16)
+check%=(check% EOR (check%>>>8))AND &FF
+Boot%!ptr%=EndDefect% OR check%
+
+REM If we have a second defect list then do that too
+IF BigDisc% THEN
+    ptr%+=4
+    check%=0
+    WHILE Defect%!ptr%<EndDefect%
+        Boot%!ptr%=Defect%!ptr%
+        PROCCheckPut(Boot%!ptr%)
+        ptr%=ptr%+4
+    ENDWHILE
+    check%=check% EOR (check%>>>16)
+    check%=(check% EOR (check%>>>8))AND &FF
+    Boot%!ptr%=EndDefect2% OR check%
+ENDIF
+
+REM zero out the remainder of the defect list
+WHILE ptr%<(MaxDefects%*4)
+ ptr%=ptr%+4
+ Boot%!ptr%=0
+ENDWHILE
+PROCSum(Boot%,BootSize%)
+PROCMoanOp(Write%,BootAdd%,Boot%,BootSize%)
+ENDPROC
+:
+DEF PROCWriteOldFsMap
+PROCmessage_print_0("WritingFreeSpace")
+LOCAL s%,I%
+s%=OldMapSize% DIV 2
+FOR I%=0 TO OldMapSize%-4 STEP 4:Buf%!I%=0:NEXT
+!Buf%=OldLWM% DIV &100
+Buf%!s%=(DiscSize%-OldLWM%-Defects%*SecSize%) DIV &100
+!(Buf%+s%-4)=DiscSize% DIV &100
+!(Buf%+OldMapSize%-5)=RND(&10000)-1
+!(Buf%+OldMapSize%-2)=3
+PROCSum(Buf%,s%)
+PROCSum(Buf%+s%,s%)
+PROCMoanOp(Write%,OldMapAdd%p,Buf%,OldMapSize%)
+ENDPROC
+:
+DEF PROCWriteRootDir
+PROCmessage_print_0("WritingRootDir")
+LOCAL BF%
+FOR I%=0 TO DirSize%-4 STEP 4:Buf%!I%=0:NEXT
+IF NewMap% THEN
+ $DirMark%="Hugo"
+ELSE
+ $DirMark%="Hugo"
+ENDIF
+Buf%!1=!DirMark%
+BF%=Buf%+DirSize%
+IF NewMap% THEN
+ BF%!-38=IndRootDirAdd%
+ELSE
+ BF%!-38=IndRootDirAdd% DIV &100
+ENDIF
+BF%?-35=ASC"$"
+BF%?-16=ASC"$"
+BF%!-5=!DirMark%
+check%=0
+PROCCheckPut(!Buf%)
+PROCCheckPut(Buf%?4)
+I%=BF%-40
+WHILE I%AND3
+ PROCCheckPut(?I%)
+ I%=I%+1
+ENDWHILE
+WHILE I%<BF%-4
+ PROCCheckPut(!I%)
+ I%=I%+4
+ENDWHILE
+check%=check% EOR (check%>>>16)
+check%=(check% EOR (check%>>>8))AND &FF
+BF%?-1=check%
+PROCMoanOp(Write%,RootDirAdd%,Buf%,DirSize%)
+ENDPROC
+:
+DEF FNLogToPhys(add%)
+LOCAL ptr%
+ptr%=0
+WHILE add%>=(Defect%!ptr%) DIV SecSize%
+ ptr%=ptr%+4
+ add%=add%+SecSize%
+ENDWHILE
+=add%
+:
+
+REM This function used to take the defect address as a byte
+REM address - this is now the sector number.
+
+DEF PROCAddPhysDefect(add%)
+LOCAL ptr%,ptr2%,defect%,defectlist%
+REM Check defect is physically on the disc
+IF (add%>=SectorsPerDisc%) THEN
+    PROCmessage_print_0("DefectTooBig")
+ELSE
+    IF NOT BigDisc% THEN
+        REM Here we have a single defect list which we adjust accordingly
+        IF Defects%<MaxDefects% THEN
+            WHILE ((Defect%!ptr%) DIV SecSize%)<add%
+                ptr%=ptr%+4
+            ENDWHILE
+            defect%=(Defect%!ptr%)/SecSize%
+            IF defect%=add% THEN
+                PROCmessage_print_0("ExistingDefect")
+            ELSE
+                ptr2%=Defects%*4
+                WHILE ptr2%>=ptr%
+                    Defect%!(ptr2%+4)=Defect%!ptr2%
+                    ptr2%=ptr2%-4
+                ENDWHILE
+                Defect%!ptr%=add%*SecSize%
+                Defects%=Defects%+1
+            ENDIF
+        ELSE
+            PROCmessage_print_0("FullDefectList")
+        ENDIF
+    ELSE
+        REM Here we have a twin defect list
+        IF Defects%<BigMaxDefects% THEN
+            IF ((add%*SecSize%) AND &E0000000)=0 AND (add%>>>(32-Log2SecSize%))=0 THEN
+                REM Defect before 512M
+                defectlist%=0
+            ELSE
+                REM Defect after 512M
+                defectlist%=1
+                WHILE (Defect%!ptr%<EndDefect%)
+                    ptr%+=4
+                ENDWHILE
+                ptr%+=4
+            ENDIF
+            IF defectlist%=1 THEN
+                WHILE (Defect%!ptr%)<add%
+                    ptr%+=4
+                ENDWHILE
+            ELSE
+                WHILE ((Defect%!ptr%)/SecSize%)<add%
+                    ptr%+=4
+                ENDWHILE
+            ENDIF
+            IF defectlist%=0 THEN
+                defect%=(Defect%!ptr%)/SecSize%
+            ELSE
+                defect%=(Defect%!ptr%)
+            ENDIF
+            IF defect%=add% THEN
+                PROCmessage_print_0("ExistingDefect")
+            ELSE
+                ptr2%=Defects%*4+4
+                WHILE ptr2%>=ptr%
+                    Defect%!(ptr2%+4)=Defect%!ptr2%
+                    ptr2%=ptr2%-4
+                ENDWHILE
+                IF defectlist%=0 THEN
+                    Defect%!ptr%=add%*SecSize%
+                ELSE
+                    Defect%!ptr%=add%
+                ENDIF
+                Defects%=Defects%+1
+            ENDIF
+        ELSE
+            PROCmessage_print_0("FullDefectList")
+        ENDIF
+    ENDIF
+ENDIF
+ENDPROC
+:
+
+DEF PROCRemovePhysDefect(add%)
+LOCAL ptr%,ptr2%,defect%,defectlist%
+ptr%=0
+defectlist%=1
+WHILE ((Defect%!ptr%)/SecSize%)<add% AND (Defect%!ptr%<EndDefect%)
+    ptr%=ptr%+4
+ENDWHILE
+IF Defect%!ptr%>=EndDefect% THEN
+    defectlist%=2
+    ptr%+=4
+    WHILE (Defect%!ptr%)<add% AND (Defect%!ptr%)<EndDefect%
+        ptr%=ptr%+4
+    ENDWHILE
+ENDIF
+IF defectlist%=1 THEN
+    defect%=(Defect%!ptr%)/SecSize%
+ELSE
+    defect%=Defect%!ptr%
+ENDIF
+IF defect%=add% THEN
+    IF BigDisc% THEN
+        WHILE ptr%<(Defects%*4+4)
+            Defect%!ptr%=Defect%!(ptr%+4)
+            ptr%=ptr%+4
+        ENDWHILE
+        Defects%=Defects%-1
+    ELSE
+        WHILE ptr%<Defects%*4
+            Defect%!ptr%=Defect%!(ptr%+4)
+            ptr%=ptr%+4
+        ENDWHILE
+        Defects%=Defects%-1
+    ENDIF
+    Defects%=Defects%-1
+ELSE
+     PROCmessage_print_0("MissingDefect")
+ENDIF
+ENDPROC
+:
+
+
+REM Checks the initial (byte address) defect list.
+
+DEF FNGoodOldDefectList
+ptr%=-4
+check%=0
+last%=-1
+good%=TRUE
+REPEAT
+ ptr%=ptr%+4
+ defect%=Boot%!ptr%
+ IF defect%<=last% good%=FALSE
+ last%=defect%
+ IF defect%<EndDefect% PROCCheckPut(defect%)
+UNTIL (defect% >= EndDefect%) OR NOT good%
+OldDefects%=ptr%DIV4
+check%=check% EOR (check%>>>16)
+check%=(check% EOR (check%>>>8))AND &FF
+= good% AND ((defect%AND&FF) = check%)
+
+DEF FNGoodNewDefectList
+ptr%=4*OldDefects%
+check%=0
+last%=-1
+good%=TRUE
+REPEAT
+ ptr%=ptr%+4
+ defect%=Boot%!ptr%
+ IF defect%<=last% good%=FALSE
+ last%=defect%
+ IF defect%<EndDefect2% PROCCheckPut(defect%)
+UNTIL (defect% >= EndDefect2%) OR NOT good%
+NewDefects%=ptr%DIV4-OldDefects%-1
+check%=check% EOR (check%>>>16)
+check%=(check% EOR (check%>>>8))AND &FF
+= good% AND ((defect%AND&FF) = check%)
+
+
+DEF FNGoodDefects
+bothgood%=FNGoodOldDefectList
+REM Only check second list if disc is big enough to have it
+IF (((BootRec%!&10) AND &E0000000)<>0 OR (BootRec%!&26)<>0) AND bothgood% THEN
+    bothgood%=bothgood% AND FNGoodNewDefectList
+ENDIF
+= bothgood% AND (FNsum(Boot%,BootSize%)=Boot%?(BootSize%-1))
+:
+
+
+DEF PROCInitDiscRec
+FOR I%=0 TO 64-4 STEP 4
+ DiscRec%!I%=0
+NEXT I%
+?DiscRec%=Log2SecSize%
+DiscRec%?1=SecsPerTrk%
+DiscRec%?2=Heads%
+DiscRec%?8=LowSector%
+DiscRec%!&C=IndRootDirAdd%
+DiscRec%!&10=DiscSize%
+DiscRec%!&24=DiscSize2%
+DiscRec%?&28=Log2ShareSize%
+REM If disc is large then flag this fact in disc record.
+IF ((DiscSize% AND &E0000000)<>0 OR (DiscSize2%<>0)) THEN 
+    DiscRec%?&29=1
+ELSE
+    DiscRec%?&29=0
+ENDIF
+DiscRec%!&14=RND(&10000)-1
+
+$(DiscRec%+&16)="HardDisc"+STR$Drive%
+
+DiscRec%?&22=Drive%
+ENDPROC
+:
+
+REM Initialises an empty boot block defect list.  As we don't know
+REM at this point type of defect list to use, we assume a large one.
+
+DEF PROCInitBootDefects
+!Boot%=EndDefect%
+Boot%!4=EndDefect2%
+
+REM We record two defect counts - one for defects in the
+REM first 512M and one for defects later in the disc.
+
+OldDefects%=0
+NewDefects%=0
+PROCInitHardDesc
+ENDPROC
+:
+
+DEF PROCInitHardDesc
+IF IDE% THEN
+ BootRec%!-&10=0
+ BootRec%!-&C=0
+ BootRec%?-5=InitFlag%
+ BootRec%?-6=LBAflag%
+ELSE
+ BootRec%!-&10= &00000000      :REM SL xxxxxx
+ BootRec%!-&C = &0D0C200A      :REM GPL2 GPL3 SH GPL1
+ REM BootRec%!-&10= &16000000  slow stepping alternative
+ REM BootRec%!-&C = &0D0CA80A  slow stepping alternative
+ BootRec%!-8  = LowCurrentCyl% OR (PreCompCyl%<<16)
+ENDIF
+
+REM If BigDisc% then park address is a sector number
+IF BigDisc%
+    BootRec%!-4  = SecsPerTrk%*Heads%*ParkCyl%
+ELSE
+    BootRec%!-4  = SecSize%*SecsPerTrk%*Heads%*ParkCyl%
+ENDIF
+
+BootRec%!-&14= &FFFFFFFF       :REM fencepost for end-of-defect-space
+ENDPROC
+:
+
+DEF FNAsk(string$,Default%,min%)
+LOCAL X,Y,reply$,value%
+IF INSTR(autoreply$,"Defaults") AND Default%>=min% THEN
+ =Default%
+ENDIF
+PRINT:VDU11
+PROCmessage_print_0(string$): X=POS: Y=VPOS
+LOCAL ERROR
+ON ERROR LOCAL IF ERR=17 PROCabort(REPORT$,1)
+REPEAT
+ PRINT TAB(X,Y);Default%;SPC3;TAB(X,Y);
+ *FX 15,1
+ INPUT ""reply$
+ IF reply$="" THEN
+  value%=Default%
+ ELSE
+  value%=EVAL(reply$)
+ ENDIF
+UNTIL value%>=min%
+PRINT TAB(X,Y);value%;SPC3
+=value%
+:
+
+DEF FNInputDec(string$,min%,max%)
+LOCAL X,Y,reply$,value%
+PRINT:VDU11
+PROCmessage_print_2(string$,STR$(min%),STR$(max%)): X=POS: Y=VPOS
+LOCAL ERROR
+ON ERROR LOCAL IF ERR=17 PROCabort(REPORT$,1)
+REPEAT
+ PRINT TAB(X,Y);SPC12;TAB(X,Y);: INPUT ""reply$
+ value%=EVAL(reply$)
+UNTIL value%>=min% AND value%<=max%
+= value%
+:
+
+DEF FNInputHex(string$)
+LOCAL X,Y,reply$,value%
+PRINT:VDU11
+PROCmessage_print_0(string$): X=POS: Y=VPOS
+LOCAL ERROR
+ON ERROR LOCAL IF ERR=17 PROCabort(REPORT$,1)
+PRINT TAB(X,Y);SPC12;TAB(X,Y);: INPUT ""reply$
+=EVAL("&"+reply$)
+
+DEF FNInputHex2(string$)
+LOCAL X,Y,reply$,value%
+PRINT:VDU11
+PROCmessage_print_0(string$): X=POS: Y=VPOS
+REMLOCAL ERROR
+REMON ERROR LOCAL IF ERR=17 PROCabort(REPORT$,1)
+PRINT TAB(X,Y);SPC12;TAB(X,Y);: INPUT ""reply$
+=FNSectorAddr(reply$)
+:
+
+DEF FNSectorAddr(reply$)
+LOCAL add%, add2%
+add%=0
+add2%=0
+
+WHILE INSTR("abcdefABCDEF0123456789",LEFT$(reply$,1))<>0 AND LEN(reply$)<>0
+    add2%=(add2%<<4)+(add%>>>28)
+    add%=add%<<4
+    add%=add%+EVAL("&"+LEFT$(reply$,1))
+    reply$=MID$(reply$,2)
+ENDWHILE
+=(add%>>>Log2SecSize%)+(add2%<<(32-Log2SecSize%))
+
+:
+
+DEF FNChoose(select$, string$, opt$, default$)
+=FNchoose_no_lookup(select$, FNmessage_lookup_0(string$), opt$, default$)
+:
+
+DEF FNchoose_no_lookup(select$,String$,english_opt$,english_default$)
+LOCAL X,Y,reply$,start,end, opt$, default$
+opt$=FNmessage_lookup_0(english_opt$)
+IF english_default$<>"" THEN
+  default$=MID$(opt$, INSTR(english_opt$, english_default$), 1)
+ELSE
+  default$=""
+ENDIF
+ 
+IF autoreply$<>"" THEN
+  start = INSTR(autoreply$,select$)
+  end = INSTR(autoreply$,",",start+1)
+  IF end=0 THEN end = LEN(autoreply$) + 1
+  IF start=0 THEN
+    PROCmessage_print_2("FailedAuto", select$, String$)
+    PROCfinish 
+  ENDIF
+  start+=LEN(select$)
+  IF start<>end THEN
+    IF dev% PRINTString$;" ";MID$(autoreply$,start,end-start)
+    =MID$(autoreply$,start,end-start)
+  ENDIF
+ENDIF
+PRINT:VDU11
+PRINT String$;: X=POS: Y=VPOS
+REPEAT
+ REPEAT
+  PRINT TAB(X,Y);default$;SPC12;TAB(X,Y);: INPUT ""reply$
+  IF reply$="" THEN reply$=default$
+ UNTIL LEN(reply$)=1
+ IF INSTR(opt$, reply$)=0 THEN reply$=CHR$(ASC(reply$)AND&DF)
+UNTIL INSTR(opt$,reply$)
+:
+REM Translate option selected back to one of the token options
+=MID$(english_opt$, INSTR(opt$, reply$), 1)
+:
+
+DEF FNreadvarval(varname$)
+LOCAL varlen%, varbuf%
+DIM  varbuf% 256
+SYS "XOS_ReadVarVal",varname$,varbuf%,256,0,3 TO ,,varlen%
+varbuf%?varlen% = 13
+=$varbuf%
+:
+
+
+DEF PROCCheckPut(I%)
+check%=(check% >>> 13) EOR ((check% AND (2^13-1)) << (32-13)) EOR I%
+ENDPROC
+:
+
+DEF FNsum(base%,len%)
+sum%=0:c%=0
+FOR I%=len%-2 TO 0 STEP-1
+sum%=sum%+base%?I%+c%
+IF sum%<&100 c%=0 ELSE sum%=sum% AND &FF:c%=1
+NEXT I%
+=sum%
+:
+DEF PROCSum(base%,len%)
+base%?(len%-1)=FNsum(base%,len%)
+ENDPROC
+:
+DEF FNNewMapCheck(B%,C%)=USR(NewCheck%)
+:
+DEF PROCAsm
+FOR opt%=0 TO 2 STEP 2
+ P%=mc%
+ [ OPT opt%
+.NewCheck%
+ MOV  R0,#0
+ ADDS R2,R1,R2  \C=0
+.loop%
+ LDR  R3,[R2,#-4]!
+ ADCS R0,R0,R3
+ TEQS R2,R1
+ BNE  loop%
+ AND  R3,R3,#&FF
+ SUB  R0,R0,R3
+ EOR  R0,R0,R0,LSR #16
+ EOR  R0,R0,R0,LSR #8
+ AND  R0,R0,#&FF
+ MOVS PC,R14
+ ]
+NEXT opt%
+ENDPROC
+:
+DEF PROCDisableEscape
+SYS "XOS_Byte",200,1,0 TO R0,OldEscState%
+SYS "XOS_Byte",247,%10101010,0 TO R0,OldBreakState%
+ENDPROC
+:
+DEF PROCRestoreEscape
+SYS "XOS_Byte",200,OldEscState%,0
+SYS "XOS_Byte",247,OldBreakState%,0
+ENDPROC
+:
+DEF PROCMoanOp(b%, C%, D%, E%)
+IF BigADFS% THEN
+    SYS AdfsSwi%, 0, b% OR AltDefectBit% OR (DiscRec%<<6), C% OR Drive%<< 29, D%, E%
+ELSE
+    SYS AdfsSwi%, 0, b% OR AltDefectBit% OR (DiscRec%<<6), (C%*SecSize%) OR Drive%<< 29, D%, E%
+ENDIF
+ENDPROC
+:
+
+DEF PROCOp(b%, C%, D%, E%)
+IF BigADFS% THEN
+    SYS AdfsSwi% OR (1<<17), 0, b% OR AltDefectBit% OR (DiscRec%<<6), C% OR Drive%<< 29, D%, E% TO Result%, R1%, ErrDiscAdd%
+ELSE
+    SYS AdfsSwi% OR (1<<17), 0, b% OR AltDefectBit% OR (DiscRec%<<6), (C%*SecSize%) OR Drive%<< 29, D%, E% TO Result%, R1%, ErrDiscAdd%
+ENDIF
+IF Result% THEN
+ IF Verbose% THEN
+  PRINT"(""";
+  I%=Result%+4:WHILE ?I% VDU?I%:I%+=1:ENDWHILE
+  PROCmessage_print_1("OpError", STR$~(!Result%))
+ ENDIF
+ IF !Result% AND (1 << 31) THEN
+  PROCmessage_print_1("Error", STR$~(Result% AND &3FFFFFFF))
+  PROCfinish
+ ELSE
+  IF ((!Result%) AND &FFFFFF)=AdfsDiscErr% THEN
+   Result%=Result%?3
+  ELSE
+   PROCmessage_print_1("Error", STR$~(!Result%)):VDU 32
+   I%=4
+   WHILE Result%?I%
+    VDU Result%?I%
+    I%=I%+1
+   ENDWHILE
+   PROCfinish
+  ENDIF
+ ENDIF
+ELSE
+ENDIF
+ENDPROC
+:
+
+DEF FNmatchstrings(str1$,str2$)
+LOCAL II%,JJ%,LI%,LJ%
+II% = 0 : LI%=LEN(str1$)
+JJ% = 0 : LJ%=LEN(str2$)
+REPEAT
+  REM skip spaces
+  WHILE II%<LI% AND ASC(MID$(str1$,II%+1,1))=ASC(" ") : II%+=1 : ENDWHILE
+  WHILE JJ%<LJ% AND ASC(MID$(str2$,JJ%+1,1))=ASC(" ") : JJ%+=1 : ENDWHILE
+  IF II%<LI% AND JJ%<LJ% THEN
+    IF ASC(MID$(str1$,II%+1,1))<>ASC(MID$(str2$,JJ%+1,1)) THEN
+      =FALSE : REM characters differ in str1$ and str2$
+    ENDIF  
+  ELSE
+    IF II%=LI% EOR JJ%=LJ% =FALSE : REM _only_ one string ended
+  ENDIF
+  IF II%<LI% II%+=1
+  IF JJ%<LJ% JJ%+=1
+UNTIL II%=LI% AND JJ%=LJ%
+=TRUE 
+:
+
+REM basic -Report error and die
+DEF PROCabort(why$,failcode%)
+LOCAL dummy$
+LOCAL ERROR
+ON ERROR OFF
+
+IF ERR=17 THEN
+  PROCmessage_print_0("UserQuit")
+  PROCfinish
+ENDIF
+
+IF msgs_file_open% THEN
+  PROCmessage_print_2("HFormFailed", why$, STR$(ERL))
+ELSE
+  PRINT'"HFORM failed : ";why$;" at line ";ERL
+ENDIF
+
+IF INSTR(autoreply$,"NOprompts")=0 THEN
+  IF msgs_file_open% THEN
+    PROCmessage_print_0("PressKey")
+  ELSE
+    PRINT "Press Return to continue ";
+  ENDIF
+  INPUT ""dummy$
+ENDIF
+PROCfinish
+ENDPROC
+:
+
+REM Unsuccessful termination - return a FAIL status and clean up
+DEF PROCfinish
+*set HForm$EndStatus 20
+PROCexit
+ENDPROC
+:
+
+REM tidy termination
+DEF PROCexit
+PROCclose_message_file
+END
+ENDPROC
+:
+
+DEF PROCrestoreparams(iface%)
+IF iface% THEN
+  PROCrestorePROD
+ELSE 
+  PROCrestoreST506 
+ENDIF
+ENDPROC
+:
+
+DEF PROCrestorePROD
+RESTORE+1
+ENDPROC
+: 
+REM Production IDE drives
+REM For automatic determination of IDE drive, the printing characters in
+REM the string below must *exactly* match those produced by the drive's 
+REM identify command. However, the 'space' character is ignored.
+REM The user never sees the burnt in name - the one in the Messages file
+REM is always displayed instead.
+REM For comparison with previous format parameters, the drive parameter
+REM lists must all be slightly different (otherwise, the drive type
+REM reported will always be the FIRST matching entry)
+
+REM Identification, name token, Sectors per track, heads, cylinders, Needs init, dummy, parking cylinder, lba flag
+                                                                                          
+DATA Conner Peripherals 40MB - CP3044,          TypeCP3044,     40,  4,  526, 1, 0,  525,  0
+
+REM Note that this drive is _physically_labelled_ as CP2044PK
+DATA Conner Peripherals 42MB - CP2044,          TypeCP2044PK,   38,  4,  548, 1, 0,  547,  0
+DATA Conner Peripherals 63MB - CP2064,          TypeCP2064,     38,  4,  823, 1, 0,  822,  0
+DATA Conner Peripherals 210MB - CFS210A,        TypeCFS210A,    38, 16,  685, 1, 0,  684,  0
+DATA Conner Peripherals 270MB - CFS270A,        TypeCFS270A,    63, 14,  600, 1, 0,  599,  0
+DATA Conner Peripherals 420MB - CFS420A,        TypeCFS420A,    63, 16,  826, 1, 0,  825,  0
+DATA Conner Peripherals 425MB - CFS425A,        TypeCFS425A,    62, 16,  839, 1, 0,  838,  0
+DATA Conner Peripherals 850MB - CFS850A,        TypeCFS850A,    63, 16, 1651, 1, 0, 1650,  1
+
+DATA OTHER,                                     TypeOTHER,      1,  1,  1,   1, 1,  1, 1: REM Must be last, numbers irrelevant (except must be non zero).
+
+DEF PROCrestoreST506
+RESTORE+1
+ENDPROC
+:
+REM fast stepping ST506 drives
+REM Manufacturer, Sectors per track, heads, cylinders, low current cylinder, precompensation cylinder, parking cylinder
+DATA 20Mb Miniscribe 8425,                      Type8425,       32, 4, 615, &3FF,  128, 663
+DATA 53Mb Rodime RO3065,                        TypeRO3065,     32, 7, 872, &3FF,  650, 871
+DATA 20Mb Kalok KL320,                          TypeKL320,      32, 4, 615, 615,   300, 615
+REM DATA 20Mb Western Digital WD362/Tandon TM362,   TypeTM362,      32, 4, 615, &3FF, &3FF, 663
+DATA OTHER,                                     TypeOTHER,      32, 4, 612, &3FF,  128, 611:REM MUST BE LAST
+:
+REM OSS Added message file handling functions during internationalisation.
+REM Note that some RMA space is claimed, because MessageTrans (in its
+REM infinit wisdom) needs its 16 byte block and the filename in the RMA.
+REM Thus we must be very careful to free this block up ROBUSTLY whenever
+REM the program terminates. The file itself is held in application space.
+:
+DEF PROCopen_message_file(filename$)
+LOCAL flags%, size%
+SYS "MessageTrans_FileInfo", ,filename$ TO flags%,,size%
+IF (flags% AND 1) THEN msgs_file_buf%=0 ELSE DIM msgs_file_buf% size%
+SYS "OS_Module", 6,,,17+LEN(filename$) TO ,,msgs_file_desc%
+$(msgs_file_desc%+16)=filename$
+SYS "MessageTrans_OpenFile", msgs_file_desc%,msgs_file_desc%+16,msgs_file_buf%
+msgs_file_open%=TRUE
+msg_lookup_buf_size%=256
+DIM msg_lookup_buf% msg_lookup_buf_size%
+ENDPROC
+:
+REM Robust procedure - called during error handling. Report errors but
+REM always continue execution.
+:
+DEF PROCclose_message_file
+LOCAL flags%
+LOCAL ERROR
+ON ERROR OFF
+
+IF msgs_file_open% THEN
+  SYS "MessageTrans_CloseFile", msgs_file_desc% TO ;flags%
+  msgs_file_open%=FALSE
+  IF (flags% AND 1) THEN REPORT
+ENDIF
+
+IF msgs_file_desc% THEN
+  SYS "OS_Module", 7,,msgs_file_desc% TO ;flags%
+  msgs_file_desc%=0
+  IF (flags% AND 1) THEN REPORT
+ENDIF
+ENDPROC
+:
+REM Procedure for lookups, with one to four parameters. Make sure there
+REM are no |M's in the strings for these, or BASIC will think it is
+REM the end of the string.
+:
+DEF FNmessage_lookup_0(tag$)
+=FNmessage_lookup_4(tag$, "", "", "", "")
+:
+DEF FNmessage_lookup_1(tag$, arg1$)
+=FNmessage_lookup_4(tag$, arg1$, "", "", "")
+:
+DEF FNmessage_lookup_2(tag$, arg1$, arg2$)
+=FNmessage_lookup_4(tag$, arg1$, arg2$, "", "")
+:
+DEF FNmessage_lookup_3(tag$, arg1$, arg2$, arg3$)
+=FNmessage_lookup_4(tag$, arg1$, arg2$, arg3$, "")
+:
+DEF FNmessage_lookup_4(tag$, arg1$, arg2$, arg3$, arg4$)
+LOCAL len%
+SYS "MessageTrans_GSLookup", msgs_file_desc%,tag$,msg_lookup_buf%,msg_lookup_buf_size%,arg1$,arg2$,arg3$,arg4$ TO ,,,len%
+msg_lookup_buf%?len%=13
+=$msg_lookup_buf%
+:
+REM Procedures for printing a looked string - can't use PRINT as we want
+REM to put |M's (char 13 - end of BASIC string) in the strings. 
+:
+DEF PROCmessage_print_0(tag$)
+PROCmessage_print_4(tag$, "", "", "", "")
+ENDPROC
+:
+DEF PROCmessage_print_1(tag$, arg1$)
+PROCmessage_print_4(tag$, arg1$, "", "", "")
+ENDPROC
+:
+DEF PROCmessage_print_2(tag$, arg1$, arg2$)
+PROCmessage_print_4(tag$, arg1$, arg2$, "", "")
+ENDPROC
+:
+DEF PROCmessage_print_3(tag$, arg1$, arg2$, arg3$)
+PROCmessage_print_4(tag$, arg1$, arg2$, arg3$, "")
+ENDPROC
+:
+DEF PROCmessage_print_4(tag$, arg1$, arg2$, arg3$, arg4$)
+LOCAL len%
+SYS "MessageTrans_GSLookup", msgs_file_desc%,tag$,msg_lookup_buf%,msg_lookup_buf_size%,arg1$,arg2$,arg3$,arg4$ TO ,,,len%
+SYS "OS_WriteN", msg_lookup_buf%, len%
+ENDPROC
+:
+
+REM This function returns TRUE if ADFS is the big version, or FALSE if
+REM it isn't
+
+DEF FNBigADFS
+    LOCAL Misc_InfoPtr%
+    LOCAL ERROR
+    ON ERROR LOCAL:RESTORE ERROR:=FALSE
+    SYS "ADFS_MiscOp",6 TO Misc_InfoPtr%
+    RESTORE ERROR
+    =((!Misc_InfoPtr%) AND (1<<9))=(1<<9)
+
+DEF PROCShareSize
+    LOCAL min%
+    min%=(LinkBits%+1)<<Log2Alloc%
+    Log2ShareSize%=0
+    WHILE (253*(SecSize%<<Log2ShareSize%)<min%)
+        Log2ShareSize%+=1
+    ENDWHILE
+    ShareSize%=1<<Log2ShareSize%
+ENDPROC
+
+DEF FNhexaddr(Sector%)
+LOCAL high$,low$
+high$=STR$~(Sector%>>>(32-Log2SecSize%))
+WHILE (LEN(high$)<8)
+    high$="0"+high$
+ENDWHILE
+low$=STR$~(Sector%<<(Log2SecSize%))
+WHILE (LEN(low$)<8)
+    low$="0"+low$
+ENDWHILE
+=high$+low$

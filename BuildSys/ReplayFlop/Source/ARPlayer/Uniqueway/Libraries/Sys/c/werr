@@ -1,0 +1,337 @@
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/*
+ * Title  : c.werr
+ * Purpose: provide error reporting in wimp programs
+ * History: IDJ: 07-Feb-92: prepared for source release
+ *
+ */
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#include <stdarg.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "swis.h"
+#include "sys.h"
+#include "werr.h"
+
+#include "msgs.h"
+#include "kernel.h"
+#include "wimp.h"
+
+/* ---------------------------------------------------------------------------------------- */
+
+#define FILE_ERR        msgs_lookup("filerr:Error accessing %s - %s (%s).")
+#define OOM_ERR         msgs_lookup("oomerr:Out of memory allocating %u bytes for %s.")
+#define CANCEL_WARNING  msgs_lookup("werr0: Choose OK to continue, choose CANCEL to quit.")
+
+/* ---------------------------------------------------------------------------------------- */
+
+static os_error error;
+static char buffer[256];    /* this is extremely horrible but is in case the error.errmess overflows... */
+
+static char *programname = NULL;
+
+static BOOL forcekilloption = FALSE;
+static BOOL clierror = TRUE;
+static const char *err_varname = NULL;
+
+static char *werr__spritename = NULL;
+static void *werr__spritearea = NULL;
+
+/* ---------------------------------------------------------------------------------------- */
+
+/*
+ * Build the actual error and call Wimp_ReportError (or fprintf as appropriate)
+ */
+
+static int give_error(wimp_errflags f)
+{
+    int answer = 1;
+
+    if (err_varname)
+    {
+        setenv(err_varname, error.errmess, 4);
+        answer = 2;
+    }
+    else if (clierror)
+    {
+        fprintf(stderr, "%s\n", error.errmess);
+    }
+    else
+    {
+        _kernel_swi_regs r;
+        if (forcekilloption)
+            f |= wimp_ECANCEL;
+
+        if (werr__spritename)                           /* ie RO 3.20+ */
+        {
+            f |= wimp_EEXTRAINFO;
+            r.r[3] = (int) werr__spritename;
+            r.r[4] = (int) werr__spritearea;
+            r.r[5] = 0;
+        }
+        else                                            /* ie RO 3.10 */
+        {
+            if ((f & wimp_EREPORT_TYPE) == wimp_EPROGRAM_ERROR)
+                f |= wimp_ECANCEL;
+
+            if (f & wimp_ECANCEL)
+                strcat(error.errmess, CANCEL_WARNING);
+
+            f &= 0xff;
+        }
+
+        r.r[0] = (int)&error;
+        r.r[1] = f;
+        r.r[2] = (int)programname;
+        _kernel_swi(Wimp_ReportError, &r, &r);
+        answer = r.r[1];
+    }
+    return answer;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+/*
+ * various flavours of error report that didn't start from an os_error
+ */
+
+void werr(int fatal, const char* format, ...)
+{
+    va_list va;
+
+    error.errnum = 0;
+    va_start(va, format);
+    vsprintf(error.errmess, format, va);
+    va_end(va);
+
+    if (give_error(wimp_EOK | (fatal ? wimp_EPROGRAM_ERROR : wimp_EWARNING_ERROR)) == 2 || fatal)
+        exit(EXIT_FAILURE);
+}
+
+void werr_quiet(int fatal, const char* format, ...)
+{
+    va_list va;
+
+    error.errnum = 0;
+    va_start(va, format);
+    vsprintf(error.errmess, format, va);
+    va_end(va);
+
+    if (give_error(wimp_EOK | wimp_ENOBEEP | (fatal ? wimp_EPROGRAM_ERROR : wimp_EWARNING_ERROR)) == 2 || fatal)
+        exit(EXIT_FAILURE);
+}
+
+int werr_question(const char *buttons, const char* format, ...)
+{
+    int return_val;
+
+    va_list va;
+    error.errnum = 0;
+    va_start(va, format);
+    vsprintf(error.errmess, format, va);
+    va_end(va);
+
+    if (werr__spritename)
+        _swix(Wimp_ReportError, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5) | _OUT(1),
+            &error,
+            wimp_EEXTRAINFO | wimp_EQUESTION | (buttons ? 0 : wimp_EOK | wimp_ECANCEL),
+            programname,
+            werr__spritename,
+            werr__spritearea,
+            buttons,
+            &return_val);
+    else
+        _swix(Wimp_ReportError, _IN(0)|_IN(1)|_IN(2) | _OUT(1),
+            &error,
+            wimp_EOK | wimp_ECANCEL | wimp_ENOERROR,
+            programname,
+            &return_val);
+
+    if (return_val >= 3)
+        return_val -= 2;
+
+    return return_val;
+}
+
+int oom_err(const char *msg, int size)
+{
+    werr(0, OOM_ERR, size, msg);
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+/*
+ * Call this after a stdio failure.
+ * If you are exceptionally lucky you may get a sensible error message.
+ */
+
+int file_err(const char *file, const char *msg)
+{
+    os_error *e = (os_error *)_kernel_last_oserror();
+    werr(0, FILE_ERR, file ? file : "file", msg, e ? e->errmess : "");
+    return FALSE;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+/*
+ * Copy error message, adding in the Debug info if it is present
+ */
+
+static os_error *do_err(os_error *e, int line, char *file, wimp_errflags flags)
+{
+    if (e)
+    {
+        if (file)
+            sprintf(error.errmess, "%s [&%x] (%s: %d)", e->errmess, e->errnum, file, line);
+        else
+            strcpy(error.errmess, e->errmess);
+
+        error.errnum = e->errnum;
+        if (give_error(flags | (flags & wimp_ECANCEL ? wimp_EPROGRAM_ERROR : wimp_EWARNING_ERROR)) == 2)
+            exit(EXIT_FAILURE);
+    }
+    return e;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+/* os_err and no_err call these function depending on state of NDEBUG flag
+
+ * os_err() was wimpt_complain() and should be used on OS calls that can fail for
+ * lack of resources or something similar. They will not usually give a quit button.
+
+ * wrap_err() is like os_err() except it allows a different message to be given with
+ * the actual error in brackets.
+
+ * no_err() was wimp_noerr() and should be used for OS calls that are not expected to
+ * fail. There will always be a way to continue however.
+
+ */
+
+os_error *os__err(os_error *e)
+{
+    return do_err(e, 0, NULL, wimp_EOK);
+}
+
+os_error *no__err(os_error *e)
+{
+    return do_err(e, 0, NULL, wimp_EOK | wimp_ECANCEL);
+}
+
+
+os_error *os__err1(os_error *e, int line, char *file)
+{
+    return do_err(e, line, file, wimp_EOK);
+}
+
+os_error *no__err1(os_error *e, int line, char *file)
+{
+    return do_err(e, line, file, wimp_EOK | wimp_ECANCEL);
+}
+
+
+os_error *wrap_err(os_error *e, const char *fmt, ...)
+{
+    if (e)
+    {
+        int     n = 0;
+        va_list ap;
+
+        va_start(ap, fmt);
+        n = vsprintf(error.errmess, fmt, ap);
+        va_end(ap);
+
+        n += sprintf(error.errmess + n, " (%s)", e->errmess);
+
+        error.errnum = e->errnum;
+        if (give_error(wimp_EOK | wimp_EWARNING_ERROR) == 2)
+            exit(EXIT_FAILURE);
+    }
+    return e;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+/* set werr module options */
+
+/*
+ * This is called from wimpt so reduce interdependencies
+ */
+
+void werr__registerprogramname(char *name)
+{
+    programname = name;
+    clierror = FALSE;
+}
+
+/*
+ * This will ensure that there is a cancel button in the error box
+ * Has no effect if new error scheme in effect
+ */
+
+void werr__setkilloption(BOOL on)
+{
+    forcekilloption = on;
+}
+
+/*
+ * Causes errors to be reported with Wimp_ReportError
+ */
+
+void werr__wimperror(void)
+{
+    clierror = FALSE;
+}
+
+/*
+ * Causes errors to be reported to stderr.
+ */
+
+void werr__clierror(void)
+{
+    clierror = TRUE;
+}
+
+/*
+ * Causes errors to be reported to 'varname'.
+ */
+
+void werr__varerror(const char *varname)
+{
+    err_varname = varname;
+}
+
+/*
+ * Causes new features of Wimp_ReportError in 3.20+ to be used
+ */
+
+void werr__registersprite(char *spritename, void *spritearea)
+{
+    werr__spritename = spritename;
+    werr__spritearea = spritearea;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+
+/* end werr.c */

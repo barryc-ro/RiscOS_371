@@ -1,0 +1,346 @@
+/* > c.pane
+
+ *
+ * © SJ Middleton, 1992
+
+ * CHANGE LOG:
+ *  22/7/92:    Added NoRemove option for dbox panes on closing 
+ *  11/8/92:    fixed protruding scroll bars and parent flipping to back when no panes are open
+ */
+
+#include "coords.h"
+#include "werr.h"
+#include "wimpx.h"
+#include "win.h"
+
+#include <stdlib.h>
+
+#include "macros.h"
+#include "screenmode.h"
+#include "wmisc.h"
+#include "pane.h"
+
+typedef struct panestr
+{
+    struct panestr      *next;
+
+    wimp_w              parent, pane;
+    coords_pointstr     offset;
+    pane_flags          flags;
+    coords_pointstr     size;
+    wimp_wflags         wflags;
+
+    void                (*open)(wimp_openstr *op, void *handle);
+    void                (*close)(void *handle);
+    void                *handle;
+} panestr;
+
+static panestr *panes = NULL;
+
+/******************************************************************************************/
+
+static void delink_pane(panestr *pp_tokill)
+{
+    if (pp_tokill == panes)
+    {
+        panes = pp_tokill->next;
+        free(pp_tokill);
+    }
+    else
+    {
+        panestr *pp;
+        for (pp = panes; pp; pp = pp->next)
+            if (pp->next == pp_tokill)
+            {
+                pp->next = pp_tokill->next;
+                free(pp_tokill);
+                break;
+            }
+    }
+}
+
+static panestr *find_pane(wimp_w pane)
+{
+    panestr *pp = NULL;
+    for (pp = panes; pp; pp = pp->next)
+        if (pp->pane == pane)
+            break;
+    return pp;
+}
+
+static void close_pane(panestr *pp)
+{
+    if (pp->close)
+        pp->close(pp->handle);
+
+    if ((pp->flags & pane_NoRemove) == 0)
+    {
+        no_err(wimp_close_wind(pp->pane));
+        no_err(wimp_delete_wind(pp->pane));
+        win_activedec();
+    }
+
+    delink_pane(pp);
+}
+
+/*
+ * pane_b is screen coords of pane work area
+ * parent_b is screen coords of parent work area
+ * parent_lwa is screen coords of parent work area origin
+
+ * return TRUE if the window should not be seen
+ */
+
+static BOOL offset_pane(const panestr *pp, wimp_box *pane_b, const wimp_box *parent_b,
+                                                             const coords_pointstr *parent_lwa)
+{
+    pane_flags      f = pp->flags;
+    BOOL            vanish = FALSE;
+    int             scroll_x = 0,
+                    scroll_y = 0;
+
+    pane_b->x0 = pp->offset.x + (f & pane_AttachLogicalX ? parent_lwa->x : 
+                                f & pane_AttachLeft ? parent_b->x0 : 
+                                                parent_b->x1);
+    pane_b->x1 = pane_b->x0 + pp->size.x;
+
+    if (f & (pane_LimitExtentX | pane_LimitExtentY))
+    {
+        scroll_x = pp->wflags & wimp_WVSCR ? 44 : 0;
+        scroll_y = pp->wflags & wimp_WHSCR ? 44 : 0;
+    }
+
+    if (f & pane_LimitExtentX)
+    {
+        if (pane_b->x1 > parent_b->x1 - scroll_x)
+            pane_b->x1 = parent_b->x1 - scroll_x;
+
+        if (pane_b->x0 < parent_b->x0)
+            pane_b->x0 = parent_b->x0;
+
+        if (pane_b->x1 <= pane_b->x0)
+            vanish = TRUE;
+    }
+
+    if (!vanish)
+    {
+        pane_b->y1 = pp->offset.y + (f & pane_AttachLogicalY ? parent_lwa->y : 
+                                    f & pane_AttachBottom ? parent_b->y0 : 
+                                                    parent_b->y1);
+        pane_b->y0 = pane_b->y1 - pp->size.y;
+
+        if (f & pane_LimitExtentY)
+        {
+            if (pane_b->y1 > parent_b->y1)
+                pane_b->y1 = parent_b->y1;
+
+            if (pane_b->y0 < parent_b->y0 + scroll_y)
+                pane_b->y0 = parent_b->y0 + scroll_y;
+
+            if (pane_b->y1 <= pane_b->y0)
+                vanish = TRUE;
+        }
+    }
+
+    return vanish;
+}
+
+/******************************************************************************************/
+
+void pane_changeoffset(wimp_w pane, int x, int y)
+{
+    panestr *pp = find_pane(pane);
+    if (pp)
+    {
+        pp->offset.x = x;
+        pp->offset.y = y;
+    }        
+}
+
+/*
+ * Call this function once both parent and pane windows have been created.
+ * x, y = offsets from physical bottom LH corner of parent to bottom LH corner of pane.
+ * Returns success;
+ */
+
+BOOL pane_setpane(wimp_w parent, wimp_w pane, int x, int y, pane_flags flags, void (*open)(wimp_openstr *op, void *handle), void (*close)(void *handle), void *handle)
+{
+    panestr *pp = calloc(sizeof(panestr), 1);
+    if (pp)
+    {
+        pp->parent = parent;
+        pp->pane = pane;
+        pp->offset.x = x;
+        pp->offset.y = y;
+        pp->flags = flags;
+        pp->open = open;
+        pp->close = close;
+        pp->handle = handle;
+
+        {
+            wimp_wstate state;
+            no_err(wimp_get_wind_state(pane, &state));
+            pp->size.x = state.o.box.x1 - state.o.box.x0;
+            pp->size.y = state.o.box.y1 - state.o.box.y0;
+            pp->wflags = state.flags;
+        }
+
+/* link into chain */
+        pp->next = panes;
+        panes = pp;
+
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL pane_remove(wimp_w pane, BOOL kill)
+{
+    panestr *pp = find_pane(pane);
+    if (pp)
+    {
+        if (kill)
+            close_pane(pp);
+        else
+            delink_pane(pp);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * Don't open parent window in event handler leave it up to this function.
+ */
+
+os_error *pane_check_open(wimp_openstr *op)
+{
+    int                 npanes_open = 0;
+    panestr             *pp;
+    wimp_openstr        parent;
+    coords_pointstr     parent_lwa;
+    wimp_w              apane = op->behind;
+
+    if (apane == -1)
+    {
+        parent = window_state(op->w);
+        op->behind = parent.behind;
+        no_err(wimp_open_wind(op));
+        parent = window_state(op->w);
+    }
+    else if (apane == -2)
+    {
+        no_err(wimp_open_wind(op));
+        parent = window_state(op->w);
+        apane = parent.behind;
+    }
+    else
+    {
+        no_err(wimp_open_wind(op));
+/*        parent = window_state(op->w); */
+        parent = *op;
+    }
+
+    parent_lwa.x = parent_lwa.y = 0;
+    coords_point_toscreen(&parent_lwa, (coords_cvtstr *) &parent.box);
+
+    for (pp = panes; pp; pp = pp->next)
+        if (pp->parent == op->w)
+        {
+            wimp_wstate         state;
+            no_err(wimp_get_wind_state(pp->pane, &state));
+/*
+            coords_pointstr     lwa;
+            lwa.x = lwa.y = 0;
+            coords_point_toscreen(&lwa, (coords_cvtstr *)&state.o.box);
+ */
+            if (offset_pane(pp, &state.o.box, &parent.box, &parent_lwa))
+                no_err(wimp_close_wind(pp->pane));
+            else
+            {
+                state.o.behind = apane;
+
+                if (pp->flags & pane_PreCallOpen && pp->open)
+                    pp->open(&state.o, pp->handle);
+
+                if (pp->flags & pane_KeepOnScreenX)
+                {
+                    int dx = screen_Vars.dx - state.o.box.x0;
+                    if (dx > 0)
+                        coords_offsetbox(&state.o.box, lowest(dx, -pp->offset.x), 0, &state.o.box);
+                }
+
+                if (pp->flags & pane_KeepOnScreenY)
+                {
+                    int dy = screen_Vars.dy - state.o.box.y0;
+                    if (dy > 0)
+                        coords_offsetbox(&state.o.box, lowest(dy, -pp->offset.y), 0, &state.o.box);
+                }
+
+                no_err(wimp_open_wind(&state.o));
+
+                if ((pp->flags & pane_PreCallOpen) == 0 && pp->open)
+                    pp->open(&state.o, pp->handle);
+
+                apane = pp->pane;
+
+                npanes_open++;
+            }
+        }
+
+/*  if (npanes_open > 0) */
+    {
+        parent.behind = apane;
+        return wimp_open_wind(&parent);
+    }
+
+    return NULL;
+}
+
+/*
+ * Call after main window has been closed.
+ * Will call pane closing functions and delink the windows
+ */
+
+void pane_check_close(wimp_w w)
+{
+    panestr *pp = panes;
+    while (pp)
+    {
+        panestr *next = pp->next;
+        if (pp->parent == w)
+            close_pane(pp);
+        pp = next;
+    }
+}
+
+static void union_box(wimp_box *bp1, const wimp_box *bp2)
+{
+    if (bp2->x0 < bp1->x0)  bp1->x0 = bp2->x0;
+    if (bp2->y0 < bp1->y0)  bp1->y0 = bp2->y0;
+    if (bp2->x1 > bp1->x1)  bp1->x1 = bp2->x1;
+    if (bp2->y1 > bp1->y1)  bp1->y1 = bp2->y1;
+}
+
+void pane_boundingbox(wimp_w parent, wimp_box *box)
+{
+    panestr         *pp = panes;
+    wimp_redrawstr  r;
+
+    r.w = parent;
+    no_err(wimp_getwindowoutline(&r));
+    *box = r.box;
+
+    while (pp)
+    {
+        if (pp->parent == parent)
+        {
+            r.w = pp->pane;
+            no_err(wimp_getwindowoutline(&r));
+            union_box(box, &r.box);
+        }
+        pp = pp->next;
+    }
+}
+
+/* eof c.pane */
+

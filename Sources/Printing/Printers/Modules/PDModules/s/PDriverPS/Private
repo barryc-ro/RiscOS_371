@@ -1,0 +1,839 @@
+; > Sources.PDriverPS.Private
+
+; Private subroutines only needed for the PostScript printer driver
+
+; Output a string of printable characters as a PostScript string, taking
+; care:
+;   (a) not to produce lines of more than 72 characters.
+;   (b) to output characters outside the range ASCII 32-126 as octal escape
+;       sequences.
+;   (c) to output "(", ")" and "\" as escape sequences.
+; Entry: R1 points to first character.
+;        R5 is number of characters.
+;        R10 = job's file handle.
+;        String is guaranteed not to contain control characters (but may
+;          include DELETEs, which will be output as octal escape sequences).
+; Exit:  All registers preserved (except R0 on an error).
+
+output_PSstringBackwards
+        Push    "r0-r7, lr"
+        MOV     r7, #-1                         ; Move backwards along the string
+        ADD     r4, r1, r5                      ; Point at the byte after the last byte
+        SUB     r4, r4, #1                      ; Point at the last byte
+        B       output_PSstringGo
+
+output_PSstring
+        Push    "r0-r7, lr"
+        MOV     r7, #1                          ; Move forwards along the string
+        MOV     r4, r1                          ; Point at the first byte
+output_PSstringGo
+        MOV     R1,R10
+        MOV     R6,#"0"
+
+        MOV     R0,#"("
+        BL      bput
+        BVS     output_PSstring_return
+
+        MOV     R2,#1                           ;R2 will count characters on
+                                                ;  current line
+output_PSstring_charloop
+
+        SUBS    R5,R5,#1                        ;Any characters left?
+        BLT     output_PSstring_return          ;Return (with V clear) if not
+
+        CMP     R2,#68                          ;Insert a "\<newline>" escape
+        BLO     output_PSstring_nonewline       ;  sequence if required to
+        MOV     R0,#"\"                         ;  limit the length of an
+        BL      bput
+        MOVVC   R0,#10
+        BLVC    bput
+        MOVVC   R2,#0
+        [       PSDebugEscapes
+        BLVC    readescapestate
+        |
+        SWIVC   XOS_ReadEscapeState             ;Check for escape, returning
+        ]
+        SETV    CS                              ;  error if so. NB top level
+        BVS     output_PSstring_return          ;  will set R0 for us if so
+output_PSstring_nonewline
+
+        LDRB    r3, [ r4 ], r7                  ; Get a character, moving pointer
+        CMP     r3, #" "
+        BLT     output_PSstring_escapedchar     ; Use normal case code if so
+        CMP     R3,#126                         ; In printable ASCII subset?
+                                                ;  NB always clears V
+        BLT     output_PSstring_normalchar      ; Use normal case code if so
+
+output_PSstring_escapedchar
+        ADD     R2,R2,#3
+        MOV     R0,#"\"
+        BL      bput
+        ADDVC   R0,R6,R3,LSR #6
+        BLVC    bput
+        BICVC   R3,R3,#2_11000000
+        ADDVC   R0,R6,R3,LSR #3
+        BLVC    bput
+        BICVC   R3,R3,#2_00111000
+        ADDVC   R0,R6,R3
+        B       output_PSstring_dolastchar
+
+output_PSstring_normalchar                      ;Note V clear on arrival here
+        TEQ     R3,#"\"                         ;Escape it in if it is "\",
+        TEQNE   R3,#"("                         ;  "(" or ")"
+        TEQNE   R3,#")"
+        MOVEQ   R0,#"\"
+        ADDEQ   R2,R2,#1
+        BLEQ    bput
+        MOVVC   R0,R3                           ;Output the character
+output_PSstring_dolastchar
+        ADDVC   R2,R2,#1
+        BLVC    bput
+        BVC     output_PSstring_charloop
+
+output_PSstring_return
+        MOVVC   R0,#")"
+        BLVC    bput
+        MOVVC   R0,#10
+        BLVC    bput
+        STRVS   R0,[R13]
+        Pull    "R0-R7,PC"
+
+        [       PSDebugEscapes
+
+; Subroutine to do an OS_ReadEscapeState and dump 0 or 1 at &100000 depending
+; on the result.
+
+readescapestate
+        Push    "R1,LR"
+        SWI     XOS_ReadEscapeState
+        MOVCC   R1,#0
+        MOVCS   R1,#1
+        ADR     LR,&100000
+        STR     R1,[LR]
+        Pull    "R1,PC"
+
+        ]
+
+;buffered byte output
+bput
+        Push    "R0-R4,LR"
+        ADRL    R2,bputbuff
+        LDRB    R3,bputNbuff
+        STRB    R0,[R2,R3]
+        ADD     R3,R3,#1
+      [ PSFlushAtEOL
+        CMP     R0,#10
+        CMPNE   R3,#90
+      |
+        CMP     R3,#90                    ;buffer about 90 bytes
+      ]
+        STRNEB  R3,bputNbuff
+        Pull    "R0-R4,PC",NE
+        MOV     R0,#2                     ;OS_GBPB 2 (write to current file position)
+        MOV     R1,R10                    ;file handle
+        SWI     XOS_GBPB
+        STRVS   R0,[SP]
+        MOV     R3,#0
+        STRB    R3,bputNbuff
+        Pull    "R0-R4,PC"
+
+bput_flush
+        Push    "R0-R4,LR"
+        LDRB    R3,bputNbuff
+        CMP     R3,#0
+        Pull   "R0-R4,PC",EQ
+        MOV     R0,#2                     ;OS_GBPB 2 (write to current file position)
+        MOV     R1,R10                    ;file handle
+        ADRL    R2,bputbuff
+        SWI     XOS_GBPB
+        STRVS   R0,[SP]
+        MOV     R3,#0
+        STRB    R3,bputNbuff
+        Pull    "R0-R4,PC"
+
+
+        [       PSCoordSpeedUps
+
+; Ensure that we are using the OS co-ordinate system.
+
+ensure_OScoords
+        Push    "LR"
+        LDR     LR,coordsystem          ;If we're not currently using
+        CMP     LR,#0                   ;  OS co-ordinates,   (NB V:=0 if EQ)
+        MOVNE   LR,#0                   ;  remember we are now using
+        STRNE   LR,coordsystem          ;  them and issue a "grestore" to
+        BLNE    output_grestore         ;  revert to them in the PostScript
+        Pull    "PC"
+
+; Ensure that we are using the text co-ordinate system with the correct
+; current font factors.
+
+ensure_textcoords
+        Push    "R0-R5,LR"
+        PrError ensure_textcoords_return
+
+        SWI     XFont_ReadScaleFactor           ;Get current scale factors
+        BVS     ensure_textcoords_return
+        ADR     LR,coordsystem                  ;Get current co-ordinate
+        LDMIA   LR,{R3-R5}                      ;  system information
+        ASSERT  coordscaleX = coordsystem+4
+        ASSERT  coordscaleY = coordscaleX+4
+        CMP     R3,#1                           ;Already correct?
+        CMPEQ   R4,R1
+        CMPEQ   R5,R2
+        BEQ     ensure_textcoords_return        ;Return (with V clear) if so
+        BL      ensure_OScoords                 ;Otherwise get back to OS
+        MOVVC   R0,#1                           ;  co-ordinates from wherever
+        ADRVC   LR,coordsystem                  ;  we are, register the new
+        STMVCIA LR,{R0-R2}                      ;  text co-ordinate system
+        BLVC    output_gsave                    ;  we're now using, then
+        BVS     ensure_textcoords_return        ;  enter correct text
+        PrPair  R1,R2,CorruptR0andR1            ;  co-ordinate system
+        PrLnIm  "TS",FallThroughOnError
+
+        PrError
+ensure_textcoords_return
+        STRVS   R0,[R13]
+        Pull    "R0-R5,PC"
+
+        ]
+
+; Output a "save" and update the colour control information accordingly.
+
+output_save
+        Push    "R1,LR"
+        BL      output_immstring
+        DCB     "S",10,0
+        ALIGN
+        B       output_savecommon
+
+; Output a "gsave" and update the colour control information accordingly.
+
+output_gsave
+        Push    "R1,LR"
+        BL      output_immstring
+        DCB     "GS",10,0
+        ALIGN
+output_savecommon
+
+        [       PSTextSpeedUps
+        LDRVC   LR,currentfontptr
+        LDRVC   R1,[LR],#4
+        STRVC   R1,[LR]
+        STRVC   LR,currentfontptr
+        ]
+
+        LDRVC   LR,currentcolptr
+        LDRVC   R1,[LR],#4
+        STRVC   R1,[LR]
+        STRVC   LR,currentcolptr
+
+        [       :LNOT:DevelopmentChecks
+
+        Pull    "R1,PC"
+
+        |
+
+        Pull    "R1,PC",VS
+        ADR     R1,currentcolsend
+        CMP     LR,R1
+        Pull    "R1,PC",LO
+        ADR     R0,saveoverflowdisaster
+        SETV
+        Pull    "R1,PC"
+
+saveoverflowdisaster
+        DCD     0
+        DCB     "DISASTER: Too many 'save's or 'gsave's",0
+
+        ]
+
+; Output a "restore" and update the colour control information accordingly.
+
+output_restore
+        Push    "LR"
+        BL      output_immstring
+        DCB     "R",10,0
+        ALIGN
+        B       output_restorecommon
+
+; Output a "grestore" and update the colour control information accordingly.
+
+output_grestore
+        Push    "LR"
+        BL      output_immstring
+        DCB     "GR",10,0
+        ALIGN
+output_restorecommon
+
+        [       PSTextSpeedUps
+        LDRVC   LR,currentfontptr
+        SUBVC   LR,LR,#4
+        STRVC   LR,currentfontptr
+        ]
+
+        LDRVC   LR,currentcolptr
+        SUBVC   LR,LR,#4
+        STRVC   LR,currentcolptr
+
+        [       :LNOT:DevelopmentChecks
+
+        Pull    "PC"
+
+        |
+
+        Pull    "PC",VS
+        Push    "R1"
+        ADR     R1,currentcols
+        CMP     LR,R1
+        Pull    "R1,PC",HS
+        ADR     R0,restoreunderflowdisaster
+        SETV
+        Pull    "R1,PC"
+
+restoreunderflowdisaster
+        DCD     0
+        DCB     "DISASTER: Too many 'restore's or 'grestore's",0
+
+        ]
+
+; Send the single character in R0 to the file handle held in R10
+
+output_character
+        Push    "R1,LR"
+        MOV     R1,R10
+        BL      bput
+        Pull    "R1,PC"
+
+; Send an immediate string (terminated by an ASCII 0) to the file handle held
+; in R10
+
+output_immstring
+        Push    "R0,R1,R2"
+        MOV     R1,R10
+        BIC     R2,LR,#&FC000003        ;Get string address
+output_immstring_loop
+        LDRB    R0,[R2],#1              ;Get a character
+        CMP     R0,#0                   ;End of string? (also clears V)
+        BEQ     output_immstring_return ;Return if so
+        BL      bput
+        BVC     output_immstring_loop
+output_immstring_errorloop
+        LDRB    R1,[R2],#1              ;Get to end of string
+        TEQ     R1,#0                   ;Preserves V
+        BNE     output_immstring_errorloop
+        STR     R0,[R13]                ;Pass error message pointer up
+output_immstring_return
+        ADD     LR,R2,#3
+        Pull    "R0,R1,R2"              ;Return, preserving V
+        BIC     PC,LR,#3
+
+; Send the string pointed to by R0 and terminated by any character not
+; between R2 and R2+R3 (inclusive) to the file handle held in R10. Assumes
+; R2 and R3 contain sensible values (i.e. byte values).
+
+output_string
+        Push    "R0,R1,R4,R5,LR"
+        MOV     R1,R10
+        MOV     R4,R0
+output_string_loop
+        LDRB    R0,[R4],#1              ;Get a character
+        SUB     R5,R0,R2                ;Within the given range? (Also clears
+        CMP     R5,R3                   ;  V provided R2 and R3 are sensible)
+        BHI     output_string_return    ;Return if so
+        BL      bput
+        BVC     output_string_loop
+output_string_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,R4,R5,PC"
+
+; Send the string pointed to by R0 and containing R2 characters to the file
+; handle held in R10, but only outputting characters between R3 and R3+R4
+; (inclusive). Assumes R3 and R4 hold sensible values (i.e. byte values).
+
+output_stringN
+        Push    "R0,R1,R2,R5,R6,LR"
+        MOV     R1,R10
+        MOV     R5,R0
+output_stringN_loop
+        SUBS    R2,R2,#1                ;Characters left?
+        BLT     output_stringN_return   ;Return if not (V will be clear)
+        LDRB    R0,[R5],#1              ;Get a character
+        SUB     R6,R0,R3                ;Check in range, clearing V as long
+        CMP     R6,R4                   ;  as R3 and R4 are reasonable
+        BLLS    bput
+        BVC     output_stringN_loop
+output_stringN_return
+        STRVS   R0,[R13]
+        Pull    "R0,R1,R2,R5,R6,PC"
+
+; Put an immediate string (terminated by an ASCII 0, 10 or 13) through
+; OS_GSTrans and send the results to the file handle held in R10
+
+output_immgstring
+        Push    "R0,R1,LR"
+        BIC     LR,LR,#&FC000003        ;Get string pointer
+        MOV     R0,LR
+output_immgstring_loop
+        LDRB    R1,[LR],#1              ;Find return address
+        CMP     R1,#0
+        BNE     output_immgstring_loop
+        ADD     LR,LR,#3
+        BIC     LR,LR,#3
+        STR     LR,[R13,#8]             ;Insert return address into stack
+        BL      output_gstring
+        STRVS   R0,[R13]
+        Pull    "R0,R1,PC"
+
+; Put the string pointed to by R0 and terminated by ASCII 0 through OS_GTrans
+; and send the results to the file handle held in R10. Allows all characters
+; in range ASCII 1-126 through to the printer.
+
+output_gstring
+        Push    "R0-R4,LR"
+        ADR     R1,expansionbuffer
+        MOV     R2,#?expansionbuffer
+        SWI     XOS_GSTrans
+        BVS     output_gstring_error
+        SUBCS   R2,R2,#1
+output_expansionbuffer
+        ADR     R0,expansionbuffer
+        MOV     R3,#1
+        MOV     R4,#126-1
+        BL      output_stringN
+output_gstring_error
+        STRVS   R0,[R13]
+        Pull    "R0-R4,PC"
+
+; Output the byte held in R0 to the file handle in R10, as a two digit
+; hexadecimal number.
+
+output_hexbyte
+        Push    "R0-R3,LR"
+        MOV     R1,R10
+        MOV     R2,R0
+        ADR     R3,output_hexdigits
+
+        AND     R0,R2,#&F0
+        LDRB    R0,[R3,R0,LSR #4]
+        BL      bput
+
+        ANDVC   R0,R2,#&F
+        LDRVCB  R0,[R3,R0]
+        BLVC    bput
+
+        STRVS   R0,[R13]
+        Pull    "R0-R3,PC"
+
+output_hexdigits
+        DCB     "0123456789ABCDEF"
+
+; Output the integer held in R0 to the file handle in R10, in decimal format
+
+output_number
+        Push    "R0-R4,LR"
+        ADR     R1,expansionbuffer
+        MOV     R2,#?expansionbuffer
+        SWI     XOS_BinaryToDecimal
+        BVC     output_expansionbuffer
+        B       output_gstring_error
+
+; Output the integer held in R0 to the file handle in R10, in decimal format,
+; followed by a space
+
+output_numberspace
+        Push    "R0-R4,LR"
+        ADR     R1,expansionbuffer
+        MOV     R2,#?expansionbuffer
+        SWI     XOS_BinaryToDecimal
+        BVS     output_gstring_error
+        MOV     R0,#" "
+        STRB    R0,[R1,R2]
+        ADD     R2,R2,#1
+        B       output_expansionbuffer
+
+; Output the co-ordinate pair in R0 and R1 to the file handle in R10, in
+; decimal format
+
+output_coordpair
+        Push    "R0,LR"
+        BL      output_numberspace
+        MOVVC   R0,R1
+        BLVC    output_numberspace
+        STRVS   R0,[R13]
+        Pull    "R0,PC"
+
+; Output the rgb value in the top 24 bits of R1 to the file handle in R10, in
+; decimal format
+
+output_rgbvalue
+        Push    "R0,LR"
+        MOV     R0,R1,LSL #16
+        MOV     R0,R0,LSR #24
+        BL      output_numberspace
+        MOVVC   R0,R1,LSL #8
+        MOVVC   R0,R0,LSR #24
+        BLVC    output_numberspace
+        MOVVC   R0,R1,LSR #24
+        BLVC    output_numberspace
+        STRVS   R0,[R13]
+        Pull    "R0,PC"
+
+; Read the value of a system variable and print it to the output
+; stream in R10.  The variable name is an immediate string.  The variable
+; value must fit in expansionbuffer, and will be truncated if it doesn't.
+; Note that this routine corrupts expansionbuffer.
+
+output_variable
+        Push    "R0-R4,LR"
+        BIC     LR,LR,#&FC000003        ;Get pointer to variable name
+        MOV     R0,LR
+output_variable_loop
+        LDRB    R1,[LR],#1              ;Find return address
+        CMP     R1,#0
+        BNE     output_variable_loop
+        ADD     LR,LR,#3
+        BIC     LR,LR,#3
+        STR     LR,[R13,#20]             ;Insert return address into stack
+        ADR     R1,expansionbuffer
+        MOV     R2,#?expansionbuffer
+        MOV     R3,#0
+        MOV     R4,#0
+        SWI     XOS_ReadVarVal
+        STRVS   R0,[R13]
+        Pull    "R0-R4,LR",VS
+        MOV     R0,R1
+        MOV     R3,#32                  ;Allow chars between 32 and 126 inclusive
+        MOV     R4,#126-32
+        BL      output_stringN
+        STRVS   R0,[R13]
+        Pull    "R0-R4,LR"
+
+; Subroutine to multiply two single precision signed numbers together and
+; get a double precision result. The word following the BL should contain
+; the numbers of the two operand registers in its bottom two bytes and the
+; number of the register to take the ls part of the result in the next byte.
+; The ms part of the result will go into the next register.
+;   This routine will only work on registers R0-R8.
+
+arith_dpmult
+        Push    "R0-R8"
+        BIC     R8,R14,#&FC000003
+        LDRB    R0,[R8]                 ;Get first operand
+        LDR     R0,[R13,R0,LSL #2]
+        LDRB    R1,[R8,#1]              ;Get second operand
+        LDR     R1,[R13,R1,LSL #2]
+        MOV     R4,R0,LSR #16           ;Split first operand into halves
+        BIC     R3,R0,R4,LSL #16
+        MOVS    R6,R1,LSR #16           ;Split second operand into halves
+        BIC     R5,R1,R6,LSL #16
+        MUL     R2,R3,R5                ;Produce low partial product
+        MUL     R3,R6,R3                ;And middle partial products
+        MUL     R5,R4,R5
+        MULNE   R6,R4,R6                ;And high partial product
+        ADDS    R3,R3,R5                ;Add middle partial products, dealing
+        ADDCS   R6,R6,#&10000           ;  with overflow
+        ADDS    R2,R2,R3,LSL #16        ;Add middle partial product sum into
+        ADC     R6,R6,R3,LSR #16        ;  result
+        TEQ     R0,#0                   ;Add cross products of operands and
+        SUBMI   R6,R6,R1                ;  operand sign extensions into
+        TEQ     R1,#0                   ;  result
+        SUBMI   R6,R6,R0
+        LDRB    R0,[R8,#2]              ;Store the result on the stack, to be
+        ADD     R0,R13,R0,LSL #2        ;  picked up by the correct registers
+        STMIA   R0,{R2,R6}
+        Pull    "R0-R8"
+        ADD     PC,R14,#4               ;Skip the argument word on return
+
+; Subroutine to divide a double precision signed number by a single precision
+; unsigned number, yielding a single precision signed result. The word
+; following the BL should contain the number of the register holding the ls
+; part of the dividend in its bottom byte; the ms part of the dividend is in
+; the next register. The next byte of the word contains the number of the
+; divisor register, the next byte the number of the register in which to
+; deposit the quotient, and the last byte the number of the register in which
+; to deposit the remainder. Quotient and divisor are calculated on "round to
+; minus infinity" rules - i.e. the quotient is the largest integer <= true
+; result and the remainder = dividend - quotient*divisor and is thus always
+; >= 0.
+;   This routine will only work on registers R0-R8. It assumes that the
+; divisor is not zero, and that the quotient will not overflow.
+
+arith_dpdivmod
+        Push    "R0-R8"
+        BIC     R8,R14,#&FC000003
+        LDRB    R0,[R8]                 ;Get first operand
+        ADD     R0,R13,R0,LSL #2
+        LDMIA   R0,{R0,R1}
+        MOVS    R4,R1,ASR #31           ;Record sign of dividend and 1's
+        MVNMI   R0,R0                   ;  complement it if negative
+        MVNMI   R1,R1
+        LDRB    R2,[R8,#1]              ;Get second operand
+        LDR     R2,[R13,R2,LSL #2]
+        MOV     R3,#1                   ;Init. quotient with a sentinel bit
+arith_dpdivmod_loop
+        ADDS    R0,R0,R0                ;Shift a bit up into the ms half of
+        ADC     R1,R1,R1                ;  the dividend
+        CMP     R1,R2                   ;Do trial subtraction, producing
+        SUBCS   R1,R1,R2                ;  result bit in C
+        ADCS    R3,R3,R3                ;Result bit into result, then loop
+        BCC     arith_dpdivmod_loop     ;  unless sentinel bit shifted out
+        TEQ     R4,#0                   ;If dividend was negative, 1's
+        MVNMI   R3,R3                   ;  complement the quotient and
+        MVNMI   R1,R1                   ;  adjust the remainder by 1's
+        ADDMI   R1,R1,R2                ;  complementing it and adding the
+                                        ;  dividend
+        LDRB    R0,[R8,#2]              ;Store the results on the stack, to
+        STR     R3,[R13,R0,LSL #2]      ;  be picked up by the correct
+        LDRB    R0,[R8,#3]              ;  registers
+        STR     R1,[R13,R0,LSL #2]
+        Pull    "R0-R8"
+        ADD     PC,R14,#4               ;Skip the argument word on return
+
+
+; routines for outputing data to be read by PostScript Level2 ASCII85Decode filter
+
+; ----- ascii85_begin ----
+; set-up for PostScript ASCII85 encoding
+;
+ascii85_begin ROUT
+        Push    "LR"
+        BL      bput_flush
+        MOV     LR,#0
+        STR     LR,a85pending
+        STRB    LR,a85Npending
+        STRB    LR,a85Ncolumns
+        Pull    "PC"
+
+
+; ----- ascii85_encode -----
+; encode and output n (1..4) bytes to (usually) n+1 printable base-85 digits, conforming
+; to PostScript ASCII85 code/decode filters
+;
+; entry:
+;   R0      = (up to) 4 bytes of data to encode (least sig byte = righmost)
+;   R3      = no. of significant bytes (normally 4, but possibly <4 for last encode)
+;   R6      = output buffer count (linefeed appended, and buffer flushed, about every 80 chars)
+;   R7      = output buffer pointer
+;   R10-R12 = usual file handle and workspace pointers
+; exit:
+;   all preserved except R6 (updated)
+;
+ascii85_encode ROUT
+        Push    "R0-R4,LR"
+
+        CMP     R0,#0
+        CMPEQ   R3,#4                     ;no special case if not 4 bytes in
+        BEQ     ascii85_encode_0000       ;special case is 0000 in = "z" out
+
+        ADD     LR,R6,R3
+        ADD     LR,LR,#1                  ;stop value for R6
+        MOV     R1,R0
+
+;1st output digit
+        MOV     R4,#&B1
+        ORR     R4,R4,#&8400
+        ORR     R4,R4,#&31C0000           ;&31C84B1 = 85^4
+        DivRem  R3, R1, R4, R0            ;R3:=R1 div R4, R1:=R1 rem R4, R4 preserved, R0 corrupt
+        ADD     R3,R3,#"!"                ;"!" is ASCII85 digit for 0
+        STRB    R3,[R7,R6]
+        ADD     R6,R6,#1
+        CMP     R6,LR
+        BEQ     ascii85_encode_checkflush
+
+;2nd output digit
+        MOV     R4,#&ED
+        ORR     R4,R4,#&5E00
+        ORR     R4,R4,#&90000             ;&95EED = 85^3
+        DivRem  R3, R1, R4, R0
+        ADD     R3,R3,#"!"
+        STRB    R3,[R7,R6]
+        ADD     R6,R6,#1
+        CMP     R6,LR
+        BEQ     ascii85_encode_checkflush
+
+;3rd output digit
+        MOV     R4,#&39
+        ORR     R4,R4,#&1C00              ;&1C39 = 85^2
+        DivRem  R3, R1, R4, R0
+        ADD     R3,R3,#"!"
+        STRB    R3,[R7,R6]
+        ADD     R6,R6,#1
+        CMP     R6,LR
+        BEQ     ascii85_encode_checkflush
+
+;4th and 5th output digits
+        MOV     R4,#85
+        DivRem  R3, R1, R4, R0
+        ADD     R3,R3,#"!"
+        STRB    R3,[R7,R6]
+        ADD     R6,R6,#1
+        CMP     R6,LR
+        BEQ     ascii85_encode_checkflush
+        ADD     R1,R1,#"!"                ;5th output digit from final remainder
+        STRB    R1,[R7,R6]
+        ADD     R6,R6,#1
+
+ascii85_encode_checkflush
+        CMP     R6,#80
+        Pull    "R0-R4,PC",LT
+;flush it
+        MOV     R0,#10                    ;linefeed
+        STRB    R0,[R7,R6]
+        ADD     R6,R6,#1
+        MOV     R0,#2                     ;OS_GBPB 2 (write to current file position)
+        MOV     R1,R10                    ;file handle
+        MOV     R2,R7                     ;start address
+        MOV     R3,R6                     ;no. of bytes
+        SWI     XOS_GBPB
+        STRVS   R0,[SP]
+        MOV     R6,#0
+        Pull    "R0-R4,PC"
+
+ascii85_encode_0000
+        MOV     R2,#"z"                 ;special case is 0000 in = "z" out
+        STRB    R2,[R7,R6]
+        ADD     R6,R6,#1
+        B       ascii85_encode_checkflush
+
+
+; ---- ascii85_block ----
+; output block of data as PostScript ASCII85 encoded data
+;
+; entry:
+;   R0 -> data
+;   R1 =  length of data
+;   R10-R12 = file handle and workspace pointers
+
+ascii85_block ROUT
+        Push    "R0-R7,LR"
+
+        MOV     R4,R0
+        MOV     R5,R1
+        LDRB    R6,a85Ncolumns
+        ADRL    R7,a85linebuffer
+
+        LDRB    R3,a85Npending
+        CMP     R3,#0
+        MOVEQ   R0,#0
+        LDRNE   R0,a85pending
+        B       %FT05
+00
+        MOV     R3,#0
+        MOV     R0,#0
+05
+        LDRB    R1,[R4],#1
+        MOV     R0,R0,LSL #8
+        ORR     R0,R0,R1
+        ADD     R3,R3,#1
+        SUBS    R5,R5,#1
+        CMPNE   R3,#4
+        BNE     %BT05
+        CMP     R3,#4             ;this also clears V
+        STRLT   R0,a85pending
+        BLT     %FT99
+        BL      ascii85_encode
+        MOV     R3,#0
+        BVS     %FT99
+        CMP     R5,#0             ;this also clears V
+        BGT     %BT00
+99
+        STRB    R6,a85Ncolumns
+        STRB    R3,a85Npending
+        STRVS   R0,[SP]    ;save error ptr
+        Pull    "R0-R7,PC"
+
+
+; ---- ascii85_byte ----
+; output byte as PostScript ASCII85 encoded data
+;
+; entry:
+;   R0 = input byte (only LSB is significant)
+;   R10-R12 = file handle and workspace pointers
+;
+ascii85_byte ROUT
+        Push    "R0-R3,LR"
+ascii85_byte_altentry
+        AND     R1,R0,#255
+        LDR     R0,a85pending
+        LDRB    R3,a85Npending
+        MOV     R0,R0,LSL #8
+        ORR     R0,R0,R1
+        ADD     R3,R3,#1
+        CMP     R3,#4
+        STRNE   R0,a85pending
+        STRNEB  R3,a85Npending
+        BNE     %FT20
+        Push    "R6,R7"
+        LDRB    R6,a85Ncolumns
+        ADRL    R7,a85linebuffer
+        BL      ascii85_encode
+        STRB    R6,a85Ncolumns
+        Pull    "R6,R7"
+        BVS     %FT99
+        MOV     R0,#0
+        STR     R0,a85pending
+        STRB    R0,a85Npending
+20
+        CLRV
+99
+        STRVS   R0,[SP]    ;save error ptr
+        Pull    "R0-R3,PC"
+
+;alternative entry, byte in R7
+ascii85_byteR7
+        Push    "R0-R3,LR"
+        MOV     R0,R7
+        B       ascii85_byte_altentry
+
+
+; ---- ascii85_end ----
+; flush and output end of data for ASCII85
+;
+ascii85_end ROUT
+        Push    "R0-R7,LR"
+
+        LDRB    R3,a85Npending
+        LDRB    R6,a85Ncolumns
+        ADRL    R7,a85linebuffer
+
+        CMP     R3,#0
+        BEQ     %FT20
+
+        LDR     R0,a85pending
+        CMP     R3,#4
+        BEQ     %FT10
+
+        RSB     R1,R3,#4
+        MOV     R1,R1,LSL #3
+        MOV     R0,R0,LSL R1
+10
+        BL      ascii85_encode
+        BVS     %FT99
+20
+        MOV     R0,#"~"
+        STRB    R0,[R7,R6]
+        ADD     R6,R6,#1
+        MOV     R0,#">"                   ;"~>" is PostScript ASCII85 end-of-data
+        STRB    R0,[R7,R6]
+        ADD     R6,R6,#1
+        MOV     R0,#10                    ;linefeed
+        STRB    R0,[R7,R6]
+        ADD     R6,R6,#1
+        MOV     R0,#2                     ;OS_GBPB 2 (write to current file position)
+        MOV     R1,R10                    ;file handle
+        MOV     R2,R7                     ;start address
+        MOV     R3,R6                     ;no. of bytes
+        SWI     XOS_GBPB
+        BVS     %FT99
+        MOV     R0,#0
+        STRB    R0,a85Ncolumns
+        STRB    R0,a85Npending
+        STR     R0,a85pending
+        CLRV
+99
+        STRVS   R0,[SP]    ;save error ptr
+        Pull    "R0-R7,PC"
+
+
+        END

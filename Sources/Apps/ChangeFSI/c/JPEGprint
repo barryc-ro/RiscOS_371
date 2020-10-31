@@ -1,0 +1,1235 @@
+
+/* JPEGprint.c - print a JPEG file (dropped onto !Printers) */
+
+#define Version "0.21"
+
+  /* set to 1 to write debug trace information to file "$.mjsgrot"
+     NOTE: it will need more WimpSlot! (say 128k, rather than 32k) */
+#define Debug 0
+
+  /* set to 1 to prime SpriteExtend for JPEG with fake plot (ensures SpriteExtend
+     has claimed enough workspace, before printer drivers invoked; should not be
+     needed with PDriverDP version doing JPEG memory counting pre-scan) */
+#define PrimeSpriteExtend 0
+
+  /* default print options */
+#define DefaultCentred     1     /* 1 or 0; equivalent to C or O options */
+#define DefaultMaxScale    0     /* 0 means no max scale */
+#define DefaultOrientation 'F'   /* F, L or P for Fit, Portrait or Landscape */
+
+
+/*
+   Author:  Mike Stephens
+
+   History:
+     0.10 MJS 17-Sep-94 Created (from test code)
+     0.11 MJS 17-Sep-94 allow options in JPEGprint$Options variable
+     0.12 MJS 19-Sep-94 add code to give SpriteExtend a chance to claim its
+                        JPEG workspace, before printing swallows memory
+     0.13 MJS 19-Sep-94 Add #define for switching debug trace on/off
+     0.14 MJS 22-Sep-94 Fix bug with options reading. Replace F option with C,O
+     0.15 MJS 23-Sep-94 Fix bug with JPEG error causing crash in prime_spriteextend
+     0.16 MJS 29-Sep-94 disable prime_spriteextend; add use of pre-scan flag in
+                        PDriver_DrawPage (drivers now work out memory requirements)
+     0.17 MJS 03-Oct-94 Internationalise errors
+     0.18 MJS 04-Oct-94 Add F option for completeness; add overall max scale of 100
+                        to avoid numeric problems for very small pictures
+     0.19 MJS 06-Oct-94 Change silly print job title (oops!); only do DeclareFont
+                        if printer driver supports it
+     0.20 MJS 11-Oct-94 Allow 'wide' translation table for Sprite plot, make sure
+                        translation table initialised only after counting pass
+     0.21 MJS 02-Nov-94 Add check for JPEG support in SpriteExtend
+*/
+     
+/*
+   - Alias$@PrintType_C85 variable should be set to call this routine with
+     filename as first argument (file type &C85 is JPEG);
+   - expects to run as a WimpTask, and print immediately (no protocol), which
+     is as required for !Printers invocation via Alias$@PrintType variable;
+   - prints image scaled to fit current printer page/margins (adjusted to
+     centre print on page);
+   - chooses Portrait or Landscape, whichever gives larger scaling;
+   - variable JPEG$Options may be present, allowing one-letter options:
+       C              = plot Centred on page
+       F              = use image orientation (Portrait or Landscape) to best Fit page
+       L              = force Landscape
+       O              = plot at Origin of page margins (not Centred)
+       Mx             = Maximum scale, where x is digit 0..9 (0 = no max)
+       P              = force Portrait
+   - Note that this code also allows file to be a Sprite, although !Paint
+     normally handles Sprites
+*/
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <signal.h>
+#include <ctype.h>
+
+#include "kernel.h"
+
+#if Debug
+#  include "alarm.h"
+#endif
+
+
+#define OS_File                0x08
+#define OS_Find                0x0d
+#define OS_ReadVarVal          0x23
+#define OS_SpriteOp            0x2e
+#define OS_ReadModeVariable    0x35
+#define OS_SWINumberFromString 0x39
+
+#define ColourTrans_SetGCOL       0x40743
+#define ColourTrans_GenerateTable 0x40763
+
+#define Hourglass_On              0x406c0
+#define Hourglass_Off             0x406c1
+
+#define MessageTrans_ErrorLookup  0x41506
+
+#define JPEG_Info                 0x49980
+#define JPEG_PlotScaled           0x49982
+
+#define PDriver_Info              0x80140
+#define PDriver_PageSize          0x80143
+#define PDriver_SelectJob         0x80145
+#define PDriver_EndJob            0x80148
+#define PDriver_AbortJob          0x80149
+#define PDriver_GiveRectangle     0x8014b
+#define PDriver_DrawPage          0x8014c
+#define PDriver_GetRectangle      0x8014d
+#define PDriver_DeclareFont       0x80155
+
+#define Wimp_Initialise           0x400c0
+#define Wimp_CloseDown            0x400dd
+#define Wimp_ReportError          0x400df
+
+#define TASK 0x4b534154  /* for Wimp_Initialise */
+
+#define PreScanIsOK     (1<<24) /* for PDriver_DrawPage */
+#define DeclareFontFlag (1<<29) /* in PDriver_Info features word */
+#define DrawPageFlags   (1<<13) /* in PDriver_Info features word */
+
+#define SpriteFileType 0xff9
+#define JPEGFileType   0xc85
+
+  /* avoid code-breaking scale for very small pictures */
+#define AbsoluteMaxScale 100
+
+  /* in millipoints (72000th inch); don't quite scale image to max on page */
+#define SafetyMargin 7200
+
+  /* in OS units (180th inch); grow rectangle to avoid clip errors */
+#define ExpandMargin 2
+
+  /* palette colours; 0xBBGGRR00 */
+#define Black 0x00000000
+#define White 0xffffff00
+
+/* ------------------------------------------------------------------------ */
+
+typedef unsigned int  uint32;
+typedef unsigned char uint8;
+
+typedef struct
+{
+  int    JPSize;
+  uint32 *jpbuff;
+} jpeg_t;
+
+typedef struct
+{
+  int    SpSize;
+  uint32 *spbuff;
+  char   spname[16];
+  uint8  *sptrans;
+  int    sptrans_generated;
+} sprite_t;
+
+typedef union
+{
+  jpeg_t   jpeg;
+  sprite_t sprite;
+} image_u;
+
+typedef struct
+{
+  int     xsize, xdpi; /* size is in pixels, dpi is dots per inch */
+  int     ysize, ydpi; /* size is in pixels, dpi is dots per inch */
+  int     image_type;  /* RISC OS file type; JPEG or Sprite */
+  image_u image;       /* specific image info */
+  int     scale[4];    /* scale factors; { xmul,ymul,xdiv,ydiv } */
+} imagerec_t;
+
+  /* printer rectangle/scaling choices */
+typedef struct
+{
+  /* low, high bound page rectangle (OS units);
+     scale (16.16 format) scales image on plotting;
+     pos (millipoints) is origin of bottom left of rectangle on page */
+  int xlow, xhigh, xscale, xpos;
+  int ylow, yhigh, yscale, ypos;
+  int landscape; /*flag */
+} printrec_t;
+
+/* ------------------------------------------------------------------------ */
+
+#if Debug
+# define MaxTrace 64*1024
+  static char trace_buff[MaxTrace], *trace_ptr = trace_buff;
+  static int  Ntrace = 0;
+  static int tstart; /* start time */
+#endif
+
+static int job_active = 0, pfile = 0, pdriver_features;
+static int task_handle, task_initialised = 0;
+
+/* ------------------------------------------------------------------------ */
+
+#if Debug
+static void tprintf(char *format, ...)
+{
+  va_list args;
+  int     len = 0;
+
+  va_start(args, format);
+  vsprintf(trace_ptr,format,args);
+  va_end(args);
+
+  len = strlen(trace_ptr);
+  Ntrace += len;
+  trace_ptr += len;
+
+  /* avoid overflow, but don't generate an error (may recurse) */
+  if (Ntrace > MaxTrace-256)
+  {
+    Ntrace -= 256;
+    trace_ptr -= 256;
+  }
+}
+#endif
+
+/* ------------------------------------------------------------------------ */
+
+#if Debug
+static void trace_dump(void)
+{
+  FILE *fp;
+
+  fp = fopen("$.mjsgrot","w");
+  if (fp != NULL)
+  {
+    fwrite(trace_buff,Ntrace,1,fp);
+    fclose(fp);
+  }
+}
+#endif
+
+/* ------------------------------------------------------------------------ */
+
+#if Debug
+#  define timestamp_trace(message) _timestamp_trace(message)
+#else
+#  define timestamp_trace(message) /* do nothing */
+#endif
+
+#if Debug
+static void _timestamp_trace(char *info)
+{
+  int tstop, tdiff, mins, secs, tenths;
+
+  tstop = alarm_timenow();
+  tdiff = alarm_timedifference(tstart,tstop) + 5; /* rounding to 10'ths */
+  tenths = (tdiff%100)/10;
+  tdiff /= 100;
+  mins  = tdiff/60;
+  secs  = tdiff%60;
+  tprintf("%s at %2d:%02d.%1d (mins:secs)\n",info,mins,secs,tenths);
+}
+#endif
+
+/* ------------------------------------------------------------------------ */
+
+static void check_JPEG_support(void)
+{
+  _kernel_swi_regs regs;
+  _kernel_oserror *error;
+
+  static void internal_give_up(char *token, char *param0);
+
+  regs.r[1] = (int)"JPEG_Info";
+  error = _kernel_swi(OS_SWINumberFromString, &regs, &regs);
+  if (error) internal_give_up("MJSOSPX:You need SpriteExtend 0.75 or "
+                              "later to print JPEG's directly",(char *)0);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void close(int handle)
+{
+  _kernel_swi_regs regs;
+
+  regs.r[0] = 0; /* close file */
+  regs.r[1] = handle;
+  timestamp_trace("call OS_Find(Close)");
+  _kernel_swi(OS_Find,&regs, &regs); /* ignore errors */
+  timestamp_trace("return OS_Find(Close)");
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void abort_job(void)
+{
+  _kernel_swi_regs regs;
+
+#if Debug
+  tprintf("abort_job called\n");
+#endif
+  regs.r[0] = pfile;
+  _kernel_swi(PDriver_AbortJob, &regs, &regs); /* ignore errors */
+
+#if Debug
+  trace_dump();
+#endif
+  job_active = 0;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void give_up(_kernel_oserror *error)
+{
+  _kernel_swi_regs regs;
+
+  static void wimp_closedown(void);
+  static void hourglass(int status);
+
+  if (job_active) abort_job();
+
+  regs.r[0] = (int)error;
+  regs.r[1] = 0;
+  regs.r[2] = (int)"JPEGprint v" Version;
+  _kernel_swi(Wimp_ReportError, &regs, &regs);
+
+#if Debug
+  tprintf("%s\n",error->errmess);
+  trace_dump();
+#endif
+
+  if (pfile) close(pfile);
+  wimp_closedown();
+
+  hourglass(0);
+  exit(1);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void internal_give_up(char *token, char *param0)
+{
+  _kernel_oserror e;
+  _kernel_swi_regs regs;
+
+  static void swi(uint32 swicode, _kernel_swi_regs *regs);
+
+  e.errnum = 0;
+  strcpy(e.errmess,token);
+
+  regs.r[0] = (int)&e;
+  regs.r[1] = 0; /* use global messages */
+  regs.r[2] = 0; /* use internal result buffer */
+  regs.r[3] = 0;
+  regs.r[4] = (int)param0;
+  regs.r[5] = regs.r[6] = regs.r[7] = 0;
+
+  /* generates the (translated) error, so swi() will call give_up() */
+  swi(MessageTrans_ErrorLookup,&regs);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void swi(uint32 swicode, _kernel_swi_regs *regs)
+{
+  _kernel_oserror *error;
+
+  error = _kernel_swi(swicode, regs, regs);
+  if (error) give_up(error);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void hourglass(int status)
+{
+  _kernel_swi_regs regs;
+
+  if (status)
+    swi(Hourglass_On,&regs);
+  else
+    swi(Hourglass_Off,&regs);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void wimp_initialise(void)
+{
+  _kernel_swi_regs regs;
+
+  regs.r[0] = 310; /* know about Wimp version 3.10 */
+  regs.r[1] = TASK;
+  regs.r[2] = (int)"JPEG printer";
+  regs.r[3] = 0;
+  swi(Wimp_Initialise,&regs);
+
+  task_handle = regs.r[1]; 
+  task_initialised = 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void wimp_closedown(void)
+{
+  _kernel_swi_regs regs;
+
+  if (task_initialised)
+  {
+    regs.r[0] = task_handle;
+    regs.r[1] = TASK;
+    swi(Wimp_CloseDown,&regs);
+    task_initialised = 0;
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void set_translation_table(sprite_t *sp)
+{
+  _kernel_swi_regs regs;
+
+  regs.r[0] = (int)sp->spbuff; /* source mode,palette ... */
+  regs.r[1] = (int)sp->spname; /* ... from sprite */
+  regs.r[2] = -1;              /* destination mode = current */
+  regs.r[3] = -1;              /* destination palette = current */
+  regs.r[4] = 0;               /* get required buffer size */
+  regs.r[5] = 1<<4;            /* flags - table may be 'wide' */
+  swi(ColourTrans_GenerateTable,&regs);
+#if Debug
+  tprintf("translation table size = %1d\n",regs.r[4]);
+#endif
+
+  if (regs.r[4] == 0)
+    sp->sptrans = (uint8 *)0; /* no table required */
+  else
+  {
+    sp->sptrans = malloc(regs.r[4]);
+    if (sp->sptrans == NULL) internal_give_up("NoMem",(char *)0);
+    regs.r[4] = (int)sp->sptrans;  /* generate table in sized buffer */
+    swi(ColourTrans_GenerateTable,&regs);
+  }
+
+  sp->sptrans_generated = 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void factorise(int *pn, int *pm)
+{
+  /* remove greatest common divisor (gcd) from n and m (n and m +ve) */
+
+  int t, n = *pn, m = *pm;
+
+  /* Euclid's clever method */
+  while (n > 0)
+  {
+    if (n < m) { t = n; n = m; m = t; }
+    n = n % m;
+  }
+
+  /* m now holds gcd */
+  *pn /= m;
+  *pm /= m;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int read_sprite(char *fname, imagerec_t *im)
+{
+  int              mode, sp_xeig, sp_yeig, sc_xeig, sc_yeig, sc_xdpi, sc_ydpi;
+  _kernel_swi_regs regs;
+
+  regs.r[0] = 23; /* read catalogue info */
+  regs.r[1] = (int)fname;
+  swi(OS_File,&regs);
+  if (regs.r[0] == 0) internal_give_up("NoFile",fname);
+  if (regs.r[6] != SpriteFileType) return 0;
+
+  im->image_type          = SpriteFileType;
+  im->image.sprite.SpSize = regs.r[4] + 4;  /* size of area = filesize + 4 */
+  im->image.sprite.spbuff = malloc(im->image.sprite.SpSize);
+  if (im->image.sprite.spbuff == NULL) internal_give_up("NoMem",(char *)0);
+#if Debug
+  tprintf("sprite file size = %1d\n",regs.r[4]);
+#endif
+
+  im->image.sprite.spbuff[0] = im->image.sprite.SpSize;
+  im->image.sprite.spbuff[2] = 16;
+  regs.r[0] = 9 + 256; /* initialise user sprite area */
+  regs.r[1] = (int)im->image.sprite.spbuff;
+  swi(OS_SpriteOp,&regs);
+
+  regs.r[0] = 10 + 256; /* load sprite file to user area */
+  regs.r[1] = (int)im->image.sprite.spbuff;
+  regs.r[2] = (int)fname;
+  swi(OS_SpriteOp,&regs);
+
+  regs.r[0] = 13 + 256; /* get name of n'th sprite */
+  regs.r[1] = (int)im->image.sprite.spbuff;
+  regs.r[2] = (int)im->image.sprite.spname;
+  regs.r[3] = 16; /* length of spname buffer */
+  regs.r[4] = 1;  /* n */
+  swi(OS_SpriteOp,&regs);
+
+  regs.r[0] = 40 + 256; /* read sprite info */
+  regs.r[1] = (int)im->image.sprite.spbuff;
+  regs.r[2] = (int)im->image.sprite.spname;
+  swi(OS_SpriteOp,&regs);
+  mode = regs.r[6];
+  im->xsize = regs.r[3];
+  im->ysize = regs.r[4];
+
+  /* printer drivers expect us to plot Sprite as if to screen, so we have
+     to use appropriate scale factors ... */
+
+  /* pixel eigenfactors (relate to pixel aspect ratio) of Sprite */
+  regs.r[0] = mode;
+  regs.r[1] = 4; /* XEigFactor */
+  swi(OS_ReadModeVariable,&regs);
+  sp_xeig = regs.r[2];
+  regs.r[1] = 5; /* YEigFactor */
+  swi(OS_ReadModeVariable,&regs);
+  sp_yeig = regs.r[2];
+
+  /* pixel eigenfactors of current screen mode */
+  regs.r[0] = -1;
+  regs.r[1] = 4; /* XEigFactor */
+  swi(OS_ReadModeVariable,&regs);
+  sc_xeig = regs.r[2];
+  regs.r[1] = 5; /* YEigFactor */
+  swi(OS_ReadModeVariable,&regs);
+  sc_yeig = regs.r[2];
+
+  /* OS unit is 180 dpi; eig is shift right factor */
+  im->xdpi = 180 >> sp_xeig;
+  im->ydpi = 180 >> sp_yeig;
+  sc_xdpi  = 180 >> sc_xeig;
+  sc_ydpi  = 180 >> sc_yeig;
+
+  /* scale factors are: xmul,ymul,xdiv,ydiv */
+  im->scale[0] = sc_xdpi; im->scale[2] = im->xdpi;
+  im->scale[1] = sc_ydpi; im->scale[3] = im->ydpi;
+
+  factorise(&(im->scale[0]), &(im->scale[2]));
+  factorise(&(im->scale[1]), &(im->scale[3]));
+
+#if Debug
+  tprintf("sprite scale factors = %1d:%1d ; %1d:%1d\n",
+          im->scale[0],im->scale[2],im->scale[1],im->scale[3]);
+#endif
+
+  im->image.sprite.sptrans_generated = 0; /* no trans table yet */
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+#if PrimeSpriteExtend
+
+static void prime_spriteextend(jpeg_t *jp)
+{
+  /* make sure SpriteExtend gets enough memory to handle JPEG plot, *before*
+       printing potentially swallows most of free memory
+     do this by plotting JPEG into a small temporary internal Sprite */
+
+  _kernel_swi_regs regs, regs60;
+  _kernel_oserror  *error;
+  uint32           *sparea;
+
+#if Debug
+  tprintf("prime SpriteExtend for JPEG plot\n");
+#endif
+
+  sparea = malloc(512); /* plenty for 8x8 32 bit Sprite */
+  if (sparea == NULL) internal_give_up("NoMem",(char *)0);
+
+  sparea[0] = 512; /* size */
+  sparea[2] = 16;
+  regs.r[0] = 9 + 256; /* initialise user sprite area */
+  regs.r[1] = (int)sparea;
+  swi(OS_SpriteOp,&regs);
+
+  regs.r[0] = 15 + 256; /* create sprite */
+  regs.r[1] = (int)sparea;
+  regs.r[2] = (int)"sp";
+  regs.r[3] = 0;
+  regs.r[4] = 8; /* 8 pixels wide */
+  regs.r[5] = 8; /* 8 pixels high */
+  regs.r[6] = (6 << 27) | (90 << 14) | (90 << 1) | 1; /* 32 bit, 90x90 dpi */
+  swi(OS_SpriteOp,&regs);
+
+  regs60.r[0] = 60 + 256; /* switch output to Sprite */
+  regs60.r[1] = (int)sparea;
+  regs60.r[2] = (int)"sp";
+  regs60.r[3] = 0; /* no need for save area */
+  swi(OS_SpriteOp,&regs60);
+
+  regs.r[0] = (int)jp->jpbuff;
+  regs.r[1] = 0;               /* x coord */
+  regs.r[2] = 0;               /* y coord */
+  regs.r[3] = 0;               /* unit scale factors */
+  regs.r[4] = jp->JPSize;
+  regs.r[5] = 0;               /* flags; no dither */
+  error = _kernel_swi(JPEG_PlotScaled,&regs,&regs);
+
+  swi(OS_SpriteOp,&regs60); /* switch output back (using returned regs60) */
+  if (error) give_up(error);
+  free(sparea);
+}
+
+#endif
+
+/* ------------------------------------------------------------------------ */
+
+static int read_jpeg(char *fname, imagerec_t *im)
+{
+  int              sc_xeig, sc_yeig, sc_xdpi, sc_ydpi;
+  _kernel_swi_regs regs;
+
+  regs.r[0] = 23; /* read catalogue info */
+  regs.r[1] = (int)fname;
+  swi(OS_File,&regs);
+  if (regs.r[0] == 0) internal_give_up("NoFile",fname);
+  if (regs.r[6] != JPEGFileType) return 0;
+
+  im->image_type        = JPEGFileType;
+  im->image.jpeg.JPSize = regs.r[4];    /* size of area required */
+  im->image.jpeg.jpbuff = malloc(im->image.jpeg.JPSize);
+  if (im->image.jpeg.jpbuff == NULL) internal_give_up("NoMem",(char *)0);
+#if Debug
+  tprintf("jpeg file size = %1d\n",regs.r[4]);
+#endif
+
+  regs.r[0] = 16;
+  regs.r[1] = (int)fname;
+  regs.r[2] = (int)im->image.jpeg.jpbuff;
+  regs.r[3] = 0;
+  swi(OS_File,&regs);
+
+  regs.r[0] = 1; /* return dimensions */
+  regs.r[1] = (int)im->image.jpeg.jpbuff;
+  regs.r[2] = im->image.jpeg.JPSize;
+  swi(JPEG_Info,&regs);
+  im->xsize = regs.r[2];
+  im->ysize = regs.r[3];
+  if (regs.r[0] & 4)
+  {
+    /* returned pixel density is simple ratio; assume 90 dpi for x */
+    im->xdpi = 90;
+    im->ydpi = (int)(90.0F*(float)regs.r[5]/(float)regs.r[4]);
+  }
+  else
+  {
+    /* returned pixel density is in dpi */
+    im->xdpi = regs.r[4];
+    im->ydpi = regs.r[5];
+  }
+#if Debug
+  tprintf("JPEG: %1dx%1d flags=&%1.1x density=%1dx%1d\n",
+          regs.r[2],regs.r[3],regs.r[0],regs.r[4],regs.r[5]);
+#endif
+
+  /* printer drivers expect us to plot JPEG as if to screen, so we have
+     to use appropriate scale factors ... */
+
+  /* pixel eigenfactors of current screen mode */
+  regs.r[0] = -1;
+  regs.r[1] = 4; /* XEigFactor */
+  swi(OS_ReadModeVariable,&regs);
+  sc_xeig = regs.r[2];
+  regs.r[1] = 5; /* YEigFactor */
+  swi(OS_ReadModeVariable,&regs);
+  sc_yeig = regs.r[2];
+
+  /* OS unit is 180 dpi; eig is shift right factor */
+  sc_xdpi = 180 >> sc_xeig;
+  sc_ydpi = 180 >> sc_yeig;
+
+  /* scale factors are: xmul,ymul,xdiv,ydiv */
+  im->scale[0] = sc_xdpi; im->scale[2] = im->xdpi;
+  im->scale[1] = sc_ydpi; im->scale[3] = im->ydpi;
+
+  factorise(&(im->scale[0]), &(im->scale[2]));
+  factorise(&(im->scale[1]), &(im->scale[3]));
+
+#if Debug
+  tprintf("jpeg scale factors = %1d:%1d ; %1d:%1d\n",
+          im->scale[0],im->scale[2],im->scale[1],im->scale[3]);
+#endif
+
+#if PrimeSpriteExtend
+  prime_spriteextend(&(im->image.jpeg));
+#endif
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void plot_sprite(sprite_t *sp, int scale[4], int only_counting)
+{
+  _kernel_swi_regs regs;
+
+  /* translation table, via ColourTrans_GenerateTable */
+  if (!sp->sptrans_generated && !only_counting) set_translation_table(sp);
+
+  regs.r[0] = 52 + 256;         /* put sprite scaled */
+  regs.r[1] = (int)sp->spbuff;
+  regs.r[2] = (int)sp->spname;
+  regs.r[3] = 0;                /* x coord */
+  regs.r[4] = 0;                /* y coord */
+  regs.r[5] = 1<<5;             /* plot action (set, trans table 'wide') */
+  regs.r[6] = (int)scale;       /* => scale factors */
+  regs.r[7] = (int)sp->sptrans; /* => translation table */
+
+  timestamp_trace("call Os_SpriteOp(52)");
+  swi(OS_SpriteOp,&regs);
+  timestamp_trace("return Os_SpriteOp(52)");
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void plot_jpeg(jpeg_t *jp, int scale[4])
+{
+  _kernel_swi_regs regs;
+
+
+  regs.r[0] = (int)jp->jpbuff;
+  regs.r[1] = 0;               /* x coord */
+  regs.r[2] = 0;               /* y coord */
+  regs.r[3] = (int)scale;      /* => scale factors */
+  regs.r[4] = jp->JPSize;
+  regs.r[5] = 0;               /* flags; no dither */
+
+  timestamp_trace("call JPEG_PlotScaled");
+  swi(JPEG_PlotScaled,&regs);
+  timestamp_trace("return JPEG_PlotScaled");
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void end_job(void)
+{
+  _kernel_swi_regs regs;
+
+  regs.r[0] = pfile;
+  timestamp_trace("call PDriver_EndJob");
+  swi(PDriver_EndJob, &regs);
+  timestamp_trace("return PDriver_EndJob");
+
+  job_active = 0;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int pdriver_info(void)
+{
+  _kernel_swi_regs regs;
+
+#if Debug
+  int              feats, vsn;
+
+  static char *feats_0[2] = { "monochrome", "colour" };
+  static char *feats_1[2] = { "full","limited" };
+  static char *feats_2[2] = { "semi-continuous", "discrete" };
+
+  timestamp_trace("call PDriver_Info");
+  swi(PDriver_Info,&regs);
+  timestamp_trace("return PDriver_Info");
+
+  vsn = regs.r[0] & 0xffff;
+  tprintf("PDriver   = no. %1d, version %1.2f\n",regs.r[0]>>16,vsn*0.01);
+  tprintf("name      = %s\n",(char *)regs.r[4]);
+  tprintf("dpi       = %1dx%1d\n",regs.r[1],regs.r[2]);
+  tprintf("htone res = %1dx%1d (repeats/inch)\n",regs.r[5],regs.r[6]);
+  feats = regs.r[3];
+  tprintf("features  = 0x%8.8x\n",feats);
+  tprintf("type      = %s (%s,%s)\n\n",
+         feats_0[feats&1],feats_1[(feats>>1)&1],feats_2[(feats>>2)&1]);
+#else
+  swi(PDriver_Info,&regs);
+#endif
+
+  return regs.r[3]; /* features word */
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void pdriver_pagesize(int landscape, int pagesize[2], int margins[4])
+{
+  _kernel_swi_regs regs;
+
+  swi(PDriver_PageSize,&regs);
+
+  /* in millipoints */
+  if (landscape)
+  {
+    pagesize[0] = regs.r[2]; /* width */
+    pagesize[1] = regs.r[1]; /* height */
+    margins[0]  = regs.r[4]; /* left margin, from left of page */
+    margins[1]  = regs.r[3]; /* bottom margin, from bottom of page */
+    margins[2]  = regs.r[6]; /* right margin, from left of page */
+    margins[3]  = regs.r[5]; /* top margin, from bottom of page */
+  }
+  else /* portrait */
+  {
+    pagesize[0] = regs.r[1]; /* width */
+    pagesize[1] = regs.r[2]; /* height */
+    margins[0]  = regs.r[3]; /* left margin, from left of page */
+    margins[1]  = regs.r[4]; /* bottom margin, from bottom of page */
+    margins[2]  = regs.r[5]; /* right margin, from left of page */
+    margins[3]  = regs.r[6]; /* top margin, from bottom of page */
+  }
+
+#if Debug
+  tprintf("page size = %1.3fx%1.3f inches\n",
+          pagesize[0]/72000.0,pagesize[1]/72000.0);
+  tprintf("left margin  = %6.3f\n",margins[0]/72000.0);
+  tprintf("bott margin  = %6.3f\n",margins[1]/72000.0);
+  tprintf("right margin = %6.3f\n",margins[2]/72000.0);
+  tprintf("top margin   = %6.3f\n",margins[3]/72000.0);
+#endif
+
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void decide_printrec(int centred, char orientation, int max_scale,
+                            imagerec_t *imagerec, printrec_t *printrec    )
+{
+  int   pagesize[2], margins[4], width, height,
+        iwidth, iheight,pwidth, pheight;
+  float recwidth_inches, imwidth_inches, width_scale,
+        recheight_inches, imheight_inches, height_scale,
+        image_aspratio, page_aspratio;
+
+  /* choose portrait or landscape to give the bigger printed image */
+  switch(orientation)
+  {
+    case 'p': /* Portrait */
+      printrec->landscape = 0;
+      pdriver_pagesize(0,pagesize,margins);
+      break;
+    case 'l': /* Landscape */
+      printrec->landscape = 1;
+      pdriver_pagesize(1,pagesize,margins);
+      break;
+    default : /* either: choose to give the bigger printed image */
+      image_aspratio = ((float)imagerec->xsize/(float)imagerec->xdpi) /
+                       ((float)imagerec->ysize/(float)imagerec->ydpi)  ;
+      printrec->landscape = 0;
+      pdriver_pagesize(0,pagesize,margins);
+      page_aspratio = ((float)margins[2] - (float)margins[0]) /
+                      ((float)margins[3] - (float)margins[1])  ;
+
+      if ( ((image_aspratio < 1.0F) && (page_aspratio > 1.0F)) ||
+           ((image_aspratio > 1.0F) && (page_aspratio < 1.0F))    )
+      {
+        printrec->landscape = 1;
+        pdriver_pagesize(1,pagesize,margins);
+      }
+      break;
+  }
+
+  if (centred)
+  {
+    /* make nominal margins symmetric (by choosing biggest), so that print
+       centres within physical page */
+    if ((pagesize[0] - margins[2]) < margins[0])
+      margins[2] = pagesize[0] - margins[0];
+    else
+      margins[0] = pagesize[0] - margins[2];
+    if ((pagesize[1] - margins[3]) < margins[1])
+      margins[3] = pagesize[1] - margins[1];
+    else
+      margins[1] = pagesize[1] - margins[3];
+    /* but give up if it causes silly printable area */
+    width   = margins[2] - margins[0];
+    height  = margins[3] - margins[1];
+    if ((width < 7200) || (height < 7200))
+      internal_give_up("MJSPATS:printable area too small",(char *)0);
+  }
+
+  /* safety margin means we don't risk clipping the image slightly */
+  margins[0] += SafetyMargin;
+  margins[1] += SafetyMargin;
+  margins[2] -= SafetyMargin;
+  margins[3] -= SafetyMargin;
+
+#if Debug
+  tprintf("> left margin  = %6.3f\n",margins[0]/72000.0);
+  tprintf("> bott margin  = %6.3f\n",margins[1]/72000.0);
+  tprintf("> right margin = %6.3f\n",margins[2]/72000.0);
+  tprintf("> top margin   = %6.3f\n",margins[3]/72000.0);
+#endif
+
+  /* width,height are printable area */
+  width   = margins[2] - margins[0];
+  height  = margins[3] - margins[1];
+
+  recwidth_inches  = (float)width/72000.0F;
+  imwidth_inches   = (float)imagerec->xsize/(float)imagerec->xdpi;
+  width_scale      = recwidth_inches/imwidth_inches;
+
+  recheight_inches = (float)height/72000.0F;
+  imheight_inches  = (float)imagerec->ysize/(float)imagerec->ydpi;
+  height_scale     = recheight_inches/imheight_inches;
+
+  /* scale to just fit, at same image aspect ratio */
+  if (width_scale < height_scale)
+    height_scale = width_scale;
+  else
+    width_scale = height_scale;
+
+  /* clamp to max scale */
+  if (max_scale == 0) max_scale = AbsoluteMaxScale;
+  if (width_scale > max_scale) width_scale = height_scale = max_scale;
+
+  printrec->xscale = (int)(width_scale*65536.0F); /* 16.16 scaled ints */
+  printrec->yscale = (int)(height_scale*65536.0F);
+   
+  /* iwidth,iheight are area of image */
+  iwidth  = (int)(imwidth_inches*72000.0F);
+  iheight = (int)(imheight_inches*72000.0F);
+
+  /* pwidth,pheight are area we really want on page */
+  pwidth  = (int)(imwidth_inches*width_scale*72000.0F);
+  pheight = (int)(imheight_inches*height_scale*72000.0F);
+
+  /* /400 is millipoints -> OS units */
+  printrec->xlow  = -ExpandMargin;
+  printrec->ylow  = -ExpandMargin;
+  printrec->xhigh = iwidth/400  + ExpandMargin;
+  printrec->yhigh = iheight/400 + ExpandMargin;
+
+  /* origin (such that image is centred within margins, if centred = 1) */
+  if (printrec->landscape)
+  {
+    if (centred)
+    {
+      printrec->xpos = margins[3] - (height-pheight)/2;
+      printrec->ypos = margins[0] + (width-pwidth)/2;
+    }
+    else
+    {
+      printrec->xpos = margins[1] + pheight;
+      printrec->ypos = margins[0];
+    }
+  }
+  else
+  {
+    if (centred)
+    {
+      printrec->xpos = margins[0] + (width-pwidth)/2;
+      printrec->ypos = margins[1] + (height-pheight)/2;
+    }
+    else
+    {
+      printrec->xpos = margins[0];
+      printrec->ypos = margins[1];
+    }
+  }
+
+#if Debug
+  tprintf("image = %1dx%1d pixels; %1dx%1d dpi\n",
+          imagerec->xsize,imagerec->ysize,imagerec->xdpi,imagerec->ydpi);
+  tprintf("image = %1.3fx%1.3f inches, after scaling\n",
+          pwidth/72000.0,pheight/72000.0);
+  tprintf("xpos  = %8.3f inches\n",printrec->xpos/72000.0);
+  tprintf("ypos  = %8.3f inches\n",printrec->ypos/72000.0);
+  tprintf("rec   = %1d,%1d to %1d,%1d\n",
+          printrec->xlow,printrec->ylow,printrec->xhigh,printrec->yhigh);
+  tprintf("scale = %1.3f,%1.3f\n",
+          printrec->xscale/65536.0,printrec->yscale/65536.0);
+  if (printrec->landscape)
+    tprintf(" --- Landscape\n");
+  else
+    tprintf(" --- Portrait\n");
+#endif
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int open(char *fname)
+{
+  _kernel_swi_regs regs;
+
+  regs.r[0] = 0x8f; /* open new file for write, name in R1 */
+  regs.r[1] = (int)fname;
+  timestamp_trace("call OS_Find(Open)");
+  swi(OS_Find,&regs);
+  timestamp_trace("return OS_Find(Open)");
+
+  return regs.r[0]; /* file handle */
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void give_rectangle(printrec_t *printrec)
+{
+  /* not sure if blocks given to PDriver_GiveRectangle must persist
+     during plotting loop; be on safe side */
+  static int rectangle[4], transform[4], pos[2];
+
+  _kernel_swi_regs regs;
+
+  rectangle[0] = printrec->xlow;
+  rectangle[1] = printrec->ylow;
+  rectangle[2] = printrec->xhigh;
+  rectangle[3] = printrec->yhigh;
+
+  /* transform matrix: a  b  is indexed [0] [2]
+                       c  d             [1] [3]  
+     then x' = ax + by ; y' = cx + dy             */
+  if (printrec->landscape)
+  {
+    /* rotate 90 */
+    transform[0] = 0;
+    transform[1] = printrec->xscale;
+    transform[2] = -printrec->yscale;
+    transform[3] = 0;
+  }
+  else
+  {
+    /* no rotation */
+    transform[0] = printrec->xscale;
+    transform[1] = 0;
+    transform[2] = 0;
+    transform[3] = printrec->yscale;
+  }
+
+  pos[0] = printrec->xpos;
+  pos[1] = printrec->ypos;
+
+  regs.r[0] = 1; /* arbitrary rectangle id */
+  regs.r[1] = (int)rectangle;
+  regs.r[2] = (int)transform;
+  regs.r[3] = (int)pos;
+  regs.r[4] = White;
+  timestamp_trace("call PDriver_GiveRectangle");
+  swi(PDriver_GiveRectangle,&regs);
+  timestamp_trace("return PDriver_GiveRectangle");
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void start_job(int pfile, char *title, printrec_t *printrec)
+{
+  _kernel_swi_regs regs;
+
+  /* select new job */
+  regs.r[0] = pfile;
+  regs.r[1] = (int)title;
+  timestamp_trace("call PDriver_SelectJob");
+  swi(PDriver_SelectJob,&regs);
+  timestamp_trace("return PDriver_SelectJob");
+
+  job_active = 1;
+
+  if (pdriver_features & DeclareFontFlag)
+  {
+    /* declare that no fonts are used */
+    regs.r[0] = 0;
+    regs.r[1] = 0;
+    timestamp_trace("call PDriver_DeclareFont");
+    swi(PDriver_DeclareFont,&regs);
+    timestamp_trace("return PDriver_DeclareFont");
+  }
+
+  /* give rectangle required for print */
+  give_rectangle(printrec);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void handle_print(imagerec_t *im)
+{
+  _kernel_swi_regs regs;
+
+  int rectangle[4];
+  int more, id, only_counting;
+
+  regs.r[0] = 1; /* 1 copy */
+  if (pdriver_features & DrawPageFlags) regs.r[0] |= PreScanIsOK;
+  regs.r[1] = (int)rectangle;
+  regs.r[2] = 0; /* or integer page number */
+  regs.r[3] = 0; /* or string page number */
+  timestamp_trace("call PDriver_DrawPage");
+  swi(PDriver_DrawPage,&regs);
+  timestamp_trace("return PDriver_DrawPage");
+
+  more = regs.r[0];
+  id   = regs.r[2]; /* as passed to GiveRectangle */
+
+  while (more)
+  {
+#if Debug
+    tprintf("print rectangle id = %1d more = %8.8x\n",id,more);
+    tprintf("print rectangle is : %1d,%1d to %1d,%1d\n",
+            rectangle[0],rectangle[1],rectangle[2],rectangle[3]);
+#endif
+    only_counting = (more & 0x1000000) != 0;
+    switch(im->image_type)
+    {
+      case JPEGFileType:
+        plot_jpeg(&(im->image.jpeg),im->scale);
+        break;
+      case SpriteFileType:
+        plot_sprite(&(im->image.sprite),im->scale, only_counting);
+        break;
+    }
+
+    regs.r[1] = (int)rectangle;
+    timestamp_trace("call PDriver_GetRectangle");
+    swi(PDriver_GetRectangle,&regs);
+    timestamp_trace("return PDriver_GetRectangle");
+    more = regs.r[0];
+    id   = regs.r[2]; /* as passed to GiveRectangle */ 
+  }
+#if Debug
+  tprintf("printing done\n\n");
+#endif
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void set_options(int *centred, int *max_scale, char *orientation)
+{
+  _kernel_swi_regs regs;
+  char             buff[256];
+  int              i, len;
+
+  *centred     = DefaultCentred;
+  *max_scale   = DefaultMaxScale;
+  *orientation = DefaultOrientation;
+
+  regs.r[0] = (int)"JPEGprint$Options";
+  regs.r[1] = (int)buff;
+  regs.r[2] = -1; /* check existence of variable */
+  regs.r[3] = 0;
+  regs.r[4] = 3;
+  _kernel_swi(OS_ReadVarVal,&regs,&regs); /* ignore error */
+
+  if (regs.r[2] != 0) /* if var exists */
+  {
+    regs.r[0] = (int)"JPEGprint$Options";
+    regs.r[1] = (int)buff;
+    regs.r[2] = 256; /* read it (256 = size of buff) */
+    regs.r[3] = 0;
+    regs.r[4] = 3;
+    swi(OS_ReadVarVal,&regs);
+
+    len = regs.r[2];
+    for (i=0; i<len; i++)
+    {
+      switch(tolower(buff[i]))
+      {
+         case 'f': /* f = fit */
+           *orientation = 'f';
+           break;
+         case 'p': /* p = portrait */
+           *orientation = 'p';
+           break;
+         case 'l': /* l = landscape */
+           *orientation = 'l';
+           break;
+         case 'o': /* o = offset, ie. not centred */
+           *centred = 0;
+           break;
+         case 'c': /* c = centred */
+           *centred = 1;
+           break;
+         case 'm': /* m = max scale; next char is 1 digit int, 1..9 */
+           *max_scale = buff[i+1] - '0';
+           if (*max_scale < 0) *max_scale = 0;
+           if (*max_scale > 9) *max_scale = 9;
+           break;
+         default:
+           break;
+      }
+    }
+  }
+
+#if Debug
+  tprintf("sysvarlen=%1d centred=%1d max_scale=%1d orientation='%c'\n",
+          len,*centred,*max_scale,*orientation);
+#endif
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+  imagerec_t imagerec;
+  printrec_t printrec;
+  int        centred, max_scale;
+  char       orientation;
+
+  /* do not abort on Escape (let Escape error stop print job properly) */
+  signal(SIGINT, SIG_IGN);
+
+#if Debug
+  tprintf("JPEGprint version %s\n",Version);
+#endif
+
+  check_JPEG_support();
+
+  if (argc != 2) internal_give_up("BadParm",(char *)0);
+
+  set_options(&centred, &max_scale, &orientation);
+
+  wimp_initialise();
+  hourglass(1);
+
+#if Debug
+  alarm_init();
+  tstart = alarm_timenow();
+#endif
+
+  pdriver_features = pdriver_info();
+
+  pfile = open("printer:");
+  if (!pfile) internal_give_up("NoAny","printer:");
+
+  if (!read_jpeg(argv[argc-1], &imagerec) &&
+      !read_sprite(argv[argc-1], &imagerec)  )
+    internal_give_up("MJSCPFT:cannot print file of this type",(char *)0);
+
+  decide_printrec(centred, orientation, max_scale, &imagerec, &printrec);
+
+  start_job(pfile,"JPEGprint", &printrec);
+
+  handle_print(&imagerec);
+
+  end_job();
+  close(pfile);
+
+  hourglass(0);
+  wimp_closedown();
+
+#if Debug
+  timestamp_trace("call exit()");
+  trace_dump();
+#endif
+
+  return 0;
+}

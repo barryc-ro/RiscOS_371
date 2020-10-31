@@ -1,0 +1,263 @@
+/*
+ *  c.callback
+ *
+ *  Routines for displaying progress and aborting image reading.
+ *
+ *  ie. These routines are for passing to the PCD library
+ *  callback-specifying functions eg: PCDsetProgress and PCDsetAbort.
+ *
+ *  When using the functions in this file, pass some sort of unique
+ *  value as the 'data' value.  Eg. the pcdhdl value would do.
+ *  ie. use something like:
+ *
+ *  PCDsetProgress(pcdhdl, callback_progress, (long)pcdhdl);
+ *  PCDsetAbort(pcdhdl, callback_abort, (long)pcdhdl);
+ *
+ */
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimpt.h"
+#include "win.h"
+#include "help.h"
+#include "template.h"
+#include "werr.h"
+#include "visdelay.h"
+
+
+
+/*--- some global status vars ---*/
+
+
+static wimp_w  callback__whandle = 0;
+static long    callback__identifier = -1;
+static BOOL    callback__abortpressed = FALSE;
+static int     callback__barlength;
+static BOOL    callback__eventqueueclear;
+
+static wimp_emask  callback__oldemask;
+
+
+
+#define  PI_BarFrame  0
+#define  PI_Bar       1
+#define  PI_Abort     2
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  callback_eventhandler(wimp_eventstr *e, void *handle)
+{
+
+   switch(e->e)
+   {
+      case wimp_ENULL:
+         callback__eventqueueclear = TRUE;
+         break;
+
+      /*----------*/
+
+
+      case wimp_EOPEN:
+         wimpt_noerr(wimp_open_wind(&e->data.o));
+         break;
+
+      /*----------*/
+
+      case wimp_ECLOSE:
+         wimpt_noerr(wimp_close_wind(e->data.o.w));
+         if (e->data.o.w == callback__whandle)
+         {
+            callback__whandle = 0;
+            callback__identifier = -2;           /* we will use '-2' to indicate that window is closed,
+                                                    but we are carrying on with the process */
+            visdelay_begin();
+         }
+         break;
+
+      /*----------*/
+
+      case wimp_EBUT: /* mouse button pressed */
+         if (e->data.but.m.i == PI_Abort)
+            callback__abortpressed = TRUE;
+         break;
+
+   }
+
+   return;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  callback__setbar(int len)
+{
+   wimp_icreate  wic;
+   wimp_i        i2;
+
+
+   /*--- get the icon description ---*/
+   wimpt_noerr(wimp_get_icon_info(callback__whandle, PI_Bar, &wic.i));
+
+   /*--- we need to recreate the icon, so get rid of its current incarnation ---*/
+   wimpt_noerr(wimp_delete_icon(callback__whandle, PI_Bar));
+
+   /*--- alter its width ---*/
+   wic.i.box.x1 = wic.i.box.x0 + ((len == 0) ? 2 : len);
+
+   /*--- recreate it now ---*/
+   wic.w = callback__whandle;
+   wimpt_noerr(wimp_create_icon(&wic, &i2));
+
+   /*--- prod it, to cause redraw ---*/
+   wimpt_noerr(wimp_set_icon_state(callback__whandle, PI_Bar, 0, 0));
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  callback_progress(int numerator, int denominator, long userdata)
+{
+
+   if (numerator == 0)        /*--- new process starting ---*/
+   {
+      wimp_icon    icon;
+
+
+      if (callback__whandle == 0)    /*--- progress window only created once ---*/
+      {
+         template      *t;
+         wimp_wstate    ws;
+         wimp_mousestr  ms;
+         int            i;
+
+
+         /*--- create the window ---*/
+         t = template_find("Progress");
+         if (t == NULL)
+            werr(TRUE, "Unexpected error: Template 'Progress' not found");
+
+         if (wimpt_complain(wimp_create_wind(&t->window, &callback__whandle)) != NULL)
+            return;
+
+         /*--- event handler for the window ---*/
+         win_register_event_handler(callback__whandle, callback_eventhandler, NULL);
+
+         /*--- claim and turn on null events ---*/
+         win_claim_idle_events(callback__whandle);
+         callback__oldemask = event_getmask();
+         event_setmask(0);
+
+         wimpt_noerr(wimp_get_wind_state(callback__whandle, &ws));
+         ws.o.behind = -1;
+
+         /*--- centre the progress window on the pointer ---*/
+         wimpt_noerr(wimp_get_point_info(&ms));
+         i = ws.o.box.x1 - ws.o.box.x0;
+         ws.o.box.x0 = ms.x - i/2;
+         ws.o.box.x1 = ws.o.box.x0 + i;
+         i = ws.o.box.y1 - ws.o.box.y0;
+         ws.o.box.y0 = ms.y - i/2;
+         ws.o.box.y1 = ws.o.box.y0 + i;
+
+         if (wimpt_complain(wimp_open_wind(&ws.o)) != NULL)
+         {
+            callback__whandle = 0;
+            callback__identifier = -1;
+            return;
+         }
+         win_activeinc();      /* count active windows */
+
+         wimpt_noerr(wimp_get_icon_info(callback__whandle, PI_Bar, &icon));
+         callback__barlength = icon.box.x1 - icon.box.x0;
+      }
+
+      callback__identifier = userdata;
+      callback__abortpressed = FALSE;
+
+      callback__setbar(0);
+
+      /*--- let mine and other apps' events be processed ---*/
+      callback__eventqueueclear = FALSE;
+      while (!callback__eventqueueclear)
+         event_process();
+
+      return;
+   }
+
+
+   /*--- if trying to show progress of some other process,
+         then tough, we can only do one at a time ---*/
+   if ((userdata != callback__identifier) && (callback__identifier != -2))      /* (-2 means that window was closed but */
+      return;                                                                   /*  operation is still proceeding)      */
+
+
+   /*--- update the sliding bar (or just the hourglass if the window is closed) ---*/
+   if (callback__identifier == -2)
+      visdelay_percent(numerator * 100 / denominator);
+   else
+   {
+      callback__setbar((numerator * callback__barlength) / denominator);
+
+      /*--- let mine and other apps' events be processed ---*/
+      callback__eventqueueclear = FALSE;
+      while (!callback__eventqueueclear)
+         event_process();
+   }
+
+
+   /*--- if at 100%, then get rid of it now ---*/
+   if (numerator == denominator)
+   {
+      if (callback__identifier == -2)
+         visdelay_end();
+      else
+         wimpt_noerr(wimp_close_wind(callback__whandle));
+      callback__whandle = 0;
+      callback__identifier = -1;
+
+      /* turn off null events */
+      event_setmask(callback__oldemask);
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL  callback_abort(long userdata)
+{
+   if (callback__abortpressed)
+   {
+      wimpt_noerr(wimp_close_wind(callback__whandle));
+      callback__whandle = 0;
+      callback__identifier = -1;
+
+      /* turn off null events */
+      event_setmask(callback__oldemask);
+   }
+
+   return (callback__abortpressed);
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
